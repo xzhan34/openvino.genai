@@ -24,7 +24,7 @@ using namespace ov::genai;
 namespace {
 struct Eagle3RTInfo {
     bool eagle3_mode = false;
-    std::vector<int32_t> hidden_layers_list;
+    std::vector<int> hidden_layers_list;
     std::filesystem::path dt_mapping_table;
 };
 
@@ -37,7 +37,7 @@ extract_eagle3_mode_from_config(ov::AnyMap& config, const std::filesystem::path&
         auto it = config.find("hidden_layers_list");
         if (it != config.end()) {
             try {
-                eagle_rt_info.hidden_layers_list = it->second.as<std::vector<int32_t>>();
+                eagle_rt_info.hidden_layers_list = it->second.as<std::vector<int>>();
                 config.erase("hidden_layers_list");
             } catch (const std::exception&) {
                 OPENVINO_THROW("please check the hidden layers input");
@@ -46,7 +46,7 @@ extract_eagle3_mode_from_config(ov::AnyMap& config, const std::filesystem::path&
             // compute the layers from number of hidden layers
             auto config_file_path = models_path / "config.json";
             if (!std::filesystem::exists(config_file_path))
-                OPENVINO_THROW("Cannot deduce layers for hidden layer extraction because the file is missing: ", config_file_path);
+                OPENVINO_THROW("cannot deduce layers for hidden layer extraction");
             std::ifstream file(config_file_path);
 
             nlohmann::json data = nlohmann::json::parse(file);
@@ -61,7 +61,7 @@ extract_eagle3_mode_from_config(ov::AnyMap& config, const std::filesystem::path&
             // If you wish to use different layers, provide the "hidden_layers_list" parameter in the config.
             eagle_rt_info.hidden_layers_list = { 2, num_decoder_layers / 2, num_decoder_layers - 3 };
         }
-        OPENVINO_ASSERT(eagle_rt_info.hidden_layers_list.size() == 3, "Eagle3 is expected to provide exactly three layers for extraction");
+        OPENVINO_ASSERT(eagle_rt_info.hidden_layers_list.size() == 3, "only exactly 3 layer extraction are expected in eagle3");
     }
     return eagle_rt_info;
 }

@@ -115,7 +115,8 @@ class ModelRunner {
     uint8_t m_hidden_state_flags = HS_NONE;
     // a container which use sequence group id and request id as key to store hidden states
     std::map<SequenceKey, HiddenStateRange> m_sequence_hidden_state_mapping;
-    std::unordered_map<size_t, ov::Tensor> m_initial_hidden_states; // shape: [N, seq_len, hidden_size]
+    std::map<size_t, ov::Tensor> m_initial_hidden_states; // shape: [N, seq_len, hidden_size]
+    size_t m_adjust_factor = 1; // to adjust the hidden size of draft model input
 
     std::shared_ptr<InputsEmbedder> m_inputs_embedder;
 
@@ -182,6 +183,10 @@ public:
     void set_inputs_embedder(const std::shared_ptr<InputsEmbedder>& inputs_embedder) {
         m_inputs_embedder = inputs_embedder;
         m_embedding = inputs_embedder->get_embedding_model();
+    }
+
+    void set_adjust_factor(size_t adjust_factor) {
+        m_adjust_factor = adjust_factor;
     }
 
     /**
@@ -358,19 +363,33 @@ public:
                 }
                 if (_is_hs_import()) {
                     auto it = m_initial_hidden_states.find(sequence_group->get_request_id());
-                    OPENVINO_ASSERT(it != m_initial_hidden_states.end() && it->second.get_size() > 0,
-                                    "Missing initial hidden state for Eagle3 draft model inference.");
-                    const auto& stored_hidden_state = it->second;
-                    auto stored_shape = stored_hidden_state.get_shape();
-                    OPENVINO_ASSERT(stored_shape.size() > 0, "Unexpected hidden state shape for Eagle3 draft model inference.");
-                    size_t stored_seq_len = stored_shape[0];
-                    size_t stored_hidden_size = stored_shape[stored_shape.size() - 1];
 
-                    OPENVINO_ASSERT(stored_hidden_size == hidden_size, "Target state hidden size does not match the expected size for Eagle3 draft model inference.");
-                    OPENVINO_ASSERT(stored_seq_len == total_num_tokens, "Target state sequence length does not match the expected length for Eagle3 draft model inference.");
+                    if (it != m_initial_hidden_states.end()) {
+                        const auto& stored_hidden_state = it->second;
 
-                    // fill the draft model hidden state input with the target hidden state
-                    hidden_state_input = stored_hidden_state;
+                        if (stored_hidden_state.get_size() > 0) {
+                            auto stored_shape = stored_hidden_state.get_shape();
+
+                            if (stored_shape.size() >= 2) {
+                                size_t stored_seq_len = stored_shape[0];
+                                size_t stored_hidden_size = stored_shape[stored_shape.size() - 1];
+
+                                if (stored_hidden_size == hidden_size) {
+                                    if (stored_seq_len == total_num_tokens) {
+                                        hidden_state_input = stored_hidden_state;  // all tokens from eagle are accepted
+                                    } else {
+                                        size_t copy_length = std::min(stored_seq_len, num_scheduled_tokens);
+
+                                        size_t source_start_idx =
+                                            stored_seq_len >= copy_length ? stored_seq_len - copy_length : 0;
+                                        _copy_roi_between_tensors(stored_hidden_state, source_start_idx, copy_length, hidden_state_input, current_token_idx);
+                                    }
+                                }
+                            }
+                        } else {
+                            OPENVINO_ASSERT(false, "missing hidden state from target model to eagle draft model");
+                        }
+                    }
                 } else if (_is_hs_internal()) {
                     // fill hidden_state_data with m_hidden_states
                     if (hidden_state_data) {
@@ -497,7 +516,29 @@ public:
             }
         }
         if (hidden_state_input && hidden_state_input.get_size() > 0) {
-            m_request.set_tensor("hidden_states", hidden_state_input);
+            if (_is_hs_import()) {
+                try {
+                    m_request.set_tensor("hidden_states", hidden_state_input);
+                    auto shape = hidden_state_input.get_shape();
+                    shape[shape.size() - 1] = shape[shape.size() - 1] / m_adjust_factor;
+                    ov::Tensor fake_tensor = ov::Tensor(hidden_state_input.get_element_type(), shape);
+                    auto fake_data = fake_tensor.data<float>();
+                    std::memset(fake_data, 0, fake_tensor.get_byte_size());
+                    m_request.set_tensor("internal_hidden_states", fake_tensor);
+                } catch (const ov::Exception& e) {
+                }
+            } else {
+                try {
+                    m_request.set_tensor("internal_hidden_states", hidden_state_input);
+                    auto shape = hidden_state_input.get_shape();
+                    shape[shape.size() - 1] = shape[shape.size() - 1] * m_adjust_factor;
+                    ov::Tensor fake_tensor = ov::Tensor(hidden_state_input.get_element_type(), shape);
+                    auto fake_data = fake_tensor.data<float>();
+                    std::memset(fake_data, 0, fake_tensor.get_byte_size());
+                    m_request.set_tensor("hidden_states", fake_tensor);
+                } catch (const ov::Exception& e) {
+                }
+            }
         }
         if (position_ids.get_shape().size() == 3) {
             // flatten positions ids for 3D position ids case
@@ -557,16 +598,20 @@ public:
         _reset_cache_rotation_coefficients();
 
         if (_is_hs_export()) {
-            m_hidden_states = m_request.get_tensor("last_hidden_state");
-            for (size_t i = 0; i < num_sequence_groups; ++i) {
-                size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
-                SequenceGroup::Ptr sequence_group = sequence_groups[seq_group_id];
-                std::vector<Sequence::Ptr> running_sequences = sequence_group->get_running_sequences();
-                for (size_t seq_idx = 0; seq_idx < running_sequences.size(); ++seq_idx) {
-                    Sequence::Ptr sequence = running_sequences[seq_idx];
-                    sequence->update_hidden_state(
-                        _get_hidden_state(sequence_group->get_request_id(), sequence->get_grouped_id()));
+            try {
+                m_hidden_states = m_request.get_tensor("last_hidden_state");
+                for (size_t i = 0; i < num_sequence_groups; ++i) {
+                    size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
+                    SequenceGroup::Ptr sequence_group = sequence_groups[seq_group_id];
+                    std::vector<Sequence::Ptr> running_sequences = sequence_group->get_running_sequences();
+                    for (size_t seq_idx = 0; seq_idx < running_sequences.size(); ++seq_idx) {
+                        Sequence::Ptr sequence = running_sequences[seq_idx];
+                        sequence->update_hidden_state(
+                            _get_hidden_state(sequence_group->get_request_id(), sequence->get_grouped_id()));
+                    }
                 }
+            } catch (const ov::Exception&) {
+                m_hidden_states = ov::Tensor();
             }
         }
         // return logits
@@ -670,10 +715,21 @@ private:
         size_t length = it->second.length;
 
         auto shape = m_hidden_states.get_shape();
-        OPENVINO_ASSERT(shape.size() >= 2,
-                        "Hidden states tensor rank is less than 2.");
+        if (shape.size() < 2) {
+            return ov::Tensor();
+        }
 
-        auto [start_coord, end_coord] = ov::genai::utils::make_roi(shape, 0, start_idx, start_idx + length);
+        ov::Coordinate start_coord(shape.size(), 0);
+        ov::Coordinate end_coord(shape.size(), 0);
+
+        start_coord[0] = start_idx;
+        end_coord[0] = start_idx + length;
+
+        for (size_t i = 1; i < shape.size(); ++i) {
+            start_coord[i] = 0;
+            end_coord[i] = shape[i];
+        }
+
         return ov::Tensor(m_hidden_states, start_coord, end_coord);
     }
 
@@ -697,11 +753,14 @@ private:
         if (hidden_size == 0) {
             for (const auto& kv : m_initial_hidden_states) {
                 const auto& initial_hidden_states = kv.second;
-                auto hidden_states_shape = initial_hidden_states.get_shape();
-                OPENVINO_ASSERT(initial_hidden_states && hidden_states_shape.size() >= 2,
-                                "Initial hidden states tensor rank is less than 2.");
-                hidden_size = hidden_states_shape.back();
-                break;
+                if (initial_hidden_states && initial_hidden_states.get_shape().size() >= 2) {
+                    auto hidden_states_shape = initial_hidden_states.get_shape();
+                    hidden_size = hidden_states_shape.back();
+                    if (!(m_hidden_state_flags & HS_IMPORT)) {
+                        hidden_size /= m_adjust_factor;
+                    }
+                    break;
+                }
             }
         }
         if (hidden_size == 0) {
@@ -727,16 +786,28 @@ private:
             return;
         }
 
+        // lambda to create ROI coordinates
+        auto make_roi = [](const std::vector<size_t>& shape, size_t first_dim_start, size_t first_dim_end) {
+            ov::Coordinate start(shape.size(), 0), end(shape.size(), 0);
+            start[0] = first_dim_start;
+            end[0] = first_dim_end;
+            for (size_t d = 1; d < shape.size(); ++d) {
+                start[d] = 0;
+                end[d] = shape[d];
+            }
+            return std::make_pair(start, end);
+        };
+
         // prepare source ROI coords
         const auto src_shape = src.get_shape();
         OPENVINO_ASSERT(!src_shape.empty(), "source tensor rank is zero");
-        auto [src_start, src_end] = ov::genai::utils::make_roi(src_shape, 0, src_start_idx, src_start_idx + copy_length);
+        auto [src_start, src_end] = make_roi(src_shape, src_start_idx, src_start_idx + copy_length);
         ov::Tensor src_roi(src, src_start, src_end);
 
         // prepare destination ROI coords
         const auto dst_shape = dst_base.get_shape();
         OPENVINO_ASSERT(!dst_shape.empty(), "destination tensor rank is zero");
-        auto [tgt_start, tgt_end] = ov::genai::utils::make_roi(dst_shape, 0, dst_first_dim_start, dst_first_dim_start + copy_length);
+        auto [tgt_start, tgt_end] = make_roi(dst_shape, dst_first_dim_start, dst_first_dim_start + copy_length);
         ov::Tensor tgt_roi(dst_base, tgt_start, tgt_end);
 
         // bulk copy

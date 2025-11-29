@@ -4,7 +4,6 @@
 #include <thread>
 
 #include "openvino/genai/text_streamer.hpp"
-#include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "speculative_decoding_impl.hpp"
 #include "continuous_batching/paged_attention_transformations.hpp"
 #include "utils.hpp"
@@ -28,29 +27,17 @@ bool are_tokenizers_equal(Tokenizer& lhs, Tokenizer& rhs) {
 
 std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig>
 ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(const ov::genai::ModelDesc& main_model_desc, const ov::genai::ModelDesc& draft_model_desc) {
-    auto main_model = main_model_desc.model;
-    auto draft_model = draft_model_desc.model;
-    OPENVINO_ASSERT(main_model != nullptr, "Main model cannot be null");
-    OPENVINO_ASSERT(draft_model != nullptr, "Draft model cannot be null");
+    OPENVINO_ASSERT(main_model_desc.model != nullptr, "Main model cannot be null");
+    OPENVINO_ASSERT(draft_model_desc.model != nullptr, "Draft model cannot be null");
+    utils::apply_paged_attention_transformations(main_model_desc.model, main_model_desc.scheduler_config.use_cache_eviction);
+    utils::apply_paged_attention_transformations(draft_model_desc.model, main_model_desc.scheduler_config.use_cache_eviction);
 
-    auto main_scheduler_config = main_model_desc.scheduler_config;
-    bool allow_score_aggregation = true;
-    bool allow_xattention = false;
-
-    ov::pass::SDPAToPagedAttention(main_model_desc.scheduler_config.use_cache_eviction,
-                                   main_model_desc.scheduler_config.use_cache_eviction,
-                                   allow_score_aggregation,
-                                   allow_xattention).run_on_model(main_model);
-    ov::pass::SDPAToPagedAttention(main_model_desc.scheduler_config.use_cache_eviction,
-                                   main_model_desc.scheduler_config.use_cache_eviction,
-                                   allow_score_aggregation,
-                                   allow_xattention).run_on_model(draft_model);
-
-    utils::apply_gather_before_matmul_transformation(main_model);
-    utils::apply_gather_before_matmul_transformation(draft_model);
+    utils::apply_gather_before_matmul_transformation(main_model_desc.model);
+    utils::apply_gather_before_matmul_transformation(draft_model_desc.model);
 
     bool is_draft_scheduler_undefined = draft_model_desc.scheduler_config == SchedulerConfig();
 
+    auto main_scheduler_config = main_model_desc.scheduler_config;
     ov::genai::SchedulerConfig main_scheduler_config_updated = main_scheduler_config,
                                draft_scheduler_config = is_draft_scheduler_undefined ? main_scheduler_config : draft_model_desc.scheduler_config;
 
@@ -69,8 +56,8 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
             }
             return total_hidden_size;
         };
-        float main_model_hidden_size = compute_total_hidden_size(main_model),
-              draft_model_hidden_size = compute_total_hidden_size(draft_model);
+        float main_model_hidden_size = compute_total_hidden_size(main_model_desc.model),
+              draft_model_hidden_size = compute_total_hidden_size(draft_model_desc.model);
         auto k = draft_model_hidden_size / (main_model_hidden_size + draft_model_hidden_size);
 
         // TODO: work with KV blocks as it will be more precise instead of GBs
@@ -279,7 +266,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::generate(const std::vector<
                         "Streaming only supports batch size=1 with greedy/multinomial");
     };
     strategy.start_timer = [](){ return std::chrono::steady_clock::now(); };
-    strategy.stop_timer  = [](const TimePoint& start){
+    strategy.stop_timer  = [](TimePoint start){
         return PerfMetrics::get_microsec(std::chrono::steady_clock::now() - start);
     };
 

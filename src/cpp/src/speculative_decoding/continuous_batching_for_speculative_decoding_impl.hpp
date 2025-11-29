@@ -23,6 +23,14 @@ public:
                                                  const ov::AnyMap& plugin_config,
                                                  bool is_validation_mode_enabled);
 
+    ContinuousBatchingForSpeculativeDecodingImpl(const std::shared_ptr<ov::Model>& model,
+                                                 std::shared_ptr<InputsEmbedder> inputs_embedder,
+                                                 const Tokenizer& tokenizer,
+                                                 const GenerationConfig& generation_config,
+                                                 const SchedulerConfig& scheduler_config,
+                                                 const std::string& device,
+                                                 const ov::AnyMap& plugin_config,
+                                                 bool is_validation_mode_enabled);
     void multistep();
 
     void finish_request(int64_t request_id = -1);
@@ -65,6 +73,25 @@ public:
         eagle_mode_enabled = true;
     };
 
+    ContinuousBatchingForEagle3DecodingImpl(const std::shared_ptr<ov::Model>& model,
+                                            std::shared_ptr<InputsEmbedder> inputs_embedder,
+                                            const Tokenizer& tokenizer,
+                                            const GenerationConfig& generation_config,
+                                            const SchedulerConfig& scheduler_config,
+                                            const std::string& device,
+                                            const ov::AnyMap& plugin_config,
+                                            bool is_validation_mode_enabled)
+        : ContinuousBatchingForSpeculativeDecodingImpl(model,
+                                                       inputs_embedder,
+                                                       tokenizer,
+                                                       generation_config,
+                                                       scheduler_config,
+                                                       device,
+                                                       plugin_config,
+                                                       is_validation_mode_enabled) {
+        eagle_mode_enabled = true;
+    };
+
     bool is_requests_empty();
 
     /**
@@ -76,7 +103,7 @@ public:
      *
      * @param d2t A shared pointer to an ov::op::v0::Constant representing the draft-to-token mapping.
      */
-    void set_d2t_for_draft_decoding(const std::shared_ptr<ov::op::v0::Constant>& d2t) {
+    void set_d2t_for_draft_decoding(std::shared_ptr<ov::op::v0::Constant>& d2t) {
         if (m_sampler) {
             m_sampler->set_d2t_for_decoding(d2t);
         }
@@ -121,6 +148,12 @@ public:
     void set_hidden_state_internal_needed(bool is_needed) {
         if (m_model_runner) {
             m_model_runner->enable_hidden_state_internal(is_needed);
+        }
+    }
+
+    void set_adjust_factor(size_t adjust_factor) {
+        if (m_model_runner) {
+            m_model_runner->set_adjust_factor(adjust_factor);
         }
     }
 };

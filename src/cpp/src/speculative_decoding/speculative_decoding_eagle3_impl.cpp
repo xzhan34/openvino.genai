@@ -7,7 +7,7 @@ namespace ov::genai {
 // sharing embedding weights between main and draft models
 // for current supported models, e.g, llama3 and qwen3 EAGLE3 models are found have no embedding weights in the torch weight, and use the same one as in the target model.
 // for future model support with its own embedding layer, e.g. gpt-oss, will need to use its own embedding weights.
-void share_embedding_weights(const std::shared_ptr<ov::Model>& main_model, const std::shared_ptr<ov::Model>& draft_model) {
+void share_embedding_weights(std::shared_ptr<ov::Model>& main_model, std::shared_ptr<ov::Model>& draft_model) {
     // extract embedding weight from main model
     auto find_embedding_gather = [](const std::shared_ptr<ov::Model>& model)
         -> std::shared_ptr<ov::Node> {
@@ -46,131 +46,243 @@ void share_embedding_weights(const std::shared_ptr<ov::Model>& main_model, const
         return;
     }
 
-    GENAI_INFO("Sharing embedding weights between main and draft models for eagle3 speculative decoding.");
-    draft_weight_node->output(0).replace(main_weight_node->output(0));
-}
-
-void shift_fc_from_draft_to_main(std::shared_ptr<ov::Model>& main_model, std::shared_ptr<ov::Model>& draft_model) {
-    // extract the FC transform weight from draft model
-    auto remove_fc_and_rewire = [](const std::shared_ptr<ov::Model>& model) -> std::shared_ptr<ov::Node> {
-        for (const auto& node : model->get_ordered_ops()) {
-            auto matmul_node = ov::as_type_ptr<ov::op::v0::MatMul>(node);
-            if (!matmul_node) continue;
-            auto input_node = matmul_node->get_input_node_shared_ptr(0);
-            auto param_node = ov::as_type_ptr<ov::op::v0::Parameter>(input_node);
-            if (!param_node || input_node->get_friendly_name().find("hidden_states") == std::string::npos) continue;
-            // Rewire all outputs of this MatMul to use the input_node directly
-            for (auto& output : matmul_node->outputs()) {
-                for (auto& target : output.get_target_inputs()) {
-                    target.replace_source_output(input_node);
-                }
-            }
-            return matmul_node->input_value(1).get_node_shared_ptr();
-        }
-        return nullptr;
-    };
-    auto fc_weights = remove_fc_and_rewire(draft_model);
-    if (!fc_weights)
-        OPENVINO_THROW("Failed to locate FC weights in eagle3 draft model for shifting to main model.");
-    // now we create the fc into main model
-    for (const auto& result : main_model->get_results()) {
-        auto input_node = result->input_value(0).get_node_shared_ptr();
-        if (input_node && input_node->get_friendly_name().find("eagle3_hidden_states_concat") != std::string::npos) {
-            auto matmul = std::make_shared<ov::op::v0::MatMul>(input_node, fc_weights, false, true);
-            matmul->set_friendly_name("eagle3_hidden_state_fc");
-            result->input(0).replace_source_output(matmul);
-            break;
-        }
+    try {
+        draft_weight_node->output(0).replace(main_weight_node->output(0));
+    } catch (const std::exception& e) {
+        GENAI_WARN(std::string("Error: failed to import embedding weights from main model to draft model. Exception: ") + e.what());
+    } catch (...) {
+        GENAI_WARN("Error: failed to import embedding weights from main model to draft model due to unknown exception.");
     }
 }
 
-std::shared_ptr<ov::op::v0::Constant> extract_d2t_mapping_table(const std::shared_ptr<ov::Model>& model) {
+std::shared_ptr<ov::op::v0::Constant> extract_d2t_mapping_table(std::shared_ptr<ov::Model>& model) {
     // extract result nodes from model
     for (const auto& result : model->get_results()) {
         auto input_node = result->input_value(0).get_node_shared_ptr();
-        auto constant = ov::as_type_ptr<ov::op::v0::Constant>(input_node);
-        if (constant && constant->get_friendly_name().find("d2t") != std::string::npos) {
-            model->remove_result(result);
-            model->validate_nodes_and_infer_types();
-            return constant;
+        if (ov::is_type<ov::op::v0::Constant>(input_node) && input_node->get_friendly_name().find("d2t") != std::string::npos) {
+            return ov::as_type_ptr<ov::op::v0::Constant>(input_node);
+        }
+    }
+    return nullptr;
+}
+void extract_hidden_state_generic(std::shared_ptr<ov::Model>& model,
+                                  const std::vector<int>& hidden_layers_to_abstract) {
+    ov::pass::Manager pm;
+    pm.register_pass<EagleModelTransform>(hidden_layers_to_abstract);
+    pm.run_passes(model);
+}
+
+EagleModelTransform::EagleModelTransform(const std::vector<int>& layers) : m_layer_ids(layers) {
+}
+
+bool EagleModelTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
+    // share the embedding weights from main model to draft model
+    m_new_parameters.clear();
+    m_new_results.clear();
+    if (m_layer_ids.size() == 1 && m_layer_ids[0] == -1) {
+        ov::pass::Manager manager;
+        manager.set_per_pass_validation(false);
+        manager.register_pass<EagleBaseTransform>(m_new_results);
+        // input transform for draft
+        // here we apply a trick for the fc layer in draft model
+        manager.register_pass<EagleInputTransform>(m_new_parameters);
+        manager.run_passes(model);
+
+        model->add_parameters(m_new_parameters);
+        model->add_results(m_new_results);
+        return true;
+    } else {
+        ov::pass::Manager manager;
+        manager.set_per_pass_validation(false);
+        manager.register_pass<Eagle3Transform>(m_layer_ids, m_hidden_layer_outputs);
+        manager.run_passes(model);
+        if (!m_hidden_layer_outputs.empty()) {
+            auto concat = std::make_shared<v0::Concat>(m_hidden_layer_outputs, -1);
+            concat->set_friendly_name("eagle3_hidden_states_concat");
+            
+            auto result = std::make_shared<v0::Result>(concat);
+            std::string output_name = "last_hidden_state";
+            result->output(0).set_names({output_name});
+            result->set_friendly_name(output_name);
+            model->add_results({result});
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+EagleInputTransform::EagleInputTransform(std::vector<std::shared_ptr<v0::Parameter>>& params) {
+    register_matcher(
+        std::make_shared<ov::pass::pattern::Matcher>(ov::pass::pattern::wrap_type<v0::MatMul>(), this->get_type_info().name),
+        ([&params, this](ov::pass::pattern::Matcher& m) {
+            auto node = m.get_match_root();
+            try {
+                if (apply(node, params)) {
+                    ++applied;
+                    return true;
+                }
+            } catch (...) {
+                OPENVINO_ASSERT(false, "EagleTransform failed to apply");
+            }
+            return false;
+        })
+    );
+}
+bool EagleInputTransform::apply(NodePtr node, std::vector<std::shared_ptr<v0::Parameter>>& params) {
+    if (ov::is_type<v0::MatMul>(node)) {
+        auto matmul_node = ov::as_type_ptr<v0::MatMul>(node);
+        // check the input of matmul node, if it is a node with name "hidden_states", then it's the node we want
+        auto input_node = matmul_node->get_input_node_shared_ptr(0);
+        if (!ov::as_type_ptr<v0::Parameter>(input_node)) {
+            return false;
+        }
+
+        auto shape = node->get_output_partial_shape(0);
+        auto internal_hidden_state = std::make_shared<v0::Parameter>(node->get_element_type(), node->get_output_partial_shape(0));
+        internal_hidden_state->output(0).set_names({"internal_hidden_states"});
+        internal_hidden_state->set_friendly_name("internal_hidden_states");
+        // create new eltwise node to add output of MatMul node and internal hidden state input from last cycle of itself
+        auto new_eltwise = std::make_shared<v1::Add>(internal_hidden_state, matmul_node->output(0));
+        ov::replace_node(matmul_node, new_eltwise);
+        params.push_back(internal_hidden_state);
+        return true;
+    }
+}
+
+EagleBaseTransform::EagleBaseTransform(std::vector<std::shared_ptr<v0::Result>>& results) {
+    register_matcher(
+        std::make_shared<ov::pass::pattern::Matcher>(ov::pass::pattern::wrap_type<v0::Result>(), this->get_type_info().name),
+        ([&results, this](ov::pass::pattern::Matcher& m) {
+            auto node = m.get_match_root();
+            try {
+                if (apply(node, results)) {
+                    ++applied;
+                    return true;
+                }
+            } catch (...) {
+                OPENVINO_ASSERT(false, "EagleTransform failed to apply");
+            }
+            return false;
+        })
+    );
+}
+
+std::shared_ptr<ov::Node> EagleBaseTransform::find_last_residual_node(const std::shared_ptr<ov::Node>& start_node, 
+                                                               std::set<ov::Node*>& visited_nodes) {
+    if (visited_nodes.count(start_node.get())) {
+        return nullptr;
+    }
+
+    visited_nodes.insert(start_node.get());
+
+    if (ov::is_type<v1::Add>(start_node)) {
+        // check the input nodes of MatMul, if found Gather node, return the gather node, otherwise ,retrun the matmul node
+        for (size_t i = 0; i < start_node->get_input_size(); ++i) {
+            auto input_node = start_node->get_input_node_shared_ptr(i);
+            if (!input_node) continue;
+            if (ov::as_type_ptr<v0::MatMul>(input_node)) {
+                return start_node; // return the Add node itself
+            }
+        }
+    }
+    
+    for (size_t i = 0; i < start_node->get_input_size(); ++i) {
+        auto input_node = start_node->get_input_node_shared_ptr(i);
+        if (!input_node) continue;
+        
+        auto result = find_last_residual_node(input_node, visited_nodes);
+        if (result) {
+            return result;
         }
     }
     return nullptr;
 }
 
-/* Transforms the given OpenVINO model to extract hidden states from specified layers.
- *
- * This function modifies the provided model by identifying and extracting the outputs of residual Add nodes
- * corresponding to the specified hidden layers. The extracted hidden states are then added as new result nodes
- * to the model, either concatenated (if multiple layers are specified) or as a single output.
- *
- */
-void hidden_state_transform(std::shared_ptr<ov::Model>& model,
-                                  const std::vector<int32_t>& hidden_layers_to_abstract) {
-    if (hidden_layers_to_abstract.empty()) {
-        return;
-    }
-    OPENVINO_ASSERT(
-        hidden_layers_to_abstract.size() == 3 || hidden_layers_to_abstract.size() == 1,
-        "Expected exactly 1 or 3 hidden layers for extraction: 1 for draft model, 3 for main model (early/middle/late stages)."
-    );
+std::shared_ptr<ov::Node> EagleBaseTransform::find_last_residual_node(const std::shared_ptr<ov::Node>& start_node) {
+    std::set<ov::Node*> visited_nodes;
+    return find_last_residual_node(start_node, visited_nodes);
+}
 
-    std::vector<std::string> patterns;
-    if (hidden_layers_to_abstract.size() > 1) {
-        patterns.reserve(hidden_layers_to_abstract.size());
-        for (int32_t idx : hidden_layers_to_abstract) {
-            patterns.emplace_back("layers." + std::to_string(idx) + "/"); // main description
-        }
-    } else {
-        patterns.emplace_back("midlayer"); // draft description
-    }
-
-    // Helper: check if node is a residual Add node with expected structure
-    auto is_residual_node = [](const std::shared_ptr<ov::Node>& node) -> bool {
-        if (const auto& add = ov::as_type_ptr<ov::op::v1::Add>(node)) {
-            auto input1 = add->get_input_node_shared_ptr(1);
-            auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(input1);
-            if (!matmul) return false;
-            auto matmul_input = matmul->get_input_node_shared_ptr(0);
-            return matmul_input && ov::is_type<ov::op::v1::Multiply>(matmul_input);
+bool EagleBaseTransform::apply(NodePtr node, std::vector<std::shared_ptr<v0::Result>>& results) {
+    {
+        // 1. without normalization layer 2. add extra input
+        if (ov::is_type<v0::Result>(node)) {
+            // we are applying transformation to the last hidden state, eagle2 mode
+            NodePtr input_node = node->get_input_node_shared_ptr(0);
+            if (!input_node) {
+                return false;
+            }
+            auto last_residual_node = find_last_residual_node(input_node);
+            if (!last_residual_node) {
+                return false;
+            }
+            auto result = std::make_shared<v0::Result>(last_residual_node);
+            std::string output_name = "last_hidden_state";
+            result->output(0).set_names({output_name});
+            result->set_friendly_name(output_name);
+            results.push_back(result);
+            return true;
         }
         return false;
-    };
+    }
+}
 
-    std::vector<ov::Output<ov::Node>> residual_outputs;
-    for (const auto& node : model->get_ordered_ops()) {
-        if (!is_residual_node(node)) continue;
-        const std::string& name = node->get_friendly_name();
-        for (const auto& pattern : patterns) {
-            if (name.find(pattern) != std::string::npos) {
-                residual_outputs.push_back(node->output(0));
+Eagle3Transform::Eagle3Transform(const std::vector<int>& layers, std::vector<Output<Node>>& hidden_state_outputs) : m_layers(layers) {
+    auto is_target_pattern = [&](const Output<Node>& output) {
+        auto add_node = ov::as_type_ptr<v1::Add>(output.get_node_shared_ptr());
+        if (!add_node)
+            return false;
+        auto add_node_name = add_node->get_friendly_name();
+        if (add_node_name.find("self_attn") != std::string::npos)
+            return false; // Skip self-attention layers
+        bool layer_matched = false;
+        for (auto layer_idx : m_layers) {
+            if (add_node_name.find("layers." + std::to_string(layer_idx) + "/") != std::string::npos) {
+                layer_matched = true;
                 break;
             }
         }
-    }
 
-    if (!residual_outputs.empty()) {
-        OPENVINO_ASSERT(residual_outputs.size() == patterns.size(),
-                        "Number of extracted hidden states does not match the requested number.");
-        std::shared_ptr<ov::Node> node_to_operate;
-        if (residual_outputs.size() > 1) {
-            auto concat = std::make_shared<ov::op::v0::Concat>(residual_outputs, -1);
-            concat->set_friendly_name("eagle3_hidden_states_concat");
-            node_to_operate = concat;
-        } else {
-            node_to_operate = residual_outputs[0].get_node_shared_ptr();
+        if (!layer_matched) {
+            return false; // Skip layers that are not in the specified layers
         }
-        auto result = std::make_shared<ov::op::v0::Result>(node_to_operate);
-        const std::string output_name = "last_hidden_state";
-        result->output(0).set_names({output_name});
-        result->set_friendly_name(output_name);
-        model->add_results({result});
-    }
+        auto input0 = add_node->get_input_node_shared_ptr(1);
+        if (!input0 || !ov::is_type<v0::MatMul>(input0)) {
+            return false;
+        }
+        auto matmul_node = input0;
+        auto matmul_input = matmul_node->get_input_node_shared_ptr(0);
+        if (!matmul_input) {
+            return false;
+        }
+
+        bool has_multiply = ov::is_type<v1::Multiply>(matmul_input); // ACT(up) dot gate
+        return has_multiply;    
+    };
+
+    auto hidden_layer = ov::pass::pattern::wrap_type<v1::Add>(is_target_pattern);
+    register_matcher(std::make_shared<ov::pass::pattern::Matcher>(hidden_layer, "Eagle3Transform::hidden_extraction"),
+        [&hidden_state_outputs, this](ov::pass::pattern::Matcher& m) {
+            auto node = m.get_match_root();
+            if (ov::is_type<v1::Add>(node)) {
+                hidden_state_outputs.push_back(node->output(0));
+                return true;
+            }
+            return false;
+        }
+    );
 }
 
 ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::genai::ModelDesc& main_model_desc,
                                                                  const ov::genai::ModelDesc& draft_model_desc,
-                                                                 const std::vector<int32_t>& hidden_layers) {
+                                                                 const std::vector<int>& hidden_layers)
+                                                                 : m_hidden_layers_to_abstract(hidden_layers) {
+    if (main_model_desc.inputs_embedder) {
+        m_inputs_embedder = main_model_desc.inputs_embedder;
+        m_model_input_type = ModelInputType::EMBEDDINGS;
+    }
+
     auto scheduler_configs = init_speculative_models(main_model_desc, draft_model_desc);
     // Eagle speculative decoding does not support dynamic_split_fuse mode
     // because it requires hidden state interaction from main model to draft model
@@ -193,32 +305,50 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
 
     // main and draft model use same tokenzier, but could differ in configurations
     // for example, llama3 draft model has different eos_token_id in config.json
-    const Tokenizer& main_model_tokenizer = main_model_desc.tokenizer;
-    const Tokenizer& draft_model_tokenizer = draft_model_desc.tokenizer;
+    Tokenizer main_model_tokenizer = main_model_desc.tokenizer;
+    Tokenizer draft_model_tokenizer = draft_model_desc.tokenizer;
     m_tokenizer = main_model_tokenizer;
     // for eagle model, we need to obtain hidden layer state as extra output
     // apply transformations needed to run eagle model
     share_embedding_weights(main_model, draft_model);
-    hidden_state_transform(main_model, hidden_layers);
-    // move the FC layer from draft model to main model
-    shift_fc_from_draft_to_main(main_model, draft_model);
-    hidden_state_transform(draft_model, { -1 });
+    extract_hidden_state_generic(main_model, hidden_layers);
+    extract_hidden_state_generic(draft_model, { -1 });
 
     // to create `main_pipeline` with enabled validation_mode and `draft_pipeline` with disabled validation mode
-    m_main_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(main_model,
-                                                                               main_model_tokenizer,
-                                                                               main_model_desc.generation_config,
-                                                                               scheduler_configs.first,
-                                                                               main_device,
-                                                                               main_model_desc.properties,
-                                                                               true);
-    m_draft_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(draft_model,
-                                                                                draft_model_tokenizer,
-                                                                                draft_model_desc.generation_config,
-                                                                                scheduler_configs.second,
-                                                                                draft_device,
-                                                                                draft_properties,
-                                                                                false);
+    if (m_model_input_type == ModelInputType::EMBEDDINGS) {
+        m_main_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(main_model,
+                                                                                    m_inputs_embedder,
+                                                                                    main_model_tokenizer,
+                                                                                    main_model_desc.generation_config,
+                                                                                    scheduler_configs.first,
+                                                                                    main_device,
+                                                                                    main_model_desc.properties,
+                                                                                    true);
+        m_draft_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(draft_model,
+                                                                                     m_inputs_embedder,
+                                                                                     draft_model_tokenizer,
+                                                                                     draft_model_desc.generation_config,
+                                                                                     scheduler_configs.second,
+                                                                                     draft_device,
+                                                                                     draft_properties,
+                                                                                     false);
+    } else {
+        m_main_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(main_model,
+                                                                                    main_model_tokenizer,
+                                                                                    main_model_desc.generation_config,
+                                                                                    scheduler_configs.first,
+                                                                                    main_device,
+                                                                                    main_model_desc.properties,
+                                                                                    true);
+        m_draft_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(draft_model,
+                                                                                     draft_model_tokenizer,
+                                                                                     draft_model_desc.generation_config,
+                                                                                     scheduler_configs.second,
+                                                                                     draft_device,
+                                                                                     draft_properties,
+                                                                                     false);
+    }
+
     m_perf_metrics = ov::genai::SDPerModelsPerfMetrics();
     m_perf_metrics.raw_metrics.m_inference_durations = {{MicroSeconds(0.0f)}};
     m_draft_pipeline->raw_perf_metrics.m_inference_durations = {{ MicroSeconds(0.0f) }};
@@ -229,9 +359,19 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     update_eagle_pipeline_params(d2t_tensor);
 }
 
+ov::Tensor ContinuousBatchingPipeline::Eagle3DecodingImpl::create_draft_input(const ov::Tensor& original_input_ids) {
+    if (m_model_input_type == ModelInputType::TOKENS) {
+        return create_draft_input_ids(original_input_ids);
+    } else {
+        return create_draft_input_embeddings(original_input_ids);
+    }
+}
+
 ov::Tensor ContinuousBatchingPipeline::Eagle3DecodingImpl::create_draft_input_ids(const ov::Tensor& original_input_ids) {
     auto shape = original_input_ids.get_shape();
-    OPENVINO_ASSERT(shape.size() != 0u && shape.back() > 1u, "input_ids shape is invalid for creating eagle3 draft input_ids");
+    if (shape.size() == 0u || shape.back() <= 1u) {
+        return ov::Tensor(original_input_ids);
+    }
 
     size_t original_length = shape.back();
     size_t new_length = original_length - 1;
@@ -247,13 +387,36 @@ ov::Tensor ContinuousBatchingPipeline::Eagle3DecodingImpl::create_draft_input_id
     return draft_input_ids;
 }
 
-void ContinuousBatchingPipeline::Eagle3DecodingImpl::update_eagle_pipeline_params(const std::shared_ptr<ov::op::v0::Constant>& d2t_tensor) {
+ov::Tensor ContinuousBatchingPipeline::Eagle3DecodingImpl::create_draft_input_embeddings(const ov::Tensor& original_input_embeddings) {
+    auto shape = original_input_embeddings.get_shape();
+
+    OPENVINO_ASSERT(shape.size() == 3u, "Input embedding tensor shape size should be 3.");
+    OPENVINO_ASSERT(shape[0] == 1u, "Input embedding tensor only support batch == 1.");
+
+    size_t original_length = shape[1];
+
+    OPENVINO_ASSERT(original_length >= 1u, "At least input length >= 1");
+    size_t new_length = original_length - 1;
+
+    ov::Tensor draft_input_embeddings(ov::element::f32, {1, new_length, shape[2]});
+
+    const float* src_data = original_input_embeddings.data<float>();
+    float* dst_data = draft_input_embeddings.data<float>();
+
+    std::copy(src_data + shape[2], src_data + original_length, dst_data);
+
+    return draft_input_embeddings;
+}
+
+void ContinuousBatchingPipeline::Eagle3DecodingImpl::update_eagle_pipeline_params(std::shared_ptr<ov::op::v0::Constant>& d2t_tensor) {
     auto m_main_eagle_pipeline  = std::dynamic_pointer_cast<ContinuousBatchingForEagle3DecodingImpl>(m_main_pipeline);
     auto m_draft_eagle_pipeline = std::dynamic_pointer_cast<ContinuousBatchingForEagle3DecodingImpl>(m_draft_pipeline);
     m_main_eagle_pipeline->set_hidden_state_export_needed(true);
     m_draft_eagle_pipeline->set_hidden_state_export_needed(true);
     m_draft_eagle_pipeline->set_hidden_state_import_needed(true);
     m_draft_eagle_pipeline->set_hidden_state_internal_needed(true);
+    m_draft_eagle_pipeline->set_adjust_factor(
+        m_hidden_layers_to_abstract.size() > 0 ? m_hidden_layers_to_abstract.size() : 1);
     m_draft_eagle_pipeline->set_d2t_for_draft_decoding(d2t_tensor);
 }
 
@@ -267,7 +430,7 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::add_request(uint64_t request_id,
     draft_sampling_params.ignore_eos = true;
     draft_sampling_params.stop_strings = {};
     // remove first token from input_ids to create draft_input_ids
-    ov::Tensor draft_input_ids = create_draft_input_ids(input_ids);
+    ov::Tensor draft_input_ids = create_draft_input(input_ids);
     m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, draft_input_ids, draft_sampling_params, token_type_ids)});
     return m_main_pipeline->add_request(request_id, input_ids, sampling_params, token_type_ids);
 }
@@ -283,7 +446,7 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::add_request(uint64_t request_id,
     // remove first token from input_ids to create draft_input_ids
     // add_special_tokens is false for better compression rate
     auto input_ids = m_tokenizer.encode(prompt, ov::genai::add_special_tokens(false)).input_ids;
-    ov::Tensor draft_input_ids = create_draft_input_ids(input_ids);
+    ov::Tensor draft_input_ids = create_draft_input(input_ids);
     m_draft_generations.insert({request_id, m_draft_pipeline->add_request(request_id, draft_input_ids, draft_sampling_params)});
     return m_main_pipeline->add_request(request_id, input_ids, sampling_params);
 }
@@ -310,7 +473,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
         draft_cfg.ignore_eos = true;
         draft_cfg.stop_strings = {};
         main_in = in_ids;
-        draft_in = create_draft_input_ids(in_ids);
+        draft_in = create_draft_input(in_ids);
     };
 
     strategy.check_streaming = [](const std::shared_ptr<ThreadedStreamerWrapper>& streamer_ptr,
@@ -324,7 +487,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
     strategy.start_timer = [](){
         return std::chrono::steady_clock::now();
     };
-    strategy.stop_timer = [](const TimePoint& start){
+    strategy.stop_timer = [](TimePoint start){
         return PerfMetrics::get_microsec(std::chrono::steady_clock::now() - start);
     };
 
