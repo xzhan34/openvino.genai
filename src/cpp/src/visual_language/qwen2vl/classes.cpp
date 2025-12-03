@@ -808,11 +808,18 @@ void VisionEncoderQwen2VL::encode_with_imagepreprocess_ov(const std::vector<ov::
     const float VIDEO_BRANCH_CONDITION = 0.f;
     const float IMAGE_BRANCH_CONDITION = 1.f;
     std::vector<float> cond_img_vid_data{images.size() == 2u ? VIDEO_BRANCH_CONDITION : IMAGE_BRANCH_CONDITION};
-    ov::Tensor cond_img_vid(ov::element::f32, ov::Shape{1}, const_cast<float*>(cond_img_vid_data.data()));
-    ov::Tensor input_image_1(ov::element::u8, image_shape, images[0].data<uint8_t>());
-    ov::Tensor input_image_2(ov::element::u8,
-                             image_shape,
-                             images.size() == 2 ? images[1].data<uint8_t>() : images[0].data<uint8_t>());
+    ov::Tensor cond_img_vid(ov::element::f32, ov::Shape{1}, cond_img_vid_data.data());
+    // const_cast is safe as ov::Tensor only views the data and doesn't modify it.
+    ov::Tensor input_image_1(
+        ov::element::u8, 
+        image_shape, 
+        const_cast<uint8_t*>(images[0].data<uint8_t>())
+    );
+    ov::Tensor input_image_2(
+        ov::element::u8,
+        image_shape,
+        const_cast<uint8_t*>(images.size() == 2 ? images[1].data<uint8_t>() : images[0].data<uint8_t>())
+    );
 
     uint64_t a_target_shape[2] = {target_image_size.height, target_image_size.width};
     ov::Tensor target_shape(ov::element::i64, ov::Shape{2}, a_target_shape);
@@ -980,12 +987,13 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
 }
 
 void InputsEmbedderQwen2VL::encode_vision_placeholder_tokens() {
-    auto encoded_vision_tokens = m_tokenizer.encode(
-        m_vlm_config.vision_start_token + m_vlm_config.image_pad_token + m_vlm_config.video_pad_token,
-        ov::genai::add_special_tokens(false));
+    auto encoded_vision_tokens = m_tokenizer.encode(m_vlm_config.vision_start_token + m_vlm_config.vision_end_token +
+                                                    m_vlm_config.image_pad_token + m_vlm_config.video_pad_token,
+                                                    ov::genai::add_special_tokens(false));
     m_vision_token_ids["vision_start"] = encoded_vision_tokens.input_ids.data<int64_t>()[0];
-    m_vision_token_ids["image_pad"] = encoded_vision_tokens.input_ids.data<int64_t>()[1];
-    m_vision_token_ids["video_pad"] = encoded_vision_tokens.input_ids.data<int64_t>()[2];
+    m_vision_token_ids["vision_end"] = encoded_vision_tokens.input_ids.data<int64_t>()[1];
+    m_vision_token_ids["image_pad"] = encoded_vision_tokens.input_ids.data<int64_t>()[2];
+    m_vision_token_ids["video_pad"] = encoded_vision_tokens.input_ids.data<int64_t>()[3];
 }
 
 size_t InputsEmbedderQwen2VL::calc_tokens_num(size_t grid_t, size_t grid_h, size_t grid_w) const {
@@ -1101,11 +1109,22 @@ ov::Tensor InputsEmbedderQwen2VL::get_inputs_embeds(const std::string& unified_p
     }
 
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
-    CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
-    EmbeddingsRequest& req = embeddings_request_guard.get();
-    ov::Tensor text_embeds = m_embedding->infer(req, input_ids);
+    ov::Tensor text_embeds;
+    {
+        // Acquire request, run inference, then copy the result to safeguard against later reuse
+        CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
+        EmbeddingsRequest& req = embeddings_request_guard.get();
+        ov::Tensor tmp_embeds = m_embedding->infer(req, input_ids);
+
+        // Deep-copy necessary: Returned InferRequest's internal memory will be reused in
+        // extract_text_features_for_cdpruner() that acquires a request from the same queue.
+        // Without deep-copy, the second inference would overwrite this data, corrupting text_embeds.
+        text_embeds = ov::Tensor(tmp_embeds.get_element_type(), tmp_embeds.get_shape());
+        std::memcpy(text_embeds.data(), tmp_embeds.data(), tmp_embeds.get_byte_size());
+    } // Request released here
 
     int64_t vision_start_token_id = m_vision_token_ids["vision_start"];
+    int64_t vision_end_token_id = m_vision_token_ids["vision_end"];
     int64_t image_pad_token_id = m_vision_token_ids["image_pad"];
     int64_t video_pad_token_id = m_vision_token_ids["video_pad"];
 
