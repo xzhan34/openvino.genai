@@ -1,0 +1,29 @@
+// Copyright (C) 2023-2025 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#include <chrono>
+#include <thread>
+
+#include "md_img_preprocess.hpp"
+
+namespace ov {
+namespace genai {
+namespace module {
+
+    ImagePreprocesModule::ImagePreprocesModule(const ModuleDesc& desc, const std::string& name) {
+
+    }
+
+    bool ImagePreprocesModule::initialize() {
+        return true;
+    }
+
+    void ImagePreprocesModule::run() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::cout << "Run: " << __FUNCTION__ << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    }
+
+}  // namespace module
+}  // namespace genai
+}  // namespace ov
