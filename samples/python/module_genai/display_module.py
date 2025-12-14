@@ -1,6 +1,7 @@
 import yaml
 from graphviz import Digraph
 import os
+import sys
 
 def generate_pipeline_dag(yaml_data, output_filename="pipeline_dag", output_format="png"):
     """
@@ -89,8 +90,14 @@ def generate_pipeline_dag(yaml_data, output_filename="pipeline_dag", output_form
         print(f"The graph file '{output_filename}.{output_format}' was not generated.")
 
 if __name__ == "__main__":
+    default_yaml_path = "config.yaml"
+    if len(sys.argv) > 1:
+        yaml_path = sys.argv[1]
+    else:
+        yaml_path = default_yaml_path
+    print(f"yaml file path: {yaml_path}")
+
     try:
-        yaml_path = "config.yaml"
         with open(yaml_path, 'r', encoding='utf-8') as f:
             yaml_content = f.read()
 

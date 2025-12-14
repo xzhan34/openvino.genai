@@ -14,9 +14,11 @@ namespace genai {
 
 namespace module {
 
+using PipelineModuleInstance = std::vector<IBaseModule::PTR>;
+
 class OPENVINO_GENAI_EXPORTS ModulePipeline {
 private:
-    std::unordered_map<std::string, std::unique_ptr<IBaseModule>> m_modules;
+    PipelineModuleInstance m_modules;
 
 public:
     // config_path: yaml file.
@@ -37,7 +39,7 @@ public:
     void finish_chat();
 
 private:
-    std::string m_device;
+    
 };
 
 }  // namespace module
