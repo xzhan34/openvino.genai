@@ -10,9 +10,7 @@ namespace ov {
 namespace genai {
 namespace module {
 
-TextEncodeModule::TextEncodeModule(const ModuleDesc& desc, const std::string& name) {
-
-}
+TextEncodeModule::TextEncodeModule(const ModuleDesc& desc) : IBaseModuleCom(desc) {}
 
 bool TextEncodeModule::initialize() {
     return true;
@@ -20,7 +18,7 @@ bool TextEncodeModule::initialize() {
 
 void TextEncodeModule::run() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    std::cout << "Run: " << __FUNCTION__ << std::endl;
+    PRINT_POS();
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 }
 

@@ -18,10 +18,10 @@ ModulePipeline::ModulePipeline(const std::filesystem::path& config_path) {
     auto pipeline_desc = utils::load_config(config_path);
 
     // Construct pipeline
-    auto pipeline_instance = construct_pipeline(pipeline_desc);
+    construct_pipeline(pipeline_desc, m_modules);
 
     // Sort pipeline
-    pipeline_instance = sort_pipeline(pipeline_instance);
+    sort_pipeline(m_modules);
 }
 
 ModulePipeline::~ModulePipeline() {}
@@ -30,7 +30,11 @@ ModulePipeline::~ModulePipeline() {}
 // "prompt": string
 // "image": image ov::Tensor or std::vector<ov::Tensor>
 // "video": video ov::Tensor
-void ModulePipeline::generate(const ov::AnyMap& any_inputs, StreamerVariant streamer) {}
+void ModulePipeline::generate(const ov::AnyMap& any_inputs, StreamerVariant streamer) {
+    for (auto& module : m_modules) {
+        module->run();
+    }
+}
 
 ov::Any ModulePipeline::get_output(const std::string& output_name) {
     return ov::Any();

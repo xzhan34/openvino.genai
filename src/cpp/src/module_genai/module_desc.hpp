@@ -28,8 +28,8 @@ struct InputPort {
 };
 
 struct ModuleDesc {
-    ModuleType type;
-    std::string name;
+    ModuleType type = ModuleType::Unknown;
+    std::string name = "Unknown";
     std::string device;
     std::string description;
     std::vector<InputPort> inputs;

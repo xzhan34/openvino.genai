@@ -4,25 +4,28 @@
 #pragma once
 
 #include "module_genai/module.hpp"
-#include "openvino/genai/module_genai/module_base.hpp"
+#include "module_genai/modules/md_base_com.hpp"
 
 namespace ov {
 namespace genai {
 namespace module {
 
-class ImagePreprocesModule : public IBaseModule {
+class ImagePreprocesModule : public IBaseModuleCom {
 protected:
     ImagePreprocesModule() = delete;
-    ImagePreprocesModule(const ModuleDesc& desc, const std::string& name);
+    ImagePreprocesModule(const ModuleDesc& desc);
 
 public:
+    ~ImagePreprocesModule() {
+        std::cout << "~ImagePreprocesModule is called." << std::endl;
+    }
     bool initialize() override;
 
     void run() override;
 
     using PTR = std::shared_ptr<ImagePreprocesModule>;
-    static PTR create(const ModuleDesc& desc, const std::string& name) {
-        return PTR(new ImagePreprocesModule(desc, name));
+    static PTR create(const ModuleDesc& desc) {
+        return PTR(new ImagePreprocesModule(desc));
     }
 };
 
