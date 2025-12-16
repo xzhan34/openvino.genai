@@ -10,7 +10,7 @@ namespace ov {
 namespace genai {
 namespace module {
 
-    ImagePreprocesModule::ImagePreprocesModule(const ModuleDesc& desc) : IBaseModuleCom(desc) {
+    ImagePreprocesModule::ImagePreprocesModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {
 
     }
 

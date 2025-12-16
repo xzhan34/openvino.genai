@@ -6,7 +6,7 @@
 namespace ov {
 namespace genai {
 namespace module {
-ParameterModule::ParameterModule(const ModuleDesc& desc) : IBaseModuleCom(desc) {
+ParameterModule::ParameterModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {
     std::cout << "ParameterModule:" << m_desc << std::endl;
 }
 
@@ -18,7 +18,7 @@ bool ParameterModule::initialize() {
     return true;
 }
 
-ResultModule::ResultModule(const ModuleDesc& desc) : IBaseModuleCom(desc) {}
+ResultModule::ResultModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {}
 
 void ResultModule::run() {
     PRINT_POS();

@@ -10,7 +10,7 @@ namespace ov {
 namespace genai {
 namespace module {
 
-TextEncodeModule::TextEncodeModule(const ModuleDesc& desc) : IBaseModuleCom(desc) {}
+TextEncodeModule::TextEncodeModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {}
 
 bool TextEncodeModule::initialize() {
     return true;
