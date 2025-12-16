@@ -12,7 +12,7 @@ namespace module {
 class TextEncodeModule : public IBaseModuleCom {
 protected:
     TextEncodeModule() = delete;
-    TextEncodeModule(const ModuleDesc& desc);
+    TextEncodeModule(const ModuleDesc::PTR& desc);
 
 public:
     ~TextEncodeModule() {
@@ -23,7 +23,7 @@ public:
     void run() override;
 
     using PTR = std::shared_ptr<TextEncodeModule>;
-    static PTR create(const ModuleDesc& desc) {
+    static PTR create(const ModuleDesc::PTR& desc) {
         return PTR(new TextEncodeModule(desc));
     }
 };

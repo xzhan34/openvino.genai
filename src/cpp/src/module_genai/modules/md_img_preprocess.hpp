@@ -12,7 +12,7 @@ namespace module {
 class ImagePreprocesModule : public IBaseModuleCom {
 protected:
     ImagePreprocesModule() = delete;
-    ImagePreprocesModule(const ModuleDesc& desc);
+    ImagePreprocesModule(const ModuleDesc::PTR& desc);
 
 public:
     ~ImagePreprocesModule() {
@@ -23,7 +23,7 @@ public:
     void run() override;
 
     using PTR = std::shared_ptr<ImagePreprocesModule>;
-    static PTR create(const ModuleDesc& desc) {
+    static PTR create(const ModuleDesc::PTR& desc) {
         return PTR(new ImagePreprocesModule(desc));
     }
 };

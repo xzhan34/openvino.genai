@@ -17,7 +17,7 @@ void module_connect(PipelineModuleInstance& pipeline_instance) {
         IBaseModuleCom* md_ptr = dynamic_cast<IBaseModuleCom*>(module_ptr.get());
         
         // Process inputs
-        for(auto& input : md_ptr->get_module_desc().inputs) {
+        for(auto& input : md_ptr->get_module_desc()->inputs) {
             auto md_map = utils::parse_source(input.source);
             auto it = std::find_if(std::begin(pipeline_instance),
                                    std::end(pipeline_instance),
@@ -33,7 +33,7 @@ void module_connect(PipelineModuleInstance& pipeline_instance) {
 void construct_pipeline(const PipelineModuleDesc& pipeline_desc, PipelineModuleInstance& pipeline_instance) {
     for (auto& module_desc : pipeline_desc) {
         IBaseModule::PTR module_ptr = nullptr;
-        switch (module_desc.second.type) {
+        switch (module_desc.second->type) {
         case ModuleType::ParameterModule:
             module_ptr = ParameterModule::create(module_desc.second);
             break;
@@ -49,7 +49,7 @@ void construct_pipeline(const PipelineModuleDesc& pipeline_desc, PipelineModuleI
         default:
             break;
         }
-        OPENVINO_ASSERT(module_ptr, "No implementation for type: " + ModuleTypeConverter::toString(module_desc.second.type));
+        OPENVINO_ASSERT(module_ptr, "No implementation for type: " + ModuleTypeConverter::toString(module_desc.second->type));
         pipeline_instance.push_back(module_ptr);
     }
     module_connect(pipeline_instance);

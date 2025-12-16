@@ -36,40 +36,36 @@ OutputPort parse_output_port(const YAML::Node& node, bool is_input) {
     return port;
 }
 
-ModuleDesc parse_module(const YAML::Node& node) {
-    ModuleDesc module;
-
+void parse_module(const YAML::Node& node, ModuleDesc::PTR module) {
     if (node["type"]) {
         std::string md_type = node["type"].as<std::string>();
-        module.type = ModuleTypeConverter::fromString(md_type);
-        OPENVINO_ASSERT(module.type != ModuleType::Unknown, "Unknown ModuleType string: " + md_type);
+        module->type = ModuleTypeConverter::fromString(md_type);
+        OPENVINO_ASSERT(module->type != ModuleType::Unknown, "Unknown ModuleType string: " + md_type);
     }
 
     if (node["device"])
-        module.device = node["device"].as<std::string>();
+        module->device = node["device"].as<std::string>();
     if (node["description"])
-        module.description = node["description"].as<std::string>();
+        module->description = node["description"].as<std::string>();
 
     if (node["inputs"] && node["inputs"].IsSequence()) {
         for (const auto& input_node : node["inputs"]) {
-            module.inputs.push_back(parse_input_port(input_node, true));
+            module->inputs.push_back(parse_input_port(input_node, true));
         }
     }
 
     if (node["outputs"] && node["outputs"].IsSequence()) {
         for (const auto& output_node : node["outputs"]) {
-            module.outputs.push_back(parse_output_port(output_node, false));
+            module->outputs.push_back(parse_output_port(output_node, false));
         }
     }
 
     if (node["params"] && node["params"].IsMap()) {
         for (YAML::const_iterator it = node["params"].begin(); it != node["params"].end(); ++it) {
-            module.params[it->first.as<std::string>()] =
+            module->params[it->first.as<std::string>()] =
                 it->second.IsScalar() ? it->second.as<std::string>() : "[Complex Value]";
         }
     }
-
-    return module;
 }
 
 std::pair<std::string, std::string> parse_source(const std::string& source) {
@@ -104,8 +100,9 @@ PipelineModuleDesc load_config(const std::string& cfg_path) {
                 std::string module_name = it->first.as<std::string>();
                 const YAML::Node& module_config = it->second;
 
-                ModuleDesc module = parse_module(module_config);
-                module.name = module_name;
+                ModuleDesc::PTR module = ModuleDesc::create();
+                module->name = module_name;
+                parse_module(module_config, module);
                 pipeline_desc[module_name] = module;
 
                 std::cout << module << std::endl;

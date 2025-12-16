@@ -35,6 +35,10 @@ struct ModuleDesc {
     std::vector<InputPort> inputs;
     std::vector<OutputPort> outputs;
     std::unordered_map<std::string, std::string> params;
+    using PTR = std::shared_ptr<ModuleDesc>;
+    static PTR create() {
+        return std::make_shared<ModuleDesc>();
+    }
 };
 std::ostream& operator<<(std::ostream& os, const ModuleDesc& desc);
 

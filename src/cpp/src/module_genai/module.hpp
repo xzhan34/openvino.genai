@@ -19,13 +19,13 @@ namespace module {
 
 class IBaseModuleCom : public IBaseModule {
 protected:
-    ModuleDesc m_desc;
+    ModuleDesc::PTR m_desc;
     using ModuleIOMap = std::pair<IBaseModuleCom::PTR, const std::string>;
     std::vector<ModuleIOMap> inputs;
     std::vector<ModuleIOMap> outputs;
 
 public:
-    IBaseModuleCom(const ModuleDesc& desc) : m_desc(desc) {
+    IBaseModuleCom(const ModuleDesc::PTR& desc) : m_desc(desc) {
         std::cout << "IBaseModuleCom:" << m_desc << std::endl;
     }
 
@@ -34,10 +34,10 @@ public:
     virtual void run() = 0;
 
     virtual std::string get_name() override {
-        return m_desc.name;
+        return m_desc->name;
     }
 
-    const ModuleDesc& get_module_desc() const {
+    const ModuleDesc::PTR& get_module_desc() const {
         return m_desc;
     }
 
@@ -49,9 +49,9 @@ public:
         outputs.emplace_back(md_ptr, input_name);
     }
 };
-#define PRINT_POS() std::cout << "Run: " << m_desc.type << "[" << m_desc.name << "]" << std::endl
+#define PRINT_POS() std::cout << "Run: " << m_desc->type << "[" << m_desc->name << "]" << std::endl
 
-using PipelineModuleDesc = std::unordered_map<std::string, ModuleDesc>;
+using PipelineModuleDesc = std::unordered_map<std::string, ModuleDesc::PTR>;
 
 void construct_pipeline(const PipelineModuleDesc& pipeline_desc, PipelineModuleInstance& pipeline_instance);
 

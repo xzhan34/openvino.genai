@@ -12,7 +12,7 @@ namespace module {
 class ParameterModule : public IBaseModuleCom {
 protected:
     ParameterModule() = delete;
-    ParameterModule(const ModuleDesc& desc);
+    ParameterModule(const ModuleDesc::PTR& desc);
 
 public:
     ~ParameterModule() {
@@ -23,7 +23,7 @@ public:
     void run() override;
 
     using PTR = std::shared_ptr<ParameterModule>;
-    static PTR create(const ModuleDesc& desc) {
+    static PTR create(const ModuleDesc::PTR& desc) {
         return PTR(new ParameterModule(desc));
     }
 
@@ -32,7 +32,7 @@ public:
 class ResultModule : public IBaseModuleCom {
 protected:
     ResultModule() = delete;
-    ResultModule(const ModuleDesc& desc);
+    ResultModule(const ModuleDesc::PTR& desc);
 
 public:
     ~ResultModule() {
@@ -43,7 +43,7 @@ public:
     void run() override;
 
     using PTR = std::shared_ptr<ResultModule>;
-    static PTR create(const ModuleDesc& desc) {
+    static PTR create(const ModuleDesc::PTR& desc) {
         return PTR(new ResultModule(desc));
     }
 };
