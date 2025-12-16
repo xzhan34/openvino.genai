@@ -3,27 +3,32 @@
 
 #pragma once
 
+#include <yaml-cpp/yaml.h>
+
 #include "module_genai/module.hpp"
+#include "module_genai/module_type.hpp"
 
 namespace ov {
 namespace genai {
 namespace module {
 
-class ImagePreprocesModule : public IBaseModuleCom {
+
+class ImagePreprocesModule : public IBaseModule {
 protected:
     ImagePreprocesModule() = delete;
-    ImagePreprocesModule(const ModuleDesc::PTR& desc);
+    ImagePreprocesModule(const IBaseModuleDesc::PTR& desc);
 
 public:
     ~ImagePreprocesModule() {
         std::cout << "~ImagePreprocesModule is called." << std::endl;
     }
+
     bool initialize() override;
 
     void run() override;
 
     using PTR = std::shared_ptr<ImagePreprocesModule>;
-    static PTR create(const ModuleDesc::PTR& desc) {
+    static PTR create(const IBaseModuleDesc::PTR& desc) {
         return PTR(new ImagePreprocesModule(desc));
     }
 };

@@ -10,15 +10,18 @@ namespace ov {
 namespace genai {
 namespace module {
 
-TextEncodeModule::TextEncodeModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {}
+TextEncoderModule::TextEncoderModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc) {
+    
+}
 
-bool TextEncodeModule::initialize() {
+bool TextEncoderModule::initialize() {
     return true;
 }
 
-void TextEncodeModule::run() {
+void TextEncoderModule::run() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    PRINT_POS();
+    std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
+              << module_desc->name << "]" << std::endl;
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 }
 

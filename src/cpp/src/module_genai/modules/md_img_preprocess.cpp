@@ -10,7 +10,7 @@ namespace ov {
 namespace genai {
 namespace module {
 
-    ImagePreprocesModule::ImagePreprocesModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {
+    ImagePreprocesModule::ImagePreprocesModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc) {
 
     }
 
@@ -20,7 +20,9 @@ namespace module {
 
     void ImagePreprocesModule::run() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        PRINT_POS();
+
+        std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
+                  << module_desc->name << "]" << std::endl;
         std::this_thread::sleep_for(std::chrono::milliseconds(700));
     }
 

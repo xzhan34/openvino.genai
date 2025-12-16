@@ -5,11 +5,24 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include "module_genai/modules/md_img_preprocess.hpp"
+#include "module_genai/modules/md_io.hpp"
+#include "module_genai/modules/md_text_encoder.hpp"
+
 namespace ov {
 namespace genai {
 
 namespace module {
 namespace utils {
+
+std::pair<std::string, std::string> parse_source(const std::string& source) {
+    size_t dot_pos = source.find('.');
+    OPENVINO_ASSERT(dot_pos != std::string::npos, "Source string doesn't contain '.'");
+
+    std::string part1 = source.substr(0, dot_pos);
+    std::string part2 = source.substr(dot_pos + 1);
+    return {part1, part2};
+}
 
 InputPort parse_input_port(const YAML::Node& node, bool is_input) {
     InputPort port;
@@ -20,7 +33,10 @@ InputPort parse_input_port(const YAML::Node& node, bool is_input) {
         port.type = node["type"].as<std::string>();
     }
     if (is_input && node["source"]) {
-        port.source = node["source"].as<std::string>();
+        std::string source = node["source"].as<std::string>();
+        auto source_md = parse_source(source);
+        port.source_module_name = source_md.first;
+        port.source_module_out_name = source_md.second;
     }
     return port;
 }
@@ -36,45 +52,42 @@ OutputPort parse_output_port(const YAML::Node& node, bool is_input) {
     return port;
 }
 
-void parse_module(const YAML::Node& node, ModuleDesc::PTR module) {
+IBaseModuleDesc::PTR parse_module(const YAML::Node& node) {
+    IBaseModuleDesc::PTR desc = IBaseModuleDesc::create();
+    ModuleType module_type = ModuleType::Unknown;
     if (node["type"]) {
         std::string md_type = node["type"].as<std::string>();
-        module->type = ModuleTypeConverter::fromString(md_type);
-        OPENVINO_ASSERT(module->type != ModuleType::Unknown, "Unknown ModuleType string: " + md_type);
+        module_type = ModuleTypeConverter::fromString(md_type);
+        OPENVINO_ASSERT(module_type != ModuleType::Unknown, "Unknown ModuleType string: " + md_type);
+        desc->type = static_cast<int>(module_type);
     }
 
+    // Parse common contribute.
     if (node["device"])
-        module->device = node["device"].as<std::string>();
+        desc->device = node["device"].as<std::string>();
     if (node["description"])
-        module->description = node["description"].as<std::string>();
+        desc->description = node["description"].as<std::string>();
 
     if (node["inputs"] && node["inputs"].IsSequence()) {
         for (const auto& input_node : node["inputs"]) {
-            module->inputs.push_back(parse_input_port(input_node, true));
+            desc->inputs.push_back(parse_input_port(input_node, true));
         }
     }
 
     if (node["outputs"] && node["outputs"].IsSequence()) {
         for (const auto& output_node : node["outputs"]) {
-            module->outputs.push_back(parse_output_port(output_node, false));
+            desc->outputs.push_back(parse_output_port(output_node, false));
         }
     }
 
     if (node["params"] && node["params"].IsMap()) {
         for (YAML::const_iterator it = node["params"].begin(); it != node["params"].end(); ++it) {
-            module->params[it->first.as<std::string>()] =
+            desc->params[it->first.as<std::string>()] =
                 it->second.IsScalar() ? it->second.as<std::string>() : "[Complex Value]";
         }
     }
-}
-
-std::pair<std::string, std::string> parse_source(const std::string& source) {
-    size_t dot_pos = source.find('.');
-    OPENVINO_ASSERT(dot_pos != std::string::npos, "Source string doesn't contain '.'");
-
-    std::string part1 = source.substr(0, dot_pos);
-    std::string part2 = source.substr(dot_pos + 1);
-    return {part1, part2};
+    
+    return desc;
 }
 
 PipelineModuleDesc load_config(const std::string& cfg_path) {
@@ -100,12 +113,11 @@ PipelineModuleDesc load_config(const std::string& cfg_path) {
                 std::string module_name = it->first.as<std::string>();
                 const YAML::Node& module_config = it->second;
 
-                ModuleDesc::PTR module = ModuleDesc::create();
-                module->name = module_name;
-                parse_module(module_config, module);
-                pipeline_desc[module_name] = module;
+                auto module_desc = parse_module(module_config);
+                module_desc->name = module_name;
+                pipeline_desc[module_name] = module_desc;
 
-                std::cout << module << std::endl;
+                std::cout << module_desc << std::endl;
             }
         } else {
             std::cout << "Error: 'pipeline_modules' key not found or is not a map." << std::endl;
@@ -118,6 +130,29 @@ PipelineModuleDesc load_config(const std::string& cfg_path) {
     }
     return pipeline_desc;
 }
+
+std::ostream& operator<<(std::ostream& os, const IBaseModuleDesc::PTR& desc) {
+    // 1. Output the ModuleType
+    os << "-- Module Name :" << desc->name << "\n";
+
+    // 2. Output Inputs and Outputs count
+    os << "    Inputs (" << desc->inputs.size() << "):\n";
+    for (const auto& input : desc->inputs) {
+        // Use std::quoted for safety if values might contain spaces/special chars
+        os << "      - name: " << input.name << "\n";
+        os << "      - type: " << input.type << "\n";
+        os << "      - source: " << input.source_module_name << "." << input.source_module_out_name << "\n";
+    }
+    os << "    Onputs (" << desc->outputs.size() << "):\n";
+    for (const auto& output : desc->outputs) {
+        // Use std::quoted for safety if values might contain spaces/special chars
+        os << "      - name: " << output.name << "\n";
+        os << "      - type: " << output.type << "\n";
+    }
+
+    return os;
+}
+
 }  // namespace utils
 }  // namespace module
 }  // namespace genai
