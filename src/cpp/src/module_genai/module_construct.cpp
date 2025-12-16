@@ -1,10 +1,10 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modules/md_img_preprocess.hpp"
-#include "modules/md_text_encoder.hpp"
-#include "modules/md_io.hpp"
 #include "module.hpp"
+#include "modules/md_img_preprocess.hpp"
+#include "modules/md_io.hpp"
+#include "modules/md_text_encoder.hpp"
 #include "utils/yaml_utils.hpp"
 
 namespace ov {
@@ -14,18 +14,21 @@ namespace module {
 void module_connect(PipelineModuleInstance& pipeline_instance) {
     std::unordered_map<std::string, IBaseModule::PTR> module_map;
     for (const auto& module_ptr : pipeline_instance) {
-        IBaseModuleCom* md_ptr = dynamic_cast<IBaseModuleCom*>(module_ptr.get());
-        
         // Process inputs
-        for(auto& input : md_ptr->get_module_desc()->inputs) {
-            auto md_map = utils::parse_source(input.source);
+        for (auto& input : module_ptr->module_desc->inputs) {
             auto it = std::find_if(std::begin(pipeline_instance),
                                    std::end(pipeline_instance),
                                    [&](const IBaseModule::PTR& ptr) {
-                                       return ptr->get_name() == md_map.first;
+                                       return ptr->get_module_name() == input.source_module_name;
                                    });
             OPENVINO_ASSERT(it != std::end(pipeline_instance), "Can't find module, please check config yaml.");
-            md_ptr->push_input(*it, md_map.second);
+
+            IBaseModule::InputModule inp_module = {*it, input.source_module_out_name};
+            module_ptr->inputs.emplace_back(inp_module);
+
+            IBaseModule::OutputModule outp_module = {module_ptr, input.source_module_out_name};
+            (*it)->outputs.emplace_back(outp_module);
+            // module_ptr->outputs.emplace_back(outp_module);
         }
     }
 }
@@ -33,7 +36,8 @@ void module_connect(PipelineModuleInstance& pipeline_instance) {
 void construct_pipeline(const PipelineModuleDesc& pipeline_desc, PipelineModuleInstance& pipeline_instance) {
     for (auto& module_desc : pipeline_desc) {
         IBaseModule::PTR module_ptr = nullptr;
-        switch (module_desc.second->type) {
+        auto cur_module_type = static_cast<ModuleType>(module_desc.second->type);
+        switch (cur_module_type) {
         case ModuleType::ParameterModule:
             module_ptr = ParameterModule::create(module_desc.second);
             break;
@@ -44,12 +48,12 @@ void construct_pipeline(const PipelineModuleDesc& pipeline_desc, PipelineModuleI
             module_ptr = ImagePreprocesModule::create(module_desc.second);
             break;
         case ModuleType::TextEncoderModule:
-            module_ptr = TextEncodeModule::create(module_desc.second);
+            module_ptr = TextEncoderModule::create(module_desc.second);
             break;
         default:
             break;
         }
-        OPENVINO_ASSERT(module_ptr, "No implementation for type: " + ModuleTypeConverter::toString(module_desc.second->type));
+        OPENVINO_ASSERT(module_ptr, "No implementation for type: " + ModuleTypeConverter::toString(cur_module_type));
         pipeline_instance.push_back(module_ptr);
     }
     module_connect(pipeline_instance);

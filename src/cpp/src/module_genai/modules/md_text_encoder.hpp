@@ -3,28 +3,31 @@
 
 #pragma once
 
+#include <yaml-cpp/yaml.h>
+
 #include "module_genai/module.hpp"
+#include "module_genai/module_type.hpp"
 
 namespace ov {
 namespace genai {
 namespace module {
 
-class TextEncodeModule : public IBaseModuleCom {
+class TextEncoderModule : public IBaseModule {
 protected:
-    TextEncodeModule() = delete;
-    TextEncodeModule(const ModuleDesc::PTR& desc);
+    TextEncoderModule() = delete;
+    TextEncoderModule(const IBaseModuleDesc::PTR& desc);
 
 public:
-    ~TextEncodeModule() {
-        std::cout << "~TextEncodeModule is called." << std::endl;
+    ~TextEncoderModule() {
+        std::cout << "~TextEncoderModule is called." << std::endl;
     }
     bool initialize() override;
 
     void run() override;
 
-    using PTR = std::shared_ptr<TextEncodeModule>;
-    static PTR create(const ModuleDesc::PTR& desc) {
-        return PTR(new TextEncodeModule(desc));
+    using PTR = std::shared_ptr<TextEncoderModule>;
+    static PTR create(const IBaseModuleDesc::PTR& desc) {
+        return PTR(new TextEncoderModule(desc));
     }
 };
 

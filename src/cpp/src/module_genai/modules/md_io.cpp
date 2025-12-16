@@ -6,22 +6,24 @@
 namespace ov {
 namespace genai {
 namespace module {
-ParameterModule::ParameterModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {
-    std::cout << "ParameterModule:" << m_desc << std::endl;
+ParameterModule::ParameterModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc) {
+    // std::cout << "ParameterModule:" << m_desc << std::endl;
 }
 
 void ParameterModule::run() {
-    PRINT_POS();
+    std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
+              << module_desc->name << "]" << std::endl;
 }
 
 bool ParameterModule::initialize() {
     return true;
 }
 
-ResultModule::ResultModule(const ModuleDesc::PTR& desc) : IBaseModuleCom(desc) {}
+ResultModule::ResultModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc) {}
 
 void ResultModule::run() {
-    PRINT_POS();
+    std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
+              << module_desc->name << "]" << std::endl;
 }
 
 bool ResultModule::initialize() {

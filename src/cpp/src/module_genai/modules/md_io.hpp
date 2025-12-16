@@ -3,16 +3,18 @@
 
 #pragma once
 
-#include "module_genai/module.hpp"
+#include <yaml-cpp/yaml.h>
 
+#include "module_genai/module.hpp"
+#include "module_genai/module_type.hpp"
 namespace ov {
 namespace genai {
 namespace module {
 
-class ParameterModule : public IBaseModuleCom {
+class ParameterModule : public IBaseModule {
 protected:
     ParameterModule() = delete;
-    ParameterModule(const ModuleDesc::PTR& desc);
+    ParameterModule(const IBaseModuleDesc::PTR& desc);
 
 public:
     ~ParameterModule() {
@@ -23,16 +25,15 @@ public:
     void run() override;
 
     using PTR = std::shared_ptr<ParameterModule>;
-    static PTR create(const ModuleDesc::PTR& desc) {
+    static PTR create(const IBaseModuleDesc::PTR& desc) {
         return PTR(new ParameterModule(desc));
     }
-
 };
 
-class ResultModule : public IBaseModuleCom {
+class ResultModule : public IBaseModule {
 protected:
     ResultModule() = delete;
-    ResultModule(const ModuleDesc::PTR& desc);
+    ResultModule(const IBaseModuleDesc::PTR& desc);
 
 public:
     ~ResultModule() {
@@ -43,7 +44,7 @@ public:
     void run() override;
 
     using PTR = std::shared_ptr<ResultModule>;
-    static PTR create(const ModuleDesc::PTR& desc) {
+    static PTR create(const IBaseModuleDesc::PTR& desc) {
         return PTR(new ResultModule(desc));
     }
 };
