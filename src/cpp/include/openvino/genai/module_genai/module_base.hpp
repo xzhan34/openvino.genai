@@ -20,10 +20,11 @@ public:
 class OPENVINO_GENAI_EXPORTS IBaseModule : public IModule {
 public:
     ~IBaseModule() = default;
+    using PTR = std::shared_ptr<IBaseModule>;
 
     virtual void run() = 0;
 
-    using PTR = std::shared_ptr<IBaseModule>;
+    virtual std::string get_name() = 0;
 };
 
 }  // namespace module

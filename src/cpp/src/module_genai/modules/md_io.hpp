@@ -4,7 +4,6 @@
 #pragma once
 
 #include "module_genai/module.hpp"
-#include "module_genai/modules/md_base_com.hpp"
 
 namespace ov {
 namespace genai {
