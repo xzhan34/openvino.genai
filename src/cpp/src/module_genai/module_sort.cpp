@@ -20,7 +20,12 @@ PipelineModuleInstance sort_pipeline(PipelineModuleInstance& pipeline_instrance)
         in_degree[pair.first] = pair.second->inputs.size();
         adjacency_list[pair.first] = {};
         for (auto& output : pair.second->outputs) {
-            adjacency_list[pair.first].push_back(output.second.module_ptr->get_module_name());
+            if (output.second.module_ptr) {
+                adjacency_list[pair.first].push_back(output.second.module_ptr->get_module_name());
+            }
+            else {
+                std::cout << "** Warning: module output port [" << output.first << "] has no child module." << std::endl;
+            }
         }
     }
 

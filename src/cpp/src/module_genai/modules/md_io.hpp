@@ -41,7 +41,8 @@ public:
         std::cout << "~ResultModule is called." << std::endl;
     }
 
-    void run() override;
+    void run() override {};
+    void run(ov::AnyMap& outputs);
 
     using PTR = std::shared_ptr<ResultModule>;
     static PTR create(const IBaseModuleDesc::PTR& desc) {

@@ -70,6 +70,19 @@ public:
     IBaseModule() = delete;
     IBaseModule(const IBaseModuleDesc::PTR& desc) : module_desc(desc) {
         std::cout << "Init IBaseModule with module name : " << module_desc->name << std::endl;
+        for (auto& input : desc->inputs) {
+            this->inputs[input.source_module_out_name] = InputModule();
+        }
+        for (auto& output : desc->outputs) {
+            this->outputs[output.name] = OutputModule();
+        }
+    }
+
+    virtual void prepare_inputs() {
+        for (auto& input : this->inputs) {
+            const auto& parent_port_name = input.first;
+            input.second.data = input.second.module_ptr->outputs[parent_port_name].data;
+        }
     }
 
     virtual void run() = 0;
@@ -83,6 +96,7 @@ public:
     std::map<std::string, OutputModule> outputs;
     IBaseModuleDesc::PTR module_desc;
     bool is_input_module = false;
+    bool is_output_module = false;
 };
 
 }  // namespace module

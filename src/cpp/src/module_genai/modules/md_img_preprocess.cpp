@@ -26,22 +26,25 @@ namespace module {
         return ov::Tensor();
     }
 
-    void ImagePreprocesModule::prepare_inputs() {
-        for (auto& input : this->inputs) {
-            const auto& parent_port_name = input.first;
-            input.second.data = input.second.module_ptr->outputs[parent_port_name].data;
-        }
-    }
-
     void ImagePreprocesModule::run() {
         prepare_inputs();
 
         auto image1_data = this->inputs["image1_data"].data.as<ov::Tensor>();
         auto image2_data = this->inputs["image2_data"].data.as<ov::Tensor>();
 
-        image1_data.data<float>()[0] = 111;
-        image2_data.data<float>()[0] = 222;
-
+        ov::Tensor img_f32 = ov::Tensor(ov::element::f32, image1_data.get_shape());
+        float* out_data = img_f32.data<float>();
+        if (image1_data.get_element_type() == ov::element::u8) {
+            uint8_t* in_data = image1_data.data<uint8_t>();
+            for (int i = 0; i < image1_data.get_size(); i++) {
+                out_data[i] = in_data[i] / 2;
+            }
+        } else if (image1_data.get_element_type() == ov::element::f32) {
+            float* in_data = image1_data.data<float>();
+            for (int i = 0; i < image1_data.get_size(); i++) {
+                out_data[i] = in_data[i] / 2;
+            }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
@@ -52,7 +55,7 @@ namespace module {
         thw_tensor.data<int>()[0] = 3;
         thw_tensor.data<int>()[1] = 4;
         thw_tensor.data<int>()[2] = 5;
-        this->outputs["raw_data"].data = image1_data;
+        this->outputs["raw_data"].data = img_f32;
         this->outputs["thw"].data = thw_tensor;
     }
 

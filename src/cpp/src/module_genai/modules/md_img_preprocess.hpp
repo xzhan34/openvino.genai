@@ -29,8 +29,6 @@ public:
     static PTR create(const IBaseModuleDesc::PTR& desc) {
         return PTR(new ImagePreprocesModule(desc));
     }
-
-    void prepare_inputs();
 };
 
 }  // namespace module
