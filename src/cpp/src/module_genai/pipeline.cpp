@@ -21,7 +21,7 @@ ModulePipeline::ModulePipeline(const std::filesystem::path& config_path) {
     construct_pipeline(pipeline_desc, m_modules);
 
     // Sort pipeline
-    sort_pipeline(m_modules);
+    m_modules = sort_pipeline(m_modules);
 }
 
 ModulePipeline::~ModulePipeline() {}
