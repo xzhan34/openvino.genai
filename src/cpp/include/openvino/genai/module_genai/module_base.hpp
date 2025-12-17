@@ -10,14 +10,24 @@ namespace ov {
 namespace genai {
 namespace module {
 
+    enum class DataType : int {
+        Unknown = 0,
+        OVTensor = 1,
+        VecOVTensor = 2,
+        OVRemoteTensor = 3,
+        VecOVRemoteTensor = 4,
+        String = 10,
+        VecString = 11,
+    };
+
 struct OutputPort {
     std::string name;
-    std::string type;
+    DataType dt_type;
 };
 
 struct InputPort {
     std::string name;
-    std::string type;
+    DataType dt_type;
     std::string source_module_name;
     std::string source_module_out_name;
 };
@@ -46,11 +56,15 @@ public:
     using PTR = std::shared_ptr<IBaseModule>;
     struct OPENVINO_GENAI_EXPORTS InputModule {
         IBaseModule::PTR module_ptr;
-        std::string out_port_name;
+        // std::string out_port_name;
+        DataType dt_type;
+        ov::Any data;
     };
     struct OPENVINO_GENAI_EXPORTS OutputModule {
         IBaseModule::PTR module_ptr;
-        std::string in_port_name;
+        // std::string in_port_name;
+        DataType dt_type;
+        ov::Any data;
     };
 
     IBaseModule() = delete;
@@ -58,17 +72,17 @@ public:
         std::cout << "Init IBaseModule with module name : " << module_desc->name << std::endl;
     }
 
-    virtual bool initialize() = 0;
-
     virtual void run() = 0;
 
     const std::string& get_module_name() const {
         return module_desc->name;
     }
 
-    std::vector<InputModule> inputs;
-    std::vector<OutputModule> outputs;
+    // Port name -> InputModule
+    std::map<std::string, InputModule> inputs;
+    std::map<std::string, OutputModule> outputs;
     IBaseModuleDesc::PTR module_desc;
+    bool is_input_module = false;
 };
 
 }  // namespace module

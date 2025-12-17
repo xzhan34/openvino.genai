@@ -30,7 +30,7 @@ public:
     // "prompt": string
     // "image": image ov::Tensor or std::vector<ov::Tensor>
     // "video": video ov::Tensor
-    void generate(const ov::AnyMap& any_inputs = {}, StreamerVariant streamer = std::monostate());
+    void generate(ov::AnyMap& inputs, StreamerVariant streamer = std::monostate());
 
     ov::Any get_output(const std::string& output_name);
 

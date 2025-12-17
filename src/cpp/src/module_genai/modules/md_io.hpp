@@ -20,9 +20,10 @@ public:
     ~ParameterModule() {
         std::cout << "~ParameterModule is called." << std::endl;
     }
-    bool initialize() override;
 
-    void run() override;
+    void run() override {};
+
+    void run(ov::AnyMap& inputs);
 
     using PTR = std::shared_ptr<ParameterModule>;
     static PTR create(const IBaseModuleDesc::PTR& desc) {
@@ -39,7 +40,6 @@ public:
     ~ResultModule() {
         std::cout << "~ResultModule is called." << std::endl;
     }
-    bool initialize() override;
 
     void run() override;
 
