@@ -23,11 +23,19 @@ void ParameterModule::run(ov::AnyMap& inputs) {
     }
 }
 
-ResultModule::ResultModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc) {}
+ResultModule::ResultModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc) {
+    is_output_module = true;
+}
 
-void ResultModule::run() {
+void ResultModule::run(ov::AnyMap& outputs) {
+    prepare_inputs();
+
+    auto raw_data = this->inputs["raw_data"].data.as<ov::Tensor>();
+
     std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
               << module_desc->name << "]" << std::endl;
+
+    outputs["raw_data"] = raw_data;
 }
 
 }  // namespace module

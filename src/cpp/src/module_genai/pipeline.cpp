@@ -35,6 +35,8 @@ void ModulePipeline::generate(ov::AnyMap& inputs, StreamerVariant streamer) {
     for (auto& module : m_modules) {
         if (module->is_input_module) {
             std::dynamic_pointer_cast<ParameterModule>(module)->run(inputs);
+        } else if (module->is_output_module) {
+            std::dynamic_pointer_cast<ResultModule>(module)->run(this->outputs);
         } else {
             module->run();
         }
@@ -42,7 +44,7 @@ void ModulePipeline::generate(ov::AnyMap& inputs, StreamerVariant streamer) {
 }
 
 ov::Any ModulePipeline::get_output(const std::string& output_name) {
-    return ov::Any();
+    return outputs[output_name];
 }
 
 void ModulePipeline::start_chat(const std::string& system_message) {}

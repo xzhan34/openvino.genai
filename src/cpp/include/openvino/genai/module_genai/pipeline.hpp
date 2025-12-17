@@ -39,7 +39,7 @@ public:
     void finish_chat();
 
 private:
-    
+    std::map<std::string, ov::Any> outputs;
 };
 
 }  // namespace module
