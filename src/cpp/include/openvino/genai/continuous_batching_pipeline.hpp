@@ -65,13 +65,18 @@ protected:
     class ContinuousBatchingImpl;
 
     class ContinuousBatchingForSpeculativeDecodingImpl;
+    class ContinuousBatchingForEagle3DecodingImpl;
     class ContinuousBatchingForPromptLookupImpl;
     class SpeculativeDecodingImpl;
+    class Eagle3DecodingImpl;
     class PromptLookupImpl;
 
     friend class ContinuousBatchingForSpeculativeDecodingImpl;
+
     friend class ContinuousBatchingForPromptLookupImpl;
+    friend class ContinuousBatchingForEagle3DecodingImpl;
     friend class SpeculativeDecodingImpl;
+    friend class Eagle3DecodingImpl;
     friend class PromptLookupImpl;
 
     std::shared_ptr<IContinuousBatchingPipeline> m_impl;
@@ -105,7 +110,7 @@ public:
 
     /**
      * @brief Constructs a ContinuousBatchingPipeline from already existing model and tokenizer.
-     * 
+     *
      * This constructor allows for the creation of a ContinuousBatchingPipeline using an existing model
      * represented as a string and a weights tensor, along with a manually initialized tokenizer.
      * This is useful when the model and tokenizer are already loaded or created in memory and do not
@@ -132,7 +137,7 @@ public:
     /**
     * @brief Constructs a ContinuousBatchingPipeline from models map.
     *
-    * @param models_map  A map where key is model name (e.g. "vision_embeddings", "text_embeddings", "language", "resampler") 
+    * @param models_map  A map where key is model name (e.g. "vision_embeddings", "text_embeddings", "language", "resampler")
     * and value is a pair of model IR as string and weights as tensor.
     * @param tokenizer A manually initialized ov::genai::Tokenizer.
     * @param scheduler_config Configuration for the scheduler.
@@ -175,7 +180,7 @@ public:
     /// Higher level interface, which can process multiple prompts in continuous batching manner
     std::vector<EncodedGenerationResult> generate(const std::vector<ov::Tensor>& input_ids, const std::vector<ov::genai::GenerationConfig>& sampling_params, const ov::genai::StreamerVariant& streamer=std::monostate{});
     std::vector<GenerationResult> generate(const std::vector<std::string>& prompts, const std::vector<ov::genai::GenerationConfig>& sampling_params, const ov::genai::StreamerVariant& streamer=std::monostate{});
-    
+
     std::vector<GenerationResult> generate(
         const std::vector<ChatHistory>& histories,
         const std::vector<ov::genai::GenerationConfig>& sampling_params,
