@@ -7,6 +7,7 @@
 
 #include "module.hpp"
 #include "utils/yaml_utils.hpp"
+#include "modules/md_io.hpp"
 
 namespace ov {
 namespace genai {
@@ -30,9 +31,13 @@ ModulePipeline::~ModulePipeline() {}
 // "prompt": string
 // "image": image ov::Tensor or std::vector<ov::Tensor>
 // "video": video ov::Tensor
-void ModulePipeline::generate(const ov::AnyMap& any_inputs, StreamerVariant streamer) {
+void ModulePipeline::generate(ov::AnyMap& inputs, StreamerVariant streamer) {
     for (auto& module : m_modules) {
-        module->run();
+        if (module->is_input_module) {
+            std::dynamic_pointer_cast<ParameterModule>(module)->run(inputs);
+        } else {
+            module->run();
+        }
     }
 }
 

@@ -14,10 +14,6 @@ TextEncoderModule::TextEncoderModule(const IBaseModuleDesc::PTR& desc) : IBaseMo
     
 }
 
-bool TextEncoderModule::initialize() {
-    return true;
-}
-
 void TextEncoderModule::run() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "module_genai/utils/yaml_utils.hpp"
+#include "module_genai/utils/data_type_converter.hpp"
 
 #include <yaml-cpp/yaml.h>
 
@@ -30,7 +31,7 @@ InputPort parse_input_port(const YAML::Node& node, bool is_input) {
         port.name = node["name"].as<std::string>();
     }
     if (node["type"]) {
-        port.type = node["type"].as<std::string>();
+        port.dt_type = DataTypeConverter::fromString(node["type"].as<std::string>());
     }
     if (is_input && node["source"]) {
         std::string source = node["source"].as<std::string>();
@@ -47,7 +48,8 @@ OutputPort parse_output_port(const YAML::Node& node, bool is_input) {
         port.name = node["name"].as<std::string>();
     }
     if (node["type"]) {
-        port.type = node["type"].as<std::string>();
+
+        port.dt_type = DataTypeConverter::fromString(node["type"].as<std::string>());
     }
     return port;
 }
@@ -140,14 +142,14 @@ std::ostream& operator<<(std::ostream& os, const IBaseModuleDesc::PTR& desc) {
     for (const auto& input : desc->inputs) {
         // Use std::quoted for safety if values might contain spaces/special chars
         os << "      - name: " << input.name << "\n";
-        os << "      - type: " << input.type << "\n";
+        os << "      - type: " << DataTypeConverter::toString(input.dt_type) << "\n";
         os << "      - source: " << input.source_module_name << "." << input.source_module_out_name << "\n";
     }
     os << "    Onputs (" << desc->outputs.size() << "):\n";
     for (const auto& output : desc->outputs) {
         // Use std::quoted for safety if values might contain spaces/special chars
         os << "      - name: " << output.name << "\n";
-        os << "      - type: " << output.type << "\n";
+        os << "      - type: " << DataTypeConverter::toString(output.dt_type) << "\n";
     }
 
     return os;

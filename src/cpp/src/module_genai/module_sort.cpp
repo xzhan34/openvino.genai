@@ -20,7 +20,7 @@ PipelineModuleInstance sort_pipeline(PipelineModuleInstance& pipeline_instrance)
         in_degree[pair.first] = pair.second->inputs.size();
         adjacency_list[pair.first] = {};
         for (auto& output : pair.second->outputs) {
-            adjacency_list[pair.first].push_back(output.module_ptr->get_module_name());
+            adjacency_list[pair.first].push_back(output.second.module_ptr->get_module_name());
         }
     }
 
@@ -34,7 +34,6 @@ PipelineModuleInstance sort_pipeline(PipelineModuleInstance& pipeline_instrance)
 
     // 3. Topological sorting
     PipelineModuleInstance sorted_pipeline;
-
     while (!ready_queue.empty()) {
         std::string current_name = ready_queue.front();
         ready_queue.pop();
@@ -53,7 +52,6 @@ PipelineModuleInstance sort_pipeline(PipelineModuleInstance& pipeline_instrance)
         }
     }
 
-    // 5. Check for circular dependencies.
     OPENVINO_ASSERT(
         sorted_pipeline.size() == pipeline_instrance.size(),
         "The pipeline contains a circular dependency (Cycle Detected). Please check input pipeline config.");

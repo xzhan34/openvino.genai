@@ -21,7 +21,6 @@ public:
     ~TextEncoderModule() {
         std::cout << "~TextEncoderModule is called." << std::endl;
     }
-    bool initialize() override;
 
     void run() override;
 

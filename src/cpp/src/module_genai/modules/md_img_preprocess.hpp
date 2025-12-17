@@ -23,14 +23,14 @@ public:
         std::cout << "~ImagePreprocesModule is called." << std::endl;
     }
 
-    bool initialize() override;
-
     void run() override;
 
     using PTR = std::shared_ptr<ImagePreprocesModule>;
     static PTR create(const IBaseModuleDesc::PTR& desc) {
         return PTR(new ImagePreprocesModule(desc));
     }
+
+    void prepare_inputs();
 };
 
 }  // namespace module
