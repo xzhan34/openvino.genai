@@ -7,6 +7,8 @@
 
 #include "module_genai/module.hpp"
 #include "module_genai/module_type.hpp"
+#include "openvino/genai/tokenizer.hpp"
+#include "tokenizer/tokenizer_impl.hpp"
 
 namespace ov {
 namespace genai {
@@ -28,6 +30,13 @@ public:
     static PTR create(const IBaseModuleDesc::PTR& desc) {
         return PTR(new TextEncoderModule(desc));
     }
+
+private:
+    std::shared_ptr<Tokenizer::TokenizerImpl> m_tokenizer_impl;
+    ov::AnyMap m_tokenization_params = {};
+    std::vector<std::string> m_prompts = {};
+    bool initialize();
+    TokenizedInputs run(const std::vector<std::string>& prompts);
 };
 
 }  // namespace module
