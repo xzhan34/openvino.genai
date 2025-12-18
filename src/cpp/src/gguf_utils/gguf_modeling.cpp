@@ -11,6 +11,7 @@
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
+#include "openvino/pass/serialize.hpp"
 
 #include "gguf_utils/building_blocks.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
@@ -126,6 +127,11 @@ std::shared_ptr<ov::Model> create_language_model(
     // Create model
     ov::ParameterVector inputs{input_ids, attention_mask, position_ids, beam_idx};
     auto model = std::make_shared<ov::Model>(ov::OutputVector({logits->output(0)}), sinks, inputs);
+
+    // debuglog
+    if (0) {
+        ov::serialize(model, "full_model_original.xml", "full_model_original.bin");
+    }
 
     // Set runtime options
     if (std::get<int>(configs.at("file_type")) == 1 || std::get<int>(configs.at("file_type")) == 0) {
