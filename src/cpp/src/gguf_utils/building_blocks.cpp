@@ -701,6 +701,7 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
                                            int head_size) {
     switch (qtype) {
     case gguf_tensor_type::GGUF_TYPE_F16:
+    case gguf_tensor_type::GGUF_TYPE_BF16:
         return make_fp16_weights(key, consts, reorder, head_size);
     case gguf_tensor_type::GGUF_TYPE_Q8_0:
         return make_int8_weights(key, consts, reorder, head_size);
