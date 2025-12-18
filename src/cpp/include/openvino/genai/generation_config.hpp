@@ -662,6 +662,10 @@ public:
     bool do_sample = false;
     size_t rng_seed = 0;
 
+    // CDPruner config
+    size_t pruning_ratio = 0;  // 0 means disabled, and values from 1 to 100 represent the percentage to prune.
+    float relevance_weight = 0.5f;
+
     // Assisting generation parameters
     float assistant_confidence_threshold = 0.f;
     size_t num_assistant_tokens = 0;
@@ -735,6 +739,10 @@ static constexpr ov::Property<float> repetition_penalty{"repetition_penalty"};
 static constexpr ov::Property<int64_t> eos_token_id{"eos_token_id"};
 static constexpr ov::Property<float> presence_penalty{"presence_penalty"};
 static constexpr ov::Property<float> frequency_penalty{"frequency_penalty"};
+
+static constexpr ov::Property<size_t> pruning_ratio{"pruning_ratio"};
+static constexpr ov::Property<float> relevance_weight{"relevance_weight"};
+
 extern OPENVINO_GENAI_EXPORTS ov::Property<size_t> rng_seed;
 
 static constexpr ov::Property<float> assistant_confidence_threshold{"assistant_confidence_threshold"};
