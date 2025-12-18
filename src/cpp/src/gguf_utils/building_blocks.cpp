@@ -11,6 +11,10 @@
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
+#include "intel_gpu/op/placeholder.hpp"
+#include "intel_gpu/op/fully_connected.hpp"
+#include <ov_ops/rms.hpp>
+#include <ov_ops/rotary_positional_embeddings.hpp>
 
 #include "gguf_utils/building_blocks.hpp"
 
@@ -194,16 +198,31 @@ std::tuple<Output<ov::Node>, Output<ov::Node>, std::pair<Output<ov::Node>, Outpu
         sin_unsqueezed = cos_sin_cached.second;
     }
 
-    // Apply rotation
-    auto q_rot = std::make_shared<v1::Add>(
-        std::make_shared<v1::Multiply>(q, cos_unsqueezed),
-        std::make_shared<v1::Multiply>(rotate_half(q, head_size, hidden_dim), sin_unsqueezed)
-    );
+    op::internal::RoPE::Config config;
+    config.rotary_ndims = head_size;
 
-    auto k_rot = std::make_shared<v1::Add>(
-        std::make_shared<v1::Multiply>(k, cos_unsqueezed),
-        std::make_shared<v1::Multiply>(rotate_half(k, head_size, hidden_dim), sin_unsqueezed)
-    );
+    // Apply rotation
+    // auto q_rot = std::make_shared<v1::Add>(
+    //     std::make_shared<v1::Multiply>(q, cos_unsqueezed),
+    //     std::make_shared<v1::Multiply>(rotate_half(q, head_size, hidden_dim), sin_unsqueezed)
+    // );
+
+    // auto k_rot = std::make_shared<v1::Add>(
+    //     std::make_shared<v1::Multiply>(k, cos_unsqueezed),
+    //     std::make_shared<v1::Multiply>(rotate_half(k, head_size, hidden_dim), sin_unsqueezed)
+    // );
+
+    std::vector<Output<Node>> q_rope_args;
+    q_rope_args.push_back(q);
+    q_rope_args.push_back(cos_unsqueezed);
+    q_rope_args.push_back(sin_unsqueezed);
+    auto q_rot = std::make_shared<internal::RoPE>(q_rope_args, config);
+
+    std::vector<Output<Node>> k_rope_args;
+    k_rope_args.push_back(k);
+    k_rope_args.push_back(cos_unsqueezed);
+    k_rope_args.push_back(sin_unsqueezed);
+    auto k_rot = std::make_shared<internal::RoPE>(k_rope_args, config);
 
     return {q_rot, k_rot, {cos_unsqueezed, sin_unsqueezed}};
 }
@@ -261,58 +280,65 @@ ov::Output<ov::Node> make_rms_norm_qwen3(
     const ov::Output<ov::Node>& input,
     const std::unordered_map<std::string, ov::Tensor>& weights,
     float rms_norm_eps) {
-    auto eps_node = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1,1,1,1}, rms_norm_eps);
-    auto square = std::make_shared<ov::op::v1::Power>(
-        input, 
-        std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{}, 2.0f));
+    // auto eps_node = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1,1,1,1}, rms_norm_eps);
+    // auto square = std::make_shared<ov::op::v1::Power>(
+    //     input, 
+    //     std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{}, 2.0f));
     
-    auto variance = std::make_shared<ov::op::v1::ReduceMean>(
-        square, 
-        std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{1}, -1),
-        true);
+    // auto variance = std::make_shared<ov::op::v1::ReduceMean>(
+    //     square, 
+    //     std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{1}, -1),
+    //     true);
 
-    auto add_eps = std::make_shared<ov::op::v1::Add>(variance, eps_node);
-    auto sqrt_node = std::make_shared<ov::op::v0::Sqrt>(add_eps);
-    auto reciprocal = std::make_shared<ov::op::v1::Divide>(
-        std::make_shared<ov::op::v0::Constant>(
-            ov::element::f32, ov::Shape{}, 1.0f),
-        sqrt_node);
+    // auto add_eps = std::make_shared<ov::op::v1::Add>(variance, eps_node);
+    // auto sqrt_node = std::make_shared<ov::op::v0::Sqrt>(add_eps);
+    // auto reciprocal = std::make_shared<ov::op::v1::Divide>(
+    //     std::make_shared<ov::op::v0::Constant>(
+    //         ov::element::f32, ov::Shape{}, 1.0f),
+    //     sqrt_node);
 
-    std::shared_ptr<ov::Node> mul = std::make_shared<ov::op::v1::Multiply>(
-        reciprocal, input, AutoBroadcastType::NUMPY);
+    // std::shared_ptr<ov::Node> mul = std::make_shared<ov::op::v1::Multiply>(
+    //     reciprocal, input, AutoBroadcastType::NUMPY);
+
+    // auto weight_tensor = weights.at(key + ".weight");
+    // // Check if all elements are 1.0
+    // bool all_ones = true;
+    // if (weight_tensor.get_element_type() == ov::element::f32) {
+    //     const float* data = weight_tensor.data<float>();
+    //     for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
+    //         if (data[i] != 1.0f) {
+    //             all_ones = false;
+    //             break;
+    //         }
+    //     }
+    // } else if (weight_tensor.get_element_type() == ov::element::f16) {
+    //     const uint16_t* data = weight_tensor.data<uint16_t>();
+    //     const uint16_t one_in_fp16 = 0x3C00;
+    //     for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
+    //         if (data[i] != one_in_fp16) {
+    //             all_ones = false;
+    //             break;
+    //         }
+    //     }
+    // } else {
+    //     OPENVINO_THROW("Unsupported weight type ", weight_tensor.get_element_type());
+    // }
+
+    // if (!all_ones) {
+    //     weight_tensor.set_shape(ov::Shape{1, 1, 1, weight_tensor.get_shape()[0]});
+    //     auto weights_const = std::make_shared<ov::op::v0::Constant>(weight_tensor);
+    //     auto weights_f32 = std::make_shared<ov::op::v0::Convert>(weights_const, ov::element::f32);
+    //     mul = std::make_shared<ov::op::v1::Multiply>(mul, weights_f32, AutoBroadcastType::NUMPY);
+    // }
 
     auto weight_tensor = weights.at(key + ".weight");
-    // Check if all elements are 1.0
-    bool all_ones = true;
-    if (weight_tensor.get_element_type() == ov::element::f32) {
-        const float* data = weight_tensor.data<float>();
-        for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
-            if (data[i] != 1.0f) {
-                all_ones = false;
-                break;
-            }
-        }
-    } else if (weight_tensor.get_element_type() == ov::element::f16) {
-        const uint16_t* data = weight_tensor.data<uint16_t>();
-        const uint16_t one_in_fp16 = 0x3C00;
-        for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
-            if (data[i] != one_in_fp16) {
-                all_ones = false;
-                break;
-            }
-        }
-    } else {
-        OPENVINO_THROW("Unsupported weight type ", weight_tensor.get_element_type());
-    }
+    weight_tensor.set_shape(ov::Shape{1, 1, 1, weight_tensor.get_shape()[0]});
+    auto weights_const = std::make_shared<ov::op::v0::Constant>(weight_tensor);
+    auto weights_f32 = std::make_shared<ov::op::v0::Convert>(weights_const, ov::element::f32);
 
-    if (!all_ones) {
-        weight_tensor.set_shape(ov::Shape{1, 1, 1, weight_tensor.get_shape()[0]});
-        auto weights_const = std::make_shared<ov::op::v0::Constant>(weight_tensor);
-        auto weights_f32 = std::make_shared<ov::op::v0::Convert>(weights_const, ov::element::f32);
-        mul = std::make_shared<ov::op::v1::Multiply>(mul, weights_f32, AutoBroadcastType::NUMPY);
-    }
+    auto rms = std::make_shared<ov::op::internal::RMS>(input, weights_f32, (double)rms_norm_eps, ov::element::f32);
 
-    return mul;
+    return rms;
 }
 
 // Helper function to split heads
@@ -756,8 +782,12 @@ ov::Output<ov::Node> make_lm_head(
     } else {
         w_f32 = embeddings_node;
     }
-    return std::make_shared<ov::op::v0::MatMul>(
-        input, w_f32, false, true);
+    // return std::make_shared<ov::op::v0::MatMul>(
+    //     input, w_f32, false, true);
+    
+    auto no_bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+    auto matmul = std::make_shared<ov::intel_gpu::op::FullyConnected>(input, w_f32, no_bias);
+    return matmul;
 }
 
 ov::Output<ov::Node> make_rms_norm(
@@ -766,66 +796,106 @@ ov::Output<ov::Node> make_rms_norm(
     const std::unordered_map<std::string, ov::Tensor>& consts,
     float epsilon) {
 
-    auto eps_node = std::make_shared<ov::op::v0::Constant>(
-        ov::element::f32, ov::Shape{1,1,1}, epsilon);
-    auto square = std::make_shared<ov::op::v1::Power>(
-        input, 
-        std::make_shared<ov::op::v0::Constant>(
-            ov::element::f32, ov::Shape{1,1,1}, 2.0f));
+    // auto eps_node = std::make_shared<ov::op::v0::Constant>(
+    //     ov::element::f32, ov::Shape{1,1,1}, epsilon);
+    // auto square = std::make_shared<ov::op::v1::Power>(
+    //     input, 
+    //     std::make_shared<ov::op::v0::Constant>(
+    //         ov::element::f32, ov::Shape{1,1,1}, 2.0f));
     
-    auto variance = std::make_shared<ov::op::v1::ReduceMean>(
-        square, 
-        std::make_shared<ov::op::v0::Constant>(
-            ov::element::i32, ov::Shape{1}, -1),
-        true);
+    // auto variance = std::make_shared<ov::op::v1::ReduceMean>(
+    //     square, 
+    //     std::make_shared<ov::op::v0::Constant>(
+    //         ov::element::i32, ov::Shape{1}, -1),
+    //     true);
 
-    auto add_eps = std::make_shared<ov::op::v1::Add>(variance, eps_node);
-    auto sqrt_node = std::make_shared<ov::op::v0::Sqrt>(add_eps);
-    auto reciprocal = std::make_shared<ov::op::v1::Divide>(
-        std::make_shared<ov::op::v0::Constant>(
-            ov::element::f32, ov::Shape{1,1,1}, 1.0f),
-        sqrt_node);
+    // auto add_eps = std::make_shared<ov::op::v1::Add>(variance, eps_node);
+    // auto sqrt_node = std::make_shared<ov::op::v0::Sqrt>(add_eps);
+    // auto reciprocal = std::make_shared<ov::op::v1::Divide>(
+    //     std::make_shared<ov::op::v0::Constant>(
+    //         ov::element::f32, ov::Shape{1,1,1}, 1.0f),
+    //     sqrt_node);
 
-    std::shared_ptr<ov::Node> mul = std::make_shared<ov::op::v1::Multiply>(
-        reciprocal, input, AutoBroadcastType::NUMPY);
+    // std::shared_ptr<ov::Node> mul = std::make_shared<ov::op::v1::Multiply>(
+    //     reciprocal, input, AutoBroadcastType::NUMPY);
+
+    // if (consts.count(key + ".weight")) {
+    //     auto weight_tensor = consts.at(key + ".weight");
+    //     // Check if all elements are 1.0
+    //     bool all_ones = true;
+    //     if (weight_tensor.get_element_type() == ov::element::f32) {
+    //         const float* data = weight_tensor.data<float>();
+    //         for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
+    //             if (data[i] != 1.0f) {
+    //                 all_ones = false;
+    //                 break;
+    //             }
+    //         }
+    //     } else if (weight_tensor.get_element_type() == ov::element::f16) {
+    //         const uint16_t* data = weight_tensor.data<uint16_t>();
+    //         const uint16_t one_in_fp16 = 0x3C00;
+    //         for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
+    //             if (data[i] != one_in_fp16) {
+    //                 all_ones = false;
+    //                 break;
+    //             }
+    //         }
+    //     } else {
+    //         OPENVINO_THROW("Unsupported weight type ", weight_tensor.get_element_type());
+    //     }
+
+    //     if (!all_ones) {
+    //         weight_tensor.set_shape(ov::Shape{1, 1, weight_tensor.get_shape()[0]});
+    //         auto weights_const = std::make_shared<ov::op::v0::Constant>(
+    //             weight_tensor);
+    //         auto weights_f32 = std::make_shared<ov::op::v0::Convert>(
+    //             weights_const, ov::element::f32);
+    //         mul = std::make_shared<ov::op::v1::Multiply>(
+    //             mul, weights_f32, AutoBroadcastType::NUMPY);
+    //     }
+    // }
+
+    // return mul;
 
     if (consts.count(key + ".weight")) {
+        // std::cout << "make_rms_norm, use internal rms" << std::endl;
         auto weight_tensor = consts.at(key + ".weight");
-        // Check if all elements are 1.0
-        bool all_ones = true;
-        if (weight_tensor.get_element_type() == ov::element::f32) {
-            const float* data = weight_tensor.data<float>();
-            for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
-                if (data[i] != 1.0f) {
-                    all_ones = false;
-                    break;
-                }
-            }
-        } else if (weight_tensor.get_element_type() == ov::element::f16) {
-            const uint16_t* data = weight_tensor.data<uint16_t>();
-            const uint16_t one_in_fp16 = 0x3C00;
-            for (size_t i = 0; i < weight_tensor.get_size(); ++i) {
-                if (data[i] != one_in_fp16) {
-                    all_ones = false;
-                    break;
-                }
-            }
-        } else {
-            OPENVINO_THROW("Unsupported weight type ", weight_tensor.get_element_type());
-        }
+        weight_tensor.set_shape(ov::Shape{1, 1, weight_tensor.get_shape()[0]});
+        auto weights_const = std::make_shared<ov::op::v0::Constant>(
+            weight_tensor);
+        auto weights_f32 = std::make_shared<ov::op::v0::Convert>(
+            weights_const, ov::element::f32);
 
-        if (!all_ones) {
-            weight_tensor.set_shape(ov::Shape{1, 1, weight_tensor.get_shape()[0]});
-            auto weights_const = std::make_shared<ov::op::v0::Constant>(
-                weight_tensor);
-            auto weights_f32 = std::make_shared<ov::op::v0::Convert>(
-                weights_const, ov::element::f32);
-            mul = std::make_shared<ov::op::v1::Multiply>(
-                mul, weights_f32, AutoBroadcastType::NUMPY);
-        }
+        auto rms = std::make_shared<ov::op::internal::RMS>(input, weights_f32, (double)epsilon, ov::element::f32);
+
+        return rms;
+    } else {
+        std::cout << "make_rms_norm, no weight" << std::endl;
+        auto eps_node = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f32, ov::Shape{1,1,1}, epsilon);
+        auto square = std::make_shared<ov::op::v1::Power>(
+            input, 
+            std::make_shared<ov::op::v0::Constant>(
+                ov::element::f32, ov::Shape{1,1,1}, 2.0f));
+        
+        auto variance = std::make_shared<ov::op::v1::ReduceMean>(
+            square, 
+            std::make_shared<ov::op::v0::Constant>(
+                ov::element::i32, ov::Shape{1}, -1),
+            true);
+
+        auto add_eps = std::make_shared<ov::op::v1::Add>(variance, eps_node);
+        auto sqrt_node = std::make_shared<ov::op::v0::Sqrt>(add_eps);
+        auto reciprocal = std::make_shared<ov::op::v1::Divide>(
+            std::make_shared<ov::op::v0::Constant>(
+                ov::element::f32, ov::Shape{1,1,1}, 1.0f),
+            sqrt_node);
+
+        std::shared_ptr<ov::Node> mul = std::make_shared<ov::op::v1::Multiply>(
+            reciprocal, input, AutoBroadcastType::NUMPY);
+
+        return mul;
     }
-
-    return mul;
 }
 
 std::tuple<ov::Output<ov::Node>, ov::Output<ov::Node>> make_embedding(
