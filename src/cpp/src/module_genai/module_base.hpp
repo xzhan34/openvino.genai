@@ -56,8 +56,9 @@ class IBaseModule {
 public:
     ~IBaseModule() = default;
     using PTR = std::shared_ptr<IBaseModule>;
+    using WEAK_PTR = std::weak_ptr<IBaseModule>;
     struct InputModule {
-        IBaseModule::PTR module_ptr;
+        IBaseModule::WEAK_PTR module_ptr;
         // std::string out_port_name;
         DataType dt_type;
         ov::Any data;
