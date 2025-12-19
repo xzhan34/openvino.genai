@@ -51,8 +51,8 @@ int test_genai_module_pipeline(int argc, char *argv[])
 
         // pipe.finish_chat();
 
-        auto output_raw_data = pipe.get_output("raw_data").as<ov::Tensor>();
-        std::cout << "Output raw data first value: " << output_raw_data.data<float>()[0] << std::endl;
+        auto output_raw_data = pipe.get_output("image_embedding").as<ov::Tensor>();
+        std::cout << "Output image embedding first value: " << output_raw_data.data<float>()[0] << std::endl;
     }
     return EXIT_SUCCESS;
 }

@@ -7,6 +7,7 @@
 #include "module_genai/module_type.hpp"
 #include "openvino/core/any.hpp"
 #include "openvino/genai/visibility.hpp"
+#include "visual_language/vision_encoder.hpp"
 
 namespace ov {
 namespace genai {
@@ -20,6 +21,7 @@ enum class DataType : int {
     VecOVRemoteTensor = 4,
     String = 10,
     VecString = 11,
+    VecInteger = 12,
 };
 
 struct OutputPort {

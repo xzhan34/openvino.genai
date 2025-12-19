@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "md_io.hpp"
+#include <openvino/runtime/tensor.hpp>
 
 namespace ov {
 namespace genai {
@@ -46,6 +47,9 @@ void ResultModule::print_static_config() {
       - name: "raw_data"
         type: "OVTensor"
         source: "ParentModuleName.OutputPortName"
+    outputs:
+      - name: "raw_data"
+        type: "OVTensor"
     )" << std::endl;
 }
 
@@ -56,12 +60,16 @@ ResultModule::ResultModule(const IBaseModuleDesc::PTR& desc) : IBaseModule(desc)
 void ResultModule::run(ov::AnyMap& outputs) {
     prepare_inputs();
 
-    auto raw_data = this->inputs["raw_data"].data.as<ov::Tensor>();
-
     std::cout << "Run: " << ModuleTypeConverter::toString(static_cast<ModuleType>(module_desc->type)) << "["
               << module_desc->name << "]" << std::endl;
 
-    outputs["raw_data"] = raw_data;
+    for (auto &output : this->outputs) {
+        if (this->inputs.find(output.first) == this->inputs.end()) {
+            std::cerr << "ResultModule[" << module_desc->name << "]: Can not find input port: " << output.first << std::endl;
+            continue;
+        }
+        outputs[output.first] = this->inputs[output.first].data.as<ov::Tensor>();
+    }
 }
 
 }  // namespace module
