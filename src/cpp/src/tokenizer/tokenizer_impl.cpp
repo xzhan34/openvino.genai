@@ -6,6 +6,9 @@
 #include "sampling/structured_output/structured_output_controller.hpp"
 #include "openvino/genai/version.hpp"
 
+#include <iostream>
+#include <algorithm>
+
 namespace ov {
 namespace genai {
 
@@ -331,6 +334,46 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
         setup_tokenizer(std::make_pair(ov_tokenizer, ov_detokenizer), filtered_properties);
         return;
     }
+    
+    // Check if this is a safetensors model that needs tokenizer conversion
+    bool is_safetensors = std::filesystem::exists(models_path / "tokenizer.json") &&
+                          (std::filesystem::exists(models_path / "model.safetensors") ||
+                           std::filesystem::exists(models_path / "model.safetensors.index.json"));
+    
+    if (is_safetensors && 
+        (!std::filesystem::exists(models_path / "openvino_tokenizer.xml") ||
+         !std::filesystem::exists(models_path / "openvino_detokenizer.xml"))) {
+        // Convert HuggingFace tokenizer to OpenVINO format
+        std::cout << "[Safetensors] Converting HuggingFace tokenizer to OpenVINO format..." << std::endl;
+        
+        std::string model_dir_str = models_path.string();
+        std::string tokenizer_path_str = (models_path / "openvino_tokenizer.xml").string();
+        std::string detokenizer_path_str = (models_path / "openvino_detokenizer.xml").string();
+        
+        // Replace backslashes with forward slashes for Python compatibility
+        std::replace(model_dir_str.begin(), model_dir_str.end(), '\\', '/');
+        std::replace(tokenizer_path_str.begin(), tokenizer_path_str.end(), '\\', '/');
+        std::replace(detokenizer_path_str.begin(), detokenizer_path_str.end(), '\\', '/');
+        
+        std::string python_cmd = 
+            "python -c \""
+            "from transformers import AutoTokenizer; "
+            "from openvino_tokenizers import convert_tokenizer; "
+            "from openvino import save_model; "
+            "t = AutoTokenizer.from_pretrained('" + model_dir_str + "'); "
+            "tok, detok = convert_tokenizer(t, with_detokenizer=True); "
+            "save_model(tok, '" + tokenizer_path_str + "'); "
+            "save_model(detok, '" + detokenizer_path_str + "'); "
+            "print('Tokenizer conversion successful')\"";
+        
+        int result = std::system(python_cmd.c_str());
+        if (result != 0) {
+            std::cerr << "[Safetensors] Warning: Tokenizer conversion failed" << std::endl;
+        } else {
+            std::cout << "[Safetensors] Tokenizer conversion completed successfully" << std::endl;
+        }
+    }
+    
     if (std::filesystem::exists(models_path / "openvino_tokenizer.xml")) {
         ov_tokenizer = core.read_model(models_path / "openvino_tokenizer.xml", {}, filtered_properties);
     }

@@ -120,6 +120,14 @@ if(NOT ENABLE_GGUF)
     list(REMOVE_ITEM SOURCE_FILES ${GGUF_SOURCES})
 endif()
 
+# Safetensors support - requires ENABLE_GGUF for building_blocks
+if(NOT ENABLE_GGUF OR NOT ENABLE_SAFETENSORS)
+    set(SAFETENSORS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/hf_config.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_loader.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_modeling.cpp)
+    list(REMOVE_ITEM SOURCE_FILES ${SAFETENSORS_SOURCES})
+endif()
+
 set(TARGET_NAME openvino_genai)
 set(TARGET_NAME_OBJ ${TARGET_NAME}_obj)
 
@@ -137,6 +145,10 @@ endif()
 if(ENABLE_GGUF)
     target_link_libraries(${TARGET_NAME_OBJ} PRIVATE gguflib)
     target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_GGUF)
+endif()
+
+if(ENABLE_GGUF AND ENABLE_SAFETENSORS)
+    target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_SAFETENSORS)
 endif()
 
 target_include_directories(${TARGET_NAME_OBJ} SYSTEM PRIVATE "${safetensors.h_SOURCE_DIR}")

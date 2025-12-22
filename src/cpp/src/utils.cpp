@@ -18,6 +18,11 @@
 #include "openvino/genai/text_streamer.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
 
+#ifdef ENABLE_SAFETENSORS
+#include "safetensors_utils/safetensors_modeling.hpp"
+#include "safetensors_utils/safetensors_loader.hpp"
+#endif
+
 
 #include "sampling/sampler.hpp"
 
@@ -355,6 +360,12 @@ bool is_gguf_model(const std::filesystem::path& file_path) {
     return file_path.extension() == ".gguf";
 }
 
+#ifdef ENABLE_SAFETENSORS
+bool is_safetensors_model_dir(const std::filesystem::path& model_dir) {
+    return ov::genai::safetensors::is_safetensors_model(model_dir);
+}
+#endif
+
 } // namespace
 
 std::pair<ov::AnyMap, bool> extract_gguf_properties(const ov::AnyMap& external_properties) {
@@ -393,19 +404,29 @@ std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  c
 #else
         OPENVINO_ASSERT("GGUF support is switched off. Please, recompile with 'cmake -DENABLE_GGUF=ON'");
 #endif
-    } else {
-        std::filesystem::path model_path = model_dir;
-
-        if (std::filesystem::exists(model_dir / "openvino_model.xml")) {
-            model_path = model_dir / "openvino_model.xml";
-        } else if (std::filesystem::exists(model_dir / "openvino_language_model.xml")) {
-            model_path = model_path / "openvino_language_model.xml";
-        } else {
-            OPENVINO_THROW("Could not find a model in the directory '", model_dir, "'");
-        }
-
-        return singleton_core().read_model(model_path, {}, filtered_properties);
     }
+    
+#ifdef ENABLE_SAFETENSORS
+    // Check if directory contains safetensors model (before checking for OpenVINO IR)
+    if (std::filesystem::is_directory(model_dir) && is_safetensors_model_dir(model_dir)) {
+        // If OpenVINO model already exists, use it; otherwise create from safetensors
+        if (!std::filesystem::exists(model_dir / "openvino_model.xml")) {
+            return ov::genai::safetensors::create_from_safetensors(model_dir, enable_save_ov_model);
+        }
+    }
+#endif
+
+    std::filesystem::path model_path = model_dir;
+
+    if (std::filesystem::exists(model_dir / "openvino_model.xml")) {
+        model_path = model_dir / "openvino_model.xml";
+    } else if (std::filesystem::exists(model_dir / "openvino_language_model.xml")) {
+        model_path = model_path / "openvino_language_model.xml";
+    } else {
+        OPENVINO_THROW("Could not find a model in the directory '", model_dir, "'");
+    }
+
+    return singleton_core().read_model(model_path, {}, filtered_properties);
 }
 
 size_t get_first_history_difference(const ov::Tensor& encoded_history, const std::vector<int64_t> tokenized_history) {
