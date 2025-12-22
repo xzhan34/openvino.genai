@@ -27,13 +27,14 @@ else()
     message(FATAL_ERROR "OpenCV not found! Check your installation and environment.")
 endif()
 
-file(GLOB src_modules "./modules/*.cpp")
-file(GLOB src_pipelines "./pipelines/*.cpp")
-file(GLOB src_utils "./utils/*.cpp")
+file(GLOB CONFIGURE_DEPENDS src_modules "./modules/*.cpp")
+file(GLOB CONFIGURE_DEPENDS src_pipelines "./pipelines/*.cpp")
+file(GLOB CONFIGURE_DEPENDS src_utils "./utils/*.cpp")
+set(src_comfyui "comfyui_json_parser.cpp" "test_comfyui_json_parser.cpp")
 
 set(TEST_TARGET_NAME "genai_modules_test")
 
-add_executable(${TEST_TARGET_NAME} ${src_modules} ${src_pipelines} ${src_utils} $<TARGET_OBJECTS:openvino_genai_obj>)
+add_executable(${TEST_TARGET_NAME} ${src_modules} ${src_pipelines} ${src_utils} ${src_comfyui} $<TARGET_OBJECTS:openvino_genai_obj>)
 
 target_link_libraries(${TEST_TARGET_NAME} PRIVATE $<TARGET_PROPERTY:openvino::genai,LINK_LIBRARIES> gtest_main gmock_main ${OpenCV_LIBS})
 target_include_directories(${TEST_TARGET_NAME} PRIVATE "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
@@ -45,7 +46,37 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   target_link_options(${TEST_TARGET_NAME} PRIVATE /IGNORE:4207,4286)
 endif()
 
+# Add ComfyUI JSON validator standalone executable
+set(COMFYUI_VALIDATOR_TARGET "comfyui_validator")
+add_executable(${COMFYUI_VALIDATOR_TARGET} comfyui_validator.cpp comfyui_json_parser.cpp)
+target_link_libraries(${COMFYUI_VALIDATOR_TARGET} PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(${COMFYUI_VALIDATOR_TARGET} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  target_link_options(${COMFYUI_VALIDATOR_TARGET} PRIVATE /IGNORE:4207,4286)
+endif()
+
+# Add ComfyUI usage example executable
+set(COMFYUI_EXAMPLE_TARGET "comfyui_usage_example")
+add_executable(${COMFYUI_EXAMPLE_TARGET} comfyui_usage_example.cpp comfyui_json_parser.cpp)
+target_link_libraries(${COMFYUI_EXAMPLE_TARGET} PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(${COMFYUI_EXAMPLE_TARGET} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  target_link_options(${COMFYUI_EXAMPLE_TARGET} PRIVATE /IGNORE:4207,4286)
+endif()
+
 install(TARGETS ${TEST_TARGET_NAME}
+        RUNTIME DESTINATION tests/
+        COMPONENT tests
+        EXCLUDE_FROM_ALL)
+
+install(TARGETS ${COMFYUI_VALIDATOR_TARGET}
+        RUNTIME DESTINATION tests/
+        COMPONENT tests
+        EXCLUDE_FROM_ALL)
+
+install(TARGETS ${COMFYUI_EXAMPLE_TARGET}
         RUNTIME DESTINATION tests/
         COMPONENT tests
         EXCLUDE_FROM_ALL)

@@ -169,7 +169,7 @@ target_include_directories(${TARGET_NAME} INTERFACE "$<INSTALL_INTERFACE:runtime
                                                     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                                                     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>")
 
-target_link_libraries(${TARGET_NAME} PUBLIC openvino::runtime PRIVATE openvino::threading nlohmann_json::nlohmann_json ${YAML_CPP_LIBRARIES} minja ${CMAKE_DL_LIBS})
+target_link_libraries(${TARGET_NAME} PUBLIC openvino::runtime PRIVATE openvino::threading nlohmann_json::nlohmann_json yaml-cpp minja ${CMAKE_DL_LIBS})
 
 if(ENABLE_XGRAMMAR)
     target_link_libraries(${TARGET_NAME} PRIVATE xgrammar)

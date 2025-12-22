@@ -176,6 +176,12 @@ class TransformerPipeline():
             print(f"enable_tiling = {enable_tiling}")
             cfg_data = self._update_config_with_tiling(cfg_data, decoder_module_name="vae")
 
+        # Save cfg_data to YAML file for debugging
+        debug_yaml_path = f"{self.model_path}/xiaolin-debug_cfg_data.yaml"
+        with open(debug_yaml_path, 'w', encoding='utf-8') as f:
+            yaml.dump(cfg_data, f, default_flow_style=False, allow_unicode=True)
+        print(f"Debug: cfg_data saved to {debug_yaml_path}")
+
         self.pipe = openvino_genai.ModulePipeline(config_yaml_content=yaml.dump(cfg_data))
 
     def _update_config_with_tiling(self, cfg_data:dict, decoder_module_name:str):
