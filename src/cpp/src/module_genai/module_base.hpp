@@ -20,6 +20,10 @@ enum class DataType : int {
     VecOVRemoteTensor = 4,
     String = 10,
     VecString = 11,
+    Int = 20,
+    VecInt = 21,
+    Float = 30,
+    VecFloat = 31
 };
 
 struct OutputPort {
@@ -50,6 +54,9 @@ public:
     static PTR create() {
         return std::make_shared<IBaseModuleDesc>();
     }
+
+    std::string get_full_path(const std::string& fn);
+    std::string config_root_path;
 };
 
 class IBaseModule {
@@ -58,13 +65,13 @@ public:
     using PTR = std::shared_ptr<IBaseModule>;
     struct InputModule {
         IBaseModule::PTR module_ptr;
-        // std::string out_port_name;
         DataType dt_type;
+
         ov::Any data;
+        std::string parent_port_name;
     };
     struct OutputModule {
         IBaseModule::PTR module_ptr;
-        // std::string in_port_name;
         DataType dt_type;
         ov::Any data;
     };

@@ -1,16 +1,25 @@
 # UT For module_genai pipeline
 
-This is UT for modular GenAI. Please verify the correctness of [pipeline](./config_pipeline/config_qwen2_5_vl.yaml) before merging code.
+This is UT for modular GenAI. Please verify the correctness of [pipeline](./ut_pipelines/config.yaml) before merging code.
 
-Step1: Build GenAI
+#### Build GenAI
 
-Step2: Add new modules in `./config_pipeline/config_qwen2_5_vl.yaml`
+Refer [Guide](https://github.com/openvinotoolkit/openvino.genai/blob/master/src/docs/BUILD.md)
 
-Step3: Build sample test and run
-
-```bash
-./ut_build.sh
-./ut_run.sh
+```
+ut_build.sh
 ```
 
-Note: Remember to modify your own model_path in yaml file, and modify openvino dir in `ut_build.sh` and `ut_run.sh`.
+#### Module Unit Test
+
+Preprare your model, take qwen2.5-vl as example: `openvino.genai/samples/cpp/module_genai/ut_pipelines/Qwen2.5-VL-3B-Instruct/INT4/`
+
+```
+./ut_modules.sh
+```
+
+#### Pipeline Unit test
+
+```bash
+./ut_pipelines.sh
+```

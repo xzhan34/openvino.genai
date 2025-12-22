@@ -3,14 +3,19 @@
 
 #include "module_genai/module_base.hpp"
 
+#include <filesystem>
+
 namespace ov {
 namespace genai {
 namespace module {
 
+namespace fs = std::filesystem;
+
 IBaseModule::IBaseModule(const IBaseModuleDesc::PTR& desc) : module_desc(desc) {
     std::cout << "Init IBaseModule with module name : " << module_desc->name << std::endl;
     for (auto& input : desc->inputs) {
-        this->inputs[input.source_module_out_name] = InputModule();
+        this->inputs[input.name] = InputModule();
+        this->inputs[input.name].parent_port_name = input.source_module_out_name;
     }
     for (auto& output : desc->outputs) {
         this->outputs[output.name] = OutputModule();
@@ -19,13 +24,26 @@ IBaseModule::IBaseModule(const IBaseModuleDesc::PTR& desc) : module_desc(desc) {
 
 void IBaseModule::prepare_inputs() {
     for (auto& input : this->inputs) {
-        const auto& parent_port_name = input.first;
+        const auto& parent_port_name = input.second.parent_port_name;
         input.second.data = input.second.module_ptr->outputs[parent_port_name].data;
     }
 }
 
 const std::string& IBaseModule::get_module_name() const {
     return module_desc->name;
+}
+
+std::string IBaseModuleDesc::get_full_path(const std::string& fn) {
+    // Check if fn is absolute path or file exists
+    if (fs::exists(fn) || fs::path(fn).is_absolute()) {
+        return fn;
+    }
+
+    fs::path joined_path = fs::path(config_root_path) / fn;
+    if (fs::exists(joined_path) || fs::path(joined_path).is_absolute()) {
+        return joined_path.string();
+    }
+    OPENVINO_ASSERT(false, "File path is invalid: " + fn);
 }
 
 }  // namespace module
