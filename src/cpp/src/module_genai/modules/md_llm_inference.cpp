@@ -13,7 +13,7 @@ void LLMInferenceModule::print_static_config() {
     std::cout << R"(
   llm_inference:                      # Module Name
     type: "LLMInferenceModule"
-    description: "Unified generation module supporting multiple modalities: LLM, VLM, Text2Image, Image2Image, Inpainting, Text2Speech"
+    description: "unified generation module supporting multiple modalities: LLM, VLM, Text2Image, Image2Image, Inpainting, Text2Speech"
     device: "GPU"                     # Target device: CPU, GPU, NPU
     inputs:
       # Text Generation (LLM/VLM)

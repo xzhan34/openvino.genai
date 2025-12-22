@@ -8,6 +8,7 @@ if(ENABLE_SAMPLES)
     add_subdirectory(cpp/visual_language_chat)
     add_subdirectory(cpp/whisper_speech_recognition)
     add_subdirectory(cpp/rag)
+    add_subdirectory(cpp/module_genai)
     add_subdirectory(c/text_generation)
     add_subdirectory(c/whisper_speech_recognition)
     add_subdirectory(c/visual_language_chat)
@@ -27,6 +28,7 @@ install(DIRECTORY
             cpp/visual_language_chat
             cpp/whisper_speech_recognition
             cpp/rag
+            cpp/module_genai
         DESTINATION samples/cpp COMPONENT cpp_samples_genai)
 
 install(DIRECTORY
