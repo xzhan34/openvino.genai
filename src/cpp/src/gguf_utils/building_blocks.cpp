@@ -12,7 +12,8 @@
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
 #include "intel_gpu/op/placeholder.hpp"
-#include "intel_gpu/op/fully_connected.hpp"
+// #include "intel_gpu/op/fully_connected.hpp"
+#include <ov_ops/fully_connected.hpp>
 #include <ov_ops/rms.hpp>
 #include <ov_ops/rotary_positional_embeddings.hpp>
 
@@ -744,6 +745,31 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
     }
 }
 
+ov::Output<ov::Node> make_fused_fc(
+    const std::string& key,
+    const ov::Output<ov::Node>& input,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    gguf_tensor_type qtype,
+    bool reorder = false,
+    int head_size = -1) {
+    auto w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size);
+
+    ov::Output<ov::Node> bias;
+
+    // Add post-MatMul Add operation if exists
+    if (consts.count(key + ".bias")) {
+        auto add_tensor = get_tensor(consts, key + ".bias");
+        auto add_const = std::make_shared<v0::Constant>(add_tensor);
+        auto bias = std::make_shared<ov::op::v0::Convert>(add_const, ov::element::f32);
+    } else {
+        bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+    }
+
+    auto output = std::make_shared<ov::op::internal::FullyConnected>(input, w_f32, bias);
+
+    return output;
+}
+
 ov::Output<ov::Node> make_fc(
     const std::string& key,
     const ov::Output<ov::Node>& input,
@@ -751,6 +777,9 @@ ov::Output<ov::Node> make_fc(
     gguf_tensor_type qtype,
     bool reorder = false,
     int head_size = -1) {
+    if (qtype == gguf_tensor_type::GGUF_TYPE_BF16 || qtype == gguf_tensor_type::GGUF_TYPE_F16) {
+        return make_fused_fc(key, input, consts, qtype, reorder, head_size);
+    }
     auto w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size);
     std::shared_ptr<ov::Node> output = std::make_shared<ov::op::v0::MatMul>(input, w_f32, false, true);
 
@@ -786,7 +815,8 @@ ov::Output<ov::Node> make_lm_head(
     //     input, w_f32, false, true);
     
     auto no_bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
-    auto matmul = std::make_shared<ov::intel_gpu::op::FullyConnected>(input, w_f32, no_bias);
+    // auto matmul = std::make_shared<ov::intel_gpu::op::FullyConnected>(input, w_f32, no_bias);
+    auto matmul = std::make_shared<ov::op::internal::FullyConnected>(input, w_f32, no_bias);
     return matmul;
 }
 
