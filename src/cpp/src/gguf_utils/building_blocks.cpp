@@ -11,8 +11,7 @@
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
-#include "intel_gpu/op/placeholder.hpp"
-// #include "intel_gpu/op/fully_connected.hpp"
+#include "openvino/op/placeholder_extension.hpp"
 #include <ov_ops/fully_connected.hpp>
 #include <ov_ops/rms.hpp>
 #include <ov_ops/rotary_positional_embeddings.hpp>
@@ -762,7 +761,7 @@ ov::Output<ov::Node> make_fused_fc(
         auto add_const = std::make_shared<v0::Constant>(add_tensor);
         auto bias = std::make_shared<ov::op::v0::Convert>(add_const, ov::element::f32);
     } else {
-        bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+        bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
     }
 
     auto output = std::make_shared<ov::op::internal::FullyConnected>(input, w_f32, bias);
@@ -813,8 +812,8 @@ ov::Output<ov::Node> make_lm_head(
     }
     // return std::make_shared<ov::op::v0::MatMul>(
     //     input, w_f32, false, true);
-    
-    auto no_bias = std::make_shared<ov::intel_gpu::op::Placeholder>();
+
+    auto no_bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
     // auto matmul = std::make_shared<ov::intel_gpu::op::FullyConnected>(input, w_f32, no_bias);
     auto matmul = std::make_shared<ov::op::internal::FullyConnected>(input, w_f32, no_bias);
     return matmul;

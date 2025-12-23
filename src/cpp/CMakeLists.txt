@@ -153,7 +153,7 @@ endif()
 
 target_include_directories(${TARGET_NAME_OBJ} SYSTEM PRIVATE "${safetensors.h_SOURCE_DIR}")
 
-target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime openvino::threading nlohmann_json::nlohmann_json minja)
+target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime openvino::core::dev openvino::threading nlohmann_json::nlohmann_json minja)
 
 target_compile_features(${TARGET_NAME_OBJ} PRIVATE cxx_std_17)
 
@@ -179,7 +179,7 @@ target_include_directories(${TARGET_NAME} INTERFACE "$<INSTALL_INTERFACE:runtime
                                                     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                                                     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>")
 
-target_link_libraries(${TARGET_NAME} PUBLIC openvino::runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../openvino/bin/intel64/RelWithDebInfo/openvino_intel_gpu_plugin.lib" openvino::threading nlohmann_json::nlohmann_json minja ${CMAKE_DL_LIBS})
+target_link_libraries(${TARGET_NAME} PUBLIC openvino::runtime PRIVATE openvino::threading nlohmann_json::nlohmann_json minja ${CMAKE_DL_LIBS})
 
 if(ENABLE_XGRAMMAR)
     target_link_libraries(${TARGET_NAME} PRIVATE xgrammar)
