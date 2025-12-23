@@ -7,6 +7,7 @@
 #include "module_genai/module_type.hpp"
 #include "openvino/core/any.hpp"
 #include "openvino/genai/visibility.hpp"
+#include "visual_language/vision_encoder.hpp"
 
 namespace ov {
 namespace genai {
@@ -63,8 +64,10 @@ class IBaseModule {
 public:
     ~IBaseModule() = default;
     using PTR = std::shared_ptr<IBaseModule>;
+    using WEAK_PTR = std::weak_ptr<IBaseModule>;
     struct InputModule {
-        IBaseModule::PTR module_ptr;
+        IBaseModule::WEAK_PTR module_ptr;
+        // std::string out_port_name;
         DataType dt_type;
 
         ov::Any data;
