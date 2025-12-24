@@ -12,6 +12,7 @@
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
 #include "openvino/op/placeholder_extension.hpp"
+#include "openvino/op/fused_mlp.hpp"
 #include <ov_ops/fully_connected.hpp>
 #include <ov_ops/rms.hpp>
 #include <ov_ops/rotary_positional_embeddings.hpp>
@@ -554,7 +555,9 @@ ov::Output<ov::Node> make_fp16_weights(
     const std::string& key,
     const std::unordered_map<std::string, ov::Tensor>& consts,
     bool reorder,
-    int head_size) {
+    int head_size,
+    bool convert_to_f32=true
+) {
 
     auto it = consts.find(key + ".weight");
     OPENVINO_ASSERT(it != consts.end(), "Weight not found: ", key);
@@ -568,7 +571,13 @@ ov::Output<ov::Node> make_fp16_weights(
     // Create FP16 constant and convert to FP32
     auto weights_node = std::make_shared<v0::Constant>(weight_f16);
     weights_node->set_friendly_name(key + ".weight");
-    return std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f32);
+    if (convert_to_f32) {
+        return std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f32);
+    } else if (weights_node->get_element_type() != ov::element::f16) {
+        return std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
+    } else {
+        return weights_node;
+    }
 }
 
 // Retrieve tensors
@@ -860,6 +869,78 @@ ov::Output<ov::Node> make_fc(
     return output;
 }
 
+ov::Output<ov::Node> make_mlp(
+    const std::string& key,
+    const ov::Output<ov::Node>& input,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    std::string name_prefix,
+    std::string name_suffix,
+    bool reorder = false,
+    int head_size = -1) {
+    auto gate_key = key + ".mlp.gate_proj";
+    auto up_key = key + ".mlp.up_proj";
+    auto down_key = key + ".mlp.down_proj";
+    auto gate_type = qtypes.at(gate_key + ".qtype");
+    auto up_type = qtypes.at(up_key + ".qtype");
+    auto down_type = qtypes.at(down_key + ".qtype");
+
+    bool has_bias = consts.count(gate_key + ".bias") || consts.count(up_key + ".bias") || consts.count(down_key + ".bias");
+
+    if (gate_type == up_type && up_type == down_type
+        && (gate_type == gguf_tensor_type::GGUF_TYPE_BF16
+            || gate_type == gguf_tensor_type::GGUF_TYPE_F16) && !has_bias) {
+        // fp16 weights, use fused mlp
+        auto gate_w_f16 = make_fp16_weights(gate_key, consts, reorder, head_size, false);
+        auto up_w_f16 = make_fp16_weights(up_key, consts, reorder, head_size, false);
+        auto down_w_f16 = make_fp16_weights(down_key, consts, reorder, head_size, false);
+
+        auto trans_const = std::make_shared<ov::op::v0::Constant>(element::i32, Shape{2}, std::vector<int32_t>{1, 0});
+        auto gate_w_f16_trans = std::make_shared<ov::op::v1::Transpose>(gate_w_f16, trans_const);
+        auto up_w_f16_trans = std::make_shared<ov::op::v1::Transpose>(up_w_f16, trans_const);
+        auto down_w_f16_trans = std::make_shared<ov::op::v1::Transpose>(down_w_f16, trans_const);
+
+        auto axes = ov::op::v0::Constant::create(ov::element::i64, Shape{1}, {3});
+        auto input_f16 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f16);
+        auto input_f16_unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(input_f16, axes);
+
+        // auto mlp_out = std::make_shared<ov::intel_gpu::op::FusedMLP>(input_f16, gate_w_f16, up_w_f16, down_w_f16);
+        auto mlp_out = std::make_shared<ov::op::internal::FusedMLP>(input_f16_unsqueeze, gate_w_f16_trans, up_w_f16_trans, down_w_f16_trans);
+        auto mlp_out_f32 = std::make_shared<ov::op::v0::Convert>(mlp_out, ov::element::f32);
+        auto mlp_out_f32_squeeze = std::make_shared<ov::op::v0::Squeeze>(mlp_out_f32, axes);
+
+        return mlp_out_f32_squeeze;
+    } else {
+        auto gate_proj = make_fc(
+            gate_key,
+            input,
+            consts,
+            gate_type,
+            reorder,
+            head_size
+        );
+        auto silu = std::make_shared<ov::op::v4::Swish>(gate_proj);
+        auto up_proj = make_fc(
+            up_key,
+            input,
+            consts,
+            up_type,
+            reorder,
+            head_size);
+        auto mul = std::make_shared<ov::op::v1::Multiply>(
+            silu, up_proj, ov::op::AutoBroadcastType::NUMPY);
+        mul->set_friendly_name(name_prefix + ".mlp.mul" + name_suffix);
+        auto down_proj = make_fc(
+            down_key,
+            mul,
+            consts,
+            down_type,
+            reorder,
+            head_size);
+        return down_proj;
+    }
+}
+
 ov::Output<ov::Node> make_lm_head(
     const std::string& key,
     const ov::Output<ov::Node>& input,
@@ -1148,29 +1229,13 @@ std::tuple<ov::Output<ov::Node>,
         std::get<float>(configs.at("rms_norm_eps")));
 
     // MLP block
-    auto gate_proj = make_fc(
-        layer_prefix + ".mlp.gate_proj",
-        post_attn_norm,
-        consts,
-        qtypes.at(layer_prefix + ".mlp.gate_proj.qtype"));
-    auto silu = std::make_shared<ov::op::v4::Swish>(gate_proj);
-    auto up_proj = make_fc(
-        layer_prefix + ".mlp.up_proj",
-        post_attn_norm,
-        consts,
-        qtypes.at(layer_prefix + ".mlp.up_proj.qtype"));
-    auto mul = std::make_shared<ov::op::v1::Multiply>(
-        silu, up_proj, ov::op::AutoBroadcastType::NUMPY);
-    mul->set_friendly_name(name_prefix + ".mlp.mul" + name_suffix);
-    auto down_proj = make_fc(
-        layer_prefix + ".mlp.down_proj",
-        mul,
-        consts,
-        qtypes.at(layer_prefix + ".mlp.down_proj.qtype"));
+    auto mlp_out = make_mlp(
+        layer_prefix, post_attn_norm, consts, qtypes, name_prefix, name_suffix, reorder
+    );
 
     // Final residual connection
     auto output = std::make_shared<ov::op::v1::Add>(
-        attn_add, down_proj, ov::op::AutoBroadcastType::NUMPY);
+        attn_add, mlp_out, ov::op::AutoBroadcastType::NUMPY);
     output->set_friendly_name(name_prefix + ".add1" + name_suffix);
 
     return {output, sinks, new_causal_mask, new_cos_sin, final_output_shape};
