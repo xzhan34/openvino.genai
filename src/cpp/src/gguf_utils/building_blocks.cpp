@@ -759,7 +759,7 @@ ov::Output<ov::Node> make_fused_fc(
     if (consts.count(key + ".bias")) {
         auto add_tensor = get_tensor(consts, key + ".bias");
         auto add_const = std::make_shared<v0::Constant>(add_tensor);
-        auto bias = std::make_shared<ov::op::v0::Convert>(add_const, ov::element::f32);
+        bias = std::make_shared<ov::op::v0::Convert>(add_const, ov::element::f32);
     } else {
         bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
     }
@@ -767,6 +767,73 @@ ov::Output<ov::Node> make_fused_fc(
     auto output = std::make_shared<ov::op::internal::FullyConnected>(input, w_f32, bias);
 
     return output;
+}
+
+// Fused QKV projection: concatenates Q, K, V weights and does single FC operation
+std::tuple<ov::Output<ov::Node>, ov::Output<ov::Node>, ov::Output<ov::Node>> 
+make_qkv_fused_fc(
+    const std::string& layer_prefix,
+    const ov::Output<ov::Node>& input,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    bool reorder,
+    int head_size,
+    int num_heads,
+    int num_heads_kv) {
+    
+    // Get individual weight subgraphs
+    auto q_weights = make_weights_subgraph(
+        layer_prefix + ".self_attn.q_proj", consts, 
+        qtypes.at(layer_prefix + ".self_attn.q_proj.qtype"), reorder, head_size);
+    auto k_weights = make_weights_subgraph(
+        layer_prefix + ".self_attn.k_proj", consts,
+        qtypes.at(layer_prefix + ".self_attn.k_proj.qtype"), reorder, head_size);
+    auto v_weights = make_weights_subgraph(
+        layer_prefix + ".self_attn.v_proj", consts,
+        qtypes.at(layer_prefix + ".self_attn.v_proj.qtype"), false, -1);
+    
+    // Concatenate weights along output dimension (axis=0 typically)
+    auto qkv_weights = std::make_shared<v0::Concat>(
+        ov::OutputVector{q_weights, k_weights, v_weights}, 0);
+    
+    // Handle biases if they exist
+    ov::Output<ov::Node> qkv_bias;
+    bool has_bias = consts.count(layer_prefix + ".self_attn.q_proj.bias") > 0;
+    
+    if (has_bias) {
+        auto q_bias_tensor = get_tensor(consts, layer_prefix + ".self_attn.q_proj.bias");
+        auto k_bias_tensor = get_tensor(consts, layer_prefix + ".self_attn.k_proj.bias");
+        auto v_bias_tensor = get_tensor(consts, layer_prefix + ".self_attn.v_proj.bias");
+        
+        auto q_bias = std::make_shared<ov::op::v0::Convert>(
+            std::make_shared<v0::Constant>(q_bias_tensor), ov::element::f32);
+        auto k_bias = std::make_shared<ov::op::v0::Convert>(
+            std::make_shared<v0::Constant>(k_bias_tensor), ov::element::f32);
+        auto v_bias = std::make_shared<ov::op::v0::Convert>(
+            std::make_shared<v0::Constant>(v_bias_tensor), ov::element::f32);
+        
+        qkv_bias = std::make_shared<v0::Concat>(
+            ov::OutputVector{q_bias, k_bias, v_bias}, 0);
+    } else {
+        qkv_bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
+    }
+    
+    // Single fused FC operation
+    auto qkv_output = std::make_shared<ov::op::internal::FullyConnected>(
+        input, qkv_weights, qkv_bias);
+    
+    // Split the output back into Q, K, V
+    int q_dim = num_heads * head_size;
+    int k_dim = num_heads_kv * head_size;
+    int v_dim = num_heads_kv * head_size;
+    
+    // Use VariadicSplit to divide into Q, K, V portions
+    auto split_lengths = std::make_shared<v0::Constant>(
+        ov::element::i64, ov::Shape{3}, std::vector<int64_t>{q_dim, k_dim, v_dim});
+    auto axis = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, -1);
+    auto split = std::make_shared<ov::op::v1::VariadicSplit>(qkv_output, axis, split_lengths);
+    
+    return {split->output(0), split->output(1), split->output(2)};
 }
 
 ov::Output<ov::Node> make_fc(
@@ -988,6 +1055,23 @@ std::tuple<ov::Output<ov::Node>,
     if (std::get<std::string>(configs.at("architecture")).find("llama") != std::string::npos) {
         reorder = true;
     }
+    
+    int num_heads = std::get<int>(configs.at("head_num"));
+    int head_size = std::get<int>(configs.at("head_size"));
+    int num_heads_kv = std::get<int>(configs.at("head_num_kv"));
+    
+    // Option 1: Use fused QKV FC (recommended for performance)
+    auto [q, k, v] = make_qkv_fused_fc(
+        layer_prefix,
+        input_layernorm,
+        consts,
+        qtypes,
+        reorder,
+        head_size,
+        num_heads,
+        num_heads_kv);
+    
+    /* Option 2: Use separate FCs (original approach)
     auto q = make_fc(
         layer_prefix + ".self_attn.q_proj",
         input_layernorm,
@@ -1009,6 +1093,7 @@ std::tuple<ov::Output<ov::Node>,
         input_layernorm,
         consts,
         qtypes.at(layer_prefix + ".self_attn.v_proj.qtype"));
+    */
 
     // Handle output shape
     std::shared_ptr<ov::Node> final_output_shape = output_shape;

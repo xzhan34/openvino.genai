@@ -20,8 +20,9 @@ int main(int argc, char* argv[]) try {
     std::size_t num_iter = argc > 5 ? std::stoul(argv[5]) : 3;
     std::size_t max_new_tokens = argc > 6 ? std::stoul(argv[6]) : 100;
     num_iter = std::max<std::size_t>(num_iter, 1);
-
-    ov::genai::LLMPipeline pipe(models_path, device);
+    ov::AnyMap pipe_config;
+    pipe_config[ov::genai::enable_save_ov_model.name()] = false;
+    ov::genai::LLMPipeline pipe(models_path, device, pipe_config);
     ov::genai::GenerationConfig config;
     config.max_new_tokens = max_new_tokens;
     config.apply_chat_template = false;
