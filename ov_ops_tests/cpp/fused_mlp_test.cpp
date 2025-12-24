@@ -1,7 +1,7 @@
 #include <openvino/openvino.hpp>
 #include "openvino/opsets/opset13.hpp"
 #include "openvino/opsets/opset10.hpp"
-#include "openvino/op/fused_mlp_extension.hpp"
+#include "openvino/op/fused_mlp.hpp"
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
     auto up_w_f16 = std::make_shared<ov::op::v0::Convert>(up_w_node, ov::element::f16);
     auto down_w_f16 = std::make_shared<ov::op::v0::Convert>(down_w_node, ov::element::f16);
 
-    auto mlp_node = std::make_shared<ov::op::internal::FusedMLPExtension>(input_f16, gate_w_f16, up_w_f16, down_w_f16);
+    auto mlp_node = std::make_shared<ov::op::internal::FusedMLP>(input_f16, gate_w_f16, up_w_f16, down_w_f16);
     auto mlp_node_f32 = std::make_shared<ov::op::v0::Convert>(mlp_node, ov::element::f32);
     auto result = std::make_shared<ov::op::v0::Result>(mlp_node_f32);
 
