@@ -6,6 +6,7 @@
 #include "modules/md_io.hpp"
 #include "modules/md_text_encoder.hpp"
 #include "modules/md_vision_encoder.hpp"
+#include "modules/md_text_embedding.hpp"
 #include "utils/yaml_utils.hpp"
 
 namespace ov {
@@ -50,6 +51,9 @@ void construct_pipeline(const PipelineModuleDesc& pipeline_desc, PipelineModuleI
             break;
         case ModuleType::VisionEncoderModule:
             module_ptr = VisionEncoderModule::create(module_desc.second);
+            break;
+        case ModuleType::TextEmbeddingModule:
+            module_ptr = TextEmbeddingModule::create(module_desc.second);
             break;
         default:
             break;
