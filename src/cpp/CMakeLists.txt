@@ -42,6 +42,8 @@ FetchContent_Declare(safetensors.h
     URL_HASH SHA256=9aaf5961609601cf9aaa96582a207bce7c6e5fbf57ed2cc669bb7bde6a937d4b)
 FetchContent_MakeAvailable(safetensors.h)
 
+add_subdirectory(src/modeling)
+
 if(ENABLE_GGUF)
     FetchContent_Declare(
       gguflib
