@@ -133,11 +133,10 @@ int main(int argc, char* argv[]) {
     // W_gate: [IC, OC, 1, 1]
     // W_up:   [IC, OC, 1, 1]
     // W_down: [OC, IC, 1, 1]
-    const int64_t b = 1;
     const int64_t ic = 2560;
     const int64_t oc = 9728;
 
-    ov::PartialShape input_shape_dynamic({1, -1, ic, 1});
+    ov::PartialShape input_shape_dynamic({-1, -1, ic, 1});
     auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, input_shape_dynamic);
     auto input_f16 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f16);
 
@@ -176,7 +175,7 @@ int main(int argc, char* argv[]) {
     auto ireq = compiled_model.create_infer_request();
 
     // ref model use matmul & swish
-    ov::PartialShape input_shape_ref{b, -1, ic};
+    ov::PartialShape input_shape_ref{-1, -1, ic};
     auto input_ref = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, input_shape_ref);
 
     std::shared_ptr<ov::Node> gate_proj = std::make_shared<ov::op::v0::MatMul>(input_ref, gate_w_node, false, false);
@@ -192,6 +191,8 @@ int main(int argc, char* argv[]) {
     auto compiled_model_ref = core.compile_model(model_ref, "GPU");
     auto ireq_ref = compiled_model_ref.create_infer_request();
 
-    test_shape(b, 2, ic, oc, gate_w_f32_val, up_w_f32_val, down_w_f32_val, ireq, ireq_ref);
-    test_shape(b, 1, ic, oc, gate_w_f32_val, up_w_f32_val, down_w_f32_val, ireq, ireq_ref);
+    test_shape(1, 2, ic, oc, gate_w_f32_val, up_w_f32_val, down_w_f32_val, ireq, ireq_ref);
+    test_shape(1, 1, ic, oc, gate_w_f32_val, up_w_f32_val, down_w_f32_val, ireq, ireq_ref);
+    test_shape(2, 2, ic, oc, gate_w_f32_val, up_w_f32_val, down_w_f32_val, ireq, ireq_ref);
+    test_shape(2, 1, ic, oc, gate_w_f32_val, up_w_f32_val, down_w_f32_val, ireq, ireq_ref);
 }
