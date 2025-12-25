@@ -15,6 +15,16 @@
 
 #include "utils.hpp"
 #include "load_image.hpp"
+#include <yaml-cpp/yaml.h>
+
+#ifndef CHECK
+#    define CHECK(cond, msg)                                                   \
+        do {                                                                   \
+            if (!(cond)) {                                                     \
+                throw std::runtime_error(std::string("Check failed: ") + msg); \
+            }                                                                  \
+        } while (0)
+#endif
 
 class ModuleTestBase {
 public:
@@ -42,12 +52,88 @@ protected:
     virtual ov::AnyMap prepare_inputs() = 0;
     virtual void verify_outputs(ov::genai::module::ModulePipeline& pipe) = 0;
 
-    virtual std::string generate_yaml() {
+    std::string save_yaml(const YAML::Node& config) {
         std::string filename = "temp_" + m_test_name + ".yaml";
         std::ofstream out(filename);
-        out << get_yaml_content();
+        out << config;
         out.close();
         return filename;
+    }
+
+    virtual std::string generate_yaml() {
+        std::string cur_module_cfg = get_yaml_content();
+        YAML::Node config = YAML::Load(cur_module_cfg);
+
+        OPENVINO_ASSERT(config["pipeline_modules"], "Test yaml config miss 'pipeline_modules'.");
+
+        YAML::Node modules = config["pipeline_modules"];
+        std::map<std::string, std::string> extracted_params;
+        std::map<std::string, std::string> extracted_results;
+
+        if (modules.size() != 1) {
+            return save_yaml(config);
+        }
+
+        // only one node recursive
+        std::string test_module_name;
+        for (auto it = modules.begin(); it != modules.end(); ++it) {
+            test_module_name = it->first.as<std::string>();
+            // get inputs
+            YAML::Node inputs = it->second["inputs"];
+            if (inputs && inputs.IsSequence()) {
+                for (const auto& input : inputs) {
+                    std::string source = input["source"].as<std::string>("");
+                    if (source.find("pipeline_params.") == 0) {
+                        std::string param_name = source.substr(16);
+                        std::string type = input["type"].as<std::string>("");
+                        extracted_params[param_name] = type;
+                    }
+                }
+            }
+
+            // get outputs
+            YAML::Node outputs = it->second["outputs"];
+            if (outputs && outputs.IsSequence()) {
+                for (const auto& output : outputs) {
+                    std::string name = output["name"].as<std::string>("");
+                    std::string type = output["type"].as<std::string>("");
+                    extracted_results[name] = type;
+                }
+            }
+        }
+
+        // pipeline_params
+        YAML::Node params_node;
+        params_node["type"] = "ParameterModule";
+        YAML::Node outputs_seq;
+        for (const auto& param : extracted_params) {
+            YAML::Node item;
+            item["name"] = param.first;
+            item["type"] = param.second;
+            outputs_seq.push_back(item);
+        }
+        if (outputs_seq.size() > 0) {
+            params_node["outputs"] = outputs_seq;
+        }
+        config["pipeline_modules"]["pipeline_params"] = params_node;
+
+        // pipeline_results
+        YAML::Node results_node;
+        results_node["type"] = "ResultModule";
+        YAML::Node inputs_seq;
+        for (const auto& result : extracted_results) {
+            YAML::Node item;
+            item["name"] = result.first;
+            item["type"] = result.second;
+            item["source"] = test_module_name + "." + result.first;
+            inputs_seq.push_back(item);
+        }
+        if (inputs_seq.size() > 0) {
+            results_node["inputs"] = inputs_seq;
+        }
+        config["pipeline_modules"]["pipeline_results"] = results_node;
+
+        return save_yaml(config);
     }
 
     virtual bool compare_tensors(const ov::Tensor& output, const ov::Tensor& expected) {
@@ -96,15 +182,6 @@ protected:
         }
         return true;
     }
-
-#ifndef CHECK
-#    define CHECK(cond, msg)                                            \
-        do {                                                                   \
-            if (!(cond)) {                                                     \
-                throw std::runtime_error(std::string("Check failed: ") + msg); \
-            }                                                                  \
-        } while (0)
-#endif
 };
 
 #ifndef DEFINE_MODULE_TEST_CONSTRUCTOR
