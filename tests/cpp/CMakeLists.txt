@@ -21,6 +21,8 @@ if(NOT TARGET gtest)
 endif()
 
 file(GLOB tests_src "*.cpp")
+file(GLOB modeling_tests_src "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src/modeling/tests/*.cpp")
+list(APPEND tests_src ${modeling_tests_src})
 
 set(TEST_TARGET_NAME "tests_continuous_batching")
 
