@@ -19,29 +19,36 @@ namespace {
 
 std::vector<float> rms_ref(const std::vector<float>& input,
                            const std::vector<float>& weight,
-                           size_t rows,
-                           size_t cols,
+                           size_t batch,
+                           size_t seq_len,
+                           size_t embedding,
                            float eps) {
-    std::vector<float> out(rows * cols, 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-        float sumsq = 0.0f;
-        for (size_t c = 0; c < cols; ++c) {
-            float v = input[r * cols + c];
-            sumsq += v * v;
-        }
-        float mean = sumsq / static_cast<float>(cols);
-        float inv = 1.0f / std::sqrt(mean + eps);
-        for (size_t c = 0; c < cols; ++c) {
-            out[r * cols + c] = input[r * cols + c] * inv * weight[c];
+    std::vector<float> out(input.size(), 0.0f);
+    const size_t frame = seq_len * embedding;
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const size_t base = b * frame + s * embedding;
+            float sumsq = 0.0f;
+            for (size_t e = 0; e < embedding; ++e) {
+                float v = input[base + e];
+                sumsq += v * v;
+            }
+            float mean = sumsq / static_cast<float>(embedding);
+            float inv = 1.0f / std::sqrt(mean + eps);
+            for (size_t e = 0; e < embedding; ++e) {
+                out[base + e] = input[base + e] * inv * weight[e];
+            }
         }
     }
     return out;
 }
 
 const float kRmsEps = 1e-6f;
+const ov::Shape kRmsInputShape{1, 2, 4};
 const std::vector<float> kRmsWeight = {1.0f, 0.5f, 2.0f, -1.0f};
 const std::vector<float> kRmsInput = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f};
-const std::vector<float> kRmsExpected = rms_ref(kRmsInput, kRmsWeight, 2, 4, kRmsEps);
+const std::vector<float> kRmsExpected =
+    rms_ref(kRmsInput, kRmsWeight, kRmsInputShape[0], kRmsInputShape[1], kRmsInputShape[2], kRmsEps);
 
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
     ASSERT_EQ(output.get_size(), expected.size());
@@ -61,6 +68,7 @@ std::shared_ptr<ov::Model> build_model_from_output(
 void run_rms_model_test(const std::shared_ptr<ov::Model>& model,
                         const std::vector<float>& input,
                         const std::vector<float>& expected,
+                        const ov::Shape& input_shape,
                         const std::string& model_file,
                         float tol = 1e-5f) {
     ov::serialize(model, model_file);
@@ -69,7 +77,7 @@ void run_rms_model_test(const std::shared_ptr<ov::Model>& model,
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    ov::Tensor input_tensor(ov::element::f32, ov::Shape{2, 4});
+    ov::Tensor input_tensor(ov::element::f32, input_shape);
     std::memcpy(input_tensor.data(), input.data(), input.size() * sizeof(float));
     request.set_input_tensor(input_tensor);
     request.infer();
@@ -108,7 +116,7 @@ ov::Output<ov::Node> make_rms_norm_internal(const ov::Output<ov::Node>& input,
 TEST(RMSNormLayer, ModelingApi) {
     ov::genai::modeling::OpContext ctx;
 
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{2, 4});
+    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, kRmsInputShape);
     ov::genai::modeling::Tensor x(param, &ctx);
 
     auto weight_node = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{4}, kRmsWeight);
@@ -118,23 +126,23 @@ TEST(RMSNormLayer, ModelingApi) {
     auto output = rms(x);
 
     auto model = build_model_from_output(output.output(), {param});
-    run_rms_model_test(model, kRmsInput, kRmsExpected, "rms_ult_model_modeling.xml");
+    run_rms_model_test(model, kRmsInput, kRmsExpected, kRmsInputShape, "rms_ult_model_modeling.xml");
 }
 
 TEST(RMSNormLayer, InternalOp) {
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{2, 4});
+    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, kRmsInputShape);
     auto weight_node = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{4}, kRmsWeight);
 
     auto output = make_rms_norm_internal(param, weight_node, kRmsEps);
     auto model = build_model_from_output(output, {param});
-    run_rms_model_test(model, kRmsInput, kRmsExpected, "rms_ult_model_internal.xml");
+    run_rms_model_test(model, kRmsInput, kRmsExpected, kRmsInputShape, "rms_ult_model_internal.xml");
 }
 
 TEST(RMSNormLayer, Opset) {
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{2, 4});
+    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, kRmsInputShape);
     auto weight_node = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{4}, kRmsWeight);
 
     auto output = make_rms_norm_opset(param, weight_node, kRmsEps);
     auto model = build_model_from_output(output, {param});
-    run_rms_model_test(model, kRmsInput, kRmsExpected, "rms_ult_model_opset.xml");
+    run_rms_model_test(model, kRmsInput, kRmsExpected, kRmsInputShape, "rms_ult_model_opset.xml");
 }
