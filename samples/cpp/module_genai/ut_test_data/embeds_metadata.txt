@@ -1,0 +1,4 @@
+tensor_count: 1
+tensor_0_element_type: f32
+tensor_0_shape: 1,30,2048
+tensor_0_byte_size: 245760

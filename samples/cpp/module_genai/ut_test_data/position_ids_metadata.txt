@@ -1,0 +1,6 @@
+pair_count: 1
+pair_0_element_type: i64
+pair_0_shape: 3,1,30
+pair_0_byte_size: 720
+pair_0_has_rope_delta: true
+pair_0_rope_delta: -2
