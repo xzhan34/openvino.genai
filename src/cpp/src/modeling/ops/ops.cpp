@@ -5,6 +5,8 @@
 
 #include <openvino/core/except.hpp>
 #include <openvino/opsets/opset13.hpp>
+#include <openvino/op/placeholder_extension.hpp>
+#include <ov_ops/fully_connected.hpp>
 
 namespace {
 
@@ -31,8 +33,32 @@ Tensor matmul(const Tensor& a, const Tensor& b, bool ta, bool tb) {
     return Tensor(node, ctx);
 }
 
+Tensor linear(const Tensor& x, const Tensor& weight) {
+    auto* ctx = resolve_context(x, weight);
+    auto no_bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
+    auto node = std::make_shared<ov::op::internal::FullyConnected>(x.output(), weight.output(), no_bias);
+    return Tensor(node, ctx);
+}
+
 Tensor reduce_mean(const Tensor& x, int64_t axis, bool keepdim) {
     return x.mean(axis, keepdim);
+}
+
+Tensor gather(const Tensor& data, const Tensor& indices, int64_t axis) {
+    auto* ctx = resolve_context(data, indices);
+    auto axis_node = ctx ? ctx->scalar_i64(axis) : ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {axis});
+    auto node = std::make_shared<ov::op::v8::Gather>(data.output(), indices.output(), axis_node, 0);
+    return Tensor(node, ctx);
+}
+
+Tensor slice(const Tensor& data, int64_t start, int64_t stop, int64_t step, int64_t axis) {
+    auto* ctx = data.context();
+    auto start_node = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {start});
+    auto stop_node = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {stop});
+    auto step_node = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {step});
+    auto axes_node = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {axis});
+    auto node = std::make_shared<ov::opset13::Slice>(data.output(), start_node, stop_node, step_node, axes_node);
+    return Tensor(node, ctx);
 }
 
 Tensor rms(const Tensor& x, const Tensor& weight, float eps) {
