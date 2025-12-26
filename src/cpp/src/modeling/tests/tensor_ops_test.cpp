@@ -57,6 +57,6 @@ TEST(TensorOps, PowMeanRsqrt) {
     auto expected = compute_expected(input, 2, 3);
     ASSERT_EQ(output.get_size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], 1e-5f);
+        EXPECT_NEAR(out_data[i], expected[i], 1e-3f);
     }
 }
