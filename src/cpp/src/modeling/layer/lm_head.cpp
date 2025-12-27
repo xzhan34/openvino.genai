@@ -1,12 +1,12 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/layer/parallel_lm_head.hpp"
+#include "modeling/layer/lm_head.hpp"
+
+#include <limits>
 
 #include <openvino/core/except.hpp>
 #include <openvino/opsets/opset13.hpp>
-
-#include <limits>
 
 #include "modeling/ops/ops.hpp"
 
@@ -35,13 +35,13 @@ namespace ov {
 namespace genai {
 namespace modeling {
 
-ParallelLMHead::ParallelLMHead(const Tensor& weight) : weight_(weight) {}
+LMHead::LMHead(const Tensor& weight) : weight_(weight) {}
 
-Tensor ParallelLMHead::operator()(const Tensor& x) const {
+Tensor LMHead::operator()(const Tensor& x) const {
     return ops::linear(x, weight_);
 }
 
-Tensor ParallelLMHead::operator()(const Tensor& x, const Tensor& cu_seqlens_q) const {
+Tensor LMHead::operator()(const Tensor& x, const Tensor& cu_seqlens_q) const {
     auto* ctx = resolve_context(x, cu_seqlens_q);
     auto cu_i64 = cu_seqlens_q.to(ov::element::i64);
 

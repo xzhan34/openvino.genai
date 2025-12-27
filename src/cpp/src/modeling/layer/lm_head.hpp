@@ -9,9 +9,9 @@ namespace ov {
 namespace genai {
 namespace modeling {
 
-class ParallelLMHead {
+class LMHead {
 public:
-    explicit ParallelLMHead(const Tensor& weight);
+    explicit LMHead(const Tensor& weight);
 
     // Decode path: compute logits for all tokens in `x`.
     Tensor operator()(const Tensor& x) const;
