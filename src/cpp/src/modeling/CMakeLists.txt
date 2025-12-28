@@ -27,7 +27,10 @@ set(TEST_MODELING_TARGET "test_modeling_api")
 
 add_executable(${TEST_MODELING_TARGET} ${modeling_tests_src} $<TARGET_OBJECTS:openvino_genai_obj>)
 
-target_link_libraries(${TEST_MODELING_TARGET} PRIVATE $<TARGET_PROPERTY:openvino::genai,LINK_LIBRARIES> gtest_main gmock_main)
+target_link_libraries(${TEST_MODELING_TARGET} PRIVATE $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>
+                                                      openvino::runtime::dev
+                                                      gtest_main
+                                                      gmock_main)
 target_include_directories(${TEST_MODELING_TARGET} PRIVATE "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
                                                            $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
 

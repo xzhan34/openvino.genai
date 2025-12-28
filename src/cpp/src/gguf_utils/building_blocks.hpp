@@ -13,6 +13,12 @@
 
 #include "gguf_utils/gguf.hpp"
 
+ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
+                                          const std::unordered_map<std::string, ov::Tensor>& consts,
+                                          gguf_tensor_type qtype,
+                                          bool reorder,
+                                          int head_size);
+
 ov::Output<ov::Node> make_lm_head(
     const std::string& key,
     const ov::Output<ov::Node>& input,

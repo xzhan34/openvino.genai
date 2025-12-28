@@ -6,6 +6,9 @@
 #include <string>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <stdexcept>
 
 #include <openvino/openvino.hpp>
@@ -14,7 +17,9 @@
 #include "openvino/pass/serialize.hpp"
 
 #include "gguf_utils/building_blocks.hpp"
+#include "gguf_utils/gguf_weight_provider.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
+#include "modeling/models/qwen3_dense.hpp"
 #include "utils.hpp"
 
 using namespace ov;
@@ -27,6 +32,40 @@ auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
 };
+
+bool use_modeling_qwen3_dense_dummy_builder() {
+    auto is_truthy = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return v == "1" || v == "true" || v == "on" || v == "yes" || v == "modeling" || v == "modeling_dummy" ||
+               v == "qwen3_dense_dummy";
+    };
+
+    if (const char* v = std::getenv("OV_GENAI_GGUF_BUILDER")) {
+        return is_truthy(v);
+    }
+    if (const char* v = std::getenv("OV_GENAI_GGUF_USE_MODELING")) {
+        return is_truthy(v);
+    }
+    return false;
+}
+
+std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
+    const std::map<std::string, GGUFMetaData>& configs,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes) {
+    ov::genai::modeling::OpContext ctx;
+    ov::genai::gguf::GGUFWeightProvider weights(consts, qtypes, &ctx);
+
+    ov::genai::modeling::models::Qwen3DenseConfig cfg;
+    cfg.architecture = std::get<std::string>(configs.at("architecture"));
+    cfg.hidden_size = std::get<int>(configs.at("hidden_size"));
+    cfg.rms_norm_eps = std::get<float>(configs.at("rms_norm_eps"));
+
+    auto model = ov::genai::modeling::models::build_qwen3_dense_dummy(cfg, weights, ctx);
+    return model;
+}
 
 std::shared_ptr<ov::Model> create_language_model(
     const std::map<std::string, GGUFMetaData>& configs,
@@ -161,7 +200,10 @@ std::shared_ptr<ov::Model> create_from_gguf(const std::string& model_path, const
     ss.str("");
     ss << "Start generating OpenVINO model...";
     ov::genai::utils::print_gguf_debug_info(ss.str());
-    if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3")) {
+    if (!model_arch.compare("qwen3") && use_modeling_qwen3_dense_dummy_builder()) {
+        ov::genai::utils::print_gguf_debug_info("Using modeling API: qwen3 dense dummy builder");
+        model = create_qwen3_dense_dummy_model(config, consts, qtypes);
+    } else if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3")) {
         model = create_language_model(config, consts, qtypes);
         if (enable_save_ov_model){
             std::filesystem::path gguf_model_path(model_path);
