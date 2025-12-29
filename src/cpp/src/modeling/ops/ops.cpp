@@ -61,6 +61,29 @@ Tensor slice(const Tensor& data, int64_t start, int64_t stop, int64_t step, int6
     return Tensor(node, ctx);
 }
 
+Tensor concat(const std::vector<Tensor>& xs, int64_t axis) {
+    if (xs.empty()) {
+        OPENVINO_THROW("concat requires at least one tensor");
+    }
+    OpContext* ctx = xs.front().context();
+    for (const auto& x : xs) {
+        auto* x_ctx = x.context();
+        if (ctx && x_ctx && ctx != x_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = x_ctx;
+        }
+    }
+    ov::OutputVector outputs;
+    outputs.reserve(xs.size());
+    for (const auto& x : xs) {
+        outputs.push_back(x.output());
+    }
+    auto node = std::make_shared<ov::op::v0::Concat>(outputs, axis);
+    return Tensor(node, ctx);
+}
+
 Tensor rms(const Tensor& x, const Tensor& weight, float eps) {
     auto orig_dtype = x.dtype();
     auto xf = x.to(ov::element::f32);

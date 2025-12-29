@@ -21,6 +21,7 @@ struct Qwen3DenseConfig {
     std::string architecture = "qwen3";
     int32_t hidden_size = 0;
     float rms_norm_eps = 1e-6f;
+    bool tie_word_embeddings = false;
 };
 
 std::shared_ptr<ov::Model> build_qwen3_dense_dummy(const Qwen3DenseConfig& cfg,
@@ -31,4 +32,3 @@ std::shared_ptr<ov::Model> build_qwen3_dense_dummy(const Qwen3DenseConfig& cfg,
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
-

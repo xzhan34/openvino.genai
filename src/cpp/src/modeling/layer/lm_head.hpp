@@ -3,15 +3,17 @@
 
 #pragma once
 
+#include "modeling/module.hpp"
 #include "modeling/ops/tensor.hpp"
 
 namespace ov {
 namespace genai {
 namespace modeling {
 
-class LMHead {
+class LMHead : public Module {
 public:
     explicit LMHead(const Tensor& weight);
+    LMHead(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
 
     // Decode path: compute logits for all tokens in `x`.
     Tensor operator()(const Tensor& x) const;
@@ -21,11 +23,17 @@ public:
     // The layer selects the last token per sequence, then computes logits.
     Tensor operator()(const Tensor& x, const Tensor& cu_seqlens_q) const;
 
+    void tie_to(Parameter& other);
+    Parameter& weight_param();
+    const Parameter& weight_param() const;
+
 private:
+    const Tensor& weight() const;
+
     Tensor weight_;
+    Parameter* weight_param_ = nullptr;
 };
 
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
-

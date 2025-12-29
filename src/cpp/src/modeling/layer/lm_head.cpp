@@ -35,10 +35,42 @@ namespace ov {
 namespace genai {
 namespace modeling {
 
-LMHead::LMHead(const Tensor& weight) : weight_(weight) {}
+LMHead::LMHead(const Tensor& weight) : Module(), weight_(weight) {}
+
+LMHead::LMHead(BuilderContext& ctx, const std::string& name, Module* parent) : Module(name, ctx, parent) {
+    weight_param_ = &register_parameter("weight");
+}
+
+void LMHead::tie_to(Parameter& other) {
+    if (!weight_param_) {
+        OPENVINO_THROW("LMHead has no registered parameter to tie");
+    }
+    weight_param_->tie_to(other);
+}
+
+Parameter& LMHead::weight_param() {
+    if (!weight_param_) {
+        OPENVINO_THROW("LMHead has no registered parameter");
+    }
+    return *weight_param_;
+}
+
+const Parameter& LMHead::weight_param() const {
+    if (!weight_param_) {
+        OPENVINO_THROW("LMHead has no registered parameter");
+    }
+    return *weight_param_;
+}
+
+const Tensor& LMHead::weight() const {
+    if (weight_param_) {
+        return weight_param_->value();
+    }
+    return weight_;
+}
 
 Tensor LMHead::operator()(const Tensor& x) const {
-    return ops::linear(x, weight_);
+    return ops::linear(x, weight());
 }
 
 Tensor LMHead::operator()(const Tensor& x, const Tensor& cu_seqlens_q) const {
@@ -54,10 +86,9 @@ Tensor LMHead::operator()(const Tensor& x, const Tensor& cu_seqlens_q) const {
 
     // x[last_indices]
     auto x_last = ops::gather(x, last_indices, 0);
-    return ops::linear(x_last, weight_);
+    return ops::linear(x_last, weight());
 }
 
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
-

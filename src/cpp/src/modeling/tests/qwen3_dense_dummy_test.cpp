@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2025 Intel Corporation
+﻿// Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cmath>
@@ -8,59 +8,64 @@
 
 #include <gtest/gtest.h>
 
+#include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset13.hpp>
 
-#include "modeling/models/qwen3_dense.hpp"
+#include "modeling/builder_context.hpp"
+#include "modeling/models/qwen3_dense_modular.hpp"
+#include "modeling/weights/weight_loader.hpp"
+#include "modeling/weights/weight_materializer.hpp"
+#include "modeling/weights/weight_source.hpp"
 
 namespace {
 
-class FakeWeightProvider : public ov::genai::modeling::weights::IWeightProvider {
+class DummyWeightSource : public ov::genai::modeling::weights::WeightSource {
 public:
-    FakeWeightProvider(ov::genai::modeling::OpContext* ctx,
-                       const std::vector<float>& embed_weight,
-                       const ov::Shape& embed_shape,
-                       const std::vector<float>& norm_weight,
-                       const ov::Shape& norm_shape,
-                       const std::vector<float>& lm_head_weight,
-                       const ov::Shape& lm_head_shape) :
-        ctx_(ctx),
-        embed_weight_(embed_weight),
-        embed_shape_(embed_shape),
-        norm_weight_(norm_weight),
-        norm_shape_(norm_shape),
-        lm_head_weight_(lm_head_weight),
-        lm_head_shape_(lm_head_shape) {}
-
-    bool has(const std::string& key) const override {
-        return key == "model.embed_tokens.weight" || key == "model.norm.weight" || key == "lm_head.weight";
+    void add(const std::string& name, const ov::Tensor& tensor) {
+        if (!weights_.count(name)) {
+            keys_.push_back(name);
+        }
+        weights_[name] = tensor;
     }
 
-    ov::genai::modeling::Tensor get(const std::string& base_key) override {
-        if (base_key == "model.embed_tokens") {
-            auto node = ov::op::v0::Constant::create(ov::element::f32, embed_shape_, embed_weight_);
-            return ov::genai::modeling::Tensor(node, ctx_);
+    std::vector<std::string> keys() const override {
+        return keys_;
+    }
+
+    bool has(const std::string& name) const override {
+        return weights_.count(name) != 0;
+    }
+
+    const ov::Tensor& get_tensor(const std::string& name) const override {
+        auto it = weights_.find(name);
+        if (it == weights_.end()) {
+            OPENVINO_THROW("Unknown weight: ", name);
         }
-        if (base_key == "model.norm") {
-            auto node = ov::op::v0::Constant::create(ov::element::f32, norm_shape_, norm_weight_);
-            return ov::genai::modeling::Tensor(node, ctx_);
-        }
-        if (base_key == "lm_head") {
-            auto node = ov::op::v0::Constant::create(ov::element::f32, lm_head_shape_, lm_head_weight_);
-            return ov::genai::modeling::Tensor(node, ctx_);
-        }
-        OPENVINO_THROW("Unknown base_key: ", base_key);
+        return it->second;
     }
 
 private:
-    ov::genai::modeling::OpContext* ctx_ = nullptr;
-    std::vector<float> embed_weight_;
-    ov::Shape embed_shape_;
-    std::vector<float> norm_weight_;
-    ov::Shape norm_shape_;
-    std::vector<float> lm_head_weight_;
-    ov::Shape lm_head_shape_;
+    std::unordered_map<std::string, ov::Tensor> weights_;
+    std::vector<std::string> keys_;
 };
+
+class DummyWeightMaterializer : public ov::genai::modeling::weights::WeightMaterializer {
+public:
+    ov::genai::modeling::Tensor materialize(const std::string& name,
+                                            ov::genai::modeling::weights::WeightSource& source,
+                                            ov::genai::modeling::OpContext& ctx) override {
+        const auto& tensor = source.get_tensor(name);
+        auto node = std::make_shared<ov::op::v0::Constant>(tensor);
+        return ov::genai::modeling::Tensor(node, &ctx);
+    }
+};
+
+ov::Tensor make_tensor(const std::vector<float>& data, const ov::Shape& shape) {
+    ov::Tensor tensor(ov::element::f32, shape);
+    std::memcpy(tensor.data(), data.data(), data.size() * sizeof(float));
+    return tensor;
+}
 
 std::vector<float> embedding_ref(const std::vector<int64_t>& ids,
                                  const std::vector<float>& weight,
@@ -140,7 +145,7 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
 }  // namespace
 
 TEST(Qwen3DenseDummy, BuildsAndRuns) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
     const size_t batch = 1;
     const size_t seq_len = 3;
@@ -169,51 +174,65 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
         -1.f, -1.f, -1.f, -1.f //
     };
 
-    FakeWeightProvider weights(&ctx, embed_weight, embed_shape, norm_weight, norm_shape, lm_head_weight, lm_head_shape);
+    DummyWeightSource weights;
+    weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
+    weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
+    weights.add("lm_head.weight", make_tensor(lm_head_weight, lm_head_shape));
+
+    DummyWeightMaterializer materializer;
 
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
     cfg.hidden_size = static_cast<int32_t>(hidden);
     cfg.rms_norm_eps = 1e-6f;
+    cfg.tie_word_embeddings = false;
 
-    auto model = ov::genai::modeling::models::build_qwen3_dense_dummy(cfg, weights, ctx);
-    ov::serialize(model, "qwen3_dummy_original.xml");
+    ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, weights, materializer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    auto logits = model.forward(input_ids, attention_mask, position_ids, beam_idx);
+    auto ov_model = ctx.build_model({logits.output()});
+    ov::serialize(ov_model, "qwen3_dummy_modular.xml");
 
     ov::Core core;
-    auto compiled = core.compile_model(model, "GPU");
+    auto compiled = core.compile_model(ov_model, "GPU");
     auto request = compiled.create_infer_request();
-    ov::serialize(compiled.get_runtime_model(), "qwen3_dummy_compiled.xml");
 
-    const std::vector<int64_t> input_ids = {0, 2, 5};
-    const std::vector<int64_t> attention_mask = {1, 1, 0};
-    const std::vector<int64_t> position_ids = {0, 1, 2};
-    const std::vector<int32_t> beam_idx = {2};
+    const std::vector<int64_t> input_ids_data = {0, 2, 5};
+    const std::vector<int64_t> attention_mask_data = {1, 1, 0};
+    const std::vector<int64_t> position_ids_data = {0, 1, 2};
+    const std::vector<int32_t> beam_idx_data = {2};
 
     ov::Tensor input_ids_tensor(ov::element::i64, {batch, seq_len});
-    std::memcpy(input_ids_tensor.data(), input_ids.data(), input_ids.size() * sizeof(int64_t));
+    std::memcpy(input_ids_tensor.data(), input_ids_data.data(), input_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(0, input_ids_tensor);
 
     ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
-    std::memcpy(attention_mask_tensor.data(), attention_mask.data(), attention_mask.size() * sizeof(int64_t));
+    std::memcpy(attention_mask_tensor.data(), attention_mask_data.data(), attention_mask_data.size() * sizeof(int64_t));
     request.set_input_tensor(1, attention_mask_tensor);
 
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
-    std::memcpy(position_ids_tensor.data(), position_ids.data(), position_ids.size() * sizeof(int64_t));
+    std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(2, position_ids_tensor);
 
-    ov::Tensor beam_idx_tensor(ov::element::i32, {beam_idx.size()});
-    std::memcpy(beam_idx_tensor.data(), beam_idx.data(), beam_idx.size() * sizeof(int32_t));
+    ov::Tensor beam_idx_tensor(ov::element::i32, {beam_idx_data.size()});
+    std::memcpy(beam_idx_tensor.data(), beam_idx_data.data(), beam_idx_data.size() * sizeof(int32_t));
     request.set_input_tensor(3, beam_idx_tensor);
 
     request.infer();
 
     // Reference: embedding -> *mask -> +pos -> +sum(beam_idx) -> rmsnorm -> linear
-    auto hidden0 = embedding_ref(input_ids, embed_weight, batch, seq_len, vocab, hidden);
+    auto hidden0 = embedding_ref(input_ids_data, embed_weight, batch, seq_len, vocab, hidden);
     for (size_t i = 0; i < batch * seq_len; ++i) {
-        const float mask = static_cast<float>(attention_mask[i]);
-        const float pos = static_cast<float>(position_ids[i]);
+        const float mask = static_cast<float>(attention_mask_data[i]);
+        const float pos = static_cast<float>(position_ids_data[i]);
         for (size_t h = 0; h < hidden; ++h) {
-            hidden0[i * hidden + h] = hidden0[i * hidden + h] * mask + pos + static_cast<float>(beam_idx[0]);
+            hidden0[i * hidden + h] = hidden0[i * hidden + h] * mask + pos + static_cast<float>(beam_idx_data[0]);
         }
     }
     auto normed = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
@@ -222,3 +241,91 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
+TEST(Qwen3DenseDummy, TiedWeights) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    const size_t batch = 1;
+    const size_t seq_len = 2;
+    const size_t vocab = 4;
+    const size_t hidden = 3;
+
+    const ov::Shape embed_shape{vocab, hidden};
+    const ov::Shape norm_shape{hidden};
+
+    const std::vector<float> embed_weight = {
+        0.f, 1.f, 2.f,  //
+        3.f, 4.f, 5.f,  //
+        6.f, 7.f, 8.f,  //
+        9.f, 10.f, 11.f //
+    };
+    const std::vector<float> norm_weight = {1.f, 1.f, 1.f};
+
+    DummyWeightSource weights;
+    weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
+    weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
+
+    DummyWeightMaterializer materializer;
+
+    ov::genai::modeling::models::Qwen3DenseConfig cfg;
+    cfg.architecture = "qwen3";
+    cfg.hidden_size = static_cast<int32_t>(hidden);
+    cfg.rms_norm_eps = 1e-6f;
+    cfg.tie_word_embeddings = true;
+
+    ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, weights, materializer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    auto logits = model.forward(input_ids, attention_mask, position_ids, beam_idx);
+    auto ov_model = ctx.build_model({logits.output()});
+
+    ov::serialize(ov_model, "qwen3_dummy_original.xml");
+
+    ov::Core core;
+    auto compiled = core.compile_model(ov_model, "GPU");
+    auto request = compiled.create_infer_request();
+
+    ov::serialize(compiled.get_runtime_model(), "qwen3_dummy_compiled.xml");
+
+    const std::vector<int64_t> input_ids_data = {0, 3};
+    const std::vector<int64_t> attention_mask_data = {1, 1};
+    const std::vector<int64_t> position_ids_data = {0, 1};
+    const std::vector<int32_t> beam_idx_data = {1};
+
+    ov::Tensor input_ids_tensor(ov::element::i64, {batch, seq_len});
+    std::memcpy(input_ids_tensor.data(), input_ids_data.data(), input_ids_data.size() * sizeof(int64_t));
+    request.set_input_tensor(0, input_ids_tensor);
+
+    ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
+    std::memcpy(attention_mask_tensor.data(),
+                attention_mask_data.data(),
+                attention_mask_data.size() * sizeof(int64_t));
+    request.set_input_tensor(1, attention_mask_tensor);
+
+    ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
+    std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
+    request.set_input_tensor(2, position_ids_tensor);
+
+    ov::Tensor beam_idx_tensor(ov::element::i32, {beam_idx_data.size()});
+    std::memcpy(beam_idx_tensor.data(), beam_idx_data.data(), beam_idx_data.size() * sizeof(int32_t));
+    request.set_input_tensor(3, beam_idx_tensor);
+
+    request.infer();
+
+    auto hidden0 = embedding_ref(input_ids_data, embed_weight, batch, seq_len, vocab, hidden);
+    for (size_t i = 0; i < batch * seq_len; ++i) {
+        const float mask = static_cast<float>(attention_mask_data[i]);
+        const float pos = static_cast<float>(position_ids_data[i]);
+        for (size_t h = 0; h < hidden; ++h) {
+            hidden0[i * hidden + h] = hidden0[i * hidden + h] * mask + pos + static_cast<float>(beam_idx_data[0]);
+        }
+    }
+    auto normed = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
+    auto expected = linear_ref_3d(normed, embed_weight, batch, seq_len, hidden, vocab);
+
+    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+}
