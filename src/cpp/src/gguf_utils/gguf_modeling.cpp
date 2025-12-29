@@ -17,9 +17,12 @@
 #include "openvino/pass/serialize.hpp"
 
 #include "gguf_utils/building_blocks.hpp"
-#include "gguf_utils/gguf_weight_provider.hpp"
+#include "gguf_utils/gguf_weight_finalizer.hpp"
+#include "gguf_utils/gguf_weight_source.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
-#include "modeling/models/qwen3_dense.hpp"
+#include "modeling/builder_context.hpp"
+#include "modeling/models/qwen3_dense_modular.hpp"
+#include "modeling/weights/weight_loader.hpp"
 #include "utils.hpp"
 
 using namespace ov;
@@ -55,16 +58,31 @@ std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
     const std::map<std::string, GGUFMetaData>& configs,
     const std::unordered_map<std::string, ov::Tensor>& consts,
     const std::unordered_map<std::string, gguf_tensor_type>& qtypes) {
-    ov::genai::modeling::OpContext ctx;
-    ov::genai::gguf::GGUFWeightProvider weights(consts, qtypes, &ctx);
+    ov::genai::modeling::BuilderContext ctx;
 
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = std::get<std::string>(configs.at("architecture"));
     cfg.hidden_size = std::get<int>(configs.at("hidden_size"));
     cfg.rms_norm_eps = std::get<float>(configs.at("rms_norm_eps"));
+    cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
 
-    auto model = ov::genai::modeling::models::build_qwen3_dense_dummy(cfg, weights, ctx);
-    return model;
+    ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
+    ov::genai::gguf::GGUFWeightSource source(consts);
+    ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
+    ov::genai::modeling::weights::load_model(model, source, finalizer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    auto logits = model.forward(input_ids, attention_mask, position_ids, beam_idx);
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
+    return std::make_shared<ov::Model>(ov::OutputVector{result->output(0)},
+                                       ov::SinkVector{},
+                                       ctx.parameters());
 }
 
 std::shared_ptr<ov::Model> create_language_model(

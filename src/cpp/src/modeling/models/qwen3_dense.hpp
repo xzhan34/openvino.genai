@@ -4,13 +4,7 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
 #include <string>
-
-#include <openvino/openvino.hpp>
-
-#include "modeling/ops/context.hpp"
-#include "modeling/weights/weights.hpp"
 
 namespace ov {
 namespace genai {
@@ -23,10 +17,6 @@ struct Qwen3DenseConfig {
     float rms_norm_eps = 1e-6f;
     bool tie_word_embeddings = false;
 };
-
-std::shared_ptr<ov::Model> build_qwen3_dense_dummy(const Qwen3DenseConfig& cfg,
-                                                   weights::IWeightProvider& weights,
-                                                   OpContext& ctx);
 
 }  // namespace models
 }  // namespace modeling

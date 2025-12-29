@@ -10,31 +10,30 @@
 
 #include "gguf_utils/gguf.hpp"
 #include "modeling/ops/context.hpp"
-#include "modeling/weights/weights.hpp"
+#include "modeling/weights/weight_finalizer.hpp"
 
 namespace ov {
 namespace genai {
 namespace gguf {
 
-class GGUFWeightProvider : public ov::genai::modeling::weights::IWeightProvider {
+class GGUFWeightFinalizer : public ov::genai::modeling::weights::WeightFinalizer {
 public:
-    GGUFWeightProvider(const std::unordered_map<std::string, ov::Tensor>& consts,
-                       const std::unordered_map<std::string, gguf_tensor_type>& qtypes,
-                       ov::genai::modeling::OpContext* ctx);
+    GGUFWeightFinalizer(const std::unordered_map<std::string, ov::Tensor>& consts,
+                        const std::unordered_map<std::string, gguf_tensor_type>& qtypes);
 
-    bool has(const std::string& key) const override;
-    ov::genai::modeling::Tensor get(const std::string& base_key) override;
+    ov::genai::modeling::Tensor finalize(const std::string& name,
+                                         ov::genai::modeling::weights::WeightSource& source,
+                                         ov::genai::modeling::OpContext& ctx) override;
 
 private:
     gguf_tensor_type resolve_qtype(const std::string& base_key) const;
+    std::string base_key_from_name(const std::string& name) const;
 
     const std::unordered_map<std::string, ov::Tensor>& consts_;
     const std::unordered_map<std::string, gguf_tensor_type>& qtypes_;
-    ov::genai::modeling::OpContext* ctx_ = nullptr;
     std::unordered_map<std::string, ov::Output<ov::Node>> cache_;
 };
 
 }  // namespace gguf
 }  // namespace genai
 }  // namespace ov
-

@@ -120,7 +120,8 @@ if(NOT ENABLE_GGUF)
     set(GGUF_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_quants.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_modeling.cpp
-                     ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_weight_provider.cpp
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_weight_finalizer.cpp
+                     ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_weight_source.cpp
                      ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/building_blocks.cpp)
     list(REMOVE_ITEM SOURCE_FILES ${GGUF_SOURCES})
 endif()
