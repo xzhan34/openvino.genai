@@ -26,18 +26,18 @@ namespace weights {
 
 void default_weight_loader(Parameter& param,
                            WeightSource& source,
-                           WeightMaterializer& materializer,
+                           WeightFinalizer& finalizer,
                            const std::string& weight_name,
                            const std::optional<int>& shard_id) {
     (void)shard_id;
     if (!param.context()) {
         OPENVINO_THROW("Parameter has no OpContext: ", param.name());
     }
-    auto weight = materializer.materialize(weight_name, source, *param.context());
+    auto weight = finalizer.finalize(weight_name, source, *param.context());
     param.bind(weight);
 }
 
-void load_model(Module& model, WeightSource& source, WeightMaterializer& materializer) {
+void load_model(Module& model, WeightSource& source, WeightFinalizer& finalizer) {
     const auto& packed = model.packed_mapping();
     for (const auto& weight_name : source.keys()) {
         bool matched = false;
@@ -46,9 +46,9 @@ void load_model(Module& model, WeightSource& source, WeightMaterializer& materia
                 const std::string param_name = replace_once(weight_name, rule.match, rule.replace);
                 auto& param = model.get_parameter(param_name);
                 if (const auto* loader = param.weight_loader()) {
-                    (*loader)(param, source, materializer, weight_name, rule.shard_id);
+                    (*loader)(param, source, finalizer, weight_name, rule.shard_id);
                 } else {
-                    default_weight_loader(param, source, materializer, weight_name, rule.shard_id);
+                    default_weight_loader(param, source, finalizer, weight_name, rule.shard_id);
                 }
                 matched = true;
                 break;
@@ -58,9 +58,9 @@ void load_model(Module& model, WeightSource& source, WeightMaterializer& materia
         if (!matched) {
             auto& param = model.get_parameter(weight_name);
             if (const auto* loader = param.weight_loader()) {
-                (*loader)(param, source, materializer, weight_name, std::nullopt);
+                (*loader)(param, source, finalizer, weight_name, std::nullopt);
             } else {
-                default_weight_loader(param, source, materializer, weight_name, std::nullopt);
+                default_weight_loader(param, source, finalizer, weight_name, std::nullopt);
             }
         }
     }

@@ -21,7 +21,7 @@ namespace modeling {
 
 namespace weights {
 class WeightSource;
-class WeightMaterializer;
+class WeightFinalizer;
 }  // namespace weights
 
 struct PackedRule {
@@ -38,7 +38,7 @@ class Parameter {
 public:
     using WeightLoaderFn = std::function<void(Parameter&,
                                               weights::WeightSource&,
-                                              weights::WeightMaterializer&,
+                                              weights::WeightFinalizer&,
                                               const std::string& weight_name,
                                               const std::optional<int>& shard_id)>;
 

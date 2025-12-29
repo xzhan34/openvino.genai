@@ -15,7 +15,7 @@
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_dense_modular.hpp"
 #include "modeling/weights/weight_loader.hpp"
-#include "modeling/weights/weight_materializer.hpp"
+#include "modeling/weights/weight_finalizer.hpp"
 #include "modeling/weights/weight_source.hpp"
 
 namespace {
@@ -50,9 +50,9 @@ private:
     std::vector<std::string> keys_;
 };
 
-class DummyWeightMaterializer : public ov::genai::modeling::weights::WeightMaterializer {
+class DummyWeightFinalizer : public ov::genai::modeling::weights::WeightFinalizer {
 public:
-    ov::genai::modeling::Tensor materialize(const std::string& name,
+    ov::genai::modeling::Tensor finalize(const std::string& name,
                                             ov::genai::modeling::weights::WeightSource& source,
                                             ov::genai::modeling::OpContext& ctx) override {
         const auto& tensor = source.get_tensor(name);
@@ -179,7 +179,7 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
     weights.add("lm_head.weight", make_tensor(lm_head_weight, lm_head_shape));
 
-    DummyWeightMaterializer materializer;
+    DummyWeightFinalizer finalizer;
 
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
@@ -188,7 +188,7 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     cfg.tie_word_embeddings = false;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
-    ov::genai::modeling::weights::load_model(model, weights, materializer);
+    ov::genai::modeling::weights::load_model(model, weights, finalizer);
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
@@ -264,7 +264,7 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
     weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
 
-    DummyWeightMaterializer materializer;
+    DummyWeightFinalizer finalizer;
 
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
@@ -273,7 +273,7 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     cfg.tie_word_embeddings = true;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
-    ov::genai::modeling::weights::load_model(model, weights, materializer);
+    ov::genai::modeling::weights::load_model(model, weights, finalizer);
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});

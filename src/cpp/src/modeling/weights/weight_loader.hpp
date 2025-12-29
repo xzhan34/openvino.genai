@@ -7,7 +7,7 @@
 #include <string>
 
 #include "modeling/module.hpp"
-#include "modeling/weights/weight_materializer.hpp"
+#include "modeling/weights/weight_finalizer.hpp"
 #include "modeling/weights/weight_source.hpp"
 
 namespace ov {
@@ -17,11 +17,11 @@ namespace weights {
 
 void default_weight_loader(Parameter& param,
                            WeightSource& source,
-                           WeightMaterializer& materializer,
+                           WeightFinalizer& finalizer,
                            const std::string& weight_name,
                            const std::optional<int>& shard_id);
 
-void load_model(Module& model, WeightSource& source, WeightMaterializer& materializer);
+void load_model(Module& model, WeightSource& source, WeightFinalizer& finalizer);
 
 }  // namespace weights
 }  // namespace modeling

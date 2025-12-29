@@ -14,11 +14,11 @@ namespace genai {
 namespace modeling {
 namespace weights {
 
-class WeightMaterializer {
+class WeightFinalizer {
 public:
-    virtual ~WeightMaterializer() = default;
+    virtual ~WeightFinalizer() = default;
 
-    virtual Tensor materialize(const std::string& name, WeightSource& source, OpContext& ctx) = 0;
+    virtual Tensor finalize(const std::string& name, WeightSource& source, OpContext& ctx) = 0;
 };
 
 }  // namespace weights
