@@ -34,15 +34,15 @@ struct PackedMapping {
     std::vector<PackedRule> rules;
 };
 
-class Parameter {
+class WeightParameter {
 public:
-    using WeightLoaderFn = std::function<void(Parameter&,
+    using WeightLoaderFn = std::function<void(WeightParameter&,
                                               weights::WeightSource&,
                                               weights::WeightFinalizer&,
                                               const std::string& weight_name,
                                               const std::optional<int>& shard_id)>;
 
-    Parameter(std::string name, OpContext* ctx);
+    WeightParameter(std::string name, OpContext* ctx);
 
     const std::string& name() const;
     OpContext* context() const;
@@ -57,14 +57,14 @@ public:
     void add_shard(int shard_id, const Tensor& shard);
     void finalize();
 
-    void tie_to(Parameter& other);
+    void tie_to(WeightParameter& other);
 
 private:
     std::string name_;
     OpContext* ctx_ = nullptr;
     Tensor weight_;
     bool bound_ = false;
-    Parameter* tied_to_ = nullptr;
+    WeightParameter* tied_to_ = nullptr;
     std::unordered_map<int, Tensor> shards_;
     WeightLoaderFn weight_loader_;
 };
@@ -83,8 +83,8 @@ public:
     const std::string& name() const;
     const std::string& full_path() const;
 
-    Parameter& register_parameter(const std::string& name);
-    Parameter& get_parameter(const std::string& full_name);
+    WeightParameter& register_parameter(const std::string& name);
+    WeightParameter& get_parameter(const std::string& full_name);
 
     BuilderContext& ctx();
     const BuilderContext& ctx() const;
@@ -99,7 +99,7 @@ protected:
     Module* parent_ = nullptr;
     std::string name_;
     std::string full_path_;
-    std::vector<std::unique_ptr<Parameter>> parameters_;
+    std::vector<std::unique_ptr<WeightParameter>> parameters_;
     PackedMapping packed_mapping_;
 };
 

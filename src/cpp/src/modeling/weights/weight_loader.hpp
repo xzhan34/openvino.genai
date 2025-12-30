@@ -15,7 +15,7 @@ namespace genai {
 namespace modeling {
 namespace weights {
 
-void default_weight_loader(Parameter& param,
+void default_weight_loader(WeightParameter& param,
                            WeightSource& source,
                            WeightFinalizer& finalizer,
                            const std::string& weight_name,

@@ -17,14 +17,14 @@ public:
 
     // Equivalent to torch.nn.functional.embedding(ids, weight).
     Tensor operator()(const Tensor& ids) const;
-    Parameter& weight_param();
-    const Parameter& weight_param() const;
+    WeightParameter& weight_param();
+    const WeightParameter& weight_param() const;
 
 private:
     const Tensor& weight() const;
 
     Tensor weight_;
-    Parameter* weight_param_ = nullptr;
+    WeightParameter* weight_param_ = nullptr;
 };
 
 }  // namespace modeling

@@ -19,14 +19,14 @@ VocabEmbedding::VocabEmbedding(BuilderContext& ctx, const std::string& name, Mod
     weight_param_ = &register_parameter("weight");
 }
 
-Parameter& VocabEmbedding::weight_param() {
+WeightParameter& VocabEmbedding::weight_param() {
     if (!weight_param_) {
         OPENVINO_THROW("VocabEmbedding has no registered parameter");
     }
     return *weight_param_;
 }
 
-const Parameter& VocabEmbedding::weight_param() const {
+const WeightParameter& VocabEmbedding::weight_param() const {
     if (!weight_param_) {
         OPENVINO_THROW("VocabEmbedding has no registered parameter");
     }

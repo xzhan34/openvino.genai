@@ -24,14 +24,14 @@ namespace genai {
 namespace modeling {
 namespace weights {
 
-void default_weight_loader(Parameter& param,
+void default_weight_loader(WeightParameter& param,
                            WeightSource& source,
                            WeightFinalizer& finalizer,
                            const std::string& weight_name,
                            const std::optional<int>& shard_id) {
     (void)shard_id;
     if (!param.context()) {
-        OPENVINO_THROW("Parameter has no OpContext: ", param.name());
+        OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
     }
     auto weight = finalizer.finalize(weight_name, source, *param.context());
     param.bind(weight);

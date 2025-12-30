@@ -17,7 +17,7 @@ namespace ov {
 namespace genai {
 namespace modeling {
 
-class Parameter;
+class WeightParameter;
 
 class BuilderContext {
 public:
@@ -32,15 +32,15 @@ public:
     OpContext& op_context();
     const OpContext& op_context() const;
 
-    void register_parameter(const std::string& full_name, Parameter* param);
-    Parameter* find_parameter(const std::string& full_name) const;
-    const std::vector<Parameter*>& registered_parameters() const;
+    void register_parameter(const std::string& full_name, WeightParameter* param);
+    WeightParameter* find_parameter(const std::string& full_name) const;
+    const std::vector<WeightParameter*>& registered_parameters() const;
 
 private:
     OpContext op_ctx_;
     ov::ParameterVector inputs_;
-    std::unordered_map<std::string, Parameter*> params_by_name_;
-    std::vector<Parameter*> params_;
+    std::unordered_map<std::string, WeightParameter*> params_by_name_;
+    std::vector<WeightParameter*> params_;
 };
 
 }  // namespace modeling

@@ -45,7 +45,7 @@ const OpContext& BuilderContext::op_context() const {
     return op_ctx_;
 }
 
-void BuilderContext::register_parameter(const std::string& full_name, Parameter* param) {
+void BuilderContext::register_parameter(const std::string& full_name, WeightParameter* param) {
     if (params_by_name_.count(full_name)) {
         OPENVINO_THROW("Duplicate parameter name: ", full_name);
     }
@@ -53,7 +53,7 @@ void BuilderContext::register_parameter(const std::string& full_name, Parameter*
     params_.push_back(param);
 }
 
-Parameter* BuilderContext::find_parameter(const std::string& full_name) const {
+WeightParameter* BuilderContext::find_parameter(const std::string& full_name) const {
     auto it = params_by_name_.find(full_name);
     if (it == params_by_name_.end()) {
         return nullptr;
@@ -61,7 +61,7 @@ Parameter* BuilderContext::find_parameter(const std::string& full_name) const {
     return it->second;
 }
 
-const std::vector<Parameter*>& BuilderContext::registered_parameters() const {
+const std::vector<WeightParameter*>& BuilderContext::registered_parameters() const {
     return params_;
 }
 

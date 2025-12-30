@@ -17,14 +17,14 @@ RMSNorm::RMSNorm(BuilderContext& ctx, const std::string& name, float eps, Module
     weight_param_ = &register_parameter("weight");
 }
 
-Parameter& RMSNorm::weight_param() {
+WeightParameter& RMSNorm::weight_param() {
     if (!weight_param_) {
         OPENVINO_THROW("RMSNorm has no registered parameter");
     }
     return *weight_param_;
 }
 
-const Parameter& RMSNorm::weight_param() const {
+const WeightParameter& RMSNorm::weight_param() const {
     if (!weight_param_) {
         OPENVINO_THROW("RMSNorm has no registered parameter");
     }

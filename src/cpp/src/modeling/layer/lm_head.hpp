@@ -23,15 +23,15 @@ public:
     // The layer selects the last token per sequence, then computes logits.
     Tensor operator()(const Tensor& x, const Tensor& cu_seqlens_q) const;
 
-    void tie_to(Parameter& other);
-    Parameter& weight_param();
-    const Parameter& weight_param() const;
+    void tie_to(WeightParameter& other);
+    WeightParameter& weight_param();
+    const WeightParameter& weight_param() const;
 
 private:
     const Tensor& weight() const;
 
     Tensor weight_;
-    Parameter* weight_param_ = nullptr;
+    WeightParameter* weight_param_ = nullptr;
 };
 
 }  // namespace modeling

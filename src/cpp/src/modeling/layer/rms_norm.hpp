@@ -16,14 +16,14 @@ public:
     RMSNorm(BuilderContext& ctx, const std::string& name, float eps, Module* parent = nullptr);
 
     Tensor operator()(const Tensor& x) const;
-    Parameter& weight_param();
-    const Parameter& weight_param() const;
+    WeightParameter& weight_param();
+    const WeightParameter& weight_param() const;
 
 private:
     const Tensor& weight() const;
 
     Tensor weight_;
-    Parameter* weight_param_ = nullptr;
+    WeightParameter* weight_param_ = nullptr;
     float eps_ = 1e-6f;
 };
 

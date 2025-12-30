@@ -13,65 +13,65 @@ namespace ov {
 namespace genai {
 namespace modeling {
 
-Parameter::Parameter(std::string name, OpContext* ctx) : name_(std::move(name)), ctx_(ctx) {}
+WeightParameter::WeightParameter(std::string name, OpContext* ctx) : name_(std::move(name)), ctx_(ctx) {}
 
-const std::string& Parameter::name() const {
+const std::string& WeightParameter::name() const {
     return name_;
 }
 
-OpContext* Parameter::context() const {
+OpContext* WeightParameter::context() const {
     return ctx_;
 }
 
-void Parameter::set_weight_loader(WeightLoaderFn fn) {
+void WeightParameter::set_weight_loader(WeightLoaderFn fn) {
     weight_loader_ = std::move(fn);
 }
 
-const Parameter::WeightLoaderFn* Parameter::weight_loader() const {
+const WeightParameter::WeightLoaderFn* WeightParameter::weight_loader() const {
     if (!weight_loader_) {
         return nullptr;
     }
     return &weight_loader_;
 }
 
-void Parameter::bind(const Tensor& weight) {
+void WeightParameter::bind(const Tensor& weight) {
     if (tied_to_) {
         tied_to_ = nullptr;
     }
     auto* w_ctx = weight.context();
     if (ctx_ && w_ctx && ctx_ != w_ctx) {
-        OPENVINO_THROW("Parameter context does not match weight context: ", name_);
+        OPENVINO_THROW("WeightParameter context does not match weight context: ", name_);
     }
     weight_ = weight;
     bound_ = true;
     shards_.clear();
 }
 
-bool Parameter::is_bound() const {
+bool WeightParameter::is_bound() const {
     return bound_ || tied_to_ != nullptr;
 }
 
-const Tensor& Parameter::value() const {
+const Tensor& WeightParameter::value() const {
     if (tied_to_) {
         return tied_to_->value();
     }
     if (!bound_) {
-        OPENVINO_THROW("Parameter not bound: ", name_);
+        OPENVINO_THROW("WeightParameter not bound: ", name_);
     }
     return weight_;
 }
 
-void Parameter::add_shard(int shard_id, const Tensor& shard) {
+void WeightParameter::add_shard(int shard_id, const Tensor& shard) {
     if (bound_) {
-        OPENVINO_THROW("Parameter already bound: ", name_);
+        OPENVINO_THROW("WeightParameter already bound: ", name_);
     }
     if (tied_to_) {
-        OPENVINO_THROW("Parameter is tied and cannot accept shards: ", name_);
+        OPENVINO_THROW("WeightParameter is tied and cannot accept shards: ", name_);
     }
     shards_[shard_id] = shard;
 }
 
-void Parameter::finalize() {
+void WeightParameter::finalize() {
     if (bound_ || tied_to_ || shards_.empty()) {
         return;
     }
@@ -97,7 +97,7 @@ void Parameter::finalize() {
     bind(merged);
 }
 
-void Parameter::tie_to(Parameter& other) {
+void WeightParameter::tie_to(WeightParameter& other) {
     if (&other == this) {
         return;
     }
@@ -121,19 +121,19 @@ const std::string& Module::full_path() const {
     return full_path_;
 }
 
-Parameter& Module::register_parameter(const std::string& name) {
+WeightParameter& Module::register_parameter(const std::string& name) {
     if (!ctx_) {
         OPENVINO_THROW("Module has no BuilderContext for parameter registration");
     }
     const std::string full_name = full_path_.empty() ? name : full_path_ + "." + name;
-    auto param = std::make_unique<Parameter>(full_name, &ctx_->op_context());
+    auto param = std::make_unique<WeightParameter>(full_name, &ctx_->op_context());
     auto* ptr = param.get();
     parameters_.push_back(std::move(param));
     ctx_->register_parameter(full_name, ptr);
     return *ptr;
 }
 
-Parameter& Module::get_parameter(const std::string& full_name) {
+WeightParameter& Module::get_parameter(const std::string& full_name) {
     if (!ctx_) {
         OPENVINO_THROW("Module has no BuilderContext for parameter lookup");
     }

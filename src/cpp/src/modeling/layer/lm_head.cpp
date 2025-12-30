@@ -41,21 +41,21 @@ LMHead::LMHead(BuilderContext& ctx, const std::string& name, Module* parent) : M
     weight_param_ = &register_parameter("weight");
 }
 
-void LMHead::tie_to(Parameter& other) {
+void LMHead::tie_to(WeightParameter& other) {
     if (!weight_param_) {
         OPENVINO_THROW("LMHead has no registered parameter to tie");
     }
     weight_param_->tie_to(other);
 }
 
-Parameter& LMHead::weight_param() {
+WeightParameter& LMHead::weight_param() {
     if (!weight_param_) {
         OPENVINO_THROW("LMHead has no registered parameter");
     }
     return *weight_param_;
 }
 
-const Parameter& LMHead::weight_param() const {
+const WeightParameter& LMHead::weight_param() const {
     if (!weight_param_) {
         OPENVINO_THROW("LMHead has no registered parameter");
     }
