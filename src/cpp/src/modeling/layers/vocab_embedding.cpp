@@ -40,7 +40,7 @@ const Tensor& VocabEmbedding::weight() const {
     return weight_;
 }
 
-Tensor VocabEmbedding::operator()(const Tensor& ids) const {
+Tensor VocabEmbedding::forward(const Tensor& ids) const {
     auto ids_i32 = ids.to(ov::element::i32);
     return ops::gather(weight(), ids_i32, 0);
 }

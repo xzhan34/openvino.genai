@@ -76,7 +76,7 @@ TEST(VocabEmbeddingLayer, Basic) {
     ov::genai::modeling::Tensor w(w_node, &ctx);
 
     ov::genai::modeling::VocabEmbedding embed(w);
-    auto y = embed(ids_t);
+    auto y = embed.forward(ids_t);
 
     auto model = build_model_from_output(y.output(), {ids_param});
 

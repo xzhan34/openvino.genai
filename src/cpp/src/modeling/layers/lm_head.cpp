@@ -69,11 +69,11 @@ const Tensor& LMHead::weight() const {
     return weight_;
 }
 
-Tensor LMHead::operator()(const Tensor& x) const {
+Tensor LMHead::forward(const Tensor& x) const {
     return ops::linear(x, weight());
 }
 
-Tensor LMHead::operator()(const Tensor& x, const Tensor& cu_seqlens_q) const {
+Tensor LMHead::forward(const Tensor& x, const Tensor& cu_seqlens_q) const {
     auto* ctx = resolve_context(x, cu_seqlens_q);
     auto cu_i64 = cu_seqlens_q.to(ov::element::i64);
 

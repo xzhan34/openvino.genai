@@ -38,7 +38,7 @@ const Tensor& RMSNorm::weight() const {
     return weight_;
 }
 
-Tensor RMSNorm::operator()(const Tensor& x) const {
+Tensor RMSNorm::forward(const Tensor& x) const {
     auto orig_dtype = x.dtype();
     auto xf = x.to(ov::element::f32);
     auto var = xf.pow(2.0f).mean(-1, true);

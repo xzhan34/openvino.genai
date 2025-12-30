@@ -16,7 +16,7 @@ public:
     VocabEmbedding(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
 
     // Equivalent to torch.nn.functional.embedding(ids, weight).
-    Tensor operator()(const Tensor& ids) const;
+    Tensor forward(const Tensor& ids) const;
     WeightParameter& weight_param();
     const WeightParameter& weight_param() const;
 

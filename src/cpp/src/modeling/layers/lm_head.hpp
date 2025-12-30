@@ -16,12 +16,12 @@ public:
     LMHead(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
 
     // Decode path: compute logits for all tokens in `x`.
-    Tensor operator()(const Tensor& x) const;
+    Tensor forward(const Tensor& x) const;
 
     // Prefill path: `x` is expected to be packed as [total_tokens, hidden],
     // `cu_seqlens_q` is expected to be [batch + 1] (prefix sums).
     // The layer selects the last token per sequence, then computes logits.
-    Tensor operator()(const Tensor& x, const Tensor& cu_seqlens_q) const;
+    Tensor forward(const Tensor& x, const Tensor& cu_seqlens_q) const;
 
     void tie_to(WeightParameter& other);
     WeightParameter& weight_param();

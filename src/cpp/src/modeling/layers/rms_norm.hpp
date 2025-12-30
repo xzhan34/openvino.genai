@@ -15,7 +15,7 @@ public:
     RMSNorm(const Tensor& weight, float eps);
     RMSNorm(BuilderContext& ctx, const std::string& name, float eps, Module* parent = nullptr);
 
-    Tensor operator()(const Tensor& x) const;
+    Tensor forward(const Tensor& x) const;
     WeightParameter& weight_param();
     const WeightParameter& weight_param() const;
 

@@ -53,9 +53,9 @@ Tensor Qwen3Model::forward(const Tensor& input_ids,
                            const Tensor& attention_mask,
                            const Tensor& position_ids,
                            const Tensor& beam_idx) {
-    auto hidden = embed_tokens_(input_ids);
+    auto hidden = embed_tokens_.forward(input_ids);
     auto attached = attach_pipeline_inputs(hidden, attention_mask, position_ids, beam_idx);
-    return norm_(attached);
+    return norm_.forward(attached);
 }
 
 VocabEmbedding& Qwen3Model::embed_tokens() {
@@ -81,7 +81,7 @@ Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids,
                                  const Tensor& position_ids,
                                  const Tensor& beam_idx) {
     auto hidden = model_.forward(input_ids, attention_mask, position_ids, beam_idx);
-    return lm_head_(hidden);
+    return lm_head_.forward(hidden);
 }
 
 Qwen3Model& Qwen3ForCausalLM::model() {

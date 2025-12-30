@@ -123,7 +123,7 @@ TEST(RMSNormLayer, ModelingApi) {
     ov::genai::modeling::Tensor w(weight_node, &ctx);
 
     ov::genai::modeling::RMSNorm rms(w, kRmsEps);
-    auto output = rms(x);
+    auto output = rms.forward(x);
 
     auto model = build_model_from_output(output.output(), {param});
     run_rms_model_test(model, kRmsInput, kRmsExpected, kRmsInputShape, "rms_ult_model_modeling.xml");

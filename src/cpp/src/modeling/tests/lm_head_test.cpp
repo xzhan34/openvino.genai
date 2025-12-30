@@ -74,7 +74,7 @@ TEST(LMHeadLayer, Decode) {
     ov::genai::modeling::Tensor w(w_node, &ctx);
 
     ov::genai::modeling::LMHead lm_head(w);
-    auto logits = lm_head(x);
+    auto logits = lm_head.forward(x);
 
     auto model = build_model_from_output(logits.output(), {x_param});
 
@@ -131,7 +131,7 @@ TEST(LMHeadLayer, PrefillLastToken) {
     ov::genai::modeling::Tensor w(w_node, &ctx);
 
     ov::genai::modeling::LMHead lm_head(w);
-    auto logits = lm_head(x, cu);
+    auto logits = lm_head.forward(x, cu);
 
     auto model = build_model_from_output(logits.output(), {x_param, cu_param});
 
