@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/layer/rms_norm.hpp"
+#include "modeling/layers/rms_norm.hpp"
 
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
@@ -49,3 +49,4 @@ Tensor RMSNorm::operator()(const Tensor& x) const {
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
+

@@ -9,7 +9,7 @@
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset13.hpp>
 
-#include "modeling/layer/vocab_embedding.hpp"
+#include "modeling/layers/vocab_embedding.hpp"
 #include "modeling/ops/context.hpp"
 #include "modeling/ops/tensor.hpp"
 
@@ -92,4 +92,5 @@ TEST(VocabEmbeddingLayer, Basic) {
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
+
 

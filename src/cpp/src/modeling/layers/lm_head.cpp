@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/layer/lm_head.hpp"
+#include "modeling/layers/lm_head.hpp"
 
 #include <limits>
 
@@ -92,3 +92,4 @@ Tensor LMHead::operator()(const Tensor& x, const Tensor& cu_seqlens_q) const {
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
+

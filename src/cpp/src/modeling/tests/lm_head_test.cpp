@@ -9,7 +9,7 @@
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset13.hpp>
 
-#include "modeling/layer/lm_head.hpp"
+#include "modeling/layers/lm_head.hpp"
 #include "modeling/ops/context.hpp"
 #include "modeling/ops/tensor.hpp"
 
@@ -151,4 +151,5 @@ TEST(LMHeadLayer, PrefillLastToken) {
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
+
 

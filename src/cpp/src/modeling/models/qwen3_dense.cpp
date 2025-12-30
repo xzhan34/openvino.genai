@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/models/qwen3_dense_modular.hpp"
+#include "modeling/models/qwen3_dense.hpp"
 
 #include <openvino/opsets/opset13.hpp>
 

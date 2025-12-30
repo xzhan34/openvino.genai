@@ -11,7 +11,7 @@
 #include <openvino/opsets/opset13.hpp>
 #include <ov_ops/rms.hpp>
 
-#include "modeling/layer/rms_norm.hpp"
+#include "modeling/layers/rms_norm.hpp"
 #include "modeling/ops/context.hpp"
 #include "modeling/ops/tensor.hpp"
 
@@ -146,3 +146,4 @@ TEST(RMSNormLayer, Opset) {
     auto model = build_model_from_output(output, {param});
     run_rms_model_test(model, kRmsInput, kRmsExpected, kRmsInputShape, "rms_ult_model_opset.xml");
 }
+

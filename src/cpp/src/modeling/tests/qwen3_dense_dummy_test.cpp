@@ -13,7 +13,7 @@
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_dense_modular.hpp"
+#include "modeling/models/qwen3_dense.hpp"
 #include "modeling/weights/weight_loader.hpp"
 #include "modeling/weights/weight_finalizer.hpp"
 #include "modeling/weights/weight_source.hpp"

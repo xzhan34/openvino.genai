@@ -21,7 +21,7 @@
 #include "gguf_utils/gguf_weight_source.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_dense_modular.hpp"
+#include "modeling/models/qwen3_dense.hpp"
 #include "modeling/weights/weight_loader.hpp"
 #include "utils.hpp"
 
