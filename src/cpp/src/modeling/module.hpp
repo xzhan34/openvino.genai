@@ -3,26 +3,18 @@
 
 #pragma once
 
-#include <functional>
 #include <memory>
-#include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <openvino/openvino.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/ops/tensor.hpp"
+#include "modeling/weights/weight_parameter.hpp"
 
 namespace ov {
 namespace genai {
 namespace modeling {
-
-namespace weights {
-class WeightSource;
-class WeightFinalizer;
-}  // namespace weights
 
 struct PackedRule {
     std::string match;
@@ -32,41 +24,6 @@ struct PackedRule {
 
 struct PackedMapping {
     std::vector<PackedRule> rules;
-};
-
-class WeightParameter {
-public:
-    using WeightLoaderFn = std::function<void(WeightParameter&,
-                                              weights::WeightSource&,
-                                              weights::WeightFinalizer&,
-                                              const std::string& weight_name,
-                                              const std::optional<int>& shard_id)>;
-
-    WeightParameter(std::string name, OpContext* ctx);
-
-    const std::string& name() const;
-    OpContext* context() const;
-
-    void set_weight_loader(WeightLoaderFn fn);
-    const WeightLoaderFn* weight_loader() const;
-
-    void bind(const Tensor& weight);
-    bool is_bound() const;
-    const Tensor& value() const;
-
-    void add_shard(int shard_id, const Tensor& shard);
-    void finalize();
-
-    void tie_to(WeightParameter& other);
-
-private:
-    std::string name_;
-    OpContext* ctx_ = nullptr;
-    Tensor weight_;
-    bool bound_ = false;
-    WeightParameter* tied_to_ = nullptr;
-    std::unordered_map<int, Tensor> shards_;
-    WeightLoaderFn weight_loader_;
 };
 
 class Module {
