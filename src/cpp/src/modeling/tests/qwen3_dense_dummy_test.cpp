@@ -134,6 +134,53 @@ std::vector<float> linear_ref_3d(const std::vector<float>& x,
     return out;
 }
 
+std::vector<float> make_seq(size_t n, float start, float step) {
+    std::vector<float> out(n, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = start + step * static_cast<float>(i);
+    }
+    return out;
+}
+
+std::vector<float> add_ref(const std::vector<float>& a, const std::vector<float>& b) {
+    std::vector<float> out(a.size(), 0.0f);
+    for (size_t i = 0; i < a.size(); ++i) {
+        out[i] = a[i] + b[i];
+    }
+    return out;
+}
+
+std::vector<float> mul_ref(const std::vector<float>& a, const std::vector<float>& b) {
+    std::vector<float> out(a.size(), 0.0f);
+    for (size_t i = 0; i < a.size(); ++i) {
+        out[i] = a[i] * b[i];
+    }
+    return out;
+}
+
+std::vector<float> silu_ref(const std::vector<float>& x) {
+    std::vector<float> out(x.size(), 0.0f);
+    for (size_t i = 0; i < x.size(); ++i) {
+        const float v = x[i];
+        out[i] = v / (1.0f + std::exp(-v));
+    }
+    return out;
+}
+
+std::vector<float> mlp_ref(const std::vector<float>& x,
+                           const std::vector<float>& gate_w,
+                           const std::vector<float>& up_w,
+                           const std::vector<float>& down_w,
+                           size_t batch,
+                           size_t seq_len,
+                           size_t hidden,
+                           size_t intermediate) {
+    auto gate = linear_ref_3d(x, gate_w, batch, seq_len, hidden, intermediate);
+    auto up = linear_ref_3d(x, up_w, batch, seq_len, hidden, intermediate);
+    auto gated = mul_ref(silu_ref(gate), up);
+    return linear_ref_3d(gated, down_w, batch, seq_len, intermediate, hidden);
+}
+
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
     ASSERT_EQ(output.get_size(), expected.size());
     const float* out_data = output.data<const float>();
@@ -151,10 +198,14 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     const size_t seq_len = 3;
     const size_t vocab = 6;
     const size_t hidden = 4;
+    const size_t intermediate = 6;
+    const size_t num_layers = 2;
 
     const ov::Shape embed_shape{vocab, hidden};
     const ov::Shape norm_shape{hidden};
     const ov::Shape lm_head_shape{vocab, hidden};
+    const ov::Shape mlp_up_shape{intermediate, hidden};
+    const ov::Shape mlp_down_shape{hidden, intermediate};
 
     const std::vector<float> embed_weight = {
         0.f, 1.f, 2.f, 3.f,      //
@@ -164,6 +215,8 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
         40.f, 41.f, 42.f, 43.f,  //
         50.f, 51.f, 52.f, 53.f,  //
     };
+    const std::vector<float> post_norm_weight0 = {1.0f, 0.9f, 1.1f, 1.05f};
+    const std::vector<float> post_norm_weight1 = {0.95f, 1.05f, 1.0f, 0.9f};
     const std::vector<float> norm_weight = {1.f, 1.f, 1.f, 1.f};
     const std::vector<float> lm_head_weight = {
         1.f, 0.f, 0.f, 0.f,    //
@@ -173,9 +226,23 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
         1.f, 1.f, 1.f, 1.f,    //
         -1.f, -1.f, -1.f, -1.f //
     };
+    const auto gate_w0 = make_seq(intermediate * hidden, 0.01f, 0.01f);
+    const auto up_w0 = make_seq(intermediate * hidden, 0.02f, 0.01f);
+    const auto down_w0 = make_seq(hidden * intermediate, 0.03f, 0.01f);
+    const auto gate_w1 = make_seq(intermediate * hidden, 0.015f, 0.01f);
+    const auto up_w1 = make_seq(intermediate * hidden, 0.025f, 0.01f);
+    const auto down_w1 = make_seq(hidden * intermediate, 0.035f, 0.01f);
 
     DummyWeightSource weights;
     weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
+    weights.add("model.layers[0].post_attention_layernorm.weight", make_tensor(post_norm_weight0, norm_shape));
+    weights.add("model.layers[0].mlp.gate_proj.weight", make_tensor(gate_w0, mlp_up_shape));
+    weights.add("model.layers[0].mlp.up_proj.weight", make_tensor(up_w0, mlp_up_shape));
+    weights.add("model.layers[0].mlp.down_proj.weight", make_tensor(down_w0, mlp_down_shape));
+    weights.add("model.layers[1].post_attention_layernorm.weight", make_tensor(post_norm_weight1, norm_shape));
+    weights.add("model.layers[1].mlp.gate_proj.weight", make_tensor(gate_w1, mlp_up_shape));
+    weights.add("model.layers[1].mlp.up_proj.weight", make_tensor(up_w1, mlp_up_shape));
+    weights.add("model.layers[1].mlp.down_proj.weight", make_tensor(down_w1, mlp_down_shape));
     weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
     weights.add("lm_head.weight", make_tensor(lm_head_weight, lm_head_shape));
 
@@ -184,18 +251,19 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
     cfg.hidden_size = static_cast<int32_t>(hidden);
+    cfg.intermediate_size = static_cast<int32_t>(intermediate);
+    cfg.num_hidden_layers = static_cast<int32_t>(num_layers);
     cfg.rms_norm_eps = 1e-6f;
+    cfg.hidden_act = "silu";
     cfg.tie_word_embeddings = false;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
     ov::genai::modeling::weights::load_model(model, weights, finalizer);
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
-    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
-    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, attention_mask, position_ids, beam_idx);
+    auto logits = model.forward(input_ids, position_ids);
     auto ov_model = ctx.build_model({logits.output()});
     ov::serialize(ov_model, "qwen3_dummy_modular.xml");
 
@@ -204,39 +272,52 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     auto request = compiled.create_infer_request();
 
     const std::vector<int64_t> input_ids_data = {0, 2, 5};
-    const std::vector<int64_t> attention_mask_data = {1, 1, 0};
     const std::vector<int64_t> position_ids_data = {0, 1, 2};
-    const std::vector<int32_t> beam_idx_data = {2};
 
     ov::Tensor input_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(input_ids_tensor.data(), input_ids_data.data(), input_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(0, input_ids_tensor);
 
-    ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
-    std::memcpy(attention_mask_tensor.data(), attention_mask_data.data(), attention_mask_data.size() * sizeof(int64_t));
-    request.set_input_tensor(1, attention_mask_tensor);
-
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
-    request.set_input_tensor(2, position_ids_tensor);
-
-    ov::Tensor beam_idx_tensor(ov::element::i32, {beam_idx_data.size()});
-    std::memcpy(beam_idx_tensor.data(), beam_idx_data.data(), beam_idx_data.size() * sizeof(int32_t));
-    request.set_input_tensor(3, beam_idx_tensor);
+    request.set_input_tensor(1, position_ids_tensor);
 
     request.infer();
 
-    // Reference: embedding -> *mask -> +pos -> +sum(beam_idx) -> rmsnorm -> linear
+    // Reference: embedding -> (post-attn rmsnorm -> mlp) * num_layers -> final rmsnorm -> linear
     auto hidden0 = embedding_ref(input_ids_data, embed_weight, batch, seq_len, vocab, hidden);
-    for (size_t i = 0; i < batch * seq_len; ++i) {
-        const float mask = static_cast<float>(attention_mask_data[i]);
-        const float pos = static_cast<float>(position_ids_data[i]);
-        for (size_t h = 0; h < hidden; ++h) {
-            hidden0[i * hidden + h] = hidden0[i * hidden + h] * mask + pos + static_cast<float>(beam_idx_data[0]);
-        }
+    std::vector<float> residual;
+    bool has_residual = false;
+
+    std::vector<float> normed;
+    std::vector<float> sum;
+
+    // Layer 0
+    if (has_residual) {
+        sum = add_ref(hidden0, residual);
+        normed = rmsnorm_ref(sum, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+        residual = sum;
+    } else {
+        normed = rmsnorm_ref(hidden0, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+        residual = hidden0;
+        has_residual = true;
     }
-    auto normed = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
-    auto expected = linear_ref_3d(normed, lm_head_weight, batch, seq_len, hidden, vocab);
+    hidden0 = mlp_ref(normed, gate_w0, up_w0, down_w0, batch, seq_len, hidden, intermediate);
+
+    // Layer 1
+    sum = add_ref(hidden0, residual);
+    normed = rmsnorm_ref(sum, post_norm_weight1, batch, seq_len, hidden, cfg.rms_norm_eps);
+    residual = sum;
+    hidden0 = mlp_ref(normed, gate_w1, up_w1, down_w1, batch, seq_len, hidden, intermediate);
+
+    // Final norm
+    if (has_residual) {
+        sum = add_ref(hidden0, residual);
+        hidden0 = rmsnorm_ref(sum, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
+    } else {
+        hidden0 = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
+    }
+    auto expected = linear_ref_3d(hidden0, lm_head_weight, batch, seq_len, hidden, vocab);
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
@@ -248,9 +329,13 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     const size_t seq_len = 2;
     const size_t vocab = 4;
     const size_t hidden = 3;
+    const size_t intermediate = 4;
+    const size_t num_layers = 1;
 
     const ov::Shape embed_shape{vocab, hidden};
     const ov::Shape norm_shape{hidden};
+    const ov::Shape mlp_up_shape{intermediate, hidden};
+    const ov::Shape mlp_down_shape{hidden, intermediate};
 
     const std::vector<float> embed_weight = {
         0.f, 1.f, 2.f,  //
@@ -258,10 +343,18 @@ TEST(Qwen3DenseDummy, TiedWeights) {
         6.f, 7.f, 8.f,  //
         9.f, 10.f, 11.f //
     };
+    const std::vector<float> post_norm_weight0 = {0.9f, 1.1f, 1.0f};
     const std::vector<float> norm_weight = {1.f, 1.f, 1.f};
+    const auto gate_w0 = make_seq(intermediate * hidden, 0.01f, 0.02f);
+    const auto up_w0 = make_seq(intermediate * hidden, 0.015f, 0.02f);
+    const auto down_w0 = make_seq(hidden * intermediate, 0.02f, 0.02f);
 
     DummyWeightSource weights;
     weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
+    weights.add("model.layers[0].post_attention_layernorm.weight", make_tensor(post_norm_weight0, norm_shape));
+    weights.add("model.layers[0].mlp.gate_proj.weight", make_tensor(gate_w0, mlp_up_shape));
+    weights.add("model.layers[0].mlp.up_proj.weight", make_tensor(up_w0, mlp_up_shape));
+    weights.add("model.layers[0].mlp.down_proj.weight", make_tensor(down_w0, mlp_down_shape));
     weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
 
     DummyWeightFinalizer finalizer;
@@ -269,18 +362,19 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
     cfg.hidden_size = static_cast<int32_t>(hidden);
+    cfg.intermediate_size = static_cast<int32_t>(intermediate);
+    cfg.num_hidden_layers = static_cast<int32_t>(num_layers);
     cfg.rms_norm_eps = 1e-6f;
+    cfg.hidden_act = "silu";
     cfg.tie_word_embeddings = true;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
     ov::genai::modeling::weights::load_model(model, weights, finalizer);
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
-    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
-    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, attention_mask, position_ids, beam_idx);
+    auto logits = model.forward(input_ids, position_ids);
     auto ov_model = ctx.build_model({logits.output()});
 
     ov::serialize(ov_model, "qwen3_dummy_original.xml");
@@ -292,40 +386,43 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     ov::serialize(compiled.get_runtime_model(), "qwen3_dummy_compiled.xml");
 
     const std::vector<int64_t> input_ids_data = {0, 3};
-    const std::vector<int64_t> attention_mask_data = {1, 1};
     const std::vector<int64_t> position_ids_data = {0, 1};
-    const std::vector<int32_t> beam_idx_data = {1};
 
     ov::Tensor input_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(input_ids_tensor.data(), input_ids_data.data(), input_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(0, input_ids_tensor);
 
-    ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
-    std::memcpy(attention_mask_tensor.data(),
-                attention_mask_data.data(),
-                attention_mask_data.size() * sizeof(int64_t));
-    request.set_input_tensor(1, attention_mask_tensor);
-
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
-    request.set_input_tensor(2, position_ids_tensor);
-
-    ov::Tensor beam_idx_tensor(ov::element::i32, {beam_idx_data.size()});
-    std::memcpy(beam_idx_tensor.data(), beam_idx_data.data(), beam_idx_data.size() * sizeof(int32_t));
-    request.set_input_tensor(3, beam_idx_tensor);
+    request.set_input_tensor(1, position_ids_tensor);
 
     request.infer();
 
     auto hidden0 = embedding_ref(input_ids_data, embed_weight, batch, seq_len, vocab, hidden);
-    for (size_t i = 0; i < batch * seq_len; ++i) {
-        const float mask = static_cast<float>(attention_mask_data[i]);
-        const float pos = static_cast<float>(position_ids_data[i]);
-        for (size_t h = 0; h < hidden; ++h) {
-            hidden0[i * hidden + h] = hidden0[i * hidden + h] * mask + pos + static_cast<float>(beam_idx_data[0]);
-        }
+    std::vector<float> residual;
+    bool has_residual = false;
+
+    std::vector<float> normed;
+    std::vector<float> sum;
+
+    if (has_residual) {
+        sum = add_ref(hidden0, residual);
+        normed = rmsnorm_ref(sum, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+        residual = sum;
+    } else {
+        normed = rmsnorm_ref(hidden0, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+        residual = hidden0;
+        has_residual = true;
     }
-    auto normed = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
-    auto expected = linear_ref_3d(normed, embed_weight, batch, seq_len, hidden, vocab);
+    hidden0 = mlp_ref(normed, gate_w0, up_w0, down_w0, batch, seq_len, hidden, intermediate);
+
+    if (has_residual) {
+        sum = add_ref(hidden0, residual);
+        hidden0 = rmsnorm_ref(sum, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
+    } else {
+        hidden0 = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
+    }
+    auto expected = linear_ref_3d(hidden0, embed_weight, batch, seq_len, hidden, vocab);
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }

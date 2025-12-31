@@ -3,38 +3,16 @@
 
 #include "modeling/models/qwen3_dense.hpp"
 
+#include <openvino/core/except.hpp>
 #include <openvino/opsets/opset13.hpp>
+
+#include "modeling/ops/ops.hpp"
 
 namespace {
 
-ov::genai::modeling::Tensor attach_pipeline_inputs(const ov::genai::modeling::Tensor& hidden,
-                                                   const ov::genai::modeling::Tensor& attention_mask,
-                                                   const ov::genai::modeling::Tensor& position_ids,
-                                                   const ov::genai::modeling::Tensor& beam_idx) {
-    using namespace ov::op;
-
-    auto* ctx = hidden.context();
-
-    // hidden *= unsqueeze(f32(attention_mask), -1)
-    auto attn_f = std::make_shared<v0::Convert>(attention_mask.output(), ov::element::f32);
-    auto attn_axis = v0::Constant::create(ov::element::i64, ov::Shape{1}, {2});
-    auto attn_unsq = std::make_shared<v0::Unsqueeze>(attn_f, attn_axis);
-    ov::genai::modeling::Tensor attn_mask_t(attn_unsq, ctx);
-    auto masked = hidden * attn_mask_t;
-
-    // hidden += unsqueeze(f32(position_ids), -1)
-    auto pos_f = std::make_shared<v0::Convert>(position_ids.output(), ov::element::f32);
-    auto pos_axis = v0::Constant::create(ov::element::i64, ov::Shape{1}, {2});
-    auto pos_unsq = std::make_shared<v0::Unsqueeze>(pos_f, pos_axis);
-    ov::genai::modeling::Tensor pos_t(pos_unsq, ctx);
-    auto with_pos = masked + pos_t;
-
-    // hidden += reduce_sum(f32(beam_idx))
-    auto beam_f = std::make_shared<v0::Convert>(beam_idx.output(), ov::element::f32);
-    auto beam_axes = v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
-    auto beam_sum = std::make_shared<v1::ReduceSum>(beam_f, beam_axes, false);
-    ov::genai::modeling::Tensor beam_sum_t(beam_sum, ctx);
-    return with_pos + beam_sum_t;
+ov::genai::modeling::Tensor silu(const ov::genai::modeling::Tensor& x) {
+    auto node = std::make_shared<ov::op::v4::Swish>(x.output());
+    return ov::genai::modeling::Tensor(node, x.context());
 }
 
 }  // namespace
@@ -44,18 +22,94 @@ namespace genai {
 namespace modeling {
 namespace models {
 
+Qwen3MLP::Qwen3MLP(BuilderContext& ctx, const std::string& name, const Qwen3DenseConfig& cfg, Module* parent)
+    : Module(name, ctx, parent) {
+    if (!cfg.hidden_act.empty() && cfg.hidden_act != "silu") {
+        OPENVINO_THROW("Unsupported Qwen3 MLP activation: ", cfg.hidden_act);
+    }
+    gate_proj_param_ = &register_parameter("gate_proj.weight");
+    up_proj_param_ = &register_parameter("up_proj.weight");
+    down_proj_param_ = &register_parameter("down_proj.weight");
+}
+
+const Tensor& Qwen3MLP::gate_proj_weight() const {
+    if (!gate_proj_param_) {
+        OPENVINO_THROW("Qwen3MLP gate projection parameter not registered");
+    }
+    return gate_proj_param_->value();
+}
+
+const Tensor& Qwen3MLP::up_proj_weight() const {
+    if (!up_proj_param_) {
+        OPENVINO_THROW("Qwen3MLP up projection parameter not registered");
+    }
+    return up_proj_param_->value();
+}
+
+const Tensor& Qwen3MLP::down_proj_weight() const {
+    if (!down_proj_param_) {
+        OPENVINO_THROW("Qwen3MLP down projection parameter not registered");
+    }
+    return down_proj_param_->value();
+}
+
+Tensor Qwen3MLP::forward(const Tensor& x) const {
+    auto gate = ops::linear(x, gate_proj_weight());
+    auto up = ops::linear(x, up_proj_weight());
+    auto gated = silu(gate) * up;
+    return ops::linear(gated, down_proj_weight());
+}
+
+Qwen3DecoderLayer::Qwen3DecoderLayer(BuilderContext& ctx,
+                                     const std::string& name,
+                                     const Qwen3DenseConfig& cfg,
+                                     Module* parent)
+    : Module(name, ctx, parent),
+      mlp_(ctx, "mlp", cfg, this),
+      input_layernorm_(ctx, "input_layernorm", cfg.rms_norm_eps, this),
+      post_attention_layernorm_(ctx, "post_attention_layernorm", cfg.rms_norm_eps, this) {}
+
+std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& positions,
+                                                     const Tensor& hidden_states,
+                                                     const std::optional<Tensor>& residual) const {
+    (void)positions;
+    Tensor normed;
+    Tensor next_residual;
+    if (residual) {
+        auto norm_out = post_attention_layernorm_.forward(hidden_states, *residual);
+        normed = norm_out.first;
+        next_residual = norm_out.second;
+    } else {
+        normed = post_attention_layernorm_.forward(hidden_states);
+        next_residual = hidden_states;
+    }
+    auto mlp_out = mlp_.forward(normed);
+    return {mlp_out, next_residual};
+}
+
 Qwen3Model::Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module* parent)
     : Module("model", ctx, parent),
       embed_tokens_(ctx, "embed_tokens", this),
-      norm_(ctx, "norm", cfg.rms_norm_eps, this) {}
+      layers_(),
+      norm_(ctx, "norm", cfg.rms_norm_eps, this) {
+    layers_.reserve(static_cast<size_t>(cfg.num_hidden_layers));
+    for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
+        layers_.emplace_back(ctx, "layers[" + std::to_string(i) + "]", cfg, this);
+    }
+}
 
-Tensor Qwen3Model::forward(const Tensor& input_ids,
-                           const Tensor& attention_mask,
-                           const Tensor& position_ids,
-                           const Tensor& beam_idx) {
-    auto hidden = embed_tokens_.forward(input_ids);
-    auto attached = attach_pipeline_inputs(hidden, attention_mask, position_ids, beam_idx);
-    return norm_.forward(attached);
+Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids) {
+    auto hidden_states = embed_tokens_.forward(input_ids);
+    std::optional<Tensor> residual;
+    for (auto& layer : layers_) {
+        auto layer_out = layer.forward(position_ids, hidden_states, residual);
+        hidden_states = layer_out.first;
+        residual = layer_out.second;
+    }
+    if (residual) {
+        return norm_.forward(hidden_states, *residual).first;
+    }
+    return norm_.forward(hidden_states);
 }
 
 VocabEmbedding& Qwen3Model::embed_tokens() {
@@ -76,11 +130,8 @@ Qwen3ForCausalLM::Qwen3ForCausalLM(BuilderContext& ctx, const Qwen3DenseConfig& 
     }
 }
 
-Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids,
-                                 const Tensor& attention_mask,
-                                 const Tensor& position_ids,
-                                 const Tensor& beam_idx) {
-    auto hidden = model_.forward(input_ids, attention_mask, position_ids, beam_idx);
+Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids, const Tensor& position_ids) {
+    auto hidden = model_.forward(input_ids, position_ids);
     return lm_head_.forward(hidden);
 }
 

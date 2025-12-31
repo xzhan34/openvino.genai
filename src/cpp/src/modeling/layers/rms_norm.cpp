@@ -46,6 +46,18 @@ Tensor RMSNorm::forward(const Tensor& x) const {
     return norm.to(orig_dtype) * weight();
 }
 
+std::pair<Tensor, Tensor> RMSNorm::forward(const Tensor& x, const Tensor& residual) const {
+    auto orig_dtype = x.dtype();
+    auto xf = x.to(ov::element::f32);
+    auto rf = residual.to(ov::element::f32);
+    auto sum = xf + rf;
+    auto residual_out = sum.to(orig_dtype);
+    auto var = sum.pow(2.0f).mean(-1, true);
+    auto norm = sum * (var + eps_).rsqrt();
+    auto out = norm.to(orig_dtype) * weight();
+    return {out, residual_out};
+}
+
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov

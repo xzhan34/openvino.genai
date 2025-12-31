@@ -63,6 +63,7 @@ std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = std::get<std::string>(configs.at("architecture"));
     cfg.hidden_size = std::get<int>(configs.at("hidden_size"));
+    cfg.num_hidden_layers = std::get<int>(configs.at("layer_num"));
     cfg.rms_norm_eps = std::get<float>(configs.at("rms_norm_eps"));
     cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
 
@@ -76,7 +77,9 @@ std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, attention_mask, position_ids, beam_idx);
+    (void)attention_mask;
+    (void)beam_idx;
+    auto logits = model.forward(input_ids, position_ids);
 
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, "logits");

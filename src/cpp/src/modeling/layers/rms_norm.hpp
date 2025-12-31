@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <utility>
+
 #include "modeling/module.hpp"
 #include "modeling/ops/tensor.hpp"
 
@@ -16,6 +18,7 @@ public:
     RMSNorm(BuilderContext& ctx, const std::string& name, float eps, Module* parent = nullptr);
 
     Tensor forward(const Tensor& x) const;
+    std::pair<Tensor, Tensor> forward(const Tensor& x, const Tensor& residual) const;
     WeightParameter& weight_param();
     const WeightParameter& weight_param() const;
 
