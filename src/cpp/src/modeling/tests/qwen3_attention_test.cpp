@@ -301,6 +301,10 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
             for (size_t i = 0; i < seq_len; ++i) {
                 float max_score = -1e30f;
                 for (size_t j = 0; j < seq_len; ++j) {
+                    if (j > i) {
+                        scores[j] = -65504.0f;
+                        continue;
+                    }
                     float acc = 0.0f;
                     const size_t q_base = ((b * num_heads + h) * seq_len + i) * head_dim;
                     const size_t k_base = ((b * num_heads + h) * seq_len + j) * head_dim;

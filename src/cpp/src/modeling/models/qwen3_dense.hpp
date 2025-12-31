@@ -58,7 +58,6 @@ private:
     int32_t hidden_size_ = 0;
     float scaling_ = 1.0f;
     float rope_theta_ = 10000.0f;
-    bool use_qk_norm_ = false;
 
     WeightParameter* q_proj_param_ = nullptr;
     WeightParameter* k_proj_param_ = nullptr;

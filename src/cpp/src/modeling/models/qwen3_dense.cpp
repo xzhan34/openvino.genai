@@ -135,6 +135,24 @@ ov::genai::modeling::Tensor repeat_kv(const ov::genai::modeling::Tensor& x,
     return ov::genai::modeling::Tensor(reshaped, ctx);
 }
 
+ov::genai::modeling::Tensor make_causal_mask(const ov::genai::modeling::Tensor& scores) {
+    auto* ctx = scores.context();
+    auto shape = std::make_shared<ov::op::v3::ShapeOf>(scores.output(), ov::element::i64);
+    auto seq = std::make_shared<ov::op::v8::Gather>(shape, i64_const(2), i64_const(0));
+
+    auto range = std::make_shared<ov::op::v4::Range>(i64_const(0), seq, i64_const(1), ov::element::i64);
+    auto row = std::make_shared<ov::op::v0::Unsqueeze>(range, i64_const(1));
+    auto col = std::make_shared<ov::op::v0::Unsqueeze>(range, i64_const(0));
+    auto ge = std::make_shared<ov::op::v1::GreaterEqual>(row, col, ov::op::AutoBroadcastType::NUMPY);
+
+    auto zero = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {0.0f});
+    auto neg = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {-65504.0f});
+    auto mask2d = std::make_shared<ov::op::v1::Select>(ge, zero, neg, ov::op::AutoBroadcastType::NUMPY);
+    auto mask4d = std::make_shared<ov::op::v0::Unsqueeze>(mask2d, i64_vec({0, 1}));
+    auto broadcast = std::make_shared<ov::op::v3::Broadcast>(mask4d, shape, ov::op::BroadcastType::NUMPY);
+    return ov::genai::modeling::Tensor(broadcast, ctx);
+}
+
 }  // namespace
 
 namespace ov {
@@ -153,7 +171,6 @@ Qwen3Attention::Qwen3Attention(BuilderContext& ctx,
       hidden_size_(cfg.hidden_size),
       scaling_(1.0f / std::sqrt(static_cast<float>(head_dim_))),
       rope_theta_(cfg.rope_theta),
-      use_qk_norm_(!cfg.attention_bias),
       q_norm_(ctx, "q_norm", cfg.rms_norm_eps, this),
       k_norm_(ctx, "k_norm", cfg.rms_norm_eps, this) {
     if (num_heads_ <= 0 || head_dim_ <= 0) {
@@ -229,10 +246,10 @@ Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_sta
     auto k_heads = reshape_to_heads(k, num_kv_heads_, head_dim_);
     auto v_heads = reshape_to_heads(v, num_kv_heads_, head_dim_);
 
-    if (use_qk_norm_ && q_norm_.weight_param().is_bound()) {
+    if (q_norm_.weight_param().is_bound()) {
         q_heads = q_norm_.forward(q_heads);
     }
-    if (use_qk_norm_ && k_norm_.weight_param().is_bound()) {
+    if (k_norm_.weight_param().is_bound()) {
         k_heads = k_norm_.forward(k_heads);
     }
 
@@ -248,7 +265,8 @@ Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_sta
 
     auto scores = ops::matmul(scaled_q, k_expanded, false, true);
     auto scores_f32 = scores.to(ov::element::f32);
-    auto softmax = std::make_shared<ov::op::v1::Softmax>(scores_f32.output(), 3);
+    auto masked_scores = scores_f32 + make_causal_mask(scores_f32);
+    auto softmax = std::make_shared<ov::op::v1::Softmax>(masked_scores.output(), 3);
     Tensor attn_probs(softmax, scores.context());
 
     auto context = ops::matmul(attn_probs, v_expanded, false, false);
