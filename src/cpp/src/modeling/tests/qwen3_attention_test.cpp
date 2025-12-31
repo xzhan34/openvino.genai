@@ -98,6 +98,25 @@ std::vector<float> linear_ref_3d(const std::vector<float>& x,
     return out;
 }
 
+std::vector<float> linear_ref_3d_bias(const std::vector<float>& x,
+                                      const std::vector<float>& w,
+                                      const std::vector<float>& bias,
+                                      size_t batch,
+                                      size_t seq_len,
+                                      size_t in_features,
+                                      size_t out_features) {
+    auto out = linear_ref_3d(x, w, batch, seq_len, in_features, out_features);
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const size_t base = (b * seq_len + s) * out_features;
+            for (size_t o = 0; o < out_features; ++o) {
+                out[base + o] += bias[o];
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<float> to_heads_ref(const std::vector<float>& x,
                                 size_t batch,
                                 size_t seq_len,
@@ -112,6 +131,34 @@ std::vector<float> to_heads_ref(const std::vector<float>& x,
                 const size_t out_base = ((b * num_heads + h) * seq_len + s) * head_dim;
                 for (size_t d = 0; d < head_dim; ++d) {
                     out[out_base + d] = x[in_base + h * head_dim + d];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<float> rmsnorm_heads_ref(const std::vector<float>& x,
+                                     const std::vector<float>& weight,
+                                     size_t batch,
+                                     size_t num_heads,
+                                     size_t seq_len,
+                                     size_t head_dim,
+                                     float eps) {
+    std::vector<float> out(x.size(), 0.0f);
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t h = 0; h < num_heads; ++h) {
+            for (size_t s = 0; s < seq_len; ++s) {
+                const size_t base = ((b * num_heads + h) * seq_len + s) * head_dim;
+                float sumsq = 0.0f;
+                for (size_t d = 0; d < head_dim; ++d) {
+                    const float v = x[base + d];
+                    sumsq += v * v;
+                }
+                const float mean = sumsq / static_cast<float>(head_dim);
+                const float inv = 1.0f / std::sqrt(mean + eps);
+                for (size_t d = 0; d < head_dim; ++d) {
+                    out[base + d] = x[base + d] * inv * weight[d];
                 }
             }
         }
@@ -175,28 +222,75 @@ std::vector<float> apply_rope_ref(const std::vector<float>& x,
     return out;
 }
 
+std::vector<float> repeat_kv_ref(const std::vector<float>& x,
+                                 size_t batch,
+                                 size_t num_heads,
+                                 size_t num_kv_heads,
+                                 size_t seq_len,
+                                 size_t head_dim) {
+    if (num_heads == num_kv_heads) {
+        return x;
+    }
+    std::vector<float> out(batch * num_heads * seq_len * head_dim, 0.0f);
+    const size_t repeats = num_heads / num_kv_heads;
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t kv = 0; kv < num_kv_heads; ++kv) {
+            for (size_t r = 0; r < repeats; ++r) {
+                const size_t h = kv * repeats + r;
+                for (size_t s = 0; s < seq_len; ++s) {
+                    const size_t in_base = ((b * num_kv_heads + kv) * seq_len + s) * head_dim;
+                    const size_t out_base = ((b * num_heads + h) * seq_len + s) * head_dim;
+                    for (size_t d = 0; d < head_dim; ++d) {
+                        out[out_base + d] = x[in_base + d];
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<float> attention_ref(const std::vector<float>& hidden,
                                  const std::vector<float>& q_w,
+                                 const std::vector<float>& q_b,
                                  const std::vector<float>& k_w,
+                                 const std::vector<float>& k_b,
                                  const std::vector<float>& v_w,
+                                 const std::vector<float>& v_b,
                                  const std::vector<float>& o_w,
+                                 const std::vector<float>& o_b,
+                                 const std::vector<float>* q_norm_w,
+                                 const std::vector<float>* k_norm_w,
                                  const std::vector<int64_t>& positions,
                                  size_t batch,
                                  size_t seq_len,
                                  size_t hidden_size,
                                  size_t num_heads,
+                                 size_t num_kv_heads,
                                  size_t head_dim,
-                                 float rope_theta) {
-    auto q = linear_ref_3d(hidden, q_w, batch, seq_len, hidden_size, hidden_size);
-    auto k = linear_ref_3d(hidden, k_w, batch, seq_len, hidden_size, hidden_size);
-    auto v = linear_ref_3d(hidden, v_w, batch, seq_len, hidden_size, hidden_size);
+                                 float rope_theta,
+                                 float rms_norm_eps) {
+    const size_t kv_hidden = num_kv_heads * head_dim;
+    auto q = linear_ref_3d_bias(hidden, q_w, q_b, batch, seq_len, hidden_size, hidden_size);
+    auto k = linear_ref_3d_bias(hidden, k_w, k_b, batch, seq_len, hidden_size, kv_hidden);
+    auto v = linear_ref_3d_bias(hidden, v_w, v_b, batch, seq_len, hidden_size, kv_hidden);
 
     auto qh = to_heads_ref(q, batch, seq_len, num_heads, head_dim);
-    auto kh = to_heads_ref(k, batch, seq_len, num_heads, head_dim);
-    auto vh = to_heads_ref(v, batch, seq_len, num_heads, head_dim);
+    auto kh = to_heads_ref(k, batch, seq_len, num_kv_heads, head_dim);
+    auto vh = to_heads_ref(v, batch, seq_len, num_kv_heads, head_dim);
+
+    if (q_norm_w) {
+        qh = rmsnorm_heads_ref(qh, *q_norm_w, batch, num_heads, seq_len, head_dim, rms_norm_eps);
+    }
+    if (k_norm_w) {
+        kh = rmsnorm_heads_ref(kh, *k_norm_w, batch, num_kv_heads, seq_len, head_dim, rms_norm_eps);
+    }
 
     qh = apply_rope_ref(qh, positions, batch, seq_len, num_heads, head_dim, rope_theta);
-    kh = apply_rope_ref(kh, positions, batch, seq_len, num_heads, head_dim, rope_theta);
+    kh = apply_rope_ref(kh, positions, batch, seq_len, num_kv_heads, head_dim, rope_theta);
+
+    auto kh_expanded = repeat_kv_ref(kh, batch, num_heads, num_kv_heads, seq_len, head_dim);
+    auto vh_expanded = repeat_kv_ref(vh, batch, num_heads, num_kv_heads, seq_len, head_dim);
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     std::vector<float> attn_probs(batch * num_heads * seq_len * seq_len, 0.0f);
@@ -211,7 +305,7 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
                     const size_t q_base = ((b * num_heads + h) * seq_len + i) * head_dim;
                     const size_t k_base = ((b * num_heads + h) * seq_len + j) * head_dim;
                     for (size_t d = 0; d < head_dim; ++d) {
-                        acc += qh[q_base + d] * kh[k_base + d];
+                        acc += qh[q_base + d] * kh_expanded[k_base + d];
                     }
                     acc *= scale;
                     scores[j] = acc;
@@ -242,7 +336,7 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
                     float acc = 0.0f;
                     for (size_t j = 0; j < seq_len; ++j) {
                         const size_t v_base = ((b * num_heads + h) * seq_len + j) * head_dim;
-                        acc += attn_probs[prob_base + j] * vh[v_base + d];
+                        acc += attn_probs[prob_base + j] * vh_expanded[v_base + d];
                     }
                     context[ctx_base + d] = acc;
                 }
@@ -251,7 +345,7 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
     }
 
     auto merged = merge_heads_ref(context, batch, seq_len, num_heads, head_dim);
-    return linear_ref_3d(merged, o_w, batch, seq_len, hidden_size, hidden_size);
+    return linear_ref_3d_bias(merged, o_w, o_b, batch, seq_len, hidden_size, hidden_size);
 }
 
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
@@ -271,22 +365,41 @@ TEST(Qwen3Attention, MatchesReference) {
     const size_t seq_len = 2;
     const size_t hidden = 4;
     const size_t num_heads = 2;
-    const size_t num_kv_heads = 2;
+    const size_t num_kv_heads = 1;
     const size_t head_dim = 2;
     const float rope_theta = 10000.0f;
+    const size_t kv_hidden = num_kv_heads * head_dim;
 
-    const ov::Shape attn_weight_shape{hidden, hidden};
+    const ov::Shape q_weight_shape{hidden, hidden};
+    const ov::Shape kv_weight_shape{kv_hidden, hidden};
+    const ov::Shape o_weight_shape{hidden, hidden};
+    const ov::Shape q_bias_shape{hidden};
+    const ov::Shape kv_bias_shape{kv_hidden};
+    const ov::Shape o_bias_shape{hidden};
+    const ov::Shape qk_norm_shape{head_dim};
 
     const auto q_w = make_seq(hidden * hidden, 0.01f, 0.01f);
-    const auto k_w = make_seq(hidden * hidden, 0.02f, 0.01f);
-    const auto v_w = make_seq(hidden * hidden, 0.03f, 0.01f);
+    const auto k_w = make_seq(kv_hidden * hidden, 0.02f, 0.01f);
+    const auto v_w = make_seq(kv_hidden * hidden, 0.03f, 0.01f);
     const auto o_w = make_seq(hidden * hidden, 0.04f, 0.01f);
+    const auto q_b = make_seq(hidden, 0.05f, 0.01f);
+    const auto k_b = make_seq(kv_hidden, -0.02f, 0.01f);
+    const auto v_b = make_seq(kv_hidden, 0.03f, 0.005f);
+    const auto o_b = make_seq(hidden, -0.01f, 0.02f);
+    const auto q_norm_w = make_seq(head_dim, 1.0f, 0.02f);
+    const auto k_norm_w = make_seq(head_dim, 0.9f, 0.03f);
 
     DummyWeightSource weights;
-    weights.add("self_attn.q_proj.weight", make_tensor(q_w, attn_weight_shape));
-    weights.add("self_attn.k_proj.weight", make_tensor(k_w, attn_weight_shape));
-    weights.add("self_attn.v_proj.weight", make_tensor(v_w, attn_weight_shape));
-    weights.add("self_attn.o_proj.weight", make_tensor(o_w, attn_weight_shape));
+    weights.add("self_attn.q_proj.weight", make_tensor(q_w, q_weight_shape));
+    weights.add("self_attn.q_proj.bias", make_tensor(q_b, q_bias_shape));
+    weights.add("self_attn.k_proj.weight", make_tensor(k_w, kv_weight_shape));
+    weights.add("self_attn.k_proj.bias", make_tensor(k_b, kv_bias_shape));
+    weights.add("self_attn.v_proj.weight", make_tensor(v_w, kv_weight_shape));
+    weights.add("self_attn.v_proj.bias", make_tensor(v_b, kv_bias_shape));
+    weights.add("self_attn.o_proj.weight", make_tensor(o_w, o_weight_shape));
+    weights.add("self_attn.o_proj.bias", make_tensor(o_b, o_bias_shape));
+    weights.add("self_attn.q_norm.weight", make_tensor(q_norm_w, qk_norm_shape));
+    weights.add("self_attn.k_norm.weight", make_tensor(k_norm_w, qk_norm_shape));
 
     DummyWeightFinalizer finalizer;
 
@@ -296,7 +409,8 @@ TEST(Qwen3Attention, MatchesReference) {
     cfg.num_key_value_heads = static_cast<int32_t>(num_kv_heads);
     cfg.head_dim = static_cast<int32_t>(head_dim);
     cfg.rope_theta = rope_theta;
-    cfg.attention_bias = true;
+    // attention_bias toggles qk_norm in this impl; keep biases to cover add-bias path.
+    cfg.attention_bias = false;
 
     ov::genai::modeling::models::Qwen3Attention attn(ctx, "self_attn", cfg);
     ov::genai::modeling::weights::load_model(attn, weights, finalizer);
@@ -329,16 +443,24 @@ TEST(Qwen3Attention, MatchesReference) {
 
     auto expected = attention_ref(hidden_data,
                                   q_w,
+                                  q_b,
                                   k_w,
+                                  k_b,
                                   v_w,
+                                  v_b,
                                   o_w,
+                                  o_b,
+                                  &q_norm_w,
+                                  &k_norm_w,
                                   position_ids,
                                   batch,
                                   seq_len,
                                   hidden,
                                   num_heads,
+                                  num_kv_heads,
                                   head_dim,
-                                  rope_theta);
+                                  rope_theta,
+                                  cfg.rms_norm_eps);
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
