@@ -23,11 +23,55 @@ namespace models {
 struct Qwen3DenseConfig {
     std::string architecture = "qwen3";
     int32_t hidden_size = 0;
+    int32_t num_attention_heads = 0;
+    int32_t num_key_value_heads = 0;
+    int32_t head_dim = 0;
     int32_t intermediate_size = 0;
     int32_t num_hidden_layers = 0;
     float rms_norm_eps = 1e-6f;
+    float rope_theta = 10000.0f;
     std::string hidden_act = "silu";
+    bool attention_bias = true;
     bool tie_word_embeddings = false;
+};
+
+class Qwen3Attention : public Module {
+public:
+    Qwen3Attention(BuilderContext& ctx, const std::string& name, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
+
+    Tensor forward(const Tensor& positions, const Tensor& hidden_states) const;
+
+private:
+    const Tensor& q_proj_weight() const;
+    const Tensor& k_proj_weight() const;
+    const Tensor& v_proj_weight() const;
+    const Tensor& o_proj_weight() const;
+
+    const Tensor* q_proj_bias() const;
+    const Tensor* k_proj_bias() const;
+    const Tensor* v_proj_bias() const;
+    const Tensor* o_proj_bias() const;
+
+    int32_t num_heads_ = 0;
+    int32_t num_kv_heads_ = 0;
+    int32_t head_dim_ = 0;
+    int32_t hidden_size_ = 0;
+    float scaling_ = 1.0f;
+    float rope_theta_ = 10000.0f;
+    bool use_qk_norm_ = false;
+
+    WeightParameter* q_proj_param_ = nullptr;
+    WeightParameter* k_proj_param_ = nullptr;
+    WeightParameter* v_proj_param_ = nullptr;
+    WeightParameter* o_proj_param_ = nullptr;
+
+    WeightParameter* q_bias_param_ = nullptr;
+    WeightParameter* k_bias_param_ = nullptr;
+    WeightParameter* v_bias_param_ = nullptr;
+    WeightParameter* o_bias_param_ = nullptr;
+
+    RMSNorm q_norm_;
+    RMSNorm k_norm_;
 };
 
 class Qwen3MLP : public Module {
@@ -55,6 +99,7 @@ public:
                                       const std::optional<Tensor>& residual) const;
 
 private:
+    Qwen3Attention self_attn_;
     Qwen3MLP mlp_;
     RMSNorm input_layernorm_;
     RMSNorm post_attention_layernorm_;

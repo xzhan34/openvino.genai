@@ -64,6 +64,11 @@ std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
     cfg.architecture = std::get<std::string>(configs.at("architecture"));
     cfg.hidden_size = std::get<int>(configs.at("hidden_size"));
     cfg.num_hidden_layers = std::get<int>(configs.at("layer_num"));
+    cfg.num_attention_heads = std::get<int>(configs.at("head_num"));
+    cfg.num_key_value_heads = std::get<int>(configs.at("head_num_kv"));
+    cfg.head_dim = std::get<int>(configs.at("head_size"));
+    cfg.rope_theta = std::get<float>(configs.at("rope_freq_base"));
+    cfg.attention_bias = consts.count("model.layers[0].self_attn.q_proj.bias") > 0;
     cfg.rms_norm_eps = std::get<float>(configs.at("rms_norm_eps"));
     cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
 

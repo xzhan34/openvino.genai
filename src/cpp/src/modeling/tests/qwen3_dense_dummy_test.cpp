@@ -181,6 +181,162 @@ std::vector<float> mlp_ref(const std::vector<float>& x,
     return linear_ref_3d(gated, down_w, batch, seq_len, intermediate, hidden);
 }
 
+std::vector<float> to_heads_ref(const std::vector<float>& x,
+                                size_t batch,
+                                size_t seq_len,
+                                size_t num_heads,
+                                size_t head_dim) {
+    std::vector<float> out(batch * num_heads * seq_len * head_dim, 0.0f);
+    const size_t hidden = num_heads * head_dim;
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const size_t in_base = (b * seq_len + s) * hidden;
+            for (size_t h = 0; h < num_heads; ++h) {
+                const size_t out_base = ((b * num_heads + h) * seq_len + s) * head_dim;
+                for (size_t d = 0; d < head_dim; ++d) {
+                    out[out_base + d] = x[in_base + h * head_dim + d];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<float> merge_heads_ref(const std::vector<float>& x,
+                                   size_t batch,
+                                   size_t seq_len,
+                                   size_t num_heads,
+                                   size_t head_dim) {
+    std::vector<float> out(batch * seq_len * num_heads * head_dim, 0.0f);
+    const size_t hidden = num_heads * head_dim;
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const size_t out_base = (b * seq_len + s) * hidden;
+            for (size_t h = 0; h < num_heads; ++h) {
+                const size_t in_base = ((b * num_heads + h) * seq_len + s) * head_dim;
+                for (size_t d = 0; d < head_dim; ++d) {
+                    out[out_base + h * head_dim + d] = x[in_base + d];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<float> apply_rope_ref(const std::vector<float>& x,
+                                  const std::vector<int64_t>& positions,
+                                  size_t batch,
+                                  size_t seq_len,
+                                  size_t num_heads,
+                                  size_t head_dim,
+                                  float rope_theta) {
+    const size_t half_dim = head_dim / 2;
+    std::vector<float> inv_freq(half_dim, 0.0f);
+    for (size_t i = 0; i < half_dim; ++i) {
+        float exponent = static_cast<float>(2 * i) / static_cast<float>(head_dim);
+        inv_freq[i] = 1.0f / std::pow(rope_theta, exponent);
+    }
+
+    std::vector<float> out(x.size(), 0.0f);
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t s = 0; s < seq_len; ++s) {
+            const float pos = static_cast<float>(positions[b * seq_len + s]);
+            for (size_t i = 0; i < half_dim; ++i) {
+                const float angle = pos * inv_freq[i];
+                const float c = std::cos(angle);
+                const float si = std::sin(angle);
+                for (size_t h = 0; h < num_heads; ++h) {
+                    const size_t base = ((b * num_heads + h) * seq_len + s) * head_dim;
+                    const float x1 = x[base + i];
+                    const float x2 = x[base + i + half_dim];
+                    out[base + i] = x1 * c - x2 * si;
+                    out[base + i + half_dim] = x1 * si + x2 * c;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<float> attention_ref(const std::vector<float>& hidden,
+                                 const std::vector<float>& q_w,
+                                 const std::vector<float>& k_w,
+                                 const std::vector<float>& v_w,
+                                 const std::vector<float>& o_w,
+                                 const std::vector<int64_t>& positions,
+                                 size_t batch,
+                                 size_t seq_len,
+                                 size_t hidden_size,
+                                 size_t num_heads,
+                                 size_t head_dim,
+                                 float rope_theta) {
+    auto q = linear_ref_3d(hidden, q_w, batch, seq_len, hidden_size, hidden_size);
+    auto k = linear_ref_3d(hidden, k_w, batch, seq_len, hidden_size, hidden_size);
+    auto v = linear_ref_3d(hidden, v_w, batch, seq_len, hidden_size, hidden_size);
+
+    auto qh = to_heads_ref(q, batch, seq_len, num_heads, head_dim);
+    auto kh = to_heads_ref(k, batch, seq_len, num_heads, head_dim);
+    auto vh = to_heads_ref(v, batch, seq_len, num_heads, head_dim);
+
+    qh = apply_rope_ref(qh, positions, batch, seq_len, num_heads, head_dim, rope_theta);
+    kh = apply_rope_ref(kh, positions, batch, seq_len, num_heads, head_dim, rope_theta);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    std::vector<float> attn_probs(batch * num_heads * seq_len * seq_len, 0.0f);
+    std::vector<float> scores(seq_len, 0.0f);
+
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t h = 0; h < num_heads; ++h) {
+            for (size_t i = 0; i < seq_len; ++i) {
+                float max_score = -1e30f;
+                for (size_t j = 0; j < seq_len; ++j) {
+                    float acc = 0.0f;
+                    const size_t q_base = ((b * num_heads + h) * seq_len + i) * head_dim;
+                    const size_t k_base = ((b * num_heads + h) * seq_len + j) * head_dim;
+                    for (size_t d = 0; d < head_dim; ++d) {
+                        acc += qh[q_base + d] * kh[k_base + d];
+                    }
+                    acc *= scale;
+                    scores[j] = acc;
+                    if (acc > max_score) {
+                        max_score = acc;
+                    }
+                }
+                float sum = 0.0f;
+                for (size_t j = 0; j < seq_len; ++j) {
+                    scores[j] = std::exp(scores[j] - max_score);
+                    sum += scores[j];
+                }
+                const size_t prob_base = ((b * num_heads + h) * seq_len + i) * seq_len;
+                for (size_t j = 0; j < seq_len; ++j) {
+                    attn_probs[prob_base + j] = scores[j] / sum;
+                }
+            }
+        }
+    }
+
+    std::vector<float> context(batch * num_heads * seq_len * head_dim, 0.0f);
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t h = 0; h < num_heads; ++h) {
+            for (size_t i = 0; i < seq_len; ++i) {
+                const size_t prob_base = ((b * num_heads + h) * seq_len + i) * seq_len;
+                const size_t ctx_base = ((b * num_heads + h) * seq_len + i) * head_dim;
+                for (size_t d = 0; d < head_dim; ++d) {
+                    float acc = 0.0f;
+                    for (size_t j = 0; j < seq_len; ++j) {
+                        const size_t v_base = ((b * num_heads + h) * seq_len + j) * head_dim;
+                        acc += attn_probs[prob_base + j] * vh[v_base + d];
+                    }
+                    context[ctx_base + d] = acc;
+                }
+            }
+        }
+    }
+
+    auto merged = merge_heads_ref(context, batch, seq_len, num_heads, head_dim);
+    return linear_ref_3d(merged, o_w, batch, seq_len, hidden_size, hidden_size);
+}
+
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
     ASSERT_EQ(output.get_size(), expected.size());
     const float* out_data = output.data<const float>();
@@ -198,14 +354,19 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     const size_t seq_len = 3;
     const size_t vocab = 6;
     const size_t hidden = 4;
+    const size_t num_heads = 2;
+    const size_t num_kv_heads = 2;
+    const size_t head_dim = 2;
+    const float rope_theta = 10000.0f;
     const size_t intermediate = 6;
-    const size_t num_layers = 2;
+    const size_t num_layers = 1;
 
     const ov::Shape embed_shape{vocab, hidden};
     const ov::Shape norm_shape{hidden};
     const ov::Shape lm_head_shape{vocab, hidden};
     const ov::Shape mlp_up_shape{intermediate, hidden};
     const ov::Shape mlp_down_shape{hidden, intermediate};
+    const ov::Shape attn_weight_shape{hidden, hidden};
 
     const std::vector<float> embed_weight = {
         0.f, 1.f, 2.f, 3.f,      //
@@ -215,8 +376,8 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
         40.f, 41.f, 42.f, 43.f,  //
         50.f, 51.f, 52.f, 53.f,  //
     };
+    const std::vector<float> input_norm_weight0 = {1.0f, 0.8f, 1.2f, 0.9f};
     const std::vector<float> post_norm_weight0 = {1.0f, 0.9f, 1.1f, 1.05f};
-    const std::vector<float> post_norm_weight1 = {0.95f, 1.05f, 1.0f, 0.9f};
     const std::vector<float> norm_weight = {1.f, 1.f, 1.f, 1.f};
     const std::vector<float> lm_head_weight = {
         1.f, 0.f, 0.f, 0.f,    //
@@ -226,23 +387,25 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
         1.f, 1.f, 1.f, 1.f,    //
         -1.f, -1.f, -1.f, -1.f //
     };
-    const auto gate_w0 = make_seq(intermediate * hidden, 0.01f, 0.01f);
-    const auto up_w0 = make_seq(intermediate * hidden, 0.02f, 0.01f);
-    const auto down_w0 = make_seq(hidden * intermediate, 0.03f, 0.01f);
-    const auto gate_w1 = make_seq(intermediate * hidden, 0.015f, 0.01f);
-    const auto up_w1 = make_seq(intermediate * hidden, 0.025f, 0.01f);
-    const auto down_w1 = make_seq(hidden * intermediate, 0.035f, 0.01f);
+    const auto q_w0 = make_seq(hidden * hidden, 0.01f, 0.01f);
+    const auto k_w0 = make_seq(hidden * hidden, 0.02f, 0.01f);
+    const auto v_w0 = make_seq(hidden * hidden, 0.03f, 0.01f);
+    const auto o_w0 = make_seq(hidden * hidden, 0.04f, 0.01f);
+    const auto gate_w0 = make_seq(intermediate * hidden, 0.05f, 0.01f);
+    const auto up_w0 = make_seq(intermediate * hidden, 0.06f, 0.01f);
+    const auto down_w0 = make_seq(hidden * intermediate, 0.07f, 0.01f);
 
     DummyWeightSource weights;
     weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
+    weights.add("model.layers[0].input_layernorm.weight", make_tensor(input_norm_weight0, norm_shape));
+    weights.add("model.layers[0].self_attn.q_proj.weight", make_tensor(q_w0, attn_weight_shape));
+    weights.add("model.layers[0].self_attn.k_proj.weight", make_tensor(k_w0, attn_weight_shape));
+    weights.add("model.layers[0].self_attn.v_proj.weight", make_tensor(v_w0, attn_weight_shape));
+    weights.add("model.layers[0].self_attn.o_proj.weight", make_tensor(o_w0, attn_weight_shape));
     weights.add("model.layers[0].post_attention_layernorm.weight", make_tensor(post_norm_weight0, norm_shape));
     weights.add("model.layers[0].mlp.gate_proj.weight", make_tensor(gate_w0, mlp_up_shape));
     weights.add("model.layers[0].mlp.up_proj.weight", make_tensor(up_w0, mlp_up_shape));
     weights.add("model.layers[0].mlp.down_proj.weight", make_tensor(down_w0, mlp_down_shape));
-    weights.add("model.layers[1].post_attention_layernorm.weight", make_tensor(post_norm_weight1, norm_shape));
-    weights.add("model.layers[1].mlp.gate_proj.weight", make_tensor(gate_w1, mlp_up_shape));
-    weights.add("model.layers[1].mlp.up_proj.weight", make_tensor(up_w1, mlp_up_shape));
-    weights.add("model.layers[1].mlp.down_proj.weight", make_tensor(down_w1, mlp_down_shape));
     weights.add("model.norm.weight", make_tensor(norm_weight, norm_shape));
     weights.add("lm_head.weight", make_tensor(lm_head_weight, lm_head_shape));
 
@@ -251,10 +414,15 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
     cfg.hidden_size = static_cast<int32_t>(hidden);
+    cfg.num_attention_heads = static_cast<int32_t>(num_heads);
+    cfg.num_key_value_heads = static_cast<int32_t>(num_kv_heads);
+    cfg.head_dim = static_cast<int32_t>(head_dim);
     cfg.intermediate_size = static_cast<int32_t>(intermediate);
     cfg.num_hidden_layers = static_cast<int32_t>(num_layers);
     cfg.rms_norm_eps = 1e-6f;
+    cfg.rope_theta = rope_theta;
     cfg.hidden_act = "silu";
+    cfg.attention_bias = true;
     cfg.tie_word_embeddings = false;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
@@ -284,39 +452,32 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
 
     request.infer();
 
-    // Reference: embedding -> (post-attn rmsnorm -> mlp) * num_layers -> final rmsnorm -> linear
+    // Reference: embedding -> input rmsnorm -> attention -> post rmsnorm -> mlp -> final rmsnorm -> linear
     auto hidden0 = embedding_ref(input_ids_data, embed_weight, batch, seq_len, vocab, hidden);
     std::vector<float> residual;
-    bool has_residual = false;
 
-    std::vector<float> normed;
-    std::vector<float> sum;
+    auto normed = rmsnorm_ref(hidden0, input_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+    residual = hidden0;
+    auto attn_out = attention_ref(normed,
+                                  q_w0,
+                                  k_w0,
+                                  v_w0,
+                                  o_w0,
+                                  position_ids_data,
+                                  batch,
+                                  seq_len,
+                                  hidden,
+                                  num_heads,
+                                  head_dim,
+                                  rope_theta);
+    auto sum = add_ref(attn_out, residual);
+    normed = rmsnorm_ref(sum, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+    residual = sum;
 
-    // Layer 0
-    if (has_residual) {
-        sum = add_ref(hidden0, residual);
-        normed = rmsnorm_ref(sum, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
-        residual = sum;
-    } else {
-        normed = rmsnorm_ref(hidden0, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
-        residual = hidden0;
-        has_residual = true;
-    }
     hidden0 = mlp_ref(normed, gate_w0, up_w0, down_w0, batch, seq_len, hidden, intermediate);
 
-    // Layer 1
     sum = add_ref(hidden0, residual);
-    normed = rmsnorm_ref(sum, post_norm_weight1, batch, seq_len, hidden, cfg.rms_norm_eps);
-    residual = sum;
-    hidden0 = mlp_ref(normed, gate_w1, up_w1, down_w1, batch, seq_len, hidden, intermediate);
-
-    // Final norm
-    if (has_residual) {
-        sum = add_ref(hidden0, residual);
-        hidden0 = rmsnorm_ref(sum, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
-    } else {
-        hidden0 = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
-    }
+    hidden0 = rmsnorm_ref(sum, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
     auto expected = linear_ref_3d(hidden0, lm_head_weight, batch, seq_len, hidden, vocab);
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
@@ -328,7 +489,11 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     const size_t batch = 1;
     const size_t seq_len = 2;
     const size_t vocab = 4;
-    const size_t hidden = 3;
+    const size_t hidden = 4;
+    const size_t num_heads = 2;
+    const size_t num_kv_heads = 2;
+    const size_t head_dim = 2;
+    const float rope_theta = 10000.0f;
     const size_t intermediate = 4;
     const size_t num_layers = 1;
 
@@ -336,21 +501,32 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     const ov::Shape norm_shape{hidden};
     const ov::Shape mlp_up_shape{intermediate, hidden};
     const ov::Shape mlp_down_shape{hidden, intermediate};
+    const ov::Shape attn_weight_shape{hidden, hidden};
 
     const std::vector<float> embed_weight = {
-        0.f, 1.f, 2.f,  //
-        3.f, 4.f, 5.f,  //
-        6.f, 7.f, 8.f,  //
-        9.f, 10.f, 11.f //
+        0.f, 1.f, 2.f, 3.f,    //
+        4.f, 5.f, 6.f, 7.f,    //
+        8.f, 9.f, 10.f, 11.f,  //
+        12.f, 13.f, 14.f, 15.f //
     };
-    const std::vector<float> post_norm_weight0 = {0.9f, 1.1f, 1.0f};
-    const std::vector<float> norm_weight = {1.f, 1.f, 1.f};
-    const auto gate_w0 = make_seq(intermediate * hidden, 0.01f, 0.02f);
-    const auto up_w0 = make_seq(intermediate * hidden, 0.015f, 0.02f);
-    const auto down_w0 = make_seq(hidden * intermediate, 0.02f, 0.02f);
+    const std::vector<float> input_norm_weight0 = {0.9f, 1.1f, 1.0f, 0.95f};
+    const std::vector<float> post_norm_weight0 = {0.9f, 1.05f, 1.0f, 0.95f};
+    const std::vector<float> norm_weight = {1.f, 1.f, 1.f, 1.f};
+    const auto q_w0 = make_seq(hidden * hidden, 0.01f, 0.01f);
+    const auto k_w0 = make_seq(hidden * hidden, 0.02f, 0.01f);
+    const auto v_w0 = make_seq(hidden * hidden, 0.03f, 0.01f);
+    const auto o_w0 = make_seq(hidden * hidden, 0.04f, 0.01f);
+    const auto gate_w0 = make_seq(intermediate * hidden, 0.05f, 0.02f);
+    const auto up_w0 = make_seq(intermediate * hidden, 0.06f, 0.02f);
+    const auto down_w0 = make_seq(hidden * intermediate, 0.07f, 0.02f);
 
     DummyWeightSource weights;
     weights.add("model.embed_tokens.weight", make_tensor(embed_weight, embed_shape));
+    weights.add("model.layers[0].input_layernorm.weight", make_tensor(input_norm_weight0, norm_shape));
+    weights.add("model.layers[0].self_attn.q_proj.weight", make_tensor(q_w0, attn_weight_shape));
+    weights.add("model.layers[0].self_attn.k_proj.weight", make_tensor(k_w0, attn_weight_shape));
+    weights.add("model.layers[0].self_attn.v_proj.weight", make_tensor(v_w0, attn_weight_shape));
+    weights.add("model.layers[0].self_attn.o_proj.weight", make_tensor(o_w0, attn_weight_shape));
     weights.add("model.layers[0].post_attention_layernorm.weight", make_tensor(post_norm_weight0, norm_shape));
     weights.add("model.layers[0].mlp.gate_proj.weight", make_tensor(gate_w0, mlp_up_shape));
     weights.add("model.layers[0].mlp.up_proj.weight", make_tensor(up_w0, mlp_up_shape));
@@ -362,10 +538,15 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.architecture = "qwen3";
     cfg.hidden_size = static_cast<int32_t>(hidden);
+    cfg.num_attention_heads = static_cast<int32_t>(num_heads);
+    cfg.num_key_value_heads = static_cast<int32_t>(num_kv_heads);
+    cfg.head_dim = static_cast<int32_t>(head_dim);
     cfg.intermediate_size = static_cast<int32_t>(intermediate);
     cfg.num_hidden_layers = static_cast<int32_t>(num_layers);
     cfg.rms_norm_eps = 1e-6f;
+    cfg.rope_theta = rope_theta;
     cfg.hidden_act = "silu";
+    cfg.attention_bias = true;
     cfg.tie_word_embeddings = true;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
@@ -400,28 +581,29 @@ TEST(Qwen3DenseDummy, TiedWeights) {
 
     auto hidden0 = embedding_ref(input_ids_data, embed_weight, batch, seq_len, vocab, hidden);
     std::vector<float> residual;
-    bool has_residual = false;
 
-    std::vector<float> normed;
-    std::vector<float> sum;
+    auto normed = rmsnorm_ref(hidden0, input_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+    residual = hidden0;
+    auto attn_out = attention_ref(normed,
+                                  q_w0,
+                                  k_w0,
+                                  v_w0,
+                                  o_w0,
+                                  position_ids_data,
+                                  batch,
+                                  seq_len,
+                                  hidden,
+                                  num_heads,
+                                  head_dim,
+                                  rope_theta);
+    auto sum = add_ref(attn_out, residual);
+    normed = rmsnorm_ref(sum, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
+    residual = sum;
 
-    if (has_residual) {
-        sum = add_ref(hidden0, residual);
-        normed = rmsnorm_ref(sum, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
-        residual = sum;
-    } else {
-        normed = rmsnorm_ref(hidden0, post_norm_weight0, batch, seq_len, hidden, cfg.rms_norm_eps);
-        residual = hidden0;
-        has_residual = true;
-    }
     hidden0 = mlp_ref(normed, gate_w0, up_w0, down_w0, batch, seq_len, hidden, intermediate);
 
-    if (has_residual) {
-        sum = add_ref(hidden0, residual);
-        hidden0 = rmsnorm_ref(sum, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
-    } else {
-        hidden0 = rmsnorm_ref(hidden0, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
-    }
+    sum = add_ref(hidden0, residual);
+    hidden0 = rmsnorm_ref(sum, norm_weight, batch, seq_len, hidden, cfg.rms_norm_eps);
     auto expected = linear_ref_3d(hidden0, embed_weight, batch, seq_len, hidden, vocab);
 
     expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
