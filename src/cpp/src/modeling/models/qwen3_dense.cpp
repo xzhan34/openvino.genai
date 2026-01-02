@@ -24,10 +24,6 @@ ov::Output<ov::Node> i64_vec(const std::vector<int64_t>& values) {
     return ov::op::v0::Constant::create(ov::element::i64, ov::Shape{values.size()}, values);
 }
 
-ov::Output<ov::Node> i32_vec(const std::vector<int32_t>& values) {
-    return ov::op::v0::Constant::create(ov::element::i32, ov::Shape{values.size()}, values);
-}
-
 ov::genai::modeling::Tensor add_bias_if_present(const ov::genai::modeling::Tensor& x,
                                                 const ov::genai::modeling::Tensor* bias) {
     if (!bias) {
@@ -37,24 +33,15 @@ ov::genai::modeling::Tensor add_bias_if_present(const ov::genai::modeling::Tenso
 }
 
 ov::genai::modeling::Tensor reshape_to_heads(const ov::genai::modeling::Tensor& x,
-                                             int32_t num_heads,
-                                             int32_t head_dim) {
-    auto* ctx = x.context();
-    auto shape = i64_vec({0, 0, num_heads, head_dim});
-    auto reshaped = std::make_shared<ov::op::v1::Reshape>(x.output(), shape, true);
-    auto order = i32_vec({0, 2, 1, 3});
-    auto transposed = std::make_shared<ov::op::v1::Transpose>(reshaped, order);
-    return ov::genai::modeling::Tensor(transposed, ctx);
+                                            int32_t num_heads,
+                                            int32_t head_dim) {
+   return x.reshape({0, 0, num_heads, head_dim}).permute({0, 2, 1, 3});
 }
 
 ov::genai::modeling::Tensor merge_heads(const ov::genai::modeling::Tensor& x, int32_t hidden_size) {
-    auto* ctx = x.context();
-    auto order = i32_vec({0, 2, 1, 3});
-    auto transposed = std::make_shared<ov::op::v1::Transpose>(x.output(), order);
-    auto shape = i64_vec({0, 0, hidden_size});
-    auto reshaped = std::make_shared<ov::op::v1::Reshape>(transposed, shape, true);
-    return ov::genai::modeling::Tensor(reshaped, ctx);
+   return x.permute({0, 2, 1, 3}).reshape({0, 0, hidden_size});
 }
+
 
 std::pair<ov::genai::modeling::Tensor, ov::genai::modeling::Tensor> rope_cos_sin(
     const ov::genai::modeling::Tensor& positions,

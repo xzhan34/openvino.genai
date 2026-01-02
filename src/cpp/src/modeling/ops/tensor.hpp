@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
+#include <vector>
 
 #include <openvino/openvino.hpp>
 
@@ -27,6 +29,19 @@ public:
     Tensor pow(float exp) const;
     Tensor mean(int64_t axis, bool keepdim = true) const;
     Tensor rsqrt() const;
+    Tensor reshape(const ov::Output<ov::Node>& shape, bool special_zero = true) const;
+    Tensor reshape(const std::vector<int64_t>& shape, bool special_zero = true) const;
+    Tensor reshape(std::initializer_list<int64_t> shape, bool special_zero = true) const;
+    Tensor permute(const std::vector<int32_t>& order) const;
+    Tensor permute(std::initializer_list<int32_t> order) const;
+    Tensor transpose(const std::vector<int32_t>& order) const;
+    Tensor transpose(std::initializer_list<int32_t> order) const;
+    Tensor unsqueeze(int64_t axis) const;
+    Tensor unsqueeze(const std::vector<int64_t>& axes) const;
+    Tensor unsqueeze(std::initializer_list<int64_t> axes) const;
+    Tensor squeeze(int64_t axis) const;
+    Tensor squeeze(const std::vector<int64_t>& axes) const;
+    Tensor squeeze(std::initializer_list<int64_t> axes) const;
 
 private:
     ov::Output<ov::Node> value_;

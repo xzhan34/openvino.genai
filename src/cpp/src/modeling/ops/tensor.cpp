@@ -3,6 +3,8 @@
 
 #include "modeling/ops/tensor.hpp"
 
+#include <vector>
+
 #include <openvino/core/except.hpp>
 #include <openvino/opsets/opset13.hpp>
 
@@ -23,6 +25,14 @@ ov::Output<ov::Node> scalar_f32(ov::genai::modeling::OpContext* ctx, float v) {
         return ctx->scalar_f32(v);
     }
     return ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {v});
+}
+
+ov::Output<ov::Node> i64_vec(const std::vector<int64_t>& values) {
+    return ov::op::v0::Constant::create(ov::element::i64, ov::Shape{values.size()}, values);
+}
+
+ov::Output<ov::Node> i32_vec(const std::vector<int32_t>& values) {
+    return ov::op::v0::Constant::create(ov::element::i32, ov::Shape{values.size()}, values);
 }
 
 }  // namespace
@@ -70,6 +80,62 @@ Tensor Tensor::rsqrt() const {
     auto one = scalar_f32(ctx_, 1.0f);
     auto node = std::make_shared<ov::op::v1::Divide>(one, sqrt_node, ov::op::AutoBroadcastType::NUMPY);
     return Tensor(node, ctx_);
+}
+
+Tensor Tensor::reshape(const ov::Output<ov::Node>& shape, bool special_zero) const {
+    auto node = std::make_shared<ov::op::v1::Reshape>(value_, shape, special_zero);
+    return Tensor(node, ctx_);
+}
+
+Tensor Tensor::reshape(const std::vector<int64_t>& shape, bool special_zero) const {
+    return reshape(i64_vec(shape), special_zero);
+}
+
+Tensor Tensor::reshape(std::initializer_list<int64_t> shape, bool special_zero) const {
+    return reshape(std::vector<int64_t>(shape), special_zero);
+}
+
+Tensor Tensor::permute(const std::vector<int32_t>& order) const {
+    auto node = std::make_shared<ov::op::v1::Transpose>(value_, i32_vec(order));
+    return Tensor(node, ctx_);
+}
+
+Tensor Tensor::permute(std::initializer_list<int32_t> order) const {
+    return permute(std::vector<int32_t>(order));
+}
+
+Tensor Tensor::transpose(const std::vector<int32_t>& order) const {
+    return permute(order);
+}
+
+Tensor Tensor::transpose(std::initializer_list<int32_t> order) const {
+    return permute(order);
+}
+
+Tensor Tensor::unsqueeze(int64_t axis) const {
+    return unsqueeze(std::vector<int64_t>{axis});
+}
+
+Tensor Tensor::unsqueeze(const std::vector<int64_t>& axes) const {
+    auto node = std::make_shared<ov::op::v0::Unsqueeze>(value_, i64_vec(axes));
+    return Tensor(node, ctx_);
+}
+
+Tensor Tensor::unsqueeze(std::initializer_list<int64_t> axes) const {
+    return unsqueeze(std::vector<int64_t>(axes));
+}
+
+Tensor Tensor::squeeze(int64_t axis) const {
+    return squeeze(std::vector<int64_t>{axis});
+}
+
+Tensor Tensor::squeeze(const std::vector<int64_t>& axes) const {
+    auto node = std::make_shared<ov::op::v0::Squeeze>(value_, i64_vec(axes));
+    return Tensor(node, ctx_);
+}
+
+Tensor Tensor::squeeze(std::initializer_list<int64_t> axes) const {
+    return squeeze(std::vector<int64_t>(axes));
 }
 
 Tensor operator+(const Tensor& a, const Tensor& b) {
