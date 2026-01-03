@@ -10,36 +10,9 @@
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
 #include "modeling/ops/ops.hpp"
+#include "modeling/tests/test_utils.hpp"
 
-namespace {
-
-std::vector<float> linear_ref(const std::vector<float>& x,
-                              const std::vector<float>& w,
-                              size_t rows,
-                              size_t in_features,
-                              size_t out_features) {
-    std::vector<float> y(rows * out_features, 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-        for (size_t o = 0; o < out_features; ++o) {
-            float acc = 0.0f;
-            for (size_t i = 0; i < in_features; ++i) {
-                acc += x[r * in_features + i] * w[o * in_features + i];
-            }
-            y[r * out_features + o] = acc;
-        }
-    }
-    return y;
-}
-
-void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
-    ASSERT_EQ(output.get_size(), expected.size());
-    const float* out_data = output.data<const float>();
-    for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], tol);
-    }
-}
-
-}  // namespace
+namespace test_utils = ov::genai::modeling::tests;
 
 TEST(LMHeadLayer, Decode) {
     ov::genai::modeling::BuilderContext ctx;
@@ -58,7 +31,8 @@ TEST(LMHeadLayer, Decode) {
         0.f, 0.f, 0.f, 1.f,   //
         1.f, 1.f, 1.f, 1.f,   //
     };
-    const std::vector<float> expected = linear_ref(x_data, w_data, x_shape[0], x_shape[1], w_shape[0]);
+    const std::vector<float> expected =
+        test_utils::linear_ref(x_data, w_data, x_shape[0], x_shape[1], w_shape[0]);
 
     auto x = ctx.parameter("x", ov::element::f32, x_shape);
 
@@ -80,7 +54,7 @@ TEST(LMHeadLayer, Decode) {
     request.set_input_tensor(input_tensor);
     request.infer();
 
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 TEST(LMHeadLayer, PrefillLastToken) {
@@ -112,7 +86,7 @@ TEST(LMHeadLayer, PrefillLastToken) {
         5.f, 6.f, 7.f, 8.f,      //
         17.f, 18.f, 19.f, 20.f,  //
     };
-    const std::vector<float> expected = linear_ref(x_last, w_data, 2, x_shape[1], w_shape[0]);
+    const std::vector<float> expected = test_utils::linear_ref(x_last, w_data, 2, x_shape[1], w_shape[0]);
 
     auto x = ctx.parameter("x", ov::element::f32, x_shape);
     auto cu = ctx.parameter("cu", ov::element::i64, cu_shape);
@@ -140,7 +114,7 @@ TEST(LMHeadLayer, PrefillLastToken) {
 
     request.infer();
 
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 

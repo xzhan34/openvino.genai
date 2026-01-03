@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +20,111 @@ namespace ov {
 namespace genai {
 namespace modeling {
 namespace tests {
+
+ov::Tensor make_tensor(const std::vector<float>& data, const ov::Shape& shape);
+std::vector<float> make_seq(size_t n, float start = 0.0f, float step = 1.0f);
+
+std::vector<float> matmul_ref(const std::vector<float>& a,
+                              const std::vector<float>& b,
+                              size_t m,
+                              size_t k,
+                              size_t n);
+std::vector<float> matmul_ref_transpose_a(const std::vector<float>& a,
+                                          const std::vector<float>& b,
+                                          size_t m,
+                                          size_t k,
+                                          size_t n);
+std::vector<float> linear_ref(const std::vector<float>& x,
+                              const std::vector<float>& w,
+                              size_t rows,
+                              size_t in_features,
+                              size_t out_features);
+std::vector<float> linear_ref_3d(const std::vector<float>& x,
+                                 const std::vector<float>& w,
+                                 size_t batch,
+                                 size_t seq_len,
+                                 size_t in_features,
+                                 size_t out_features);
+std::vector<float> linear_ref_3d_bias(const std::vector<float>& x,
+                                      const std::vector<float>& w,
+                                      const std::vector<float>& bias,
+                                      size_t batch,
+                                      size_t seq_len,
+                                      size_t in_features,
+                                      size_t out_features);
+std::vector<float> mean_ref(const std::vector<float>& x, size_t rows, size_t cols);
+std::vector<float> rms_ref(const std::vector<float>& x,
+                           const std::vector<float>& weight,
+                           size_t rows,
+                           size_t cols,
+                           float eps);
+std::vector<float> embedding_ref(const std::vector<int64_t>& ids,
+                                 const std::vector<float>& weight,
+                                 size_t rows,
+                                 size_t cols,
+                                 size_t embed_dim);
+std::vector<float> add_ref(const std::vector<float>& a, const std::vector<float>& b);
+std::vector<float> mul_ref(const std::vector<float>& a, const std::vector<float>& b);
+std::vector<float> silu_ref(const std::vector<float>& x);
+std::vector<float> mlp_ref(const std::vector<float>& x,
+                           const std::vector<float>& gate_w,
+                           const std::vector<float>& up_w,
+                           const std::vector<float>& down_w,
+                           size_t batch,
+                           size_t seq_len,
+                           size_t hidden,
+                           size_t intermediate);
+std::vector<float> to_heads_ref(const std::vector<float>& x,
+                                size_t batch,
+                                size_t seq_len,
+                                size_t num_heads,
+                                size_t head_dim);
+std::vector<float> rmsnorm_heads_ref(const std::vector<float>& x,
+                                     const std::vector<float>& weight,
+                                     size_t batch,
+                                     size_t num_heads,
+                                     size_t seq_len,
+                                     size_t head_dim,
+                                     float eps);
+std::vector<float> merge_heads_ref(const std::vector<float>& x,
+                                   size_t batch,
+                                   size_t seq_len,
+                                   size_t num_heads,
+                                   size_t head_dim);
+std::vector<float> apply_rope_ref(const std::vector<float>& x,
+                                  const std::vector<int64_t>& positions,
+                                  size_t batch,
+                                  size_t seq_len,
+                                  size_t num_heads,
+                                  size_t head_dim,
+                                  float rope_theta);
+std::vector<float> repeat_kv_ref(const std::vector<float>& x,
+                                 size_t batch,
+                                 size_t num_heads,
+                                 size_t num_kv_heads,
+                                 size_t seq_len,
+                                 size_t head_dim);
+std::vector<float> attention_ref(const std::vector<float>& hidden,
+                                 const std::vector<float>& q_w,
+                                 const std::vector<float>& q_b,
+                                 const std::vector<float>& k_w,
+                                 const std::vector<float>& k_b,
+                                 const std::vector<float>& v_w,
+                                 const std::vector<float>& v_b,
+                                 const std::vector<float>& o_w,
+                                 const std::vector<float>& o_b,
+                                 const std::vector<float>* q_norm_w,
+                                 const std::vector<float>* k_norm_w,
+                                 const std::vector<int64_t>& positions,
+                                 size_t batch,
+                                 size_t seq_len,
+                                 size_t hidden_size,
+                                 size_t num_heads,
+                                 size_t num_kv_heads,
+                                 size_t head_dim,
+                                 float rope_theta,
+                                 float rms_norm_eps);
+void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol);
 
 class DummyWeightSource : public weights::WeightSource {
 public:

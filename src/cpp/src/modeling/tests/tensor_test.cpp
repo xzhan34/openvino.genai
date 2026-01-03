@@ -13,16 +13,11 @@
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
 #include "modeling/ops/tensor.hpp"
+#include "modeling/tests/test_utils.hpp"
+
+namespace test_utils = ov::genai::modeling::tests;
 
 namespace {
-
-std::vector<float> make_seq(size_t n, float start = 0.0f, float step = 1.0f) {
-    std::vector<float> out(n, 0.0f);
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = start + step * static_cast<float>(i);
-    }
-    return out;
-}
 
 std::vector<float> pow_mean_rsqrt_expected(const std::vector<float>& input, size_t rows, size_t cols) {
     std::vector<float> out(rows, 0.0f);
@@ -48,35 +43,6 @@ std::vector<float> mean_expected(const std::vector<float>& input, size_t rows, s
         out[r] = acc / static_cast<float>(cols);
     }
     return out;
-}
-
-std::vector<float> to_heads_ref(const std::vector<float>& x,
-                                size_t batch,
-                                size_t seq_len,
-                                size_t num_heads,
-                                size_t head_dim) {
-    std::vector<float> out(batch * num_heads * seq_len * head_dim, 0.0f);
-    const size_t hidden = num_heads * head_dim;
-    for (size_t b = 0; b < batch; ++b) {
-        for (size_t s = 0; s < seq_len; ++s) {
-            const size_t in_base = (b * seq_len + s) * hidden;
-            for (size_t h = 0; h < num_heads; ++h) {
-                const size_t out_base = ((b * num_heads + h) * seq_len + s) * head_dim;
-                for (size_t d = 0; d < head_dim; ++d) {
-                    out[out_base + d] = x[in_base + h * head_dim + d];
-                }
-            }
-        }
-    }
-    return out;
-}
-
-void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
-    ASSERT_EQ(output.get_size(), expected.size());
-    const float* out_data = output.data<const float>();
-    for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], tol);
-    }
 }
 
 void expect_tensor_eq_i64(const ov::Tensor& output, const std::vector<int64_t>& expected) {
@@ -107,13 +73,13 @@ TEST(TensorOps, TypeConversions) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto input_data = make_seq(6, 0.0f, 1.0f);
+    auto input_data = test_utils::make_seq(6, 0.0f, 1.0f);
     ov::Tensor input_tensor(ov::element::f32, {2, 3});
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     request.set_input_tensor(input_tensor);
     request.infer();
 
-    expect_tensor_near(request.get_output_tensor(), input_data, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), input_data, 1e-3f);
 }
 
 TEST(TensorOps, PowMeanRsqrtAndMean) {
@@ -131,7 +97,7 @@ TEST(TensorOps, PowMeanRsqrtAndMean) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto input_data = make_seq(6, 1.0f, 1.0f);
+    auto input_data = test_utils::make_seq(6, 1.0f, 1.0f);
     ov::Tensor input_tensor(ov::element::f32, {2, 3});
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     request.set_input_tensor(input_tensor);
@@ -140,8 +106,8 @@ TEST(TensorOps, PowMeanRsqrtAndMean) {
     auto expected_z = pow_mean_rsqrt_expected(input_data, 2, 3);
     auto expected_mean = mean_expected(input_data, 2, 3);
 
-    expect_tensor_near(request.get_output_tensor(0), expected_z, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(1), expected_mean, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_z, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_mean, 1e-3f);
 }
 
 TEST(TensorOps, ArithmeticOperators) {
@@ -207,19 +173,19 @@ TEST(TensorOps, ArithmeticOperators) {
     std::vector<float> expected_div_scalar = {0.5f, 1.5f, 3.5f};
     std::vector<float> expected_div_scalar_rev = {2.0f, 0.6666667f, 0.2857143f};
 
-    expect_tensor_near(request.get_output_tensor(0), expected_sum, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(1), expected_sum_scalar, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(2), expected_sum_rev, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(3), expected_diff, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(4), expected_diff_scalar, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(5), expected_diff_rev, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(6), expected_neg, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(7), expected_prod, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(8), expected_prod_scalar, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(9), expected_prod_scalar_rev, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(10), expected_div, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(11), expected_div_scalar, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(12), expected_div_scalar_rev, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_sum, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_sum_scalar, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_sum_rev, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(3), expected_diff, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(4), expected_diff_scalar, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(5), expected_diff_rev, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(6), expected_neg, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(7), expected_prod, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(8), expected_prod_scalar, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(9), expected_prod_scalar_rev, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(10), expected_div, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(11), expected_div_scalar, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(12), expected_div_scalar_rev, 1e-3f);
 }
 
 TEST(TensorOps, TrigExpLogSoftmax) {
@@ -270,11 +236,11 @@ TEST(TensorOps, TrigExpLogSoftmax) {
         expected_softmax[i] = std::exp(x_data[i] - max_val) / denom;
     }
 
-    expect_tensor_near(request.get_output_tensor(0), expected_sin, 1e-4f);
-    expect_tensor_near(request.get_output_tensor(1), expected_cos, 1e-4f);
-    expect_tensor_near(request.get_output_tensor(2), expected_exp, 1e-4f);
-    expect_tensor_near(request.get_output_tensor(3), expected_log, 1e-4f);
-    expect_tensor_near(request.get_output_tensor(4), expected_softmax, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_sin, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_cos, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_exp, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(3), expected_log, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(4), expected_softmax, 1e-4f);
 }
 
 TEST(TensorShapeOps, ReshapePermuteMerge) {
@@ -298,7 +264,7 @@ TEST(TensorShapeOps, ReshapePermuteMerge) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto input_data = make_seq(batch * seq_len * hidden);
+    auto input_data = test_utils::make_seq(batch * seq_len * hidden);
     ov::Tensor input_tensor(ov::element::f32, {batch, seq_len, hidden});
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     request.set_input_tensor(input_tensor);
@@ -310,9 +276,9 @@ TEST(TensorShapeOps, ReshapePermuteMerge) {
     EXPECT_EQ(heads_output.get_shape(), (ov::Shape{batch, num_heads, seq_len, head_dim}));
     EXPECT_EQ(merged_output.get_shape(), (ov::Shape{batch, seq_len, hidden}));
 
-    auto expected_heads = to_heads_ref(input_data, batch, seq_len, num_heads, head_dim);
-    expect_tensor_near(heads_output, expected_heads, 1e-3f);
-    expect_tensor_near(merged_output, input_data, 1e-3f);
+    auto expected_heads = test_utils::to_heads_ref(input_data, batch, seq_len, num_heads, head_dim);
+    test_utils::expect_tensor_near(heads_output, expected_heads, 1e-3f);
+    test_utils::expect_tensor_near(merged_output, input_data, 1e-3f);
 }
 
 TEST(ShapeOps, ShapeHelpersBroadcast) {
@@ -342,7 +308,7 @@ TEST(ShapeOps, ShapeHelpersBroadcast) {
 
     expect_tensor_eq_i64(request.get_output_tensor(0), {1});
     expect_tensor_eq_i64(request.get_output_tensor(1), {3});
-    expect_tensor_near(request.get_output_tensor(2), {1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f}, 1e-6f);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), {1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f}, 1e-6f);
 }
 
 TEST(TensorShapeOps, UnsqueezeSqueezeChain) {
@@ -360,7 +326,7 @@ TEST(TensorShapeOps, UnsqueezeSqueezeChain) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto input_data = make_seq(rows * cols);
+    auto input_data = test_utils::make_seq(rows * cols);
     ov::Tensor input_tensor(ov::element::f32, {rows, cols});
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     request.set_input_tensor(input_tensor);
@@ -368,5 +334,5 @@ TEST(TensorShapeOps, UnsqueezeSqueezeChain) {
 
     auto output = request.get_output_tensor();
     EXPECT_EQ(output.get_shape(), (ov::Shape{rows, cols}));
-    expect_tensor_near(output, input_data, 1e-6f);
+    test_utils::expect_tensor_near(output, input_data, 1e-6f);
 }

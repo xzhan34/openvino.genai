@@ -10,118 +10,9 @@
 #include <openvino/openvino.hpp>
 #include "modeling/builder_context.hpp"
 #include "modeling/ops/ops.hpp"
+#include "modeling/tests/test_utils.hpp"
 
-namespace {
-
-std::vector<float> make_seq(size_t n, float start = 0.0f, float step = 1.0f) {
-    std::vector<float> out(n, 0.0f);
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = start + step * static_cast<float>(i);
-    }
-    return out;
-}
-
-std::vector<float> matmul_ref(const std::vector<float>& a,
-                              const std::vector<float>& b,
-                              size_t m,
-                              size_t k,
-                              size_t n) {
-    std::vector<float> out(m * n, 0.0f);
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            float acc = 0.0f;
-            for (size_t kk = 0; kk < k; ++kk) {
-                acc += a[i * k + kk] * b[kk * n + j];
-            }
-            out[i * n + j] = acc;
-        }
-    }
-    return out;
-}
-
-std::vector<float> matmul_ref_transpose_a(const std::vector<float>& a,
-                                          const std::vector<float>& b,
-                                          size_t m,
-                                          size_t k,
-                                          size_t n) {
-    std::vector<float> out(m * n, 0.0f);
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            float acc = 0.0f;
-            for (size_t kk = 0; kk < k; ++kk) {
-                acc += a[kk * m + i] * b[kk * n + j];
-            }
-            out[i * n + j] = acc;
-        }
-    }
-    return out;
-}
-
-std::vector<float> linear_ref_3d(const std::vector<float>& x,
-                                 const std::vector<float>& w,
-                                 size_t batch,
-                                 size_t seq_len,
-                                 size_t in_features,
-                                 size_t out_features) {
-    std::vector<float> out(batch * seq_len * out_features, 0.0f);
-    for (size_t b = 0; b < batch; ++b) {
-        for (size_t s = 0; s < seq_len; ++s) {
-            const size_t x_base = (b * seq_len + s) * in_features;
-            const size_t y_base = (b * seq_len + s) * out_features;
-            for (size_t o = 0; o < out_features; ++o) {
-                float acc = 0.0f;
-                for (size_t i = 0; i < in_features; ++i) {
-                    acc += x[x_base + i] * w[o * in_features + i];
-                }
-                out[y_base + o] = acc;
-            }
-        }
-    }
-    return out;
-}
-
-std::vector<float> mean_ref(const std::vector<float>& x, size_t rows, size_t cols) {
-    std::vector<float> out(rows, 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-        float acc = 0.0f;
-        for (size_t c = 0; c < cols; ++c) {
-            acc += x[r * cols + c];
-        }
-        out[r] = acc / static_cast<float>(cols);
-    }
-    return out;
-}
-
-std::vector<float> rms_ref(const std::vector<float>& x,
-                           const std::vector<float>& weight,
-                           size_t rows,
-                           size_t cols,
-                           float eps) {
-    std::vector<float> out(x.size(), 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-        float sumsq = 0.0f;
-        for (size_t c = 0; c < cols; ++c) {
-            float v = x[r * cols + c];
-            sumsq += v * v;
-        }
-        float mean = sumsq / static_cast<float>(cols);
-        float inv = 1.0f / std::sqrt(mean + eps);
-        for (size_t c = 0; c < cols; ++c) {
-            out[r * cols + c] = x[r * cols + c] * inv * weight[c];
-        }
-    }
-    return out;
-}
-
-void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
-    ASSERT_EQ(output.get_size(), expected.size());
-    const float* out_data = output.data<const float>();
-    for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], tol);
-    }
-}
-
-}  // namespace
+namespace test_utils = ov::genai::modeling::tests;
 
 TEST(Ops, Matmul) {
     ov::genai::modeling::BuilderContext ctx;
@@ -136,8 +27,8 @@ TEST(Ops, Matmul) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto a_data = make_seq(6, 1.0f, 1.0f);
-    auto b_data = make_seq(6, 7.0f, 1.0f);
+    auto a_data = test_utils::make_seq(6, 1.0f, 1.0f);
+    auto b_data = test_utils::make_seq(6, 7.0f, 1.0f);
     ov::Tensor a_tensor(ov::element::f32, {2, 3});
     ov::Tensor b_tensor(ov::element::f32, {3, 2});
     std::memcpy(a_tensor.data(), a_data.data(), a_data.size() * sizeof(float));
@@ -147,8 +38,8 @@ TEST(Ops, Matmul) {
     request.set_input_tensor(1, b_tensor);
     request.infer();
 
-    auto expected = matmul_ref(a_data, b_data, 2, 3, 2);
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    auto expected = test_utils::matmul_ref(a_data, b_data, 2, 3, 2);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 TEST(Ops, MatmulTransposeA) {
@@ -168,8 +59,8 @@ TEST(Ops, MatmulTransposeA) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto a_data = make_seq(k * m, 0.5f, 0.5f);
-    auto b_data = make_seq(k * n, 1.0f, 0.25f);
+    auto a_data = test_utils::make_seq(k * m, 0.5f, 0.5f);
+    auto b_data = test_utils::make_seq(k * n, 1.0f, 0.25f);
     ov::Tensor a_tensor(ov::element::f32, {k, m});
     ov::Tensor b_tensor(ov::element::f32, {k, n});
     std::memcpy(a_tensor.data(), a_data.data(), a_data.size() * sizeof(float));
@@ -179,8 +70,8 @@ TEST(Ops, MatmulTransposeA) {
     request.set_input_tensor(1, b_tensor);
     request.infer();
 
-    auto expected = matmul_ref_transpose_a(a_data, b_data, m, k, n);
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    auto expected = test_utils::matmul_ref_transpose_a(a_data, b_data, m, k, n);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 TEST(Ops, Linear) {
@@ -201,8 +92,8 @@ TEST(Ops, Linear) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto x_data = make_seq(batch * seq_len * in_features, 0.1f, 0.1f);
-    auto w_data = make_seq(out_features * in_features, 0.2f, 0.05f);
+    auto x_data = test_utils::make_seq(batch * seq_len * in_features, 0.1f, 0.1f);
+    auto w_data = test_utils::make_seq(out_features * in_features, 0.2f, 0.05f);
     ov::Tensor x_tensor(ov::element::f32, {batch, seq_len, in_features});
     ov::Tensor w_tensor(ov::element::f32, {out_features, in_features});
     std::memcpy(x_tensor.data(), x_data.data(), x_data.size() * sizeof(float));
@@ -212,8 +103,8 @@ TEST(Ops, Linear) {
     request.set_input_tensor(1, w_tensor);
     request.infer();
 
-    auto expected = linear_ref_3d(x_data, w_data, batch, seq_len, in_features, out_features);
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    auto expected = test_utils::linear_ref_3d(x_data, w_data, batch, seq_len, in_features, out_features);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 TEST(Ops, ConstHelpers) {
@@ -242,8 +133,8 @@ TEST(Ops, ConstHelpers) {
     request.set_input_tensor(x_tensor);
     request.infer();
 
-    expect_tensor_near(request.get_output_tensor(0), {6.0f, 10.0f}, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(1), {5.0f}, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), {6.0f, 10.0f}, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), {5.0f}, 1e-3f);
 }
 
 TEST(Ops, ReduceMean) {
@@ -258,15 +149,15 @@ TEST(Ops, ReduceMean) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto x_data = make_seq(6, 1.0f, 1.0f);
+    auto x_data = test_utils::make_seq(6, 1.0f, 1.0f);
     ov::Tensor x_tensor(ov::element::f32, {2, 3});
     std::memcpy(x_tensor.data(), x_data.data(), x_data.size() * sizeof(float));
 
     request.set_input_tensor(x_tensor);
     request.infer();
 
-    auto expected = mean_ref(x_data, 2, 3);
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    auto expected = test_utils::mean_ref(x_data, 2, 3);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 TEST(Ops, GatherSliceConcat) {
@@ -285,7 +176,7 @@ TEST(Ops, GatherSliceConcat) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto data_values = make_seq(10, 0.0f, 1.0f);
+    auto data_values = test_utils::make_seq(10, 0.0f, 1.0f);
     ov::Tensor data_tensor(ov::element::f32, {2, 5});
     std::memcpy(data_tensor.data(), data_values.data(), data_values.size() * sizeof(float));
 
@@ -301,9 +192,9 @@ TEST(Ops, GatherSliceConcat) {
     std::vector<float> expected_slice = {1.0f, 3.0f, 6.0f, 8.0f};
     std::vector<float> expected_concat = {0.0f, 2.0f, 1.0f, 3.0f, 5.0f, 7.0f, 6.0f, 8.0f};
 
-    expect_tensor_near(request.get_output_tensor(0), expected_gather, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(1), expected_slice, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(2), expected_concat, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_gather, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_slice, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_concat, 1e-3f);
 }
 
 TEST(Ops, Rms) {
@@ -321,7 +212,7 @@ TEST(Ops, Rms) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto x_data = make_seq(6, 1.0f, 1.0f);
+    auto x_data = test_utils::make_seq(6, 1.0f, 1.0f);
     auto w_data = std::vector<float>{0.5f, 1.0f, 1.5f};
     ov::Tensor x_tensor(ov::element::f32, {2, 3});
     ov::Tensor w_tensor(ov::element::f32, {3});
@@ -332,6 +223,6 @@ TEST(Ops, Rms) {
     request.set_input_tensor(1, w_tensor);
     request.infer();
 
-    auto expected = rms_ref(x_data, w_data, 2, 3, eps);
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    auto expected = test_utils::rms_ref(x_data, w_data, 2, 3, eps);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }

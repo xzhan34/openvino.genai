@@ -10,35 +10,9 @@
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/vocab_embedding.hpp"
 #include "modeling/ops/ops.hpp"
+#include "modeling/tests/test_utils.hpp"
 
-namespace {
-
-std::vector<float> embedding_ref(const std::vector<int64_t>& ids,
-                                 const std::vector<float>& weight,
-                                 size_t rows,
-                                 size_t cols,
-                                 size_t embed_dim) {
-    std::vector<float> y(rows * cols * embed_dim, 0.0f);
-    for (size_t r = 0; r < rows; ++r) {
-        for (size_t c = 0; c < cols; ++c) {
-            int64_t idx = ids[r * cols + c];
-            for (size_t e = 0; e < embed_dim; ++e) {
-                y[(r * cols + c) * embed_dim + e] = weight[static_cast<size_t>(idx) * embed_dim + e];
-            }
-        }
-    }
-    return y;
-}
-
-void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
-    ASSERT_EQ(output.get_size(), expected.size());
-    const float* out_data = output.data<const float>();
-    for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], tol);
-    }
-}
-
-}  // namespace
+namespace test_utils = ov::genai::modeling::tests;
 
 TEST(VocabEmbeddingLayer, Basic) {
     ov::genai::modeling::BuilderContext ctx;
@@ -60,7 +34,7 @@ TEST(VocabEmbeddingLayer, Basic) {
         0, 2, 5,  //
         3, 1, 4,  //
     };
-    const std::vector<float> expected = embedding_ref(ids, weight, ids_shape[0], ids_shape[1], embed_dim);
+    const std::vector<float> expected = test_utils::embedding_ref(ids, weight, ids_shape[0], ids_shape[1], embed_dim);
 
     auto ids_t = ctx.parameter("ids", ov::element::i64, ids_shape);
 
@@ -83,7 +57,7 @@ TEST(VocabEmbeddingLayer, Basic) {
 
     request.infer();
 
-    expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
 
 
