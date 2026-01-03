@@ -11,6 +11,7 @@
 #include <openvino/openvino.hpp>
 
 #include "modeling/ops/context.hpp"
+#include "modeling/ops/op_policy.hpp"
 #include "modeling/ops/tensor.hpp"
 
 namespace ov {
@@ -22,6 +23,7 @@ class WeightParameter;
 class BuilderContext {
 public:
     BuilderContext() = default;
+    explicit BuilderContext(const OpPolicy& policy);
 
     Tensor parameter(const std::string& name, const ov::element::Type& type, const ov::PartialShape& shape);
 
@@ -31,6 +33,8 @@ public:
 
     OpContext& op_context();
     const OpContext& op_context() const;
+    OpPolicy& op_policy();
+    const OpPolicy& op_policy() const;
 
     void register_parameter(const std::string& full_name, WeightParameter* param);
     WeightParameter* find_parameter(const std::string& full_name) const;
@@ -38,6 +42,7 @@ public:
 
 private:
     OpContext op_ctx_;
+    OpPolicy op_policy_;
     ov::ParameterVector inputs_;
     std::unordered_map<std::string, WeightParameter*> params_by_name_;
     std::vector<WeightParameter*> params_;

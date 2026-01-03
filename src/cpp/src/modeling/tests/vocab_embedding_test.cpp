@@ -7,11 +7,9 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
-#include <openvino/opsets/opset13.hpp>
-
+#include "modeling/builder_context.hpp"
 #include "modeling/layers/vocab_embedding.hpp"
-#include "modeling/ops/context.hpp"
-#include "modeling/ops/tensor.hpp"
+#include "modeling/ops/ops.hpp"
 
 namespace {
 
@@ -40,15 +38,10 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
     }
 }
 
-std::shared_ptr<ov::Model> build_model_from_output(const ov::Output<ov::Node>& output, const ov::ParameterVector& params) {
-    auto result = std::make_shared<ov::op::v0::Result>(output);
-    return std::make_shared<ov::Model>(ov::OutputVector{result}, params);
-}
-
 }  // namespace
 
 TEST(VocabEmbeddingLayer, Basic) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
     const size_t vocab_size = 6;
     const size_t embed_dim = 4;
@@ -69,16 +62,16 @@ TEST(VocabEmbeddingLayer, Basic) {
     };
     const std::vector<float> expected = embedding_ref(ids, weight, ids_shape[0], ids_shape[1], embed_dim);
 
-    auto ids_param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ids_shape);
-    ov::genai::modeling::Tensor ids_t(ids_param, &ctx);
+    auto ids_t = ctx.parameter("ids", ov::element::i64, ids_shape);
 
-    auto w_node = ov::op::v0::Constant::create(ov::element::f32, weight_shape, weight);
-    ov::genai::modeling::Tensor w(w_node, &ctx);
+    ov::Tensor w_tensor(ov::element::f32, weight_shape);
+    std::memcpy(w_tensor.data(), weight.data(), weight.size() * sizeof(float));
+    auto w = ov::genai::modeling::ops::constant(w_tensor, &ctx.op_context());
 
     ov::genai::modeling::VocabEmbedding embed(w);
     auto y = embed.forward(ids_t);
 
-    auto model = build_model_from_output(y.output(), {ids_param});
+    auto model = ctx.build_model({y.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");

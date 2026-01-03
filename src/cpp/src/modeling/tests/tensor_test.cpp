@@ -1,6 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -8,9 +9,9 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
-#include <openvino/opsets/opset13.hpp>
-
-#include "modeling/ops/context.hpp"
+#include "modeling/builder_context.hpp"
+#include "modeling/ops/ops.hpp"
+#include "modeling/ops/shape.hpp"
 #include "modeling/ops/tensor.hpp"
 
 namespace {
@@ -78,13 +79,20 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
     }
 }
 
+void expect_tensor_eq_i64(const ov::Tensor& output, const std::vector<int64_t>& expected) {
+    ASSERT_EQ(output.get_size(), expected.size());
+    const int64_t* out_data = output.data<const int64_t>();
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_EQ(out_data[i], expected[i]);
+    }
+}
+
 }  // namespace
 
 TEST(TensorOps, TypeConversions) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{2, 3});
-    ov::genai::modeling::Tensor x(param, &ctx);
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{2, 3});
     EXPECT_EQ(x.dtype(), ov::element::f32);
 
     auto y = x.to(ov::element::f16);
@@ -93,8 +101,7 @@ TEST(TensorOps, TypeConversions) {
     auto z = y.to(ov::element::f32);
     EXPECT_EQ(z.dtype(), ov::element::f32);
 
-    auto result = std::make_shared<ov::op::v0::Result>(z.output());
-    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, ov::ParameterVector{param});
+    auto model = ctx.build_model({z.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
@@ -110,19 +117,15 @@ TEST(TensorOps, TypeConversions) {
 }
 
 TEST(TensorOps, PowMeanRsqrtAndMean) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{2, 3});
-    ov::genai::modeling::Tensor x(param, &ctx);
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{2, 3});
 
     auto y = x.pow(2.0f).mean(-1, true);
     auto z = (y + 1.0f).rsqrt();
     auto mean_flat = x.mean(1, false);
 
-    auto z_result = std::make_shared<ov::op::v0::Result>(z.output());
-    auto mean_result = std::make_shared<ov::op::v0::Result>(mean_flat.output());
-    auto model = std::make_shared<ov::Model>(ov::OutputVector{z_result, mean_result},
-                                             ov::ParameterVector{param});
+    auto model = ctx.build_model({z.output(), mean_flat.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
@@ -142,27 +145,38 @@ TEST(TensorOps, PowMeanRsqrtAndMean) {
 }
 
 TEST(TensorOps, ArithmeticOperators) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
-    auto x_param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{3});
-    auto y_param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{3});
-    ov::genai::modeling::Tensor x(x_param, &ctx);
-    ov::genai::modeling::Tensor y(y_param, &ctx);
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{3});
+    auto y = ctx.parameter("y", ov::element::f32, ov::Shape{3});
 
     auto sum = x + y;
     auto sum_scalar = sum + 1.0f;
     auto sum_rev = 2.0f + x;
+    auto diff = x - y;
+    auto diff_scalar = x - 1.0f;
+    auto diff_rev = 2.0f - x;
+    auto neg = -x;
     auto prod = x * y;
+    auto prod_scalar = x * 2.0f;
+    auto prod_scalar_rev = 2.0f * x;
     auto div = prod / (x + 1.0f);
+    auto div_scalar = x / 2.0f;
+    auto div_scalar_rev = 2.0f / x;
 
-    auto sum_result = std::make_shared<ov::op::v0::Result>(sum.output());
-    auto sum_scalar_result = std::make_shared<ov::op::v0::Result>(sum_scalar.output());
-    auto sum_rev_result = std::make_shared<ov::op::v0::Result>(sum_rev.output());
-    auto prod_result = std::make_shared<ov::op::v0::Result>(prod.output());
-    auto div_result = std::make_shared<ov::op::v0::Result>(div.output());
-    auto model = std::make_shared<ov::Model>(
-        ov::OutputVector{sum_result, sum_scalar_result, sum_rev_result, prod_result, div_result},
-        ov::ParameterVector{x_param, y_param});
+    auto model = ctx.build_model({sum.output(),
+                                  sum_scalar.output(),
+                                  sum_rev.output(),
+                                  diff.output(),
+                                  diff_scalar.output(),
+                                  diff_rev.output(),
+                                  neg.output(),
+                                  prod.output(),
+                                  prod_scalar.output(),
+                                  prod_scalar_rev.output(),
+                                  div.output(),
+                                  div_scalar.output(),
+                                  div_scalar_rev.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
@@ -182,18 +196,89 @@ TEST(TensorOps, ArithmeticOperators) {
     std::vector<float> expected_sum = {5.0f, 7.0f, 15.0f};
     std::vector<float> expected_sum_scalar = {6.0f, 8.0f, 16.0f};
     std::vector<float> expected_sum_rev = {3.0f, 5.0f, 9.0f};
+    std::vector<float> expected_diff = {-3.0f, -1.0f, -1.0f};
+    std::vector<float> expected_diff_scalar = {0.0f, 2.0f, 6.0f};
+    std::vector<float> expected_diff_rev = {1.0f, -1.0f, -5.0f};
+    std::vector<float> expected_neg = {-1.0f, -3.0f, -7.0f};
     std::vector<float> expected_prod = {4.0f, 12.0f, 56.0f};
+    std::vector<float> expected_prod_scalar = {2.0f, 6.0f, 14.0f};
+    std::vector<float> expected_prod_scalar_rev = {2.0f, 6.0f, 14.0f};
     std::vector<float> expected_div = {2.0f, 3.0f, 7.0f};
+    std::vector<float> expected_div_scalar = {0.5f, 1.5f, 3.5f};
+    std::vector<float> expected_div_scalar_rev = {2.0f, 0.6666667f, 0.2857143f};
 
     expect_tensor_near(request.get_output_tensor(0), expected_sum, 1e-3f);
     expect_tensor_near(request.get_output_tensor(1), expected_sum_scalar, 1e-3f);
     expect_tensor_near(request.get_output_tensor(2), expected_sum_rev, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(3), expected_prod, 1e-3f);
-    expect_tensor_near(request.get_output_tensor(4), expected_div, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(3), expected_diff, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(4), expected_diff_scalar, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(5), expected_diff_rev, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(6), expected_neg, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(7), expected_prod, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(8), expected_prod_scalar, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(9), expected_prod_scalar_rev, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(10), expected_div, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(11), expected_div_scalar, 1e-3f);
+    expect_tensor_near(request.get_output_tensor(12), expected_div_scalar_rev, 1e-3f);
+}
+
+TEST(TensorOps, TrigExpLogSoftmax) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{1, 3});
+
+    auto sin_x = x.sin();
+    auto cos_x = x.cos();
+    auto exp_x = x.exp();
+    auto log_x = exp_x.log();
+    auto softmax_x = x.softmax(1);
+
+    auto model = ctx.build_model({sin_x.output(), cos_x.output(), exp_x.output(), log_x.output(), softmax_x.output()});
+
+    ov::Core core;
+    auto compiled = core.compile_model(model, "GPU");
+    auto request = compiled.create_infer_request();
+
+    std::vector<float> x_data = {0.0f, 1.0f, 2.0f};
+    ov::Tensor x_tensor(ov::element::f32, {1, 3});
+    std::memcpy(x_tensor.data(), x_data.data(), x_data.size() * sizeof(float));
+    request.set_input_tensor(x_tensor);
+    request.infer();
+
+    std::vector<float> expected_sin;
+    std::vector<float> expected_cos;
+    std::vector<float> expected_exp;
+    std::vector<float> expected_log;
+    std::vector<float> expected_softmax;
+    expected_sin.reserve(x_data.size());
+    expected_cos.reserve(x_data.size());
+    expected_exp.reserve(x_data.size());
+    expected_log.reserve(x_data.size());
+    expected_softmax.resize(x_data.size(), 0.0f);
+
+    float max_val = *std::max_element(x_data.begin(), x_data.end());
+    float denom = 0.0f;
+    for (float v : x_data) {
+        expected_sin.push_back(std::sin(v));
+        expected_cos.push_back(std::cos(v));
+        float ev = std::exp(v);
+        expected_exp.push_back(ev);
+        expected_log.push_back(std::log(ev));
+        denom += std::exp(v - max_val);
+    }
+    for (size_t i = 0; i < x_data.size(); ++i) {
+        expected_softmax[i] = std::exp(x_data[i] - max_val) / denom;
+    }
+
+    expect_tensor_near(request.get_output_tensor(0), expected_sin, 1e-4f);
+    expect_tensor_near(request.get_output_tensor(1), expected_cos, 1e-4f);
+    expect_tensor_near(request.get_output_tensor(2), expected_exp, 1e-4f);
+    expect_tensor_near(request.get_output_tensor(3), expected_log, 1e-4f);
+    expect_tensor_near(request.get_output_tensor(4), expected_softmax, 1e-4f);
 }
 
 TEST(TensorShapeOps, ReshapePermuteMerge) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
     const size_t batch = 1;
     const size_t seq_len = 2;
@@ -201,17 +286,13 @@ TEST(TensorShapeOps, ReshapePermuteMerge) {
     const size_t head_dim = 3;
     const size_t hidden = num_heads * head_dim;
 
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{batch, seq_len, hidden});
-    ov::genai::modeling::Tensor x(param, &ctx);
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{batch, seq_len, hidden});
 
     auto heads = x.reshape({0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_dim)})
                     .permute({0, 2, 1, 3});
     auto merged = heads.transpose({0, 2, 1, 3}).reshape({0, 0, static_cast<int64_t>(hidden)});
 
-    auto heads_result = std::make_shared<ov::op::v0::Result>(heads.output());
-    auto merged_result = std::make_shared<ov::op::v0::Result>(merged.output());
-    auto model = std::make_shared<ov::Model>(ov::OutputVector{heads_result, merged_result},
-                                             ov::ParameterVector{param});
+    auto model = ctx.build_model({heads.output(), merged.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
@@ -234,18 +315,46 @@ TEST(TensorShapeOps, ReshapePermuteMerge) {
     expect_tensor_near(merged_output, input_data, 1e-3f);
 }
 
+TEST(ShapeOps, ShapeHelpersBroadcast) {
+    ov::genai::modeling::BuilderContext ctx;
+    auto* op_ctx = &ctx.op_context();
+
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{1, 3});
+
+    auto dim0 = ov::genai::modeling::shape::dim(x, 0);
+    auto dim1 = ov::genai::modeling::shape::dim(x, 1);
+    auto target =
+        ov::genai::modeling::shape::make({ov::genai::modeling::ops::const_vec(op_ctx, std::vector<int64_t>{2}),
+                                          dim1});
+    auto bcast = ov::genai::modeling::shape::broadcast_to(x, target);
+
+    auto model = ctx.build_model({dim0, dim1, bcast.output()});
+
+    ov::Core core;
+    auto compiled = core.compile_model(model, "GPU");
+    auto request = compiled.create_infer_request();
+
+    std::vector<float> x_data = {1.0f, 2.0f, 3.0f};
+    ov::Tensor x_tensor(ov::element::f32, {1, 3});
+    std::memcpy(x_tensor.data(), x_data.data(), x_data.size() * sizeof(float));
+    request.set_input_tensor(x_tensor);
+    request.infer();
+
+    expect_tensor_eq_i64(request.get_output_tensor(0), {1});
+    expect_tensor_eq_i64(request.get_output_tensor(1), {3});
+    expect_tensor_near(request.get_output_tensor(2), {1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f}, 1e-6f);
+}
+
 TEST(TensorShapeOps, UnsqueezeSqueezeChain) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
     const size_t rows = 2;
     const size_t cols = 3;
 
-    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{rows, cols});
-    ov::genai::modeling::Tensor x(param, &ctx);
+    auto x = ctx.parameter("x", ov::element::f32, ov::Shape{rows, cols});
 
     auto y = x.unsqueeze({0, 2}).squeeze({0, 2});
-    auto result = std::make_shared<ov::op::v0::Result>(y.output());
-    auto model = std::make_shared<ov::Model>(ov::OutputVector{result}, ov::ParameterVector{param});
+    auto model = ctx.build_model({y.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");

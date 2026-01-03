@@ -22,13 +22,6 @@ ov::genai::modeling::OpContext* resolve_context(const ov::genai::modeling::Tenso
     return a_ctx ? a_ctx : b_ctx;
 }
 
-ov::Output<ov::Node> scalar_i64(ov::genai::modeling::OpContext* ctx, int64_t v) {
-    if (ctx) {
-        return ctx->scalar_i64(v);
-    }
-    return ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {v});
-}
-
 }  // namespace
 
 namespace ov {
@@ -79,10 +72,8 @@ Tensor LMHead::forward(const Tensor& x, const Tensor& cu_seqlens_q) const {
 
     // last_indices = cu_seqlens_q[1:] - 1
     auto cu_tail = ops::slice(cu_i64, 1, std::numeric_limits<int64_t>::max(), 1, 0);
-    auto one = scalar_i64(ctx, 1);
-    auto last_indices_node =
-        std::make_shared<ov::op::v1::Subtract>(cu_tail.output(), one, ov::op::AutoBroadcastType::NUMPY);
-    Tensor last_indices(last_indices_node, ctx);
+    auto one = Tensor(ops::const_scalar(ctx, static_cast<int64_t>(1)), ctx);
+    auto last_indices = cu_tail - one;
 
     // x[last_indices]
     auto x_last = ops::gather(x, last_indices, 0);

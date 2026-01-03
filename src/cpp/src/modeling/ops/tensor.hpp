@@ -29,6 +29,11 @@ public:
     Tensor pow(float exp) const;
     Tensor mean(int64_t axis, bool keepdim = true) const;
     Tensor rsqrt() const;
+    Tensor sin() const;
+    Tensor cos() const;
+    Tensor exp() const;
+    Tensor log() const;
+    Tensor softmax(int64_t axis) const;
     Tensor reshape(const ov::Output<ov::Node>& shape, bool special_zero = true) const;
     Tensor reshape(const std::vector<int64_t>& shape, bool special_zero = true) const;
     Tensor reshape(std::initializer_list<int64_t> shape, bool special_zero = true) const;
@@ -52,8 +57,18 @@ Tensor operator+(const Tensor& a, const Tensor& b);
 Tensor operator+(const Tensor& a, float b);
 Tensor operator+(float a, const Tensor& b);
 
+Tensor operator-(const Tensor& a, const Tensor& b);
+Tensor operator-(const Tensor& a, float b);
+Tensor operator-(float a, const Tensor& b);
+Tensor operator-(const Tensor& a);
+
 Tensor operator*(const Tensor& a, const Tensor& b);
+Tensor operator*(const Tensor& a, float b);
+Tensor operator*(float a, const Tensor& b);
+
 Tensor operator/(const Tensor& a, const Tensor& b);
+Tensor operator/(const Tensor& a, float b);
+Tensor operator/(float a, const Tensor& b);
 
 }  // namespace modeling
 }  // namespace genai

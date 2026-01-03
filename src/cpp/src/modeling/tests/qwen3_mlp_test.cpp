@@ -3,63 +3,17 @@
 
 #include <cmath>
 #include <cstring>
-#include <unordered_map>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
-#include <openvino/opsets/opset13.hpp>
-
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_dense.hpp"
-#include "modeling/weights/weight_finalizer.hpp"
+#include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
-#include "modeling/weights/weight_source.hpp"
 
 namespace {
-
-class DummyWeightSource : public ov::genai::modeling::weights::WeightSource {
-public:
-    void add(const std::string& name, const ov::Tensor& tensor) {
-        if (!weights_.count(name)) {
-            keys_.push_back(name);
-        }
-        weights_[name] = tensor;
-    }
-
-    std::vector<std::string> keys() const override {
-        return keys_;
-    }
-
-    bool has(const std::string& name) const override {
-        return weights_.count(name) != 0;
-    }
-
-    const ov::Tensor& get_tensor(const std::string& name) const override {
-        auto it = weights_.find(name);
-        if (it == weights_.end()) {
-            OPENVINO_THROW("Unknown weight: ", name);
-        }
-        return it->second;
-    }
-
-private:
-    std::unordered_map<std::string, ov::Tensor> weights_;
-    std::vector<std::string> keys_;
-};
-
-class DummyWeightFinalizer : public ov::genai::modeling::weights::WeightFinalizer {
-public:
-    ov::genai::modeling::Tensor finalize(const std::string& name,
-                                         ov::genai::modeling::weights::WeightSource& source,
-                                         ov::genai::modeling::OpContext& ctx) override {
-        const auto& tensor = source.get_tensor(name);
-        auto node = std::make_shared<ov::op::v0::Constant>(tensor);
-        return ov::genai::modeling::Tensor(node, &ctx);
-    }
-};
 
 ov::Tensor make_tensor(const std::vector<float>& data, const ov::Shape& shape) {
     ov::Tensor tensor(ov::element::f32, shape);
@@ -154,12 +108,12 @@ TEST(Qwen3MLP, MatchesReference) {
     const auto up_w = make_seq(intermediate * hidden, 0.015f, 0.02f);
     const auto down_w = make_seq(hidden * intermediate, 0.02f, 0.02f);
 
-    DummyWeightSource weights;
+    ov::genai::modeling::tests::DummyWeightSource weights;
     weights.add("mlp.gate_proj.weight", make_tensor(gate_w, mlp_up_shape));
     weights.add("mlp.up_proj.weight", make_tensor(up_w, mlp_up_shape));
     weights.add("mlp.down_proj.weight", make_tensor(down_w, mlp_down_shape));
 
-    DummyWeightFinalizer finalizer;
+    ov::genai::modeling::tests::DummyWeightFinalizer finalizer;
 
     ov::genai::modeling::models::Qwen3DenseConfig cfg;
     cfg.hidden_size = static_cast<int32_t>(hidden);

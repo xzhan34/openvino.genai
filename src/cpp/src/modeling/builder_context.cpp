@@ -19,6 +19,8 @@ namespace ov {
 namespace genai {
 namespace modeling {
 
+BuilderContext::BuilderContext(const OpPolicy& policy) : op_policy_(policy) {}
+
 Tensor BuilderContext::parameter(const std::string& name,
                                  const ov::element::Type& type,
                                  const ov::PartialShape& shape) {
@@ -43,6 +45,14 @@ OpContext& BuilderContext::op_context() {
 
 const OpContext& BuilderContext::op_context() const {
     return op_ctx_;
+}
+
+OpPolicy& BuilderContext::op_policy() {
+    return op_policy_;
+}
+
+const OpPolicy& BuilderContext::op_policy() const {
+    return op_policy_;
 }
 
 void BuilderContext::register_parameter(const std::string& full_name, WeightParameter* param) {

@@ -7,11 +7,9 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
-#include <openvino/opsets/opset13.hpp>
-
+#include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
-#include "modeling/ops/context.hpp"
-#include "modeling/ops/tensor.hpp"
+#include "modeling/ops/ops.hpp"
 
 namespace {
 
@@ -41,15 +39,10 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
     }
 }
 
-std::shared_ptr<ov::Model> build_model_from_output(const ov::Output<ov::Node>& output, const ov::ParameterVector& params) {
-    auto result = std::make_shared<ov::op::v0::Result>(output);
-    return std::make_shared<ov::Model>(ov::OutputVector{result}, params);
-}
-
 }  // namespace
 
 TEST(LMHeadLayer, Decode) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
     const ov::Shape x_shape{2, 4};
     const ov::Shape w_shape{5, 4};
@@ -67,16 +60,16 @@ TEST(LMHeadLayer, Decode) {
     };
     const std::vector<float> expected = linear_ref(x_data, w_data, x_shape[0], x_shape[1], w_shape[0]);
 
-    auto x_param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, x_shape);
-    ov::genai::modeling::Tensor x(x_param, &ctx);
+    auto x = ctx.parameter("x", ov::element::f32, x_shape);
 
-    auto w_node = ov::op::v0::Constant::create(ov::element::f32, w_shape, w_data);
-    ov::genai::modeling::Tensor w(w_node, &ctx);
+    ov::Tensor w_tensor(ov::element::f32, w_shape);
+    std::memcpy(w_tensor.data(), w_data.data(), w_data.size() * sizeof(float));
+    auto w = ov::genai::modeling::ops::constant(w_tensor, &ctx.op_context());
 
     ov::genai::modeling::LMHead lm_head(w);
     auto logits = lm_head.forward(x);
 
-    auto model = build_model_from_output(logits.output(), {x_param});
+    auto model = ctx.build_model({logits.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
@@ -91,7 +84,7 @@ TEST(LMHeadLayer, Decode) {
 }
 
 TEST(LMHeadLayer, PrefillLastToken) {
-    ov::genai::modeling::OpContext ctx;
+    ov::genai::modeling::BuilderContext ctx;
 
     // Two sequences with lengths [2, 3] -> cu_seqlens_q = [0, 2, 5]
     const std::vector<int64_t> cu_seqlens = {0, 2, 5};
@@ -121,19 +114,17 @@ TEST(LMHeadLayer, PrefillLastToken) {
     };
     const std::vector<float> expected = linear_ref(x_last, w_data, 2, x_shape[1], w_shape[0]);
 
-    auto x_param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, x_shape);
-    auto cu_param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, cu_shape);
+    auto x = ctx.parameter("x", ov::element::f32, x_shape);
+    auto cu = ctx.parameter("cu", ov::element::i64, cu_shape);
 
-    ov::genai::modeling::Tensor x(x_param, &ctx);
-    ov::genai::modeling::Tensor cu(cu_param, &ctx);
-
-    auto w_node = ov::op::v0::Constant::create(ov::element::f32, w_shape, w_data);
-    ov::genai::modeling::Tensor w(w_node, &ctx);
+    ov::Tensor w_tensor(ov::element::f32, w_shape);
+    std::memcpy(w_tensor.data(), w_data.data(), w_data.size() * sizeof(float));
+    auto w = ov::genai::modeling::ops::constant(w_tensor, &ctx.op_context());
 
     ov::genai::modeling::LMHead lm_head(w);
     auto logits = lm_head.forward(x, cu);
 
-    auto model = build_model_from_output(logits.output(), {x_param, cu_param});
+    auto model = ctx.build_model({logits.output()});
 
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
