@@ -42,9 +42,6 @@ Qwen3Attention::Qwen3Attention(BuilderContext& ctx,
     if (num_heads_ <= 0 || head_dim_ <= 0) {
         OPENVINO_THROW("Invalid attention head configuration");
     }
-    if (hidden_size_ != num_heads_ * head_dim_) {
-        OPENVINO_THROW("hidden_size must equal num_attention_heads * head_dim");
-    }
     if (num_heads_ % num_kv_heads_ != 0) {
         OPENVINO_THROW("num_attention_heads must be divisible by num_key_value_heads");
     }
@@ -128,7 +125,8 @@ Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_sta
     auto v_expanded = ops::llm::repeat_kv(v_heads, num_heads_, num_kv_heads_, head_dim_);
 
     auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
-    auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, hidden_size_});
+    const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
+    auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
     auto out = add_bias_if_present(ops::linear(merged, o_proj_weight()), o_proj_bias());
     return out;
 }

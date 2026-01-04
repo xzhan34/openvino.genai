@@ -41,14 +41,10 @@ bool use_modeling_qwen3_dense_dummy_builder() {
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
         });
-        return v == "1" || v == "true" || v == "on" || v == "yes" || v == "modeling" || v == "modeling_dummy" ||
-               v == "qwen3_dense_dummy";
+        return v == "1" || v == "true" || v == "on" || v == "yes" ;
     };
 
-    if (const char* v = std::getenv("OV_GENAI_GGUF_BUILDER")) {
-        return is_truthy(v);
-    }
-    if (const char* v = std::getenv("OV_GENAI_GGUF_USE_MODELING")) {
+    if (const char* v = std::getenv("OV_GENAI_USE_MODELING_API")) {
         return is_truthy(v);
     }
     return false;
