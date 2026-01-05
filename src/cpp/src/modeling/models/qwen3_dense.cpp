@@ -5,9 +5,12 @@
 
 #include <cmath>
 #include <openvino/core/except.hpp>
+#include <openvino/op/util/variable.hpp>
+#include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/llm.hpp"
 #include "modeling/ops/ops.hpp"
+#include "modeling/ops/shape.hpp"
 
 namespace {
 
@@ -100,7 +103,52 @@ const Tensor* Qwen3Attention::o_proj_bias() const {
     return (o_bias_param_ && o_bias_param_->is_bound()) ? &o_bias_param_->value() : nullptr;
 }
 
-Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_states) const {
+std::pair<Tensor, Tensor> Qwen3Attention::append_kv_cache(const Tensor& keys,
+                                                          const Tensor& values,
+                                                          const Tensor& beam_idx) const {
+    auto* op_ctx = keys.context();
+    // Build stateful KV cache (ReadValue/Assign) so incremental decoding keeps context.
+    auto batch = shape::dim(keys, 0);
+    auto kv_heads = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(num_kv_heads_)});
+    auto zero_len = ops::const_vec(op_ctx, std::vector<int64_t>{0});
+    auto head_dim = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(head_dim_)});
+    auto cache_shape = shape::make({batch, kv_heads, zero_len, head_dim});
+
+    auto zero = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(keys.dtype());
+    auto k_init = shape::broadcast_to(zero, cache_shape);
+    auto v_init = shape::broadcast_to(zero, cache_shape);
+
+    const std::string cache_prefix = full_path().empty() ? name() : full_path();
+    const std::string k_name = cache_prefix + ".key_cache";
+    const std::string v_name = cache_prefix + ".value_cache";
+
+    ov::op::util::VariableInfo k_info{ov::PartialShape{-1, num_kv_heads_, -1, head_dim_},
+                                      keys.dtype(),
+                                      k_name};
+    auto k_var = std::make_shared<ov::op::util::Variable>(k_info);
+    auto k_read = std::make_shared<ov::op::v6::ReadValue>(k_init.output(), k_var);
+
+    ov::op::util::VariableInfo v_info{ov::PartialShape{-1, num_kv_heads_, -1, head_dim_},
+                                      values.dtype(),
+                                      v_name};
+    auto v_var = std::make_shared<ov::op::util::Variable>(v_info);
+    auto v_read = std::make_shared<ov::op::v6::ReadValue>(v_init.output(), v_var);
+
+    auto k_cached = ops::gather(Tensor(k_read->output(0), op_ctx), beam_idx, 0);
+    auto v_cached = ops::gather(Tensor(v_read->output(0), op_ctx), beam_idx, 0);
+
+    auto k_combined = ops::concat({k_cached, keys}, 2);
+    auto v_combined = ops::concat({v_cached, values}, 2);
+
+    auto k_assign = std::make_shared<ov::opset13::Assign>(k_combined.output(), k_var);
+    auto v_assign = std::make_shared<ov::opset13::Assign>(v_combined.output(), v_var);
+    ctx().register_sink(k_assign);
+    ctx().register_sink(v_assign);
+
+    return {k_combined, v_combined};
+}
+
+Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_states, const Tensor& beam_idx) const {
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
     auto k = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
     auto v = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
@@ -121,8 +169,9 @@ Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_sta
     auto q_rot = ops::llm::apply_rope(q_heads, cos_sin.first, cos_sin.second, head_dim_, policy);
     auto k_rot = ops::llm::apply_rope(k_heads, cos_sin.first, cos_sin.second, head_dim_, policy);
 
-    auto k_expanded = ops::llm::repeat_kv(k_rot, num_heads_, num_kv_heads_, head_dim_);
-    auto v_expanded = ops::llm::repeat_kv(v_heads, num_heads_, num_kv_heads_, head_dim_);
+    auto cached = append_kv_cache(k_rot, v_heads, beam_idx);
+    auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
+    auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
     auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
@@ -181,6 +230,7 @@ Qwen3DecoderLayer::Qwen3DecoderLayer(BuilderContext& ctx,
 
 std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& positions,
                                                      const Tensor& hidden_states,
+                                                     const Tensor& beam_idx,
                                                      const std::optional<Tensor>& residual) const {
     Tensor normed;
     Tensor next_residual;
@@ -192,7 +242,7 @@ std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& positions,
         normed = input_layernorm_.forward(hidden_states);
         next_residual = hidden_states;
     }
-    auto attn_out = self_attn_.forward(positions, normed);
+    auto attn_out = self_attn_.forward(positions, normed, beam_idx);
     auto post_norm = post_attention_layernorm_.forward(attn_out, next_residual);
     auto mlp_out = mlp_.forward(post_norm.first);
     return {mlp_out, post_norm.second};
@@ -209,11 +259,11 @@ Qwen3Model::Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module*
     }
 }
 
-Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids) {
+Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids, const Tensor& beam_idx) {
     auto hidden_states = embed_tokens_.forward(input_ids);
     std::optional<Tensor> residual;
     for (auto& layer : layers_) {
-        auto layer_out = layer.forward(position_ids, hidden_states, residual);
+        auto layer_out = layer.forward(position_ids, hidden_states, beam_idx, residual);
         hidden_states = layer_out.first;
         residual = layer_out.second;
     }
@@ -241,8 +291,10 @@ Qwen3ForCausalLM::Qwen3ForCausalLM(BuilderContext& ctx, const Qwen3DenseConfig& 
     }
 }
 
-Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids, const Tensor& position_ids) {
-    auto hidden = model_.forward(input_ids, position_ids);
+Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids,
+                                 const Tensor& position_ids,
+                                 const Tensor& beam_idx) {
+    auto hidden = model_.forward(input_ids, position_ids, beam_idx);
     return lm_head_.forward(hidden);
 }
 

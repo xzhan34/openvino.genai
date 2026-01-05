@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <openvino/openvino.hpp>
+#include <openvino/op/sink.hpp>
 
 #include "modeling/ops/context.hpp"
 #include "modeling/ops/op_policy.hpp"
@@ -30,6 +31,8 @@ public:
     const ov::ParameterVector& parameters() const;
     std::shared_ptr<ov::Model> build_model(const ov::OutputVector& outputs,
                                            const ov::SinkVector& sinks = {}) const;
+    void register_sink(const std::shared_ptr<ov::op::Sink>& sink) const;
+    const ov::SinkVector& sinks() const;
 
     OpContext& op_context();
     const OpContext& op_context() const;
@@ -46,6 +49,7 @@ private:
     ov::ParameterVector inputs_;
     std::unordered_map<std::string, WeightParameter*> params_by_name_;
     std::vector<WeightParameter*> params_;
+    mutable ov::SinkVector sinks_;
 };
 
 }  // namespace modeling

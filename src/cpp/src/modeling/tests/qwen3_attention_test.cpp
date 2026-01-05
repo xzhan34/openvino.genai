@@ -1,6 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -74,8 +75,9 @@ TEST(Qwen3Attention, MatchesReference) {
 
     auto hidden_states = ctx.parameter("hidden_states", ov::element::f32, ov::PartialShape{batch, seq_len, hidden});
     auto positions = ctx.parameter("positions", ov::element::i64, ov::PartialShape{batch, seq_len});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{batch});
 
-    auto output = attn.forward(positions, hidden_states);
+    auto output = attn.forward(positions, hidden_states, beam_idx);
     auto ov_model = ctx.build_model({output.output()});
 
     ov::Core core;
@@ -95,6 +97,10 @@ TEST(Qwen3Attention, MatchesReference) {
     ov::Tensor pos_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(pos_tensor.data(), position_ids.data(), position_ids.size() * sizeof(int64_t));
     request.set_input_tensor(1, pos_tensor);
+
+    ov::Tensor beam_tensor(ov::element::i32, {batch});
+    std::fill_n(beam_tensor.data<int32_t>(), batch, 0);
+    request.set_input_tensor(2, beam_tensor);
 
     request.infer();
 

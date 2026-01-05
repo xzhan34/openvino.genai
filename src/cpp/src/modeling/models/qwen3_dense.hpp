@@ -39,7 +39,7 @@ class Qwen3Attention : public Module {
 public:
     Qwen3Attention(BuilderContext& ctx, const std::string& name, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
 
-    Tensor forward(const Tensor& positions, const Tensor& hidden_states) const;
+    Tensor forward(const Tensor& positions, const Tensor& hidden_states, const Tensor& beam_idx) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -51,6 +51,9 @@ private:
     const Tensor* k_proj_bias() const;
     const Tensor* v_proj_bias() const;
     const Tensor* o_proj_bias() const;
+    std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
+                                              const Tensor& values,
+                                              const Tensor& beam_idx) const;
 
     int32_t num_heads_ = 0;
     int32_t num_kv_heads_ = 0;
@@ -95,6 +98,7 @@ public:
 
     std::pair<Tensor, Tensor> forward(const Tensor& positions,
                                       const Tensor& hidden_states,
+                                      const Tensor& beam_idx,
                                       const std::optional<Tensor>& residual) const;
 
 private:
@@ -109,7 +113,8 @@ public:
     Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
 
     Tensor forward(const Tensor& input_ids,
-                   const Tensor& position_ids);
+                   const Tensor& position_ids,
+                   const Tensor& beam_idx);
 
     VocabEmbedding& embed_tokens();
     RMSNorm& norm();
@@ -125,7 +130,8 @@ public:
     Qwen3ForCausalLM(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
 
     Tensor forward(const Tensor& input_ids,
-                   const Tensor& position_ids);
+                   const Tensor& position_ids,
+                   const Tensor& beam_idx);
 
     Qwen3Model& model();
     LMHead& lm_head();

@@ -79,14 +79,16 @@ std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
     auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
     (void)attention_mask;
-    (void)beam_idx;
-    auto logits = model.forward(input_ids, position_ids);
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
 
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, "logits");
-    return std::make_shared<ov::Model>(ov::OutputVector{result->output(0)},
-                                       ov::SinkVector{},
-                                       ctx.parameters());
+    auto ov_model = ctx.build_model({result->output(0)});
+    if (std::get<int>(configs.at("file_type")) == 1 || std::get<int>(configs.at("file_type")) == 0) {
+        ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    }
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
 }
 
 std::shared_ptr<ov::Model> create_language_model(

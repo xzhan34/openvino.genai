@@ -36,7 +36,8 @@ const ov::ParameterVector& BuilderContext::parameters() const {
 
 std::shared_ptr<ov::Model> BuilderContext::build_model(const ov::OutputVector& outputs,
                                                        const ov::SinkVector& sinks) const {
-    return std::make_shared<ov::Model>(outputs, sinks, inputs_);
+    const ov::SinkVector& model_sinks = sinks.empty() ? sinks_ : sinks;
+    return std::make_shared<ov::Model>(outputs, model_sinks, inputs_);
 }
 
 OpContext& BuilderContext::op_context() {
@@ -73,6 +74,17 @@ WeightParameter* BuilderContext::find_parameter(const std::string& full_name) co
 
 const std::vector<WeightParameter*>& BuilderContext::registered_parameters() const {
     return params_;
+}
+
+void BuilderContext::register_sink(const std::shared_ptr<ov::op::Sink>& sink) const {
+    if (!sink) {
+        return;
+    }
+    sinks_.push_back(sink);
+}
+
+const ov::SinkVector& BuilderContext::sinks() const {
+    return sinks_;
 }
 
 }  // namespace modeling

@@ -1,6 +1,7 @@
 ﻿// Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -113,8 +114,9 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, position_ids);
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
     auto ov_model = ctx.build_model({logits.output()});
     ov::serialize(ov_model, "qwen3_dummy_original.xml");
 
@@ -133,6 +135,10 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(1, position_ids_tensor);
+
+    ov::Tensor beam_tensor(ov::element::i32, {batch});
+    std::fill_n(beam_tensor.data<int32_t>(), batch, 0);
+    request.set_input_tensor(2, beam_tensor);
 
     request.infer();
 
@@ -260,8 +266,9 @@ TEST(Qwen3DenseDummy, TiedWeights) {
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, position_ids);
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
     auto ov_model = ctx.build_model({logits.output()});
 
     ov::serialize(ov_model, "qwen3_dummy_original.xml");
@@ -282,6 +289,10 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(1, position_ids_tensor);
+
+    ov::Tensor beam_tensor(ov::element::i32, {batch});
+    std::fill_n(beam_tensor.data<int32_t>(), batch, 0);
+    request.set_input_tensor(2, beam_tensor);
 
     request.infer();
 
