@@ -130,7 +130,9 @@ endif()
 if(NOT ENABLE_GGUF OR NOT ENABLE_SAFETENSORS)
     set(SAFETENSORS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/hf_config.cpp
                             ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_loader.cpp
-                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_modeling.cpp)
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_modeling.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_source.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_finalizer.cpp)
     list(REMOVE_ITEM SOURCE_FILES ${SAFETENSORS_SOURCES})
 endif()
 

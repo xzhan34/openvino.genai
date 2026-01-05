@@ -4,6 +4,8 @@
 #include "safetensors_utils/safetensors_modeling.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/hf_config.hpp"
+#include "safetensors_utils/safetensors_weight_source.hpp"
+#include "safetensors_utils/safetensors_weight_finalizer.hpp"
 
 #include <map>
 #include <vector>
@@ -11,16 +13,24 @@
 #include <iostream>
 #include <chrono>
 #include <stdexcept>
+#include <cstdlib>
+#include <algorithm>
+#include <cctype>
 
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
 #include "openvino/pass/serialize.hpp"
 
-// Include GGUF building blocks - we'll reuse these
+// Include GGUF building blocks - we'll reuse these for legacy path
 #include "gguf_utils/building_blocks.hpp"
 #include "gguf_utils/gguf.hpp"
 #include "utils.hpp"
+
+// Include modeling API components
+#include "modeling/builder_context.hpp"
+#include "modeling/models/qwen3_dense.hpp"
+#include "modeling/weights/weight_loader.hpp"
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -36,6 +46,25 @@ auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
 };
+
+/**
+ * @brief Check if new modeling API should be used
+ *
+ * Controlled by OV_GENAI_USE_MODELING_API environment variable
+ */
+bool use_modeling_api() {
+    auto is_truthy = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return v == "1" || v == "true" || v == "on" || v == "yes";
+    };
+
+    if (const char* v = std::getenv("OV_GENAI_USE_MODELING_API")) {
+        return is_truthy(v);
+    }
+    return false;
+}
 
 /**
  * @brief Convert HuggingFace weight name to building_blocks format
@@ -129,7 +158,59 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
 }
 
 /**
- * @brief Create the language model from HuggingFace weights
+ * @brief Create model using new modeling API
+ *
+ * This uses the Qwen3ForCausalLM class from modeling/models/qwen3_dense.hpp
+ */
+std::shared_ptr<ov::Model> create_model_with_modeling_api(
+    const HFConfig& hf_config,
+    std::unordered_map<std::string, ov::Tensor>& tensors) {
+
+    ov::genai::modeling::BuilderContext ctx;
+
+    // Configure model
+    ov::genai::modeling::models::Qwen3DenseConfig cfg;
+    cfg.architecture = hf_config.model_type;
+    cfg.hidden_size = hf_config.hidden_size;
+    cfg.num_hidden_layers = hf_config.num_hidden_layers;
+    cfg.num_attention_heads = hf_config.num_attention_heads;
+    cfg.num_key_value_heads = hf_config.kv_heads();
+    cfg.head_dim = hf_config.head_size();
+    cfg.rope_theta = hf_config.rope_theta;
+    cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
+    cfg.rms_norm_eps = hf_config.rms_norm_eps;
+    cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+
+    // Create model
+    ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
+
+    // Load weights using safetensors source and finalizer
+    SafetensorsWeightSource source(tensors);
+    SafetensorsWeightFinalizer finalizer;
+    ov::genai::modeling::weights::load_model(model, source, finalizer);
+
+    // Create input parameters
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    (void)attention_mask;  // Attention mask is handled internally
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
+    auto ov_model = ctx.build_model({result->output(0)});
+
+    // Set runtime options for optimal performance
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+
+    return ov_model;
+}
+
+/**
+ * @brief Create the language model from HuggingFace weights (legacy building_blocks path)
  */
 std::shared_ptr<ov::Model> create_language_model(
     const HFConfig& hf_config,
@@ -363,42 +444,37 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     
     std::cout << "[Safetensors] Loaded " << st_data.tensors.size() << " weight tensors" << std::endl;
 
-    // Step 2.5: Convert weight names from HF format to building_blocks format
-    // HF uses: model.layers.0.xxx, building_blocks uses: model.layers[0].xxx
-    std::cout << "[Safetensors] Converting weight names to building_blocks format..." << std::endl;
+    // Step 2.5: Convert weight names from HF format to internal format
+    // HF uses: model.layers.0.xxx, internal uses: model.layers[0].xxx
+    // This conversion is required for both modeling API and building_blocks paths
     std::unordered_map<std::string, ov::Tensor> converted_weights;
     for (auto& [name, tensor] : st_data.tensors) {
         std::string converted_name = convert_weight_name(name);
         converted_weights[converted_name] = std::move(tensor);
     }
     st_data.tensors = std::move(converted_weights);
-    
-    // Debug: Print first few converted weight names
-    std::cout << "[Safetensors] First 10 converted weight names:" << std::endl;
-    count = 0;
-    for (const auto& [name, tensor] : st_data.tensors) {
-        if (count++ < 10) {
-            std::cout << "  - " << name << std::endl;
-        }
-    }
 
     auto load_finish_time = std::chrono::high_resolution_clock::now();
     auto load_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         load_finish_time - start_time).count();
     std::cout << "[Safetensors] Weight loading done. Time: " << load_duration << "ms" << std::endl;
     
-    // Step 3: Create qtype entries for building_blocks compatibility
-    std::unordered_map<std::string, gguf_tensor_type> qtypes;
-    create_qtype_entries(qtypes, st_data.tensors, config.num_hidden_layers);
-    
     // Step 4: Build model
     std::cout << "[Safetensors] Building OpenVINO model..." << std::endl;
     
     std::shared_ptr<ov::Model> model;
     const std::string& model_type = config.model_type;
-    
-    if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
-        model_type == "mistral" || model_type == "mixtral") {
+
+    // Check if new modeling API should be used
+    if (model_type == "qwen3" && use_modeling_api()) {
+        std::cout << "[Safetensors] Using new modeling API" << std::endl;
+        model = create_model_with_modeling_api(config, st_data.tensors);
+    } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
+               model_type == "mistral" || model_type == "mixtral") {
+        std::cout << "[Safetensors] Using legacy building_blocks" << std::endl;
+        // Create qtype entries for building_blocks compatibility (only needed for legacy path)
+        std::unordered_map<std::string, gguf_tensor_type> qtypes;
+        create_qtype_entries(qtypes, st_data.tensors, config.num_hidden_layers);
         model = create_language_model(config, st_data.tensors, qtypes);
     } else {
         throw std::runtime_error("Unsupported model architecture '" + model_type + "'");
