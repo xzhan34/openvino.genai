@@ -184,7 +184,9 @@ Tensor Qwen3Attention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, &causal_mask, false, policy);
+    // Build causal mask that works with KV cache scenario
+    auto mask = ops::llm::build_kv_causal_mask(q_rot, k_expanded);
+    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, &mask, false, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
     auto out = add_bias_if_present(ops::linear(merged, o_proj_weight()), o_proj_bias());

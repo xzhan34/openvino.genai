@@ -126,10 +126,24 @@ Tensor range(const Tensor& stop, int64_t start, int64_t step, const ov::element:
     return Tensor(node, ctx);
 }
 
+Tensor range(const Tensor& start, const Tensor& stop, int64_t step, const ov::element::Type& type) {
+    auto* ctx = resolve_context(start, stop);
+    auto step_node = const_scalar(ctx, step);
+    auto node = std::make_shared<ov::op::v4::Range>(start.output(), stop.output(), step_node, type);
+    return Tensor(node, ctx);
+}
+
 Tensor greater_equal(const Tensor& a, const Tensor& b) {
     auto* ctx = resolve_context(a, b);
     auto node =
         std::make_shared<ov::op::v1::GreaterEqual>(a.output(), b.output(), ov::op::AutoBroadcastType::NUMPY);
+    return Tensor(node, ctx);
+}
+
+Tensor less_equal(const Tensor& a, const Tensor& b) {
+    auto* ctx = resolve_context(a, b);
+    auto node =
+        std::make_shared<ov::op::v1::LessEqual>(a.output(), b.output(), ov::op::AutoBroadcastType::NUMPY);
     return Tensor(node, ctx);
 }
 

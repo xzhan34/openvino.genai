@@ -27,6 +27,10 @@ Tensor apply_rope(const Tensor& x,
 Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32_t head_dim);
 Tensor causal_mask_from_seq_len(const Tensor& seq_len);
 Tensor causal_mask(const Tensor& scores);
+// Build causal mask that works with KV cache: Q shape [batch, heads, q_len, head_dim],
+// K shape [batch, heads, kv_len, head_dim]. Returns mask [batch, 1, q_len, kv_len].
+// For decode step: q_len=1, mask allows attending to all cached + current positions.
+Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k);
 Tensor sdpa(const Tensor& q,
             const Tensor& k,
             const Tensor& v,

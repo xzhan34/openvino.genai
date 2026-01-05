@@ -6,6 +6,8 @@
 #include <cmath>
 #include <vector>
 
+#include <openvino/opsets/opset13.hpp>
+
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
 
@@ -100,6 +102,64 @@ Tensor causal_mask(const Tensor& scores) {
     return shape::broadcast_to(mask4d, scores_shape);
 }
 
+Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k) {
+    // Build causal mask for KV cache scenario:
+    // Q: [batch, heads, q_len, head_dim]
+    // K: [batch, heads, kv_len, head_dim]
+    // Output: [batch, 1, q_len, kv_len] where mask[i,j]=0 if col_j <= row_i_absolute, else -inf
+    //
+    // For prefill: q_len=N, kv_len=N, behaves like standard causal mask
+    // For decode: q_len=1, kv_len=cache_len+1, allows attending to all positions
+    auto* ctx = q.context();
+
+    // Get dimensions as shape [1] tensors
+    auto batch = shape::dim(q, 0);  // [1]
+    auto q_len = shape::dim(q, 2);  // [1]
+    auto kv_len = shape::dim(k, 2); // [1]
+
+    // Squeeze to scalars for Range op
+    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
+    auto kv_len_scalar = Tensor(kv_len, ctx).squeeze(0);
+
+    // Calculate cache_seq_len = kv_len - q_len (as scalar)
+    auto cache_len_scalar = Tensor(
+        std::make_shared<ov::opset13::Subtract>(kv_len_scalar.output(), q_len_scalar.output())->output(0), ctx);
+
+    // Convert to i32 for Range
+    auto cache_len_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(cache_len_scalar.output(), ov::element::i32)->output(0), ctx);
+    auto q_len_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(q_len_scalar.output(), ov::element::i32)->output(0), ctx);
+    auto kv_len_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(kv_len_scalar.output(), ov::element::i32)->output(0), ctx);
+
+    // Create col indices: [0, 1, 2, ..., kv_len-1] -> [1, kv_len]
+    auto col_range = range(kv_len_i32, 0, 1, ov::element::i32);
+    auto col_indices = col_range.unsqueeze(0);  // [1, kv_len]
+
+    // Create row indices: [cache_len, cache_len+1, ..., cache_len+q_len-1] -> [q_len, 1]
+    // These represent the absolute positions of query tokens
+    auto q_len_plus_cache = cache_len_i32 + q_len_i32;
+    auto row_range = range(cache_len_i32, q_len_plus_cache, 1, ov::element::i32);
+    auto row_indices = row_range.unsqueeze(1);  // [q_len, 1]
+
+    // Causal condition: col <= row (attend to current and past positions)
+    auto causal_cond = less_equal(col_indices, row_indices);  // [q_len, kv_len]
+
+    // Build mask: 0 where can attend, -inf where masked
+    auto zero_val = Tensor(const_scalar(ctx, 0.0f), ctx);
+    auto neg_inf = Tensor(const_scalar(ctx, -65504.0f), ctx);
+    auto mask_2d = where(causal_cond, zero_val, neg_inf);  // [q_len, kv_len]
+
+    // Expand to [batch, 1, q_len, kv_len]
+    auto mask_4d = mask_2d.unsqueeze({0, 1});
+
+    // Broadcast to batch size
+    auto one_val = const_vec(ctx, std::vector<int64_t>{1});
+    auto target_shape = shape::make({batch, one_val, q_len, kv_len});
+    return shape::broadcast_to(mask_4d, target_shape);
+}
+
 Tensor sdpa(const Tensor& q,
             const Tensor& k,
             const Tensor& v,
@@ -109,17 +169,21 @@ Tensor sdpa(const Tensor& q,
             bool causal,
             const OpPolicy* policy) {
     (void)policy;
-    auto q_scaled = (scale == 1.0f) ? q : q * scale;
-    auto scores = matmul(q_scaled, k, false, true);
-    auto scores_f32 = scores.to(ov::element::f32);
+    (void)softmax_axis;  // Native SDPA handles this internally
+    (void)scale;  // Native SDPA handles scaling internally
+
+    auto* ctx = q.context();
+
+    // Use native ScaledDotProductAttention for optimal GPU performance
     if (mask) {
-        scores_f32 = scores_f32 + mask->to(ov::element::f32);
+        auto sdpa_node = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
+            q.output(), k.output(), v.output(), mask->output(), causal);
+        return Tensor(sdpa_node, ctx);
+    } else {
+        auto sdpa_node = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
+            q.output(), k.output(), v.output(), causal);
+        return Tensor(sdpa_node, ctx);
     }
-    if (causal) {
-        scores_f32 = scores_f32 + causal_mask(scores_f32);
-    }
-    auto probs = scores_f32.softmax(softmax_axis);
-    return matmul(probs, v, false, false);
 }
 
 }  // namespace llm
