@@ -40,6 +40,10 @@ public:
     Qwen3Attention(BuilderContext& ctx, const std::string& name, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
 
     Tensor forward(const Tensor& positions, const Tensor& hidden_states, const Tensor& beam_idx) const;
+    Tensor forward(const Tensor& hidden_states,
+                   const Tensor& beam_idx,
+                   const Tensor& rope_cos,
+                   const Tensor& rope_sin) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -96,9 +100,10 @@ class Qwen3DecoderLayer : public Module {
 public:
     Qwen3DecoderLayer(BuilderContext& ctx, const std::string& name, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
 
-    std::pair<Tensor, Tensor> forward(const Tensor& positions,
-                                      const Tensor& hidden_states,
+    std::pair<Tensor, Tensor> forward(const Tensor& hidden_states,
                                       const Tensor& beam_idx,
+                                      const Tensor& rope_cos,
+                                      const Tensor& rope_sin,
                                       const std::optional<Tensor>& residual) const;
 
 private:
@@ -123,6 +128,8 @@ private:
     VocabEmbedding embed_tokens_;
     std::vector<Qwen3DecoderLayer> layers_;
     RMSNorm norm_;
+    int32_t head_dim_ = 0;
+    float rope_theta_ = 10000.0f;
 };
 
 class Qwen3ForCausalLM : public Module {

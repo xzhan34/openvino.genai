@@ -149,6 +149,15 @@ std::pair<Tensor, Tensor> Qwen3Attention::append_kv_cache(const Tensor& keys,
 }
 
 Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_states, const Tensor& beam_idx) const {
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(positions, head_dim_, rope_theta_, policy);
+    return forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second);
+}
+
+Tensor Qwen3Attention::forward(const Tensor& hidden_states,
+                               const Tensor& beam_idx,
+                               const Tensor& rope_cos,
+                               const Tensor& rope_sin) const {
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
     auto k = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
     auto v = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
@@ -165,9 +174,8 @@ Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_sta
     }
 
     auto* policy = &ctx().op_policy();
-    auto cos_sin = ops::llm::rope_cos_sin(positions, head_dim_, rope_theta_, policy);
-    auto q_rot = ops::llm::apply_rope(q_heads, cos_sin.first, cos_sin.second, head_dim_, policy);
-    auto k_rot = ops::llm::apply_rope(k_heads, cos_sin.first, cos_sin.second, head_dim_, policy);
+    auto q_rot = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, head_dim_, policy);
+    auto k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
 
     auto cached = append_kv_cache(k_rot, v_heads, beam_idx);
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
@@ -228,9 +236,10 @@ Qwen3DecoderLayer::Qwen3DecoderLayer(BuilderContext& ctx,
       input_layernorm_(ctx, "input_layernorm", cfg.rms_norm_eps, this),
       post_attention_layernorm_(ctx, "post_attention_layernorm", cfg.rms_norm_eps, this) {}
 
-std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& positions,
-                                                     const Tensor& hidden_states,
+std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& hidden_states,
                                                      const Tensor& beam_idx,
+                                                     const Tensor& rope_cos,
+                                                     const Tensor& rope_sin,
                                                      const std::optional<Tensor>& residual) const {
     Tensor normed;
     Tensor next_residual;
@@ -242,7 +251,7 @@ std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& positions,
         normed = input_layernorm_.forward(hidden_states);
         next_residual = hidden_states;
     }
-    auto attn_out = self_attn_.forward(positions, normed, beam_idx);
+    auto attn_out = self_attn_.forward(normed, beam_idx, rope_cos, rope_sin);
     auto post_norm = post_attention_layernorm_.forward(attn_out, next_residual);
     auto mlp_out = mlp_.forward(post_norm.first);
     return {mlp_out, post_norm.second};
@@ -252,7 +261,11 @@ Qwen3Model::Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module*
     : Module("model", ctx, parent),
       embed_tokens_(ctx, "embed_tokens", this),
       layers_(),
-      norm_(ctx, "norm", cfg.rms_norm_eps, this) {
+      norm_(ctx, "norm", cfg.rms_norm_eps, this),
+      head_dim_(cfg.head_dim > 0
+                    ? cfg.head_dim
+                    : (cfg.num_attention_heads > 0 ? (cfg.hidden_size / cfg.num_attention_heads) : 0)),
+      rope_theta_(cfg.rope_theta) {
     layers_.reserve(static_cast<size_t>(cfg.num_hidden_layers));
     for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
         layers_.emplace_back(ctx, "layers[" + std::to_string(i) + "]", cfg, this);
@@ -261,9 +274,11 @@ Qwen3Model::Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module*
 
 Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids, const Tensor& beam_idx) {
     auto hidden_states = embed_tokens_.forward(input_ids);
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
     std::optional<Tensor> residual;
     for (auto& layer : layers_) {
-        auto layer_out = layer.forward(position_ids, hidden_states, beam_idx, residual);
+        auto layer_out = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, residual);
         hidden_states = layer_out.first;
         residual = layer_out.second;
     }
