@@ -43,7 +43,8 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& beam_idx,
                    const Tensor& rope_cos,
-                   const Tensor& rope_sin) const;
+                   const Tensor& rope_sin,
+                   const Tensor& causal_mask) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -104,6 +105,7 @@ public:
                                       const Tensor& beam_idx,
                                       const Tensor& rope_cos,
                                       const Tensor& rope_sin,
+                                      const Tensor& causal_mask,
                                       const std::optional<Tensor>& residual) const;
 
 private:

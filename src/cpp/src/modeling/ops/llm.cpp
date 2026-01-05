@@ -80,12 +80,9 @@ Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32
     return broadcast.reshape(reshape_shape, false);
 }
 
-Tensor causal_mask(const Tensor& scores) {
-    auto* ctx = scores.context();
-    auto scores_shape = shape::of(scores);
-    auto seq = Tensor(shape::dim(scores, 2), ctx).squeeze(0);
-
-    auto idx = range(seq, 0, 1, ov::element::i64);
+Tensor causal_mask_from_seq_len(const Tensor& seq_len) {
+    auto* ctx = seq_len.context();
+    auto idx = range(seq_len, 0, 1, ov::element::i64);
     auto row = idx.unsqueeze(1);
     auto col = idx.unsqueeze(0);
     auto ge = greater_equal(row, col);
@@ -93,7 +90,13 @@ Tensor causal_mask(const Tensor& scores) {
     auto zero = Tensor(const_scalar(ctx, 0.0f), ctx);
     auto neg = Tensor(const_scalar(ctx, -65504.0f), ctx);
     auto mask2d = where(ge, zero, neg);
-    auto mask4d = mask2d.unsqueeze({0, 1});
+    return mask2d.unsqueeze({0, 1});
+}
+
+Tensor causal_mask(const Tensor& scores) {
+    auto scores_shape = shape::of(scores);
+    auto seq = Tensor(shape::dim(scores, 2), scores.context()).squeeze(0);
+    auto mask4d = causal_mask_from_seq_len(seq);
     return shape::broadcast_to(mask4d, scores_shape);
 }
 

@@ -151,13 +151,16 @@ std::pair<Tensor, Tensor> Qwen3Attention::append_kv_cache(const Tensor& keys,
 Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_states, const Tensor& beam_idx) const {
     auto* policy = &ctx().op_policy();
     auto cos_sin = ops::llm::rope_cos_sin(positions, head_dim_, rope_theta_, policy);
-    return forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second);
+    auto seq_len = Tensor(shape::dim(positions, 1), positions.context()).squeeze(0);
+    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
+    return forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, causal_mask);
 }
 
 Tensor Qwen3Attention::forward(const Tensor& hidden_states,
                                const Tensor& beam_idx,
                                const Tensor& rope_cos,
-                               const Tensor& rope_sin) const {
+                               const Tensor& rope_sin,
+                               const Tensor& causal_mask) const {
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
     auto k = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
     auto v = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
@@ -181,7 +184,7 @@ Tensor Qwen3Attention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
+    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, &causal_mask, false, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
     auto out = add_bias_if_present(ops::linear(merged, o_proj_weight()), o_proj_bias());
@@ -240,6 +243,7 @@ std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& hidden_states
                                                      const Tensor& beam_idx,
                                                      const Tensor& rope_cos,
                                                      const Tensor& rope_sin,
+                                                     const Tensor& causal_mask,
                                                      const std::optional<Tensor>& residual) const {
     Tensor normed;
     Tensor next_residual;
@@ -251,7 +255,7 @@ std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& hidden_states
         normed = input_layernorm_.forward(hidden_states);
         next_residual = hidden_states;
     }
-    auto attn_out = self_attn_.forward(normed, beam_idx, rope_cos, rope_sin);
+    auto attn_out = self_attn_.forward(normed, beam_idx, rope_cos, rope_sin, causal_mask);
     auto post_norm = post_attention_layernorm_.forward(attn_out, next_residual);
     auto mlp_out = mlp_.forward(post_norm.first);
     return {mlp_out, post_norm.second};
@@ -276,9 +280,11 @@ Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids, 
     auto hidden_states = embed_tokens_.forward(input_ids);
     auto* policy = &ctx().op_policy();
     auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    auto seq_len = Tensor(shape::dim(position_ids, 1), position_ids.context()).squeeze(0);
+    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
     std::optional<Tensor> residual;
     for (auto& layer : layers_) {
-        auto layer_out = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, residual);
+        auto layer_out = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, causal_mask, residual);
         hidden_states = layer_out.first;
         residual = layer_out.second;
     }

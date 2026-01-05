@@ -25,6 +25,7 @@ Tensor apply_rope(const Tensor& x,
                   int32_t head_dim,
                   const OpPolicy* policy = nullptr);
 Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32_t head_dim);
+Tensor causal_mask_from_seq_len(const Tensor& seq_len);
 Tensor causal_mask(const Tensor& scores);
 Tensor sdpa(const Tensor& q,
             const Tensor& k,
