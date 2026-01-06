@@ -248,6 +248,30 @@ if(rpaths)
     set_target_properties(${TARGET_NAME} PROPERTIES INSTALL_RPATH "${rpaths}")
 endif()
 
+# Test executable for MOE layer
+if(ENABLE_GGUF)
+    add_executable(test_moe_layer 
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/test_moe_layer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/building_blocks.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_quants.cpp)
+    target_link_libraries(test_moe_layer PRIVATE openvino::runtime openvino::core::dev openvino::threading gguflib nlohmann_json::nlohmann_json minja)
+    target_include_directories(test_moe_layer PRIVATE 
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_BINARY_DIR}"
+        "${gguflib_SOURCE_DIR}"
+        "${safetensors.h_SOURCE_DIR}")
+    target_compile_features(test_moe_layer PRIVATE cxx_std_17)
+    target_compile_definitions(test_moe_layer PRIVATE ENABLE_GGUF openvino_genai_EXPORTS)
+    if(MSVC)
+        target_compile_options(test_moe_layer PRIVATE "/bigobj")
+    endif()
+    set_target_properties(test_moe_layer PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+        FOLDER "tests")
+endif()
+
 install(TARGETS ${TARGET_NAME} EXPORT OpenVINOGenAITargets
         LIBRARY DESTINATION ${LIBRARY_DESTINATION} COMPONENT core_genai
             NAMELINK_COMPONENT core_genai_dev

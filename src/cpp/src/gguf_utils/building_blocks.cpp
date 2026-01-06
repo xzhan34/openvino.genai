@@ -13,6 +13,7 @@
 #include "openvino/opsets/opset13.hpp"
 #include "openvino/op/placeholder_extension.hpp"
 #include "openvino/op/fused_mlp.hpp"
+#include "openvino/op/moe.hpp"
 #include <ov_ops/fully_connected.hpp>
 #include <ov_ops/rms.hpp>
 #include <ov_ops/rotary_positional_embeddings.hpp>
@@ -666,15 +667,21 @@ ov::Output<ov::Node> make_int4_weights(
 
     // Convert weight to uint8 view and adjust shape
     ov::Shape orig_weight_shape = weight.get_shape();
-    orig_weight_shape[1] *= sizeof(uint32_t) / sizeof(uint8_t) * 2; // Double number of columns for 4-bit representation
+    bool has_expert_dim = (orig_weight_shape.size() == 3);  // [num_experts, rows, cols_bytes] vs [rows, cols_bytes]
+    
+    size_t rows_idx = has_expert_dim ? 1 : 0;
+    size_t cols_idx = has_expert_dim ? 2 : 1;
+    
+    // Unpack u32 packed format: each cols value contains 8 x 4-bit values
+    orig_weight_shape[cols_idx] *= sizeof(uint32_t) / sizeof(uint8_t) * 2;
 
     // Retrieve scales and biases
     ov::Tensor scales = get_tensor(consts, key + ".scales");
     ov::Tensor biases = get_tensor(consts, key + ".biases");
 
-    // Expand dimensions for scales and biases
+    // Expand dimensions for scales and biases (add group_size=1 dimension at the end)
     ov::Shape scale_bias_shape = scales.get_shape();
-    scale_bias_shape.push_back(1); // Add new axis at the end
+    scale_bias_shape.push_back(1);
     scales.set_shape(scale_bias_shape);
     biases.set_shape(scale_bias_shape);
 
@@ -685,12 +692,24 @@ ov::Output<ov::Node> make_int4_weights(
         biases = reorder_interleaved_format(biases, head_size);
     }
 
-    // Create INT4 weight tensor
-    ov::Shape packed_shape = {
-        orig_weight_shape[0],
-        orig_weight_shape[1] / group_size,
-        group_size
-    };
+    // Create INT4 weight tensor with proper shape
+    // 2D: [rows, group_num, group_size]
+    // 3D: [num_experts, rows, group_num, group_size]
+    ov::Shape packed_shape;
+    if (has_expert_dim) {
+        packed_shape = {
+            orig_weight_shape[0],  // num_experts
+            orig_weight_shape[1],  // rows
+            orig_weight_shape[2] / group_size,  // group_num
+            group_size
+        };
+    } else {
+        packed_shape = {
+            orig_weight_shape[0],  // rows
+            orig_weight_shape[1] / group_size,  // group_num
+            group_size
+        };
+    }
 
     auto weights_node = std::make_shared<v0::Constant>(ov::element::u4, packed_shape, static_cast<uint8_t*>(weight.data()), nullptr);
     weights_node->get_rt_info()["__gguf_tensor_holde"] = weight;
@@ -1239,6 +1258,380 @@ std::tuple<ov::Output<ov::Node>,
     output->set_friendly_name(name_prefix + ".add1" + name_suffix);
 
     return {output, sinks, new_causal_mask, new_cos_sin, final_output_shape};
+}
+
+// Current implementation creates MOE node, expecting ConvertMOEToMOECompressed to run first,
+// but that transformation may not match if weights don't have the expected decompression pattern.
+//
+ov::Output<ov::Node> moe_layer_internal(
+    const std::string& layer_prefix,
+    const ov::Output<ov::Node>& hidden_states,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    int num_experts,
+    int topk) {
+    
+    std::cout << "\n=== MOE Layer Construction Debug ===" << std::endl;
+    std::cout << "hidden_states shape: " << hidden_states.get_partial_shape() << std::endl;
+    std::cout << "num_experts: " << num_experts << ", topk: " << topk << std::endl;
+    
+    // Flatten batch*seq_len dimensions: [batch, seq, hidden] -> [batch*seq, hidden]
+    auto flatten_shape = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{2}, std::vector<int64_t>{-1, static_cast<int64_t>(hidden_states.get_partial_shape()[2].get_length())});
+    auto hidden_states_flat = std::make_shared<ov::op::v1::Reshape>(hidden_states, flatten_shape, false);
+    std::cout << "hidden_states_flat shape: " << hidden_states_flat->get_output_partial_shape(0) << std::endl;
+
+    // 1. Router MatMul - must be preserved for FuseMOE3GemmCompressed pattern
+    auto router_key = layer_prefix + ".router";
+    auto router_weights = make_weights_subgraph(router_key, consts,
+        qtypes.count(router_key + ".qtype") ? qtypes.at(router_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    
+    std::cout << "router_weights shape: " << router_weights.get_partial_shape() << std::endl;
+    
+    auto router_matmul = std::make_shared<ov::op::v0::MatMul>(
+        hidden_states_flat, router_weights, false, true);
+    std::cout << "router_matmul shape: " << router_matmul->get_output_partial_shape(0) << std::endl;
+    
+    auto softmax = std::make_shared<ov::op::v8::Softmax>(router_matmul, -1);
+    std::cout << "softmax shape: " << softmax->get_output_partial_shape(0) << std::endl;
+    
+    // 2. TopK expert selection
+    auto topk_const = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, topk);
+    auto topk_op = std::make_shared<ov::op::v11::TopK>(
+        softmax, topk_const, -1,
+        ov::op::v11::TopK::Mode::MAX,
+        ov::op::v11::TopK::SortType::SORT_VALUES,
+        ov::element::i64);
+    
+    auto topk_values = topk_op->output(0);
+    auto topk_indices = topk_op->output(1);
+    std::cout << "topk_values shape: " << topk_values.get_partial_shape() << std::endl;
+    std::cout << "topk_indices shape: " << topk_indices.get_partial_shape() << std::endl;
+    
+    // 3. Normalize routing weights (for MOECompressed input 1)
+    auto reduce_axis = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+    auto sum_reduce = std::make_shared<ov::op::v1::ReduceSum>(topk_values, reduce_axis, true);
+    std::cout << "sum_reduce shape: " << sum_reduce->get_output_partial_shape(0) << std::endl;
+    
+    auto normalized_weights = std::make_shared<ov::op::v1::Divide>(topk_values, sum_reduce);
+    std::cout << "normalized_weights shape: " << normalized_weights->get_output_partial_shape(0) << std::endl;
+    
+    // 4. Routing reshape path for MOECompressed - matches FuseMOE3GemmCompressed pattern
+    // ShapeOf → Gather → Unsqueeze → Concat → Broadcast → ScatterElementsUpdate → Transpose → Reshape → Unsqueeze
+    auto shape_of = std::make_shared<ov::op::v3::ShapeOf>(topk_indices, ov::element::i64);
+    auto gather_axis = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 0);
+    auto batch_seq_idx = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 0);
+    auto batch_seq_gather = std::make_shared<ov::op::v8::Gather>(shape_of, batch_seq_idx, gather_axis);
+    auto unsqueeze_batch_seq = std::make_shared<ov::op::v0::Unsqueeze>(
+        batch_seq_gather,
+        std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 0));
+    
+    auto num_experts_const = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, num_experts);
+    auto unsqueeze_experts = std::make_shared<ov::op::v0::Unsqueeze>(
+        num_experts_const,
+        std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 0));
+    
+    auto concat_shape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{unsqueeze_batch_seq, unsqueeze_experts}, 0);
+    std::cout << "concat_shape (broadcast target): [batch*seq, experts]" << std::endl;
+    
+    auto zeros_const = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{}, 0.0f);
+    auto broadcast = std::make_shared<ov::op::v3::Broadcast>(zeros_const, concat_shape);
+    std::cout << "broadcast shape: " << broadcast->get_output_partial_shape(0) << std::endl;
+    
+    auto scatter_axis = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 1);
+    auto scatter = std::make_shared<ov::op::v12::ScatterElementsUpdate>(
+        broadcast, topk_indices, normalized_weights, scatter_axis);
+    std::cout << "scatter shape: " << scatter->get_output_partial_shape(0) << std::endl;
+    
+    auto transpose_order = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
+    auto transpose = std::make_shared<ov::op::v1::Transpose>(scatter, transpose_order);
+    std::cout << "transpose shape: " << transpose->get_output_partial_shape(0) << std::endl;
+    
+    // Reshape to [experts, batch*seq, 1]
+    auto one_const = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 1);
+    auto concat_reshape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{unsqueeze_experts, unsqueeze_batch_seq, one_const}, 0);
+    std::cout << "concat_reshape target: [experts, batch*seq, 1]" << std::endl;
+    
+    auto reshape = std::make_shared<ov::op::v1::Reshape>(transpose, concat_reshape, false);
+    std::cout << "reshape shape: " << reshape->get_output_partial_shape(0) << std::endl;
+    
+    auto routing_unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(
+        reshape,
+        std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 3));
+    std::cout << "routing_unsqueeze shape: " << routing_unsqueeze->get_output_partial_shape(0) << std::endl;
+    
+    // 5. Load concatenated expert weights (already in correct layout)
+    std::string gate_concat_key = layer_prefix + ".experts.gate_proj_fused";
+    std::string up_concat_key = layer_prefix + ".experts.up_proj_fused";
+    std::string down_concat_key = layer_prefix + ".experts.down_proj_fused";
+    
+    auto fused_gate_weights = make_weights_subgraph(gate_concat_key, consts,
+        qtypes.count(gate_concat_key + ".qtype") ? qtypes.at(gate_concat_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    auto fused_up_weights = make_weights_subgraph(up_concat_key, consts,
+        qtypes.count(up_concat_key + ".qtype") ? qtypes.at(up_concat_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    auto fused_down_weights = make_weights_subgraph(down_concat_key, consts,
+        qtypes.count(down_concat_key + ".qtype") ? qtypes.at(down_concat_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    
+    std::cout << "fused_gate_weights shape: " << fused_gate_weights.get_partial_shape() << std::endl;
+    std::cout << "fused_up_weights shape: " << fused_up_weights.get_partial_shape() << std::endl;
+    std::cout << "fused_down_weights shape: " << fused_down_weights.get_partial_shape() << std::endl;
+    
+    // 7. Weights are already in correct layout [E, I, H] - no transpose needed
+    // gate_proj/up_proj: [E, I, H] (ff_dim, hidden_dim)
+    // down_proj: [E, H, I] (hidden_dim, ff_dim)
+    
+    // 8. Create MOE internal op
+    ov::OutputVector moe_inputs = {
+        hidden_states_flat,
+        routing_unsqueeze,
+        topk_indices,
+        fused_gate_weights, fused_up_weights, fused_down_weights
+    };
+    
+    ov::op::internal::MOE::Config config;
+    config.expert_type = ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU;
+    
+    auto moe_node = std::make_shared<ov::op::internal::MOE>(moe_inputs, config);
+    std::cout << "moe_node output shape: " << moe_node->get_output_partial_shape(0) << std::endl;
+    
+    std::cout << "\n=== Pattern Matching Analysis ===" << std::endl;
+    std::cout << "MOE node created with " << moe_inputs.size() << " inputs (expects 6)" << std::endl;
+    std::cout << "  Input 0 (hidden_states): " << moe_inputs[0].get_node()->get_type_name() << std::endl;
+    std::cout << "  Input 1 (routing): " << moe_inputs[1].get_node()->get_type_name() << std::endl;
+    std::cout << "  Input 2 (indices): " << moe_inputs[2].get_node()->get_type_name() << std::endl;
+    std::cout << "  Input 3 (gate_weight): " << moe_inputs[3].get_node()->get_type_name() << std::endl;
+    std::cout << "  Input 4 (up_weight): " << moe_inputs[4].get_node()->get_type_name() << std::endl;
+    std::cout << "  Input 5 (down_weight): " << moe_inputs[5].get_node()->get_type_name() << std::endl;
+    
+    // Check weight structure for ConvertMOEToMOECompressed matching
+    auto check_weight_pattern = [](const ov::Output<ov::Node>& weight, const std::string& name) {
+        std::cout << "  " << name << " chain: ";
+        auto node = weight.get_node_shared_ptr();
+        int depth = 0;
+        while (node && depth < 5) {
+            std::cout << node->get_type_name();
+            if (node->get_type_name() == "Constant") {
+                auto const_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(node);
+                if (const_node) {
+                    std::cout << "[" << const_node->get_element_type() << "]";
+                }
+                break;
+            }
+            std::cout << " ← ";
+            if (node->get_input_size() > 0) {
+                node = node->get_input_node_shared_ptr(0);
+            } else {
+                break;
+            }
+            depth++;
+        }
+        std::cout << std::endl;
+    };
+    
+    check_weight_pattern(moe_inputs[3], "gate_weight");
+    check_weight_pattern(moe_inputs[4], "up_weight");
+    check_weight_pattern(moe_inputs[5], "down_weight");
+    
+    std::cout << "\nFuseMOE3GemmCompressed requires:" << std::endl;
+    std::cout << "  - MOECompressed node (not MOE) with 12 inputs (weight+scale+zp for each)" << std::endl;
+    std::cout << "  - Weight pattern: Constant[u4/i4] → Convert → Subtract → Multiply" << std::endl;
+    std::cout << "  - Routing subgraph with specific structure (2 Concat nodes)" << std::endl;
+    std::cout << "=== End MOE Layer Construction ===" << std::endl;
+    
+    return moe_node->output(0);
+}
+
+// Fixed moe_layer implementation that matches GPU fusion pattern
+// Key changes:
+// 1. Add Reshape after Tile
+// 2. Use transpose_b=true for MatMuls
+// 3. Transpose weight layout to [num_experts, ff_dim, hidden_dim]
+// 4. Fix routing path operation order
+
+ov::Output<ov::Node> moe_layer_fused(
+    const std::string& layer_prefix,
+    const ov::Output<ov::Node>& hidden_states,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    int num_experts,
+    int topk) {
+
+    // Flatten batch*seq_len dimensions: [batch, seq, hidden] -> [batch*seq, hidden]
+    auto flatten_shape = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{2}, std::vector<int64_t>{-1, static_cast<int64_t>(hidden_states.get_partial_shape()[2].get_length())});
+    auto hidden_states_flat = std::make_shared<ov::op::v1::Reshape>(hidden_states, flatten_shape, false);
+    std::cout << "hidden_states_flat shape: " << hidden_states_flat->get_output_partial_shape(0) << std::endl;
+    // 1. Router network
+    auto router_key = layer_prefix + ".router";
+    auto router_weights = make_weights_subgraph(router_key, consts, 
+        qtypes.count(router_key + ".qtype") ? qtypes.at(router_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    
+    auto router_logits = std::make_shared<ov::op::v0::MatMul>(
+        hidden_states_flat, router_weights, false, true);
+    
+    auto softmax = std::make_shared<ov::op::v8::Softmax>(router_logits, -1);
+    
+    // 2. TopK expert selection
+    auto topk_const = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{}, topk);
+    auto topk_op = std::make_shared<ov::op::v11::TopK>(
+        softmax, topk_const, -1,
+        ov::op::v11::TopK::Mode::MAX,
+        ov::op::v11::TopK::SortType::SORT_VALUES,
+        ov::element::i64);
+    
+    auto topk_values = topk_op->output(0);
+    auto topk_indices = topk_op->output(1);
+    
+    // 3. Normalize routing weights
+    auto reduce_axis = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+    auto sum_reduce = std::make_shared<ov::op::v1::ReduceSum>(
+        topk_values, reduce_axis, true);
+    auto normalized_weights = std::make_shared<ov::op::v1::Divide>(
+        topk_values, sum_reduce);
+    
+    // 4. Create sparse routing tensor [batch*seq_len, num_experts]
+    auto input_shape = std::make_shared<ov::op::v3::ShapeOf>(hidden_states_flat, ov::element::i64);
+    auto axis_0 = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 0);
+    auto axis_1 = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 1);
+    
+    auto seq_dim = std::make_shared<ov::op::v8::Gather>(input_shape, axis_0, axis_0);
+    auto hidden_dim_from_shape = std::make_shared<ov::op::v8::Gather>(input_shape, axis_1, axis_0);
+
+    auto seq_dim_unsqueezed = std::make_shared<ov::op::v0::Unsqueeze>(
+        seq_dim, std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 0));
+    auto hidden_dim_unsqueezed = std::make_shared<ov::op::v0::Unsqueeze>(
+        hidden_dim_from_shape, std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 0));
+
+    auto num_experts_const = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{1}, num_experts);
+    auto scatter_shape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{seq_dim_unsqueezed, num_experts_const}, 0);
+    
+    auto zeros_scalar = std::make_shared<ov::op::v0::Constant>(
+        ov::element::f32, ov::Shape{}, 0.0f);
+    auto zeros_tensor = std::make_shared<ov::op::v3::Broadcast>(
+        zeros_scalar, scatter_shape);
+    
+    auto scatter_axis = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{1}, 1);
+    auto routing_sparse = std::make_shared<ov::op::v12::ScatterElementsUpdate>(
+        zeros_tensor, topk_indices, normalized_weights, scatter_axis);
+    
+    // 5. Load concatenated expert weights (already in correct layout)
+    // Weights are in layout: gate/up [E, FF, H] (ff_dim, hidden_dim), down [E, FF, H] (ff_dim, hidden_dim)
+    // For transpose_b=true MatMuls on gate/up, they become [E, H, FF] for multiplication
+    // For down projection, weights are already [E, FF, H] so no transpose needed
+    std::string gate_concat_key = layer_prefix + ".experts.gate_proj_fused";
+    std::string up_concat_key = layer_prefix + ".experts.up_proj_fused";
+    std::string down_concat_key = layer_prefix + ".experts.down_proj_fused";
+    
+    auto fused_gate_weights = make_weights_subgraph(gate_concat_key, consts,
+        qtypes.count(gate_concat_key + ".qtype") ? qtypes.at(gate_concat_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    auto fused_up_weights = make_weights_subgraph(up_concat_key, consts,
+        qtypes.count(up_concat_key + ".qtype") ? qtypes.at(up_concat_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    auto fused_down_weights = make_weights_subgraph(down_concat_key, consts,
+        qtypes.count(down_concat_key + ".qtype") ? qtypes.at(down_concat_key + ".qtype") : gguf_tensor_type::GGUF_TYPE_F16,
+        false, -1);
+    
+    // Weights are already in layout [E, FF, H] for all projections
+    // Since we use transpose_b=true in MatMuls for gate/up:
+    // - gate/up: [E, FF, H] transposed in MatMul -> [E, H, FF] for multiplication
+    // For down projection, no transpose needed:
+    // - down: [E, FF, H] used as-is for multiplication
+    
+    auto neg_one = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, -1);
+    
+    // ========== DENSE MOE: Process all experts (for pattern matching) ==========
+    // Reshape from [B*S, H] to [1, B*S, H]
+    auto one_const = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 1);
+    auto reshape_to_3d_shape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{one_const, neg_one, hidden_dim_unsqueezed}, 0);
+    auto input_3d = std::make_shared<ov::op::v1::Reshape>(
+        hidden_states_flat, reshape_to_3d_shape, false);  // [1, B*S, H]
+    
+    std::cout << "input_3d shape: " << input_3d->get_output_partial_shape(0) << std::endl;
+
+    auto tile_shape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{num_experts_const,
+                        one_const,
+                        one_const}, 0);
+    auto tiled_input = std::make_shared<ov::op::v0::Tile>(input_3d, tile_shape);  // [E, B*S, H]
+    
+    std::cout << "tiled_input shape: " << tiled_input->get_output_partial_shape(0) << std::endl;
+
+    // CRITICAL: Add Reshape after Tile (required by pattern)
+    auto reshape_after_tile_shape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{num_experts_const, neg_one, hidden_dim_unsqueezed}, 0);
+    auto reshaped_tiled_input = std::make_shared<ov::op::v1::Reshape>(
+        tiled_input, reshape_after_tile_shape, false);  // [E, B*S, H]
+    
+    // 7. Expert computation with transpose_b=TRUE
+    // gate: [E, B*S, H] × [E, FF, H]^T -> [E, B*S, FF]
+    auto gate_bmm = std::make_shared<ov::op::v0::MatMul>(
+        reshaped_tiled_input, fused_gate_weights, false, true);  // transpose_b=true
+    auto gate_swish = std::make_shared<ov::op::v4::Swish>(gate_bmm);
+    
+    // up: [E, B*S, H] × [E, FF, H]^T -> [E, B*S, FF]
+    auto up_bmm = std::make_shared<ov::op::v0::MatMul>(
+        reshaped_tiled_input, fused_up_weights, false, true);  // transpose_b=true
+    
+    // SwiGLU
+    auto swiglu_mul = std::make_shared<ov::op::v1::Multiply>(gate_swish, up_bmm);
+    
+    // down: [E, B*S, FF] × [E, FF, H] -> [E, B*S, H]
+    // Note: down weights are in [E, FF, H] layout, so no transpose needed
+    auto down_bmm = std::make_shared<ov::op::v0::MatMul>(
+        swiglu_mul, fused_down_weights, false, true);  // transpose_b=false
+    
+    // Add Reshape after down_bmm (required by pattern)
+    auto down_reshape = std::make_shared<ov::op::v1::Reshape>(
+        down_bmm, reshape_after_tile_shape, false);
+    
+    // 8. Routing path: MATCH THE PATTERN ORDER
+    // Pattern: ScatterElementsUpdate -> Transpose -> Reshape -> Unsqueeze
+    auto routing_transpose_perm = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
+    auto routing_transposed = std::make_shared<ov::op::v1::Transpose>(
+        routing_sparse, routing_transpose_perm);  // [E, B*S]
+    
+    auto routing_reshape_shape = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{num_experts_const, seq_dim_unsqueezed}, 0);
+    auto routing_reshaped = std::make_shared<ov::op::v1::Reshape>(
+        routing_transposed, routing_reshape_shape, false);  // [E, B*S]
+    
+    auto routing_weights_3d = std::make_shared<ov::op::v0::Unsqueeze>(
+        routing_reshaped, 
+        std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, -1));  // [E, B*S, 1]
+    //routing_weights_3d->set_friendly_name("debug_routing_weights_3d");
+    
+    // 9. Weight expert outputs and reduce
+    //down_reshape->set_friendly_name("debug_expert_outputs_before_weight");
+    auto weighted_outputs = std::make_shared<ov::op::v1::Multiply>(
+        down_reshape, routing_weights_3d);
+    
+    auto expert_reduce_axis = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{1}, 0);
+    auto reduced_output = std::make_shared<ov::op::v1::ReduceSum>(
+        weighted_outputs, expert_reduce_axis, false);  // [B*S, H]
+    
+    // 10. Reshape back to original shape
+    auto original_shape = std::make_shared<ov::op::v3::ShapeOf>(hidden_states, ov::element::i64);
+    auto final_output = std::make_shared<ov::op::v1::Reshape>(
+        reduced_output, original_shape, false);
+    
+    // DEBUG: Return weighted_outputs instead of final_output
+    return final_output;
 }
 
 ov::Output<ov::Node> init_rope(

@@ -58,6 +58,24 @@ std::tuple<ov::Output<ov::Node>,
         const std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>>& cos_sin_cached,
         const std::shared_ptr<ov::Node>& output_shape);
 
+// MOE Layer using ov::op::internal::MOE node (for GPU optimization)
+// Creates the internal MOE op which can be matched by ConvertMOEToMOECompressed
+ov::Output<ov::Node> moe_layer_internal(
+    const std::string& layer_prefix,
+    const ov::Output<ov::Node>& hidden_states,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    int num_experts,
+    int topk);
+
+ov::Output<ov::Node> moe_layer_fused(
+    const std::string& layer_prefix,
+    const ov::Output<ov::Node>& hidden_states,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    int num_experts,
+    int topk);
+
 ov::Output<ov::Node> init_rope(
     int64_t head_dim,
     int64_t max_position_embeddings = 2048,
