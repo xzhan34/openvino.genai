@@ -22,6 +22,7 @@
 #include "gguf_utils/gguf_modeling.hpp"
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_dense.hpp"
+#include "modeling/models/smollm3.hpp"
 #include "modeling/weights/weight_loader.hpp"
 #include "utils.hpp"
 
@@ -69,6 +70,54 @@ std::shared_ptr<ov::Model> create_qwen3_dense_dummy_model(
     cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
 
     ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
+    ov::genai::gguf::GGUFWeightSource source(consts);
+    ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
+    ov::genai::modeling::weights::load_model(model, source, finalizer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    (void)attention_mask;
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
+    auto ov_model = ctx.build_model({result->output(0)});
+    if (std::get<int>(configs.at("file_type")) == 1 || std::get<int>(configs.at("file_type")) == 0) {
+        ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    }
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
+}
+
+std::shared_ptr<ov::Model> create_smollm3_model(
+    const std::map<std::string, GGUFMetaData>& configs,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    const std::unordered_map<std::string, gguf_tensor_type>& qtypes) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    ov::genai::modeling::models::SmolLM3Config cfg;
+    cfg.architecture = std::get<std::string>(configs.at("architecture"));
+    cfg.hidden_size = std::get<int>(configs.at("hidden_size"));
+    cfg.num_hidden_layers = std::get<int>(configs.at("layer_num"));
+    cfg.num_attention_heads = std::get<int>(configs.at("head_num"));
+    cfg.num_key_value_heads = std::get<int>(configs.at("head_num_kv"));
+    cfg.head_dim = std::get<int>(configs.at("head_size"));
+    cfg.rope_theta = std::get<float>(configs.at("rope_freq_base"));
+    cfg.rms_norm_eps = std::get<float>(configs.at("rms_norm_eps"));
+    cfg.attention_bias = consts.count("model.layers[0].self_attn.q_proj.bias") > 0;
+    cfg.mlp_bias = consts.count("model.layers[0].mlp.gate_proj.bias") > 0;
+    cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
+    if (configs.count("no_rope_layer_interval")) {
+        cfg.no_rope_layer_interval = std::get<int>(configs.at("no_rope_layer_interval"));
+    }
+    if (configs.count("no_rope_layers")) {
+        cfg.no_rope_layers = std::get<std::vector<int32_t>>(configs.at("no_rope_layers"));
+    }
+
+    ov::genai::modeling::models::SmolLM3ForCausalLM model(ctx, cfg);
     ov::genai::gguf::GGUFWeightSource source(consts);
     ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
     ov::genai::modeling::weights::load_model(model, source, finalizer);
@@ -224,7 +273,10 @@ std::shared_ptr<ov::Model> create_from_gguf(const std::string& model_path, const
     ss.str("");
     ss << "Start generating OpenVINO model...";
     ov::genai::utils::print_gguf_debug_info(ss.str());
-    if (!model_arch.compare("qwen3") && use_modeling_qwen3_dense_dummy_builder()) {
+    if (!model_arch.compare("smollm3")) {
+        ov::genai::utils::print_gguf_debug_info("Using modeling API: SmolLM3 builder");
+        model = create_smollm3_model(config, consts, qtypes);
+    } else if (!model_arch.compare("qwen3") && use_modeling_qwen3_dense_dummy_builder()) {
         ov::genai::utils::print_gguf_debug_info("Using modeling API: qwen3 dense dummy builder");
         model = create_qwen3_dense_dummy_model(config, consts, qtypes);
     } else if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3")) {

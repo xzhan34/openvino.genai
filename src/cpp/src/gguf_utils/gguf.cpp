@@ -3,6 +3,7 @@
 
 #include "gguf_utils/gguf.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -372,6 +373,27 @@ int metadata_to_int(const std::unordered_map<std::string, GGUFMetaData>& metadat
     return *(tensor.data<ov::element_type_traits<ov::element::i32>::value_type>());
 }
 
+std::vector<int32_t> metadata_to_int_vec(const std::unordered_map<std::string, GGUFMetaData>& metadata,
+                                         const std::string& key) {
+    auto tensor = std::get<ov::Tensor>(metadata.at(key));
+    const auto size = tensor.get_size();
+    std::vector<int32_t> out(size, 0);
+    const auto type = tensor.get_element_type();
+    if (type == ov::element::i32) {
+        const int32_t* data = tensor.data<const int32_t>();
+        std::copy(data, data + size, out.begin());
+        return out;
+    }
+    if (type == ov::element::i64) {
+        const int64_t* data = tensor.data<const int64_t>();
+        for (size_t i = 0; i < size; ++i) {
+            out[i] = static_cast<int32_t>(data[i]);
+        }
+        return out;
+    }
+    OPENVINO_THROW("[load_gguf] Unsupported metadata array type for key: ", key);
+}
+
 std::map<std::string, GGUFMetaData> config_from_meta(const std::unordered_map<std::string, GGUFMetaData>& metadata) {
     std::map<std::string, GGUFMetaData> config;
     auto arch = std::get<std::string>(metadata.at("general.architecture"));
@@ -392,6 +414,12 @@ std::map<std::string, GGUFMetaData> config_from_meta(const std::unordered_map<st
     config["rope_freq_base"] = metadata.count(arch + ".rope.freq_base") ?
             metadata_to_float(metadata, arch + ".rope.freq_base") : 10000.0f;
     config["file_type"] = metadata_to_int(metadata, "general.file_type");
+    if (metadata.count(arch + ".no_rope_layer_interval")) {
+        config["no_rope_layer_interval"] = metadata_to_int(metadata, arch + ".no_rope_layer_interval");
+    }
+    if (metadata.count(arch + ".no_rope_layers")) {
+        config["no_rope_layers"] = metadata_to_int_vec(metadata, arch + ".no_rope_layers");
+    }
     return config;
 }
 

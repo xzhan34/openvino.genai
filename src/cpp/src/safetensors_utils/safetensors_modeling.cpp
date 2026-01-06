@@ -466,7 +466,7 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    if (model_type == "qwen3" && use_modeling_api()) {
+    if ((model_type == "qwen3" || model_type == "smollm3")&& use_modeling_api()) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
         model = create_model_with_modeling_api(config, st_data.tensors);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 

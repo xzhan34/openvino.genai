@@ -123,7 +123,8 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
                                  size_t num_kv_heads,
                                  size_t head_dim,
                                  float rope_theta,
-                                 float rms_norm_eps);
+                                 float rms_norm_eps,
+                                 bool use_rope = true);
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol);
 
 class DummyWeightSource : public weights::WeightSource {

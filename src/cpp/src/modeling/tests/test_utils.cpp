@@ -365,7 +365,8 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
                                  size_t num_kv_heads,
                                  size_t head_dim,
                                  float rope_theta,
-                                 float rms_norm_eps) {
+                                 float rms_norm_eps,
+                                 bool use_rope) {
     const size_t kv_hidden = num_kv_heads * head_dim;
     auto q = linear_ref_3d_bias(hidden, q_w, q_b, batch, seq_len, hidden_size, hidden_size);
     auto k = linear_ref_3d_bias(hidden, k_w, k_b, batch, seq_len, hidden_size, kv_hidden);
@@ -382,8 +383,10 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
         kh = rmsnorm_heads_ref(kh, *k_norm_w, batch, num_kv_heads, seq_len, head_dim, rms_norm_eps);
     }
 
-    qh = apply_rope_ref(qh, positions, batch, seq_len, num_heads, head_dim, rope_theta);
-    kh = apply_rope_ref(kh, positions, batch, seq_len, num_kv_heads, head_dim, rope_theta);
+    if (use_rope) {
+        qh = apply_rope_ref(qh, positions, batch, seq_len, num_heads, head_dim, rope_theta);
+        kh = apply_rope_ref(kh, positions, batch, seq_len, num_kv_heads, head_dim, rope_theta);
+    }
 
     auto kh_expanded = repeat_kv_ref(kh, batch, num_heads, num_kv_heads, seq_len, head_dim);
     auto vh_expanded = repeat_kv_ref(vh, batch, num_heads, num_kv_heads, seq_len, head_dim);
