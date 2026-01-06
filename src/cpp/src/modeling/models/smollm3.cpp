@@ -4,6 +4,7 @@
 #include "modeling/models/smollm3.hpp"
 
 #include <cmath>
+#include <openvino/openvino.hpp>
 
 #include <openvino/core/except.hpp>
 #include <openvino/op/util/variable.hpp>
@@ -12,6 +13,7 @@
 #include "modeling/ops/llm.hpp"
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
+#include "modeling/weights/weight_loader.hpp"
 
 namespace {
 
@@ -22,6 +24,11 @@ ov::genai::modeling::Tensor add_bias_if_present(const ov::genai::modeling::Tenso
     }
     return x + *bias;
 }
+
+auto set_name = [](auto node, const std::string& name) {
+    node->output(0).set_names({name});
+    node->set_friendly_name(name);
+};
 
 bool resolve_use_rope(const ov::genai::modeling::models::SmolLM3Config& cfg, int32_t layer_idx) {
     if (!cfg.no_rope_layers.empty()) {
@@ -350,6 +357,28 @@ SmolLM3Model& SmolLM3ForCausalLM::model() {
 
 LMHead& SmolLM3ForCausalLM::lm_head() {
     return lm_head_;
+}
+
+std::shared_ptr<ov::Model> create_smollm3_model(
+    const SmolLM3Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    SmolLM3ForCausalLM model(ctx, cfg);
+
+    ov::genai::modeling::weights::load_model(model, source, finalizer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    (void)attention_mask;
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
+    return ctx.build_model({result->output(0)});
 }
 
 }  // namespace models

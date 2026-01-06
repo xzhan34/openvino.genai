@@ -28,9 +28,8 @@
 #include "utils.hpp"
 
 // Include modeling API components
-#include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_dense.hpp"
-#include "modeling/weights/weight_loader.hpp"
+#include "modeling/models/smollm3.hpp"
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -165,42 +164,40 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
 std::shared_ptr<ov::Model> create_model_with_modeling_api(
     const HFConfig& hf_config,
     std::unordered_map<std::string, ov::Tensor>& tensors) {
-
-    ov::genai::modeling::BuilderContext ctx;
-
-    // Configure model
-    ov::genai::modeling::models::Qwen3DenseConfig cfg;
-    cfg.architecture = hf_config.model_type;
-    cfg.hidden_size = hf_config.hidden_size;
-    cfg.num_hidden_layers = hf_config.num_hidden_layers;
-    cfg.num_attention_heads = hf_config.num_attention_heads;
-    cfg.num_key_value_heads = hf_config.kv_heads();
-    cfg.head_dim = hf_config.head_size();
-    cfg.rope_theta = hf_config.rope_theta;
-    cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
-    cfg.rms_norm_eps = hf_config.rms_norm_eps;
-    cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
-
-    // Create model
-    ov::genai::modeling::models::Qwen3ForCausalLM model(ctx, cfg);
-
-    // Load weights using safetensors source and finalizer
     SafetensorsWeightSource source(tensors);
     SafetensorsWeightFinalizer finalizer;
-    ov::genai::modeling::weights::load_model(model, source, finalizer);
 
-    // Create input parameters
-    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
-    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
-    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
-    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
-
-    (void)attention_mask;  // Attention mask is handled internally
-    auto logits = model.forward(input_ids, position_ids, beam_idx);
-
-    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
-    set_name(result, "logits");
-    auto ov_model = ctx.build_model({result->output(0)});
+    std::shared_ptr<ov::Model> ov_model;
+    if (hf_config.model_type == "qwen3") {
+        ov::genai::modeling::models::Qwen3DenseConfig cfg;
+        cfg.architecture = hf_config.model_type;
+        cfg.hidden_size = hf_config.hidden_size;
+        cfg.num_hidden_layers = hf_config.num_hidden_layers;
+        cfg.num_attention_heads = hf_config.num_attention_heads;
+        cfg.num_key_value_heads = hf_config.kv_heads();
+        cfg.head_dim = hf_config.head_size();
+        cfg.rope_theta = hf_config.rope_theta;
+        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.rms_norm_eps = hf_config.rms_norm_eps;
+        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        ov_model = ov::genai::modeling::models::create_qwen3_dense_model(cfg, source, finalizer);
+    } else if (hf_config.model_type == "smollm3") {
+        ov::genai::modeling::models::SmolLM3Config cfg;
+        cfg.architecture = hf_config.model_type;
+        cfg.hidden_size = hf_config.hidden_size;
+        cfg.num_hidden_layers = hf_config.num_hidden_layers;
+        cfg.num_attention_heads = hf_config.num_attention_heads;
+        cfg.num_key_value_heads = hf_config.kv_heads();
+        cfg.head_dim = hf_config.head_size();
+        cfg.rope_theta = hf_config.rope_theta;
+        cfg.rms_norm_eps = hf_config.rms_norm_eps;
+        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.mlp_bias = tensors.count("model.layers[0].mlp.gate_proj.bias") > 0;
+        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        ov_model = ov::genai::modeling::models::create_smollm3_model(cfg, source, finalizer);
+    } else {
+        throw std::runtime_error("Unsupported model architecture '" + hf_config.model_type + "'");
+    }
 
     // Set runtime options for optimal performance
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});

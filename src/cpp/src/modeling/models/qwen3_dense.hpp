@@ -4,10 +4,26 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace ov {
+class Model;
+}  // namespace ov
+
+namespace ov {
+namespace genai {
+namespace modeling {
+namespace weights {
+class WeightFinalizer;
+class WeightSource;
+}  // namespace weights
+}  // namespace modeling
+}  // namespace genai
+}  // namespace ov
 
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
@@ -150,6 +166,11 @@ private:
     Qwen3Model model_;
     LMHead lm_head_;
 };
+
+std::shared_ptr<ov::Model> create_qwen3_dense_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
 
 }  // namespace models
 }  // namespace modeling
