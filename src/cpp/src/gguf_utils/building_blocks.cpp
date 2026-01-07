@@ -13,7 +13,7 @@
 #include "openvino/opsets/opset13.hpp"
 #include "openvino/op/placeholder_extension.hpp"
 #include "openvino/op/fused_mlp.hpp"
-#include "openvino/op/moe_compressed.hpp"
+#include "openvino/op/moe_3gemm_fused_compressed.hpp"
 #include "openvino/op/moe.hpp"
 #include <ov_ops/fully_connected.hpp>
 #include <ov_ops/rms.hpp>
