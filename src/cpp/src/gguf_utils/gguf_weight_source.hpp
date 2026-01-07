@@ -25,7 +25,8 @@ public:
 
 private:
     const std::unordered_map<std::string, ov::Tensor>& consts_;
-    std::vector<std::string> keys_;
+    std::vector<std::string> keys_;  // Canonical names
+    std::unordered_map<std::string, std::string> canonical_to_gguf_;  // canonical -> gguf mapping
 };
 
 }  // namespace gguf

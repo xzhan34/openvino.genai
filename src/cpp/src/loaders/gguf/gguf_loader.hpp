@@ -11,8 +11,15 @@
  * It integrates with the existing gguf_utils for file parsing.
  */
 
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+#include <openvino/openvino.hpp>
+
 #include "loaders/model_loader.hpp"
 #include "loaders/model_config.hpp"
+#include "gguf_utils/gguf.hpp"
 
 namespace ov {
 namespace genai {
@@ -30,6 +37,8 @@ namespace loaders {
  * Weight naming convention:
  * - GGUF uses: blk.N.xxx format for layer weights
  * - Converted to canonical: model.layers[N].xxx
+ * 
+ * The loader caches loaded data to avoid re-parsing the file multiple times.
  * 
  * @see IModelLoader for interface documentation
  */
@@ -63,7 +72,7 @@ public:
      * @param path Path to .gguf file
      * @return WeightSource that provides tensor data
      */
-    std::shared_ptr<ov::genai::WeightSource> create_weight_source(
+    std::shared_ptr<WeightSource> create_weight_source(
         const std::string& path) const override;
 
     /**
@@ -71,7 +80,7 @@ public:
      * @param config Model configuration
      * @return WeightFinalizer for post-processing tensors
      */
-    std::shared_ptr<ov::genai::WeightFinalizer> create_weight_finalizer(
+    std::shared_ptr<WeightFinalizer> create_weight_finalizer(
         const ModelConfig& config) const override;
 
     /**
@@ -80,6 +89,19 @@ public:
      * @return Tokenizer/detokenizer pair
      */
     TokenizerPair load_tokenizer(const std::string& path) const override;
+
+private:
+    /**
+     * @brief Ensure data is loaded from GGUF file.
+     * Loads and caches metadata, tensors, and quantization types.
+     */
+    void ensure_loaded(const std::string& path) const;
+
+    // Cached data from GGUF file (mutable for lazy loading)
+    mutable std::string cached_path_;
+    mutable std::map<std::string, GGUFMetaData> cached_metadata_;
+    mutable std::unordered_map<std::string, ov::Tensor> cached_tensors_;
+    mutable std::unordered_map<std::string, gguf_tensor_type> cached_qtypes_;
 };
 
 }  // namespace loaders
