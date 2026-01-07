@@ -989,6 +989,99 @@ ov::Output<ov::Node> make_fc(
     return output;
 }
 
+ov::Output<ov::Node> make_moe(
+    const std::string& key,
+    const ov::Output<ov::Node>& input,
+    const std::map<std::string, GGUFMetaData>& configs,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    std::string name_prefix,
+    std::string name_suffix,
+    bool reorder = false,
+    int head_size = -1) {
+    auto gate_inp_key = key + ".moe.gate_inp";
+    auto gate_exps_key = key + ".moe.gate_exps";
+    auto up_exps_key = key + ".moe.up_exps";
+    auto down_exps_key = key + ".moe.down_exps";
+
+    auto gate_inp_type = qtypes.at(gate_inp_key + ".qtype");
+    auto gate_exps_type = qtypes.at(gate_exps_key + ".qtype");
+    auto up_exps_type = qtypes.at(up_exps_key + ".qtype");
+    auto down_exps_type = qtypes.at(down_exps_key + ".qtype");
+
+    // TODO: support other types
+    if (gate_inp_type != gguf_tensor_type::GGUF_TYPE_F32) {
+        std::cout << "gate_inp_type != f32 " << gate_inp_type << std::endl;
+        exit(0);
+    }
+
+    // TODO: support q8
+    if (gate_exps_type != up_exps_type || gate_exps_type != down_exps_type || gate_exps_type != gguf_tensor_type::GGUF_TYPE_Q4_1) {
+        std::cout << "gate/up/down exps type should be q4_1" << std::endl;
+        exit(0);
+    }
+
+    auto hidden_f16 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f16);
+    auto gate_inp_w_f32 = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, gate_inp_key + ".weight"));
+    auto gate_inp_w_f16 = std::make_shared<ov::op::v0::Convert>(gate_inp_w_f32, ov::element::f16);
+    auto router_f16 = std::make_shared<ov::op::v0::MatMul>(hidden_f16, gate_inp_w_f16, false, true);
+
+    auto gate_w = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, gate_exps_key + ".weight"));
+    auto gate_s = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, gate_exps_key + ".scales"));
+    auto gate_z = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, gate_exps_key + ".zps"));
+
+    auto up_w = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, up_exps_key + ".weight"));
+    auto up_s = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, up_exps_key + ".scales"));
+    auto up_z = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, up_exps_key + ".zps"));
+
+    auto down_w = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, down_exps_key + ".weight"));
+    auto down_s = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, down_exps_key + ".scales"));
+    auto down_z = std::make_shared<ov::op::v0::Constant>(get_tensor(consts, down_exps_key + ".zps"));
+
+    const auto gate_shape = get_tensor(consts, gate_exps_key + ".weight").get_shape();
+    const auto down_shape = get_tensor(consts, down_exps_key + ".weight").get_shape();
+    const auto scales_shape = get_tensor(consts, gate_exps_key + ".scales").get_shape();
+
+    const size_t num_experts = gate_shape[0];
+    const size_t inter_size = gate_shape[1];
+    const size_t hidden_size = down_shape[1];
+    // TODO: channelwise
+    const size_t group_size = 128;
+
+    int cfg_num_expert = 0;
+    int cfg_top_k = 0;
+    int cfg_inter_size = 0;
+    if (configs.count("expert_count")) {
+        cfg_num_expert = std::get<int>(configs.at("expert_count"));
+    }
+    if (configs.count("expert_used_count")) {
+        cfg_top_k = std::get<int>(configs.at("expert_used_count"));
+    }
+    if (configs.count("moe_inter_size")) {
+        cfg_inter_size = std::get<int>(configs.at("moe_inter_size"));
+    }
+
+    ov::op::internal::MOE3GemmFusedCompressed::Config config;
+    config.hidden_size = static_cast<int>(hidden_size);
+    config.inter_size = cfg_inter_size > 0 ? cfg_inter_size : static_cast<int>(inter_size);
+    config.num_expert = cfg_num_expert > 0 ? cfg_num_expert : static_cast<int>(num_experts);
+    config.top_k = cfg_top_k > 0 ? cfg_top_k : 1;
+    config.group_size = static_cast<int>(group_size);
+    config.out_type = ov::element::f16;
+
+    ov::OutputVector args = {
+        hidden_f16,
+        router_f16,
+        gate_w, gate_s, gate_z,
+        up_w, up_s, up_z,
+        down_w, down_s, down_z};
+
+    auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
+    auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
+    moe_f32->set_friendly_name(name_prefix + ".moe" + name_suffix);
+    return moe_f32;
+}
+
 ov::Output<ov::Node> make_mlp(
     const std::string& key,
     const ov::Output<ov::Node>& input,
@@ -1348,15 +1441,31 @@ std::tuple<ov::Output<ov::Node>,
         consts,
         std::get<float>(configs.at("rms_norm_eps")));
 
-    // MLP block
-    auto mlp_out = make_mlp(
-        layer_prefix, post_attn_norm, consts, qtypes, name_prefix, name_suffix, reorder
-    );
+    ov::Output<ov::Node> output;
 
-    // Final residual connection
-    auto output = std::make_shared<ov::op::v1::Add>(
-        attn_add, mlp_out, ov::op::AutoBroadcastType::NUMPY);
-    output->set_friendly_name(name_prefix + ".add1" + name_suffix);
+    if (std::get<std::string>(configs.at("architecture")) == "qwen3moe") {
+        // MoE block
+        auto moe_out = make_moe(
+            layer_prefix, post_attn_norm, configs, consts, qtypes, name_prefix, name_suffix, reorder
+        );
+        output = std::make_shared<ov::op::v1::Add>(
+            attn_add, moe_out, ov::op::AutoBroadcastType::NUMPY);
+    } else {
+        // MLP block
+        auto mlp_out = make_mlp(
+            layer_prefix, post_attn_norm, consts, qtypes, name_prefix, name_suffix, reorder
+        );
+
+        // Final residual connection
+        output = std::make_shared<ov::op::v1::Add>(
+            attn_add, mlp_out, ov::op::AutoBroadcastType::NUMPY);
+        // output.set_friendly_name(name_prefix + ".add1" + name_suffix);
+    }
+
+    // // Final residual connection
+    // auto output = std::make_shared<ov::op::v1::Add>(
+    //     attn_add, mlp_out, ov::op::AutoBroadcastType::NUMPY);
+    // output->set_friendly_name(name_prefix + ".add1" + name_suffix);
 
     return {output, sinks, new_causal_mask, new_cos_sin, final_output_shape};
 }

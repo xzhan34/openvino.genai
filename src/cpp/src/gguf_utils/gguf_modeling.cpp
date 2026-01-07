@@ -231,7 +231,7 @@ std::shared_ptr<ov::Model> create_from_gguf(const std::string& model_path, const
         ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
         model = ov::genai::modeling::models::create_qwen3_dense_model(cfg, source, finalizer);
         apply_runtime_options(config, model);
-    } else if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3")) {
+    } else if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3") || !model_arch.compare("qwen3moe")) {
         model = create_language_model(config, consts, qtypes);
         if (enable_save_ov_model){
             std::filesystem::path gguf_model_path(model_path);

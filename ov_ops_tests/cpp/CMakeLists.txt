@@ -34,7 +34,8 @@ function(add_test_executable target_name)
 endfunction()
 
 set (TEST_LIST
-    fused_mlp_test)
+    fused_mlp_test
+    moe_q41_moe3gemm_test)
 
 foreach(testcase IN LISTS TEST_LIST)
     add_test_executable(${testcase})
