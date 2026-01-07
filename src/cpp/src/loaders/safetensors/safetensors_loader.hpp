@@ -11,6 +11,10 @@
  * It reads config.json for model configuration and *.safetensors files for weights.
  */
 
+#include <string>
+#include <vector>
+#include <unordered_map>
+
 #include "loaders/model_loader.hpp"
 #include "loaders/model_config.hpp"
 
@@ -63,7 +67,7 @@ public:
      * @param path Path to model directory
      * @return WeightSource that provides tensor data
      */
-    std::shared_ptr<ov::genai::WeightSource> create_weight_source(
+    std::shared_ptr<WeightSource> create_weight_source(
         const std::string& path) const override;
 
     /**
@@ -71,7 +75,7 @@ public:
      * @param config Model configuration
      * @return WeightFinalizer for post-processing tensors
      */
-    std::shared_ptr<ov::genai::WeightFinalizer> create_weight_finalizer(
+    std::shared_ptr<WeightFinalizer> create_weight_finalizer(
         const ModelConfig& config) const override;
 
     /**
