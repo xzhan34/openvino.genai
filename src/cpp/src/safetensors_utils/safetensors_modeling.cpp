@@ -34,6 +34,7 @@
 // Include modeling API components
 #include "modeling/models/qwen3_dense.hpp"
 #include "modeling/models/smollm3.hpp"
+#include "modeling/models/youtu_llm.hpp"
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -258,6 +259,28 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.mlp_bias = tensors.count("model.layers[0].mlp.gate_proj.bias") > 0;
         cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
         ov_model = ov::genai::modeling::models::create_smollm3_model(cfg, source, finalizer);
+    } else if (hf_config.model_type == "youtu_llm") {
+        ov::genai::modeling::models::YoutuConfig cfg;
+        cfg.architecture = hf_config.model_type;
+        cfg.hidden_size = hf_config.hidden_size;
+        cfg.intermediate_size = hf_config.intermediate_size;
+        cfg.num_hidden_layers = hf_config.num_hidden_layers;
+        cfg.num_attention_heads = hf_config.num_attention_heads;
+        cfg.num_key_value_heads = hf_config.kv_heads();
+        cfg.q_lora_rank = hf_config.q_lora_rank;
+        cfg.kv_lora_rank = hf_config.kv_lora_rank;
+        cfg.qk_rope_head_dim = hf_config.qk_rope_head_dim;
+        cfg.qk_nope_head_dim = hf_config.qk_nope_head_dim;
+        cfg.qk_head_dim = hf_config.qk_head_dim;
+        cfg.v_head_dim = hf_config.v_head_dim;
+        cfg.rope_theta = hf_config.rope_theta;
+        cfg.rope_interleave = hf_config.rope_interleave;
+        cfg.rms_norm_eps = hf_config.rms_norm_eps;
+        cfg.hidden_act = hf_config.hidden_act;
+        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_a_proj.bias") > 0;
+        cfg.mlp_bias = tensors.count("model.layers[0].mlp.gate_proj.bias") > 0;
+        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        ov_model = ov::genai::modeling::models::create_youtu_llm_model(cfg, source, finalizer);
     } else {
         throw std::runtime_error("Unsupported model architecture '" + hf_config.model_type + "'");
     }
@@ -533,7 +556,7 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    if ((model_type == "qwen3" || model_type == "smollm3")&& use_modeling_api()) {
+    if ((model_type == "qwen3" || model_type == "smollm3" || model_type == "youtu_llm") && use_modeling_api()) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
         model = create_model_with_modeling_api(config, st_data.tensors);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
