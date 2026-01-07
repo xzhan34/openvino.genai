@@ -3,6 +3,7 @@
 
 #include "safetensors_utils/hf_config.hpp"
 
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -148,6 +149,82 @@ std::vector<std::string> extract_string_array(const std::string& json, const std
     return result;
 }
 
+std::string trim(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        ++start;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string extract_raw_value(const std::string& json, const std::string& key) {
+    std::string search_key = "\"" + key + "\"";
+    size_t pos = json.find(search_key);
+    if (pos == std::string::npos) return "";
+
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return "";
+
+    // Skip whitespace
+    pos++;
+    while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) pos++;
+    if (pos >= json.size()) return "";
+
+    if (json.compare(pos, 4, "null") == 0) {
+        return "null";
+    }
+
+    if (json[pos] == '{') {
+        size_t start = pos;
+        int depth = 0;
+        for (; pos < json.size(); ++pos) {
+            if (json[pos] == '{') depth++;
+            if (json[pos] == '}') {
+                depth--;
+                if (depth == 0) {
+                    ++pos;
+                    break;
+                }
+            }
+        }
+        return json.substr(start, pos - start);
+    }
+
+    if (json[pos] == '[') {
+        size_t start = pos;
+        int depth = 0;
+        for (; pos < json.size(); ++pos) {
+            if (json[pos] == '[') depth++;
+            if (json[pos] == ']') {
+                depth--;
+                if (depth == 0) {
+                    ++pos;
+                    break;
+                }
+            }
+        }
+        return json.substr(start, pos - start);
+    }
+
+    if (json[pos] == '"') {
+        size_t start = pos + 1;
+        size_t end = json.find('"', start);
+        if (end == std::string::npos) return "";
+        return json.substr(start, end - start);
+    }
+
+    // Fallback: numbers, booleans
+    size_t end = pos;
+    while (end < json.size() && json[end] != ',' && json[end] != '}' && json[end] != '\n' && json[end] != '\r') {
+        end++;
+    }
+    return trim(json.substr(pos, end - pos));
+}
+
 }  // anonymous namespace
 
 HFConfig load_hf_config(const std::filesystem::path& model_dir) {
@@ -189,6 +266,25 @@ HFConfig load_hf_config(const std::filesystem::path& model_dir) {
     
     // RoPE
     config.rope_theta = extract_float(json, "rope_theta", 10000.0f);
+    config.rope_scaling = extract_raw_value(json, "rope_scaling");
+    if (config.rope_scaling == "null") {
+        config.rope_scaling.clear();
+    }
+    config.rope_interleave = extract_bool(json, "rope_interleave", false);
+
+    // Youtu (MLA) specific fields
+    config.q_lora_rank = extract_int(json, "q_lora_rank", 0);
+    config.kv_lora_rank = extract_int(json, "kv_lora_rank", 0);
+    config.qk_rope_head_dim = extract_int(json, "qk_rope_head_dim", 0);
+    config.qk_nope_head_dim = extract_int(json, "qk_nope_head_dim", 0);
+    config.v_head_dim = extract_int(json, "v_head_dim", 0);
+    if (config.qk_rope_head_dim > 0 || config.qk_nope_head_dim > 0) {
+        config.qk_head_dim = config.qk_rope_head_dim + config.qk_nope_head_dim;
+    }
+
+    // Attention/MLP flags
+    config.attention_bias = extract_bool(json, "attention_bias", false);
+    config.mlp_bias = extract_bool(json, "mlp_bias", false);
     
     // Activation
     config.hidden_act = extract_string(json, "hidden_act");

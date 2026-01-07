@@ -59,6 +59,44 @@ Tensor apply_rope(const Tensor& x,
     return concat({rot1, rot2}, 3);
 }
 
+Tensor apply_rope_interleave(const Tensor& x,
+                             const Tensor& cos,
+                             const Tensor& sin,
+                             int32_t head_dim,
+                             const OpPolicy* policy) {
+    (void)policy;
+    const int32_t half_dim = head_dim / 2;
+    auto interleaved = x.reshape({0, 0, 0, half_dim, 2})
+                           .permute({0, 1, 2, 4, 3})
+                           .reshape({0, 0, 0, head_dim});
+    return apply_rope(interleaved, cos, sin, head_dim, policy);
+}
+
+Tensor pad_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim) {
+    if (target_head_dim <= head_dim) {
+        return x;
+    }
+    auto* ctx = x.context();
+    const int32_t pad = target_head_dim - head_dim;
+
+    auto batch = shape::dim(x, 0);
+    auto heads = shape::dim(x, 1);
+    auto seq = shape::dim(x, 2);
+    auto pad_dim = const_vec(ctx, std::vector<int64_t>{static_cast<int64_t>(pad)});
+    auto pad_shape = shape::make({batch, heads, seq, pad_dim});
+
+    auto zero = Tensor(const_scalar(ctx, 0.0f), ctx).to(x.dtype());
+    auto pad_tensor = shape::broadcast_to(zero, pad_shape);
+    return concat({x, pad_tensor}, 3);
+}
+
+Tensor slice_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim) {
+    if (target_head_dim >= head_dim) {
+        return x;
+    }
+    return slice(x, 0, target_head_dim, 1, 3);
+}
+
 Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32_t head_dim) {
     if (num_heads == num_kv_heads) {
         return x;

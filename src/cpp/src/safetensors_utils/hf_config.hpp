@@ -31,13 +31,26 @@ struct HFConfig {
     int head_dim = 0;                 // 128 for Qwen3-4B
     int vocab_size = 0;               // 151936 for Qwen3-4B
     int max_position_embeddings = 0;  // 40960 for Qwen3-4B
+
+    // Youtu (MLA) specific dimensions
+    int q_lora_rank = 0;
+    int kv_lora_rank = 0;
+    int qk_rope_head_dim = 0;
+    int qk_nope_head_dim = 0;
+    int qk_head_dim = 0;
+    int v_head_dim = 0;
     
     // Normalization
     float rms_norm_eps = 1e-6f;       // RMS normalization epsilon
     
     // RoPE (Rotary Position Embedding)
     float rope_theta = 10000.0f;      // 1000000 for Qwen3
-    // TODO: Add rope_scaling support
+    std::string rope_scaling;         // Raw JSON string or empty if null/absent
+    bool rope_interleave = false;
+
+    // Attention/MLP flags
+    bool attention_bias = false;
+    bool mlp_bias = false;
     
     // Activation
     std::string hidden_act = "silu";  // "silu", "gelu", etc.
@@ -59,6 +72,9 @@ struct HFConfig {
     }
     
     int head_size() const {
+        if (qk_head_dim > 0) {
+            return qk_head_dim;
+        }
         return head_dim > 0 ? head_dim : (hidden_size / num_attention_heads);
     }
 };
