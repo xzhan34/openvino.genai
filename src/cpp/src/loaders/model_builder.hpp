@@ -4,20 +4,23 @@
 /**
  * @file model_builder.hpp
  * @brief Factory for building models from configuration and weights
+ * 
+ * ModelBuilder provides a unified interface for constructing OpenVINO models
+ * from different architectures using the modeling API.
  */
 
 #pragma once
 
-#include <filesystem>
-#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
+#include <unordered_map>
 
 #include <openvino/openvino.hpp>
 
 #include "loaders/model_config.hpp"
-#include "modeling/builder_context.hpp"
 #include "modeling/weights/weight_source.hpp"
 #include "modeling/weights/weight_finalizer.hpp"
 
@@ -26,30 +29,24 @@ namespace genai {
 namespace loaders {
 
 /**
- * @brief Model architecture builder function type
+ * @brief Builder function type for architecture-specific model construction
  * 
- * @param ctx Builder context for creating the model graph
- * @param config Model configuration
- * @param source Weight source providing tensor data
- * @param finalizer Weight finalizer for post-processing
+ * @param config Unified model configuration
+ * @param weight_source Source for loading weights
+ * @param weight_finalizer Finalizer for processing weights
  * @return Constructed OpenVINO model
  */
 using ArchitectureBuilder = std::function<std::shared_ptr<ov::Model>(
-    modeling::BuilderContext& ctx,
     const ModelConfig& config,
-    modeling::weights::WeightSource& source,
-    modeling::weights::WeightFinalizer& finalizer)>;
+    modeling::weights::WeightSource& weight_source,
+    modeling::weights::WeightFinalizer& weight_finalizer)>;
 
 /**
  * @brief Factory for building models from different architectures
  * 
- * ModelBuilder manages a registry of architecture-specific builders and
- * provides a unified interface for model construction.
- * 
- * Usage:
- * @code
- * auto model = ModelBuilder::instance().build(config, *source, *finalizer);
- * @endcode
+ * ModelBuilder uses the modeling API (Qwen3ForCausalLM, etc.) to construct
+ * OpenVINO models. It provides a unified entry point for model construction
+ * regardless of the source format (GGUF, Safetensors, etc.).
  */
 class ModelBuilder {
 public:
@@ -68,39 +65,41 @@ public:
     bool register_architecture(const std::string& architecture, ArchitectureBuilder builder);
 
     /**
-     * @brief Build a model from configuration
-     * 
-     * @param config Model configuration
-     * @param source Weight source
-     * @param finalizer Weight finalizer
-     * @return Constructed OpenVINO model
-     * @throws std::runtime_error if architecture is not supported
-     */
-    std::shared_ptr<ov::Model> build(
-        const ModelConfig& config,
-        modeling::weights::WeightSource& source,
-        modeling::weights::WeightFinalizer& finalizer) const;
-
-    /**
      * @brief Check if an architecture is supported
      */
     bool has_architecture(const std::string& architecture) const;
 
     /**
-     * @brief Get list of supported architectures
+     * @brief Get list of registered architectures
      */
-    std::vector<std::string> supported_architectures() const;
+    std::vector<std::string> registered_architectures() const;
+
+    /**
+     * @brief Build a model from configuration and weights
+     * 
+     * @param config Model configuration
+     * @param weight_source Source for loading weights
+     * @param weight_finalizer Finalizer for processing weights
+     * @return Constructed OpenVINO model
+     * @throws std::runtime_error if architecture is not supported
+     */
+    std::shared_ptr<ov::Model> build(
+        const ModelConfig& config,
+        modeling::weights::WeightSource& weight_source,
+        modeling::weights::WeightFinalizer& weight_finalizer) const;
 
 private:
-    ModelBuilder();
+    ModelBuilder() = default;
     ~ModelBuilder() = default;
     ModelBuilder(const ModelBuilder&) = delete;
     ModelBuilder& operator=(const ModelBuilder&) = delete;
 
-    // Register built-in architectures
-    void register_builtin_architectures();
+    // Normalize architecture name for case-insensitive comparison
+    static std::string normalize_arch_name(const std::string& name);
 
-    std::map<std::string, ArchitectureBuilder> builders_;
+    mutable std::mutex m_mutex;
+    std::map<std::string, ArchitectureBuilder> m_builders;
+    std::vector<std::string> m_registered_archs;
 };
 
 /**

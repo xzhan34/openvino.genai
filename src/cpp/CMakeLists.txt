@@ -136,6 +136,17 @@ if(NOT ENABLE_GGUF OR NOT ENABLE_SAFETENSORS)
     list(REMOVE_ITEM SOURCE_FILES ${SAFETENSORS_SOURCES})
 endif()
 
+# New multi-format loaders - conditional compilation
+if(NOT ENABLE_GGUF)
+    set(GGUF_LOADER_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/loaders/gguf/gguf_loader.cpp)
+    list(REMOVE_ITEM SOURCE_FILES ${GGUF_LOADER_SOURCES})
+endif()
+
+if(NOT ENABLE_GGUF OR NOT ENABLE_SAFETENSORS)
+    set(SAFETENSORS_LOADER_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/loaders/safetensors/safetensors_loader.cpp)
+    list(REMOVE_ITEM SOURCE_FILES ${SAFETENSORS_LOADER_SOURCES})
+endif()
+
 set(TARGET_NAME openvino_genai)
 set(TARGET_NAME_OBJ ${TARGET_NAME}_obj)
 

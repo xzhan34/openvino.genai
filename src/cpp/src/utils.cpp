@@ -6,6 +6,7 @@
 #include <variant>
 #include <fstream>
 #include <memory>
+#include <cstdlib>
 
 #include "openvino/op/add.hpp"
 #include "openvino/op/divide.hpp"
@@ -17,6 +18,9 @@
 #include "openvino/op/transpose.hpp"
 #include "openvino/genai/text_streamer.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
+
+// New unified loader system
+#include "loaders/loaders.hpp"
 
 #ifdef ENABLE_SAFETENSORS
 #include "safetensors_utils/safetensors_modeling.hpp"
@@ -396,8 +400,69 @@ void save_openvino_model(const std::shared_ptr<ov::Model>& model, const std::str
     }
 }
 
+// Check if new unified loader should be used
+bool use_unified_loader() {
+    const char* env = std::getenv("OV_GENAI_USE_UNIFIED_LOADER");
+    // Default to false for now (use existing path)
+    // Set OV_GENAI_USE_UNIFIED_LOADER=1 to enable new loader system
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}
+
 std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  const ov::AnyMap& properties) {
     auto [filtered_properties, enable_save_ov_model] = extract_gguf_properties(properties);
+    
+    // =========================================================================
+    // New unified loader path (opt-in via OV_GENAI_USE_UNIFIED_LOADER=1)
+    // =========================================================================
+    if (use_unified_loader()) {
+        try {
+            auto& registry = loaders::LoaderRegistry::instance();
+            
+            // Detect format and get appropriate loader
+            auto format = registry.detect_format(model_dir);
+            
+            if (format != loaders::ModelFormat::Auto) {
+                // GGUF or Safetensors format: use loader to create model
+                auto loader = registry.get_loader(format);
+                
+                if (loader && loader->supports(model_dir.string())) {
+                    std::cout << "[UnifiedLoader] Using " 
+                              << (format == loaders::ModelFormat::GGUF ? "GGUF" : "Safetensors")
+                              << " loader for: " << model_dir << std::endl;
+                    
+                    // Load config
+                    auto config = loader->load_config(model_dir.string());
+                    
+                    // Create weight source and finalizer
+                    auto source = loader->create_weight_source(model_dir.string());
+                    auto finalizer = loader->create_weight_finalizer(config);
+                    
+                    // Build model using ModelBuilder
+                    std::cout << "[UnifiedLoader] Building model via ModelBuilder..." << std::endl;
+                    auto model = loaders::ModelBuilder::instance().build(config, *source, *finalizer);
+                    
+                    // Optionally save the model
+                    if (enable_save_ov_model) {
+                        auto xml_path = model_dir / "openvino_model.xml";
+                        auto bin_path = model_dir / "openvino_model.bin";
+                        ov::save_model(model, xml_path.string());
+                        std::cout << "[UnifiedLoader] Saved model to: " << xml_path << std::endl;
+                    }
+                    
+                    return model;
+                }
+            }
+            
+            // Fall through to legacy path (e.g., for OpenVINO IR)
+        } catch (const std::exception& e) {
+            std::cerr << "[UnifiedLoader] Error: " << e.what() 
+                      << ", falling back to legacy path" << std::endl;
+        }
+    }
+    
+    // =========================================================================
+    // Legacy path (default)
+    // =========================================================================
     if (is_gguf_model(model_dir)) {
 #ifdef ENABLE_GGUF
         return create_from_gguf(model_dir.string(), enable_save_ov_model);
