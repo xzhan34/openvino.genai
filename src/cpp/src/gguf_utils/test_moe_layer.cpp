@@ -14,7 +14,7 @@ using namespace ov;
 
 int main(int argc, char* argv[]) {
     // Parse command-line arguments
-    std::string weight_type = "q4";  // Default to FP16
+    std::string weight_type = "q4";  // Default to q4
     if (argc > 1) {
         weight_type = argv[1];
         // Convert to lowercase
@@ -316,14 +316,17 @@ int main(int argc, char* argv[]) {
     }
     
     // 4. Build MOE layer using moe_layer_internal() which creates the internal MOE op
-    auto moe_output = moe_layer_fused(
+    /* auto moe_output =
+        moe_layer_fused(
         layer_prefix,
         hidden_states_param,
         remapped_consts,
         remapped_qtypes,
         num_experts,
-        topk);
+        topk);*/
     
+    auto moe_output =
+        moe_layer_internal(layer_prefix, hidden_states_param, remapped_consts, remapped_qtypes, num_experts, topk);
 
     moe_output.get_node_shared_ptr()->set_friendly_name("moe_output");
         
