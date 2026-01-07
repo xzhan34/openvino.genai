@@ -1,0 +1,274 @@
+// Copyright (C) 2023-2025 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#include "loaders/model_config.hpp"
+
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+
+namespace ov {
+namespace genai {
+namespace loaders {
+
+namespace {
+
+// Helper to safely get value from GGUFMetaData variant
+template<typename T>
+T get_or_default(const std::map<std::string, GGUFMetaData>& meta,
+                 const std::string& key,
+                 const T& default_value) {
+    auto it = meta.find(key);
+    if (it == meta.end()) {
+        return default_value;
+    }
+    if (auto* val = std::get_if<T>(&it->second)) {
+        return *val;
+    }
+    return default_value;
+}
+
+// Simple JSON value extraction (for basic types)
+// Note: For production, use a proper JSON library like nlohmann/json
+std::string extract_json_string(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return "";
+    
+    pos = json.find("\"", pos);
+    if (pos == std::string::npos) return "";
+    
+    auto end = json.find("\"", pos + 1);
+    if (end == std::string::npos) return "";
+    
+    return json.substr(pos + 1, end - pos - 1);
+}
+
+int extract_json_int(const std::string& json, const std::string& key, int default_val = 0) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+    
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return default_val;
+    
+    // Skip whitespace
+    pos++;
+    while (pos < json.size() && std::isspace(json[pos])) pos++;
+    
+    // Read number
+    std::string num_str;
+    while (pos < json.size() && (std::isdigit(json[pos]) || json[pos] == '-')) {
+        num_str += json[pos++];
+    }
+    
+    return num_str.empty() ? default_val : std::stoi(num_str);
+}
+
+float extract_json_float(const std::string& json, const std::string& key, float default_val = 0.0f) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+    
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return default_val;
+    
+    // Skip whitespace
+    pos++;
+    while (pos < json.size() && std::isspace(json[pos])) pos++;
+    
+    // Read number
+    std::string num_str;
+    while (pos < json.size() && (std::isdigit(json[pos]) || json[pos] == '-' || 
+                                  json[pos] == '.' || json[pos] == 'e' || json[pos] == 'E' || json[pos] == '+')) {
+        num_str += json[pos++];
+    }
+    
+    return num_str.empty() ? default_val : std::stof(num_str);
+}
+
+bool extract_json_bool(const std::string& json, const std::string& key, bool default_val = false) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+    
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return default_val;
+    
+    // Skip whitespace
+    pos++;
+    while (pos < json.size() && std::isspace(json[pos])) pos++;
+    
+    if (json.substr(pos, 4) == "true") return true;
+    if (json.substr(pos, 5) == "false") return false;
+    
+    return default_val;
+}
+
+}  // namespace
+
+ModelConfig ModelConfig::from_gguf(const std::map<std::string, GGUFMetaData>& meta) {
+    ModelConfig config;
+    
+    // Architecture
+    config.architecture = get_or_default<std::string>(meta, "architecture", "unknown");
+    config.model_type = config.architecture;  // GGUF uses architecture as model type
+    
+    // Dimensions
+    config.hidden_size = get_or_default<int>(meta, "hidden_size", 0);
+    config.intermediate_size = get_or_default<int>(meta, "intermediate_size", 0);
+    config.num_hidden_layers = get_or_default<int>(meta, "layer_num", 0);
+    config.num_attention_heads = get_or_default<int>(meta, "head_num", 0);
+    config.num_key_value_heads = get_or_default<int>(meta, "head_num_kv", 0);
+    config.head_dim = get_or_default<int>(meta, "head_size", 0);
+    config.vocab_size = get_or_default<int>(meta, "vocab_size", 0);
+    config.max_position_embeddings = get_or_default<int>(meta, "max_position_embeddings", 0);
+    
+    // Normalization
+    config.rms_norm_eps = get_or_default<float>(meta, "rms_norm_eps", 1e-6f);
+    
+    // RoPE
+    config.rope_theta = get_or_default<float>(meta, "rope_freq_base", 10000.0f);
+    config.rope_scaling_factor = get_or_default<float>(meta, "rope_scaling_factor", 1.0f);
+    
+    // Other
+    config.file_type = get_or_default<int>(meta, "file_type", 0);
+    
+    // Compute head_dim if not provided
+    if (config.head_dim == 0 && config.hidden_size > 0 && config.num_attention_heads > 0) {
+        config.head_dim = config.hidden_size / config.num_attention_heads;
+    }
+    
+    return config;
+}
+
+ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) {
+    // Read JSON file
+    std::ifstream file(config_path);
+    if (!file) {
+        throw std::runtime_error("Cannot open config file: " + config_path.string());
+    }
+    
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string json = buffer.str();
+    
+    ModelConfig config;
+    
+    // Parse JSON fields
+    config.model_type = extract_json_string(json, "model_type");
+    config.architecture = config.model_type;
+    
+    // Handle architectures array if present
+    std::string arch = extract_json_string(json, "architectures");
+    if (!arch.empty()) {
+        // First architecture in the list
+        if (arch.find("Qwen3") != std::string::npos) config.architecture = "qwen3";
+        else if (arch.find("Qwen2") != std::string::npos) config.architecture = "qwen2";
+        else if (arch.find("Llama") != std::string::npos) config.architecture = "llama";
+        else if (arch.find("Mistral") != std::string::npos) config.architecture = "mistral";
+    }
+    
+    // Dimensions
+    config.hidden_size = extract_json_int(json, "hidden_size");
+    config.intermediate_size = extract_json_int(json, "intermediate_size");
+    config.num_hidden_layers = extract_json_int(json, "num_hidden_layers");
+    config.num_attention_heads = extract_json_int(json, "num_attention_heads");
+    config.num_key_value_heads = extract_json_int(json, "num_key_value_heads", config.num_attention_heads);
+    config.head_dim = extract_json_int(json, "head_dim", 0);
+    config.vocab_size = extract_json_int(json, "vocab_size");
+    config.max_position_embeddings = extract_json_int(json, "max_position_embeddings");
+    
+    // Normalization
+    config.rms_norm_eps = extract_json_float(json, "rms_norm_eps", 1e-6f);
+    
+    // RoPE
+    config.rope_theta = extract_json_float(json, "rope_theta", 10000.0f);
+    
+    // Other
+    config.tie_word_embeddings = extract_json_bool(json, "tie_word_embeddings", false);
+    config.hidden_act = extract_json_string(json, "hidden_act");
+    if (config.hidden_act.empty()) {
+        config.hidden_act = "silu";
+    }
+    
+    // Compute head_dim if not provided
+    if (config.head_dim == 0 && config.hidden_size > 0 && config.num_attention_heads > 0) {
+        config.head_dim = config.hidden_size / config.num_attention_heads;
+    }
+    
+    // Parse torch_dtype
+    std::string dtype_str = extract_json_string(json, "torch_dtype");
+    if (dtype_str == "bfloat16") config.dtype = ov::element::bf16;
+    else if (dtype_str == "float16") config.dtype = ov::element::f16;
+    else if (dtype_str == "float32") config.dtype = ov::element::f32;
+    
+    return config;
+}
+
+std::map<std::string, GGUFMetaData> ModelConfig::to_gguf_format() const {
+    std::map<std::string, GGUFMetaData> meta;
+    
+    meta["architecture"] = architecture;
+    meta["hidden_size"] = hidden_size;
+    meta["intermediate_size"] = intermediate_size;
+    meta["layer_num"] = num_hidden_layers;
+    meta["head_num"] = num_attention_heads;
+    meta["head_num_kv"] = num_key_value_heads;
+    meta["head_size"] = head_dim;
+    meta["vocab_size"] = vocab_size;
+    meta["max_position_embeddings"] = max_position_embeddings;
+    meta["rms_norm_eps"] = rms_norm_eps;
+    meta["rope_freq_base"] = rope_theta;
+    meta["rope_scaling_factor"] = rope_scaling_factor;
+    meta["file_type"] = file_type;
+    
+    return meta;
+}
+
+void ModelConfig::validate() const {
+    std::vector<std::string> missing;
+    
+    if (architecture.empty()) missing.push_back("architecture");
+    if (hidden_size <= 0) missing.push_back("hidden_size");
+    if (num_hidden_layers <= 0) missing.push_back("num_hidden_layers");
+    if (num_attention_heads <= 0) missing.push_back("num_attention_heads");
+    if (vocab_size <= 0) missing.push_back("vocab_size");
+    
+    if (!missing.empty()) {
+        std::string msg = "Missing required config fields: ";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            if (i > 0) msg += ", ";
+            msg += missing[i];
+        }
+        throw std::runtime_error(msg);
+    }
+}
+
+std::string ModelConfig::summary() const {
+    std::stringstream ss;
+    ss << "ModelConfig {\n"
+       << "  architecture: " << architecture << "\n"
+       << "  model_type: " << model_type << "\n"
+       << "  hidden_size: " << hidden_size << "\n"
+       << "  intermediate_size: " << intermediate_size << "\n"
+       << "  num_hidden_layers: " << num_hidden_layers << "\n"
+       << "  num_attention_heads: " << num_attention_heads << "\n"
+       << "  num_key_value_heads: " << num_key_value_heads << "\n"
+       << "  head_dim: " << head_dim << "\n"
+       << "  vocab_size: " << vocab_size << "\n"
+       << "  max_position_embeddings: " << max_position_embeddings << "\n"
+       << "  rms_norm_eps: " << rms_norm_eps << "\n"
+       << "  rope_theta: " << rope_theta << "\n"
+       << "  tie_word_embeddings: " << (tie_word_embeddings ? "true" : "false") << "\n"
+       << "  hidden_act: " << hidden_act << "\n"
+       << "}";
+    return ss.str();
+}
+
+}  // namespace loaders
+}  // namespace genai
+}  // namespace ov
