@@ -7,6 +7,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+
+#include "openvino/genai/chat_history.hpp"
 #include "openvino/genai/llm_pipeline.hpp"
 
 int main(int argc, char* argv[]) try {
@@ -23,11 +25,20 @@ int main(int argc, char* argv[]) try {
     ov::AnyMap pipe_config;
     pipe_config[ov::genai::enable_save_ov_model.name()] = false;
     ov::genai::LLMPipeline pipe(models_path, device, pipe_config);
-    ov::genai::GenerationConfig config;
+    ov::genai::GenerationConfig config = pipe.get_generation_config();
     config.max_new_tokens = max_new_tokens;
-    config.apply_chat_template = false;
+    config.do_sample = false;  // keep greedy decoding but preserve model-specific defaults
 
-    auto input_data = pipe.get_tokenizer().encode(prompt);
+    auto tokenizer = pipe.get_tokenizer();
+    ov::genai::TokenizedInputs input_data;
+    if (config.apply_chat_template && !tokenizer.get_chat_template().empty()) {
+        ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
+        constexpr bool add_generation_prompt = true;
+        auto templated_prompt = tokenizer.apply_chat_template(history, add_generation_prompt);
+        input_data = tokenizer.encode(templated_prompt, ov::genai::add_special_tokens(false));
+    } else {
+        input_data = tokenizer.encode(prompt, ov::genai::add_special_tokens(true));
+    }
     std::size_t prompt_token_size = input_data.input_ids.get_shape()[1];
     std::cout << "Prompt token size: " << prompt_token_size << std::endl;
 
