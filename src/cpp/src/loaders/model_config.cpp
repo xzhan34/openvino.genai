@@ -108,6 +108,40 @@ bool extract_json_bool(const std::string& json, const std::string& key, bool def
     return default_val;
 }
 
+std::vector<int32_t> extract_json_int_array(const std::string& json, const std::string& key) {
+    std::vector<int32_t> result;
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return result;
+    
+    pos = json.find("[", pos);
+    if (pos == std::string::npos) return result;
+    
+    auto end = json.find("]", pos);
+    if (end == std::string::npos) return result;
+    
+    // Parse integers between [ and ]
+    std::string array_content = json.substr(pos + 1, end - pos - 1);
+    std::stringstream ss(array_content);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        // Trim whitespace
+        size_t start = token.find_first_not_of(" \t\n\r");
+        size_t finish = token.find_last_not_of(" \t\n\r");
+        if (start != std::string::npos && finish != std::string::npos) {
+            std::string num_str = token.substr(start, finish - start + 1);
+            if (!num_str.empty()) {
+                try {
+                    result.push_back(std::stoi(num_str));
+                } catch (...) {
+                    // Skip invalid entries
+                }
+            }
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 ModelConfig ModelConfig::from_gguf(const std::map<std::string, GGUFMetaData>& meta) {
@@ -170,6 +204,16 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
         else if (arch.find("Qwen2") != std::string::npos) config.architecture = "qwen2";
         else if (arch.find("Llama") != std::string::npos) config.architecture = "llama";
         else if (arch.find("Mistral") != std::string::npos) config.architecture = "mistral";
+        else if (arch.find("SmolLM3") != std::string::npos) config.architecture = "smollm3";
+    }
+    
+    // Also check model_type for SmolLM3
+    if (config.model_type == "smollm3" || config.model_type == "LlamaForCausalLM") {
+        // SmolLM3 may use LlamaForCausalLM as model_type, check for smollm3-specific fields
+        int no_rope_interval = extract_json_int(json, "no_rope_layer_interval", 0);
+        if (no_rope_interval > 0) {
+            config.architecture = "smollm3";
+        }
     }
     
     // Dimensions
@@ -190,10 +234,16 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     
     // Other
     config.tie_word_embeddings = extract_json_bool(json, "tie_word_embeddings", false);
+    config.attention_bias = extract_json_bool(json, "attention_bias", false);
+    config.mlp_bias = extract_json_bool(json, "mlp_bias", false);
     config.hidden_act = extract_json_string(json, "hidden_act");
     if (config.hidden_act.empty()) {
         config.hidden_act = "silu";
     }
+    
+    // SmolLM3-specific
+    config.no_rope_layer_interval = extract_json_int(json, "no_rope_layer_interval", 0);
+    config.no_rope_layers = extract_json_int_array(json, "no_rope_layers");
     
     // Compute head_dim if not provided
     if (config.head_dim == 0 && config.hidden_size > 0 && config.num_attention_heads > 0) {

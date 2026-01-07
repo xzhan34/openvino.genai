@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 #include <filesystem>
 
 #include <openvino/openvino.hpp>
@@ -105,8 +106,19 @@ struct ModelConfig {
     /// Whether attention has bias
     bool attention_bias = false;
     
+    /// Whether MLP has bias (SmolLM3)
+    bool mlp_bias = false;
+    
     /// Activation function (e.g., "silu", "gelu")
     std::string hidden_act = "silu";
+    
+    // ========== SmolLM3-specific ==========
+    
+    /// Interval for layers without RoPE (SmolLM3: every 4th layer has no RoPE)
+    int32_t no_rope_layer_interval = 0;
+    
+    /// Explicit list of layers without RoPE (alternative to interval)
+    std::vector<int32_t> no_rope_layers;
     
     /// Model data type (e.g., bf16, fp16)
     ov::element::Type dtype = ov::element::bf16;

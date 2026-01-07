@@ -15,6 +15,7 @@ This module provides a unified interface for loading models from different file 
 | Architecture | Status | Models |
 |--------------|--------|--------|
 | **Qwen3** | ✅ Tested | Qwen3-0.6B, Qwen3-4B |
+| **SmolLM3** | ✅ Tested | SmolLM3-3B |
 | **Qwen2** | 🚧 Pending | Requires validation |
 | **LLaMA** | 🚧 TODO | - |
 | **Mistral** | 🚧 TODO | - |
@@ -46,6 +47,7 @@ Tested configurations:
 |-------|--------|----------------|--------|
 | Qwen3-0.6B-BF16.gguf | GGUF | 3 env configs | ✅ Pass |
 | qwen3-4b-hf | Safetensors | 3 env configs | ✅ Pass |
+| SmolLM3-3B | Safetensors | Unified loader | ✅ Pass |
 
 Test command:
 ```bash

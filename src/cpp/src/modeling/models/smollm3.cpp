@@ -385,3 +385,103 @@ std::shared_ptr<ov::Model> create_smollm3_model(
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
+
+// ============================================================================
+// Model Builder Registration
+// ============================================================================
+// The build function and registration are placed here (in the model file)
+// rather than in model_builder.cpp, following the pattern from vLLM where
+// each model file is self-contained with its own registration.
+// This allows adding new models without modifying model_builder.cpp.
+// ============================================================================
+
+#include "loaders/model_builder.hpp"
+#include "modeling/weights/weight_loader.hpp"
+
+namespace {
+
+/**
+ * @brief Build SmolLM3 model using modeling API
+ *
+ * This function converts ModelConfig to SmolLM3Config, creates the model
+ * structure, loads weights, and builds the final OpenVINO model.
+ */
+std::shared_ptr<ov::Model> build_smollm3_model(
+    const ov::genai::loaders::ModelConfig& config,
+    ov::genai::modeling::weights::WeightSource& weight_source,
+    ov::genai::modeling::weights::WeightFinalizer& weight_finalizer) {
+
+    using namespace ov::genai::modeling;
+    using namespace ov::genai::modeling::models;
+
+    BuilderContext ctx;
+
+    // Convert ModelConfig to SmolLM3Config
+    SmolLM3Config cfg;
+    cfg.architecture = config.architecture;
+    cfg.hidden_size = config.hidden_size;
+    cfg.num_hidden_layers = config.num_hidden_layers;
+    cfg.num_attention_heads = config.num_attention_heads;
+    cfg.num_key_value_heads = config.num_key_value_heads > 0
+        ? config.num_key_value_heads : config.num_attention_heads;
+    cfg.head_dim = config.head_dim > 0
+        ? config.head_dim : (config.hidden_size / config.num_attention_heads);
+    cfg.intermediate_size = config.intermediate_size;
+    cfg.rope_theta = config.rope_theta;
+    cfg.attention_bias = config.attention_bias;
+    cfg.mlp_bias = config.mlp_bias;
+    cfg.rms_norm_eps = config.rms_norm_eps;
+    cfg.tie_word_embeddings = config.tie_word_embeddings;
+    cfg.hidden_act = config.hidden_act;
+    
+    // SmolLM3-specific: no_rope_layer_interval
+    cfg.no_rope_layer_interval = config.no_rope_layer_interval;
+    cfg.no_rope_layers = config.no_rope_layers;
+
+    // Create model
+    SmolLM3ForCausalLM model(ctx, cfg);
+
+    // Load weights
+    weights::load_model(model, weight_source, weight_finalizer);
+
+    // Helper to set tensor name
+    auto set_name = [](auto node, const std::string& name) {
+        node->output(0).set_names({name});
+    };
+
+    // Create input parameters
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    // Set tensor names for inputs
+    input_ids.output().get_node()->output(0).set_names({"input_ids"});
+    attention_mask.output().get_node()->output(0).set_names({"attention_mask"});
+    position_ids.output().get_node()->output(0).set_names({"position_ids"});
+    beam_idx.output().get_node()->output(0).set_names({"beam_idx"});
+
+    (void)attention_mask;  // Attention mask is handled internally by SDPA
+
+    // Forward pass
+    auto logits = model.forward(input_ids, position_ids, beam_idx);
+
+    // Build model with named output
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
+    auto ov_model = ctx.build_model({result->output(0)});
+
+    // Set runtime options for optimal performance
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+
+    return ov_model;
+}
+
+// Self-registration: Register SmolLM3 builder at static initialization
+static bool smollm3_registered = []() {
+    ov::genai::loaders::ModelBuilder::instance().register_architecture("smollm3", build_smollm3_model);
+    return true;
+}();
+
+}  // namespace
