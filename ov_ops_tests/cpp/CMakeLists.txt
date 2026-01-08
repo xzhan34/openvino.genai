@@ -35,8 +35,21 @@ endfunction()
 
 set (TEST_LIST
     fused_mlp_test
-    moe_q41_moe3gemm_test)
+    moe_q41_moe3gemm_test
+    test_moe_layer)
 
 foreach(testcase IN LISTS TEST_LIST)
     add_test_executable(${testcase})
 endforeach()
+
+# test_moe_layer needs access to gguf_utils headers and gguflib
+# Also needs to compile building_blocks.cpp and gguf.cpp which contain required functions
+target_sources(test_moe_layer PRIVATE 
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src/gguf_utils/building_blocks.cpp"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src/gguf_utils/gguf.cpp"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src/gguf_utils/gguf_quants.cpp")
+target_include_directories(test_moe_layer PRIVATE "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src")
+if(ENABLE_GGUF AND TARGET gguflib)
+    target_link_libraries(test_moe_layer PRIVATE gguflib)
+    target_compile_definitions(test_moe_layer PRIVATE ENABLE_GGUF)
+endif()
