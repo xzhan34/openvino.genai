@@ -11,6 +11,7 @@
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/llm.hpp"
+#include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
 #include "modeling/weights/weight_loader.hpp"
@@ -127,50 +128,6 @@ const Tensor* SmolLM3Attention::o_proj_bias() const {
     return (o_bias_param_ && o_bias_param_->is_bound()) ? &o_bias_param_->value() : nullptr;
 }
 
-std::pair<Tensor, Tensor> SmolLM3Attention::append_kv_cache(const Tensor& keys,
-                                                            const Tensor& values,
-                                                            const Tensor& beam_idx) const {
-    auto* op_ctx = keys.context();
-    auto batch = shape::dim(keys, 0);
-    auto kv_heads = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(num_kv_heads_)});
-    auto zero_len = ops::const_vec(op_ctx, std::vector<int64_t>{0});
-    auto head_dim = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(head_dim_)});
-    auto cache_shape = shape::make({batch, kv_heads, zero_len, head_dim});
-
-    auto zero = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(keys.dtype());
-    auto k_init = shape::broadcast_to(zero, cache_shape);
-    auto v_init = shape::broadcast_to(zero, cache_shape);
-
-    const std::string cache_prefix = full_path().empty() ? name() : full_path();
-    const std::string k_name = cache_prefix + ".key_cache";
-    const std::string v_name = cache_prefix + ".value_cache";
-
-    ov::op::util::VariableInfo k_info{ov::PartialShape{-1, num_kv_heads_, -1, head_dim_},
-                                      keys.dtype(),
-                                      k_name};
-    auto k_var = std::make_shared<ov::op::util::Variable>(k_info);
-    auto k_read = std::make_shared<ov::op::v6::ReadValue>(k_init.output(), k_var);
-
-    ov::op::util::VariableInfo v_info{ov::PartialShape{-1, num_kv_heads_, -1, head_dim_},
-                                      values.dtype(),
-                                      v_name};
-    auto v_var = std::make_shared<ov::op::util::Variable>(v_info);
-    auto v_read = std::make_shared<ov::op::v6::ReadValue>(v_init.output(), v_var);
-
-    auto k_cached = ops::gather(Tensor(k_read->output(0), op_ctx), beam_idx, 0);
-    auto v_cached = ops::gather(Tensor(v_read->output(0), op_ctx), beam_idx, 0);
-
-    auto k_combined = ops::concat({k_cached, keys}, 2);
-    auto v_combined = ops::concat({v_cached, values}, 2);
-
-    auto k_assign = std::make_shared<ov::opset13::Assign>(k_combined.output(), k_var);
-    auto v_assign = std::make_shared<ov::opset13::Assign>(v_combined.output(), v_var);
-    ctx().register_sink(k_assign);
-    ctx().register_sink(v_assign);
-
-    return {k_combined, v_combined};
-}
-
 Tensor SmolLM3Attention::forward(const Tensor& hidden_states,
                                  const Tensor& beam_idx,
                                  const Tensor& rope_cos,
@@ -191,7 +148,8 @@ Tensor SmolLM3Attention::forward(const Tensor& hidden_states,
         k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
     }
 
-    auto cached = append_kv_cache(k_rot, v_heads, beam_idx);
+    const std::string cache_prefix = full_path().empty() ? name() : full_path();
+    auto cached = ops::append_kv_cache(k_rot, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx());
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 

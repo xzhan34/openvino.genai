@@ -21,6 +21,7 @@
 #include "gguf_utils/gguf_weight_source.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
 #include "modeling/models/qwen3_dense.hpp"
+#include "modeling/models/qwen3_moe.hpp"
 #include "modeling/models/smollm3.hpp"
 #include "utils.hpp"
 
@@ -230,6 +231,27 @@ std::shared_ptr<ov::Model> create_from_gguf(const std::string& model_path, const
         ov::genai::gguf::GGUFWeightSource source(consts);
         ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
         model = ov::genai::modeling::models::create_qwen3_dense_model(cfg, source, finalizer);
+        apply_runtime_options(config, model);
+    } else if (!model_arch.compare("qwen3moe") && use_modeling_qwen3_dense_dummy_builder()) {
+        ov::genai::utils::print_gguf_debug_info("Using modeling API: qwen3 moe builder");
+        ov::genai::modeling::models::Qwen3MoeConfig cfg;
+        cfg.architecture = std::get<std::string>(config.at("architecture"));
+        cfg.hidden_size = std::get<int>(config.at("hidden_size"));
+        cfg.num_hidden_layers = std::get<int>(config.at("layer_num"));
+        cfg.num_attention_heads = std::get<int>(config.at("head_num"));
+        cfg.num_key_value_heads = std::get<int>(config.at("head_num_kv"));
+        cfg.head_dim = std::get<int>(config.at("head_size"));
+        cfg.intermediate_size = std::get<int>(config.at("moe_inter_size"));
+        cfg.rope_theta = std::get<float>(config.at("rope_freq_base"));
+        cfg.attention_bias = consts.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.rms_norm_eps = std::get<float>(config.at("rms_norm_eps"));
+        cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
+        cfg.expert_count = std::get<int>(config.at("expert_count"));
+        cfg.expert_used_count = std::get<int>(config.at("expert_used_count"));
+        cfg.moe_intermediate_size = std::get<int>(config.at("moe_inter_size"));
+        ov::genai::gguf::GGUFWeightSource source(consts);
+        ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
+        model = ov::genai::modeling::models::create_qwen3_moe_model(cfg, source, finalizer);
         apply_runtime_options(config, model);
     } else if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3") || !model_arch.compare("qwen3moe")) {
         model = create_language_model(config, consts, qtypes);

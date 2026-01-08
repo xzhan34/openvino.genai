@@ -6,6 +6,7 @@
 #include <openvino/core/except.hpp>
 #include <openvino/opsets/opset13.hpp>
 #include <openvino/op/placeholder_extension.hpp>
+#include <openvino/op/moe_3gemm_fused_compressed.hpp>
 #include <ov_ops/fully_connected.hpp>
 
 namespace {
@@ -90,6 +91,54 @@ Tensor linear(const Tensor& x, const Tensor& weight) {
     auto no_bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
     auto node = std::make_shared<ov::op::internal::FullyConnected>(x.output(), weight.output(), no_bias);
     return Tensor(node, ctx);
+}
+
+Tensor moe3gemm_fused_compressed(const Tensor& input,
+                                 const Tensor& gate_inp_weight,
+                                 const Tensor& gate_exps_weight,
+                                 const Tensor& gate_exps_scales,
+                                 const Tensor& gate_exps_zps,
+                                 const Tensor& up_exps_weight,
+                                 const Tensor& up_exps_scales,
+                                 const Tensor& up_exps_zps,
+                                 const Tensor& down_exps_weight,
+                                 const Tensor& down_exps_scales,
+                                 const Tensor& down_exps_zps,
+                                 int32_t hidden_size,
+                                 int32_t inter_size,
+                                 int32_t num_experts,
+                                 int32_t top_k,
+                                 int32_t group_size,
+                                 const ov::element::Type& out_type) {
+    auto* ctx = input.context();
+    auto hidden_f16 = input.to(ov::element::f16);
+    auto gate_inp_f16 = gate_inp_weight.to(ov::element::f16);
+    auto router = matmul(hidden_f16, gate_inp_f16, false, true);
+
+    ov::op::internal::MOE3GemmFusedCompressed::Config config;
+    config.hidden_size = hidden_size;
+    config.inter_size = inter_size;
+    config.num_expert = num_experts;
+    config.top_k = top_k;
+    config.group_size = group_size;
+    config.out_type = out_type;
+
+    ov::OutputVector args = {
+        hidden_f16.output(),
+        router.output(),
+        gate_exps_weight.output(),
+        gate_exps_scales.output(),
+        gate_exps_zps.output(),
+        up_exps_weight.output(),
+        up_exps_scales.output(),
+        up_exps_zps.output(),
+        down_exps_weight.output(),
+        down_exps_scales.output(),
+        down_exps_zps.output()
+    };
+    auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
+    auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
+    return Tensor(moe_f32, ctx);
 }
 
 Tensor silu(const Tensor& x) {

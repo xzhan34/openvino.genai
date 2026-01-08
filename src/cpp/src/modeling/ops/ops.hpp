@@ -23,6 +23,23 @@ Tensor constant(const ov::Tensor& tensor, OpContext* ctx = nullptr);
 
 Tensor matmul(const Tensor& a, const Tensor& b, bool ta = false, bool tb = false);
 Tensor linear(const Tensor& x, const Tensor& weight);
+Tensor moe3gemm_fused_compressed(const Tensor& input,
+                                 const Tensor& gate_inp_weight,
+                                 const Tensor& gate_exps_weight,
+                                 const Tensor& gate_exps_scales,
+                                 const Tensor& gate_exps_zps,
+                                 const Tensor& up_exps_weight,
+                                 const Tensor& up_exps_scales,
+                                 const Tensor& up_exps_zps,
+                                 const Tensor& down_exps_weight,
+                                 const Tensor& down_exps_scales,
+                                 const Tensor& down_exps_zps,
+                                 int32_t hidden_size,
+                                 int32_t inter_size,
+                                 int32_t num_experts,
+                                 int32_t top_k,
+                                 int32_t group_size,
+                                 const ov::element::Type& out_type);
 Tensor silu(const Tensor& x);
 Tensor reduce_mean(const Tensor& x, int64_t axis, bool keepdim = true);
 Tensor gather(const Tensor& data, const Tensor& indices, int64_t axis);

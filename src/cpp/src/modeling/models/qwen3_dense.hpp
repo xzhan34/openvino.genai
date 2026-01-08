@@ -72,10 +72,6 @@ private:
     const Tensor* k_proj_bias() const;
     const Tensor* v_proj_bias() const;
     const Tensor* o_proj_bias() const;
-    std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
-                                              const Tensor& values,
-                                              const Tensor& beam_idx) const;
-
     int32_t num_heads_ = 0;
     int32_t num_kv_heads_ = 0;
     int32_t head_dim_ = 0;
