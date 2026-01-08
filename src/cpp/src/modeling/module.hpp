@@ -42,6 +42,9 @@ public:
 
     WeightParameter& register_parameter(const std::string& name);
     WeightParameter& get_parameter(const std::string& full_name);
+    void register_module(const std::string& name, Module* child);
+    std::vector<std::pair<std::string, Module*>> named_modules(bool include_self = true) const;
+    std::vector<std::pair<std::string, WeightParameter*>> named_parameters(bool recurse = true) const;
 
     BuilderContext& ctx();
     const BuilderContext& ctx() const;
@@ -57,6 +60,7 @@ protected:
     std::string name_;
     std::string full_path_;
     std::vector<std::unique_ptr<WeightParameter>> parameters_;
+    std::vector<std::pair<std::string, Module*>> children_;
     PackedMapping packed_mapping_;
 };
 

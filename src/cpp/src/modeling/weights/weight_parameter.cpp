@@ -106,6 +106,14 @@ void WeightParameter::tie_to(WeightParameter& other) {
     tied_to_ = &other;
 }
 
+void WeightParameter::set_optional(bool optional) {
+    optional_ = optional;
+}
+
+bool WeightParameter::is_optional() const {
+    return optional_;
+}
+
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov

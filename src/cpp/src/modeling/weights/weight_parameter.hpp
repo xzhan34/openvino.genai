@@ -43,12 +43,15 @@ public:
     void finalize();
 
     void tie_to(WeightParameter& other);
+    void set_optional(bool optional);
+    bool is_optional() const;
 
 private:
     std::string name_;
     OpContext* ctx_ = nullptr;
     Tensor weight_;
     bool bound_ = false;
+    bool optional_ = false;
     WeightParameter* tied_to_ = nullptr;
     std::unordered_map<int, Tensor> shards_;
     WeightLoaderFn weight_loader_;
