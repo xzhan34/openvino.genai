@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "openvino/genai/visibility.hpp"
 #include <openvino/openvino.hpp>
 
 #include "modeling/ops/context.hpp"
@@ -21,7 +22,7 @@ namespace safetensors {
  * Safetensors weights are typically in BF16/F16/F32 format and don't require
  * dequantization. This finalizer simply creates constant nodes from the tensors.
  */
-class SafetensorsWeightFinalizer : public ov::genai::modeling::weights::WeightFinalizer {
+class OPENVINO_GENAI_EXPORTS SafetensorsWeightFinalizer : public ov::genai::modeling::weights::WeightFinalizer {
 public:
     SafetensorsWeightFinalizer();
 

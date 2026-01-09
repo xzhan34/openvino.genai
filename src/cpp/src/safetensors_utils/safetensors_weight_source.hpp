@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "openvino/genai/visibility.hpp"
 #include <openvino/openvino.hpp>
 
 #include "modeling/weights/weight_source.hpp"
@@ -30,7 +31,7 @@ namespace safetensors {
  * // source->keys() returns canonical names like "layers[0].self_attn.q_proj.weight"
  * @endcode
  */
-class SafetensorsWeightSource : public ov::genai::modeling::weights::WeightSource {
+class OPENVINO_GENAI_EXPORTS SafetensorsWeightSource : public ov::genai::modeling::weights::WeightSource {
 public:
     /**
      * @brief Construct from loaded SafetensorsData (takes ownership)

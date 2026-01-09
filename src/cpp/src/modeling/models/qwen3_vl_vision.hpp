@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "openvino/genai/visibility.hpp"
+
 namespace ov {
 class Model;
 }  // namespace ov
@@ -34,12 +36,12 @@ namespace genai {
 namespace modeling {
 namespace models {
 
-struct Qwen3VLVisionOutput {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionOutput {
     Tensor visual_embeds;
     std::vector<Tensor> deepstack_embeds;
 };
 
-class Qwen3VLVisionPatchEmbed : public Module {
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionPatchEmbed : public Module {
 public:
     Qwen3VLVisionPatchEmbed(BuilderContext& ctx, const std::string& name, const Qwen3VLVisionConfig& cfg,
                             Module* parent = nullptr);
@@ -59,7 +61,7 @@ private:
     WeightParameter* bias_param_ = nullptr;
 };
 
-class Qwen3VLVisionAttention : public Module {
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionAttention : public Module {
 public:
     Qwen3VLVisionAttention(BuilderContext& ctx, const std::string& name, const Qwen3VLVisionConfig& cfg,
                            Module* parent = nullptr);
@@ -89,7 +91,7 @@ private:
     WeightParameter* proj_bias_param_ = nullptr;
 };
 
-class Qwen3VLVisionMLP : public Module {
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionMLP : public Module {
 public:
     Qwen3VLVisionMLP(BuilderContext& ctx, const std::string& name, const Qwen3VLVisionConfig& cfg,
                      Module* parent = nullptr);
@@ -108,7 +110,7 @@ private:
     WeightParameter* fc2_bias_param_ = nullptr;
 };
 
-class Qwen3VLVisionBlock : public Module {
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionBlock : public Module {
 public:
     Qwen3VLVisionBlock(BuilderContext& ctx, const std::string& name, const Qwen3VLVisionConfig& cfg,
                        Module* parent = nullptr);
@@ -133,7 +135,7 @@ private:
     WeightParameter* norm2_bias_param_ = nullptr;
 };
 
-class Qwen3VLVisionPatchMerger : public Module {
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionPatchMerger : public Module {
 public:
     Qwen3VLVisionPatchMerger(BuilderContext& ctx,
                              const std::string& name,
@@ -164,7 +166,7 @@ private:
     WeightParameter* fc2_bias_param_ = nullptr;
 };
 
-class Qwen3VLVisionModel : public Module {
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionModel : public Module {
 public:
     Qwen3VLVisionModel(BuilderContext& ctx, const Qwen3VLVisionConfig& cfg, Module* parent = nullptr);
 
@@ -186,7 +188,7 @@ private:
     std::vector<int32_t> deepstack_indexes_;
 };
 
-std::shared_ptr<ov::Model> create_qwen3_vl_vision_model(
+OPENVINO_GENAI_EXPORTS std::shared_ptr<ov::Model> create_qwen3_vl_vision_model(
     const Qwen3VLConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);

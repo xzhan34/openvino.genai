@@ -455,7 +455,7 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
     if (enable_visual_inputs) {
         visual_embeds = ctx.parameter(Qwen3VLTextIO::kVisualEmbeds,
                                       float_type,
-                                      ov::PartialShape{-1, cfg.text.hidden_size});
+                                      ov::PartialShape{-1, -1, cfg.text.hidden_size});
         visual_pos_mask = ctx.parameter(Qwen3VLTextIO::kVisualPosMask,
                                         ov::element::boolean,
                                         ov::PartialShape{-1, -1});
@@ -468,7 +468,7 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
             std::string name = std::string(Qwen3VLTextIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i);
             deepstack_inputs.emplace_back(ctx.parameter(name,
                                                         float_type,
-                                                        ov::PartialShape{-1, cfg.text.hidden_size}));
+                                                        ov::PartialShape{-1, -1, cfg.text.hidden_size}));
         }
         if (!deepstack_inputs.empty()) {
             deepstack_ptr = &deepstack_inputs;

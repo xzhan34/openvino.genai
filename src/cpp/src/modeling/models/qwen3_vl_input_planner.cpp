@@ -311,6 +311,47 @@ std::vector<ov::Tensor> Qwen3VLInputPlanner::scatter_deepstack_embeds(
     return out;
 }
 
+ov::Tensor Qwen3VLInputPlanner::build_decode_position_ids(const ov::Tensor& rope_deltas,
+                                                          int64_t past_length,
+                                                          int64_t seq_len) {
+    if (rope_deltas.get_element_type() != ov::element::i64) {
+        OPENVINO_THROW("rope_deltas must be i64");
+    }
+    if (past_length < 0 || seq_len <= 0) {
+        OPENVINO_THROW("Invalid past_length or seq_len for decode position ids");
+    }
+    const auto shape = rope_deltas.get_shape();
+    size_t batch = 0;
+    if (shape.size() == 1) {
+        batch = shape[0];
+    } else if (shape.size() == 2) {
+        if (shape[1] != 1) {
+            OPENVINO_THROW("rope_deltas must have shape [B] or [B, 1]");
+        }
+        batch = shape[0];
+    } else {
+        OPENVINO_THROW("rope_deltas must have shape [B] or [B, 1]");
+    }
+
+    ov::Tensor position_ids(ov::element::i64, {3, batch, static_cast<size_t>(seq_len)});
+    auto* out = position_ids.data<int64_t>();
+    const int64_t* deltas = rope_deltas.data<const int64_t>();
+    const size_t plane_stride = batch * static_cast<size_t>(seq_len);
+
+    for (size_t b = 0; b < batch; ++b) {
+        const int64_t base = past_length + deltas[b];
+        for (int64_t s = 0; s < seq_len; ++s) {
+            const int64_t value = base + s;
+            const size_t idx = b * static_cast<size_t>(seq_len) + static_cast<size_t>(s);
+            out[idx] = value;
+            out[plane_stride + idx] = value;
+            out[2 * plane_stride + idx] = value;
+        }
+    }
+
+    return position_ids;
+}
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

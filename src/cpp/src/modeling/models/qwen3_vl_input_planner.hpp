@@ -7,6 +7,7 @@
 #include <optional>
 #include <vector>
 
+#include "openvino/genai/visibility.hpp"
 #include <openvino/openvino.hpp>
 
 #include "modeling/models/qwen3_vl_spec.hpp"
@@ -16,13 +17,13 @@ namespace genai {
 namespace modeling {
 namespace models {
 
-struct Qwen3VLInputPlan {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLInputPlan {
     ov::Tensor position_ids;
     ov::Tensor visual_pos_mask;
     ov::Tensor rope_deltas;
 };
 
-class Qwen3VLInputPlanner {
+class OPENVINO_GENAI_EXPORTS Qwen3VLInputPlanner {
 public:
     explicit Qwen3VLInputPlanner(const Qwen3VLConfig& cfg);
 
@@ -38,6 +39,10 @@ public:
 
     static std::vector<ov::Tensor> scatter_deepstack_embeds(const std::vector<ov::Tensor>& deepstack_embeds,
                                                             const ov::Tensor& visual_pos_mask);
+
+    static ov::Tensor build_decode_position_ids(const ov::Tensor& rope_deltas,
+                                                int64_t past_length,
+                                                int64_t seq_len);
 
 private:
     int64_t image_token_id_ = 0;

@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "openvino/genai/visibility.hpp"
+
 #include <nlohmann/json.hpp>
 
 namespace ov {
@@ -15,13 +17,13 @@ namespace genai {
 namespace modeling {
 namespace models {
 
-struct Qwen3VLRopeConfig {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLRopeConfig {
     bool mrope_interleaved = false;
     std::vector<int32_t> mrope_section = {24, 20, 20};
     std::string rope_type = "default";
 };
 
-struct Qwen3VLTextConfig {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLTextConfig {
     std::string model_type = "qwen3_vl_text";
     int32_t vocab_size = 0;
     int32_t hidden_size = 0;
@@ -46,7 +48,7 @@ struct Qwen3VLTextConfig {
     void validate() const;
 };
 
-struct Qwen3VLVisionConfig {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionConfig {
     std::string model_type = "qwen3_vl";
     int32_t depth = 0;
     int32_t hidden_size = 0;
@@ -67,7 +69,7 @@ struct Qwen3VLVisionConfig {
     void validate() const;
 };
 
-struct Qwen3VLConfig {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLConfig {
     std::string model_type = "qwen3_vl";
     std::vector<std::string> architectures;
     Qwen3VLTextConfig text;
@@ -85,7 +87,7 @@ struct Qwen3VLConfig {
     static Qwen3VLConfig from_json_file(const std::filesystem::path& config_path);
 };
 
-struct Qwen3VLModuleNames {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLModuleNames {
     static constexpr const char* kRoot = "model";
     static constexpr const char* kVision = "visual";
     static constexpr const char* kText = "language_model";
@@ -95,7 +97,7 @@ struct Qwen3VLModuleNames {
     static std::string text_layer(int32_t index);
 };
 
-struct Qwen3VLVisionIO {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionIO {
     static constexpr const char* kPixelValues = "pixel_values";
     static constexpr const char* kGridThw = "grid_thw";
     static constexpr const char* kPosEmbeds = "pos_embeds";
@@ -105,7 +107,7 @@ struct Qwen3VLVisionIO {
     static constexpr const char* kDeepstackEmbedsPrefix = "deepstack_embeds";
 };
 
-struct Qwen3VLTextIO {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLTextIO {
     static constexpr const char* kInputIds = "input_ids";
     static constexpr const char* kInputsEmbeds = "inputs_embeds";
     static constexpr const char* kAttentionMask = "attention_mask";
@@ -117,7 +119,7 @@ struct Qwen3VLTextIO {
     static constexpr const char* kLogits = "logits";
 };
 
-struct Qwen3VLGraphSpec {
+struct OPENVINO_GENAI_EXPORTS Qwen3VLGraphSpec {
     static std::vector<std::string> vision_required_inputs(bool use_external_pos_embeds);
     static std::vector<std::string> vision_outputs(const Qwen3VLVisionConfig& cfg);
     static std::vector<std::string> text_required_inputs(bool use_inputs_embeds);
