@@ -665,6 +665,8 @@ std::shared_ptr<ov::Model> create_from_safetensors_compressed(
             
             if (compression_config.mode == InFlightCompressionConfig::Mode::INT4_SYM) {
                 quantized = rtn::quantize_int4_sym(original_weight, compression_config.group_size);
+            } else if (compression_config.mode == InFlightCompressionConfig::Mode::INT4_ASYM) {
+                quantized = rtn::quantize_int4_asym(original_weight, compression_config.group_size);
             } else if (compression_config.mode == InFlightCompressionConfig::Mode::INT8_SYM) {
                 quantized = rtn::quantize_int8_sym(original_weight, compression_config.group_size);
             } else {

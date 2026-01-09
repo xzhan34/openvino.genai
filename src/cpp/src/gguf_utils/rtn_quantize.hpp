@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -193,6 +194,72 @@ inline float convert_f16(uint16_t val) { return fp16_to_float(val); }
 inline float convert_bf16(uint16_t val) { return bf16_to_float(val); }
 
 /**
+ * @brief Templated quantization for INT4 asymmetric - optimized inner loop
+ */
+template<typename DataType, float (*ConvertFunc)(DataType)>
+void quantize_int4_asym_typed(
+    const DataType* src_data,
+    uint8_t* compressed_data,
+    uint16_t* scale_data,
+    uint8_t* zero_point_data,
+    size_t out_features,
+    size_t in_features,
+    size_t packed_in_features,
+    size_t num_groups,
+    int group_size
+) {
+    constexpr float levels = 15.0f;  // 2^4 - 1
+    constexpr int32_t level_low = 0;
+    constexpr int32_t level_high = 15;
+    constexpr float eps = 1.1920929e-7f;
+    
+    for (size_t row = 0; row < out_features; row++) {
+        const DataType* row_data = src_data + row * in_features;
+        uint8_t* row_compressed = compressed_data + row * packed_in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        uint8_t* row_zp = zero_point_data + row * num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t col = group_start; col < group_end; col++) {
+                float val = ConvertFunc(row_data[col]);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            float scale_val = (w_max - w_min) / levels;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            int32_t zp = static_cast<int32_t>(std::round(-w_min * inv_scale));
+            zp = std::max(level_low, std::min(level_high, zp));
+            
+            row_scale[g] = float_to_fp16(scale_val);
+            row_zp[g] = static_cast<uint8_t>(zp);
+            
+            for (size_t col = group_start; col < group_end; col++) {
+                float val = ConvertFunc(row_data[col]);
+                int32_t quantized = static_cast<int32_t>(std::round(val * inv_scale)) + zp;
+                quantized = std::max(level_low, std::min(level_high, quantized));
+                
+                uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
+                size_t byte_idx = col / 2;
+                if (col % 2 == 0) {
+                    row_compressed[byte_idx] = packed;
+                } else {
+                    row_compressed[byte_idx] |= (packed << 4);
+                }
+            }
+        }
+    }
+}
+
+/**
  * @brief Quantize weights using symmetric INT4 RTN algorithm (NNCF-compatible)
  * 
  * NNCF Algorithm:
@@ -254,6 +321,74 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
     result.compressed = compressed;
     result.scale = scale;
     result.has_zero_point = false;
+    return result;
+}
+
+/**
+ * @brief Quantize weights using asymmetric INT4 RTN algorithm (NNCF-compatible)
+ * 
+ * NNCF Algorithm:
+ *   levels = 2^num_bits - 1 = 15 for INT4
+ *   scale = (max - min) / levels
+ *   zero_point = round(-min / scale)
+ *   quantized = round(weight / scale) + zero_point
+ *   quantized = clamp(quantized, 0, 15)
+ * 
+ * Optimized version with:
+ *   - Type dispatch outside hot loops
+ *   - Precomputed inverse scale (multiply instead of divide)
+ * 
+ * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features]
+ * @param group_size Number of elements per quantization group (default: 128)
+ * @return QuantizedWeight with INT4 weights packed as U8, FP16 scales, and U8 zero points
+ */
+inline QuantizedWeight quantize_int4_asym(const ov::Tensor& weight, int group_size = 128) {
+    auto shape = weight.get_shape();
+    if (shape.size() != 2) {
+        throw std::runtime_error("Weight tensor must be 2D for quantization");
+    }
+    
+    size_t out_features = shape[0];
+    size_t in_features = shape[1];
+    size_t num_groups = (in_features + group_size - 1) / group_size;
+    size_t packed_in_features = (in_features + 1) / 2;
+    
+    ov::Tensor compressed(ov::element::u8, {out_features, packed_in_features});
+    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    ov::Tensor zero_point(ov::element::u8, {out_features, num_groups});
+    
+    auto* compressed_data = static_cast<uint8_t*>(compressed.data());
+    auto* scale_data = static_cast<uint16_t*>(scale.data());
+    auto* zero_point_data = static_cast<uint8_t*>(zero_point.data());
+    
+    // Initialize compressed data to zero (for nibble packing)
+    std::memset(compressed_data, 0, out_features * packed_in_features);
+    
+    auto dtype = weight.get_element_type();
+    if (dtype == ov::element::f32) {
+        quantize_int4_asym_typed<float, convert_f32>(
+            static_cast<const float*>(weight.data()),
+            compressed_data, scale_data, zero_point_data,
+            out_features, in_features, packed_in_features, num_groups, group_size);
+    } else if (dtype == ov::element::f16) {
+        quantize_int4_asym_typed<uint16_t, convert_f16>(
+            static_cast<const uint16_t*>(weight.data()),
+            compressed_data, scale_data, zero_point_data,
+            out_features, in_features, packed_in_features, num_groups, group_size);
+    } else if (dtype == ov::element::bf16) {
+        quantize_int4_asym_typed<uint16_t, convert_bf16>(
+            static_cast<const uint16_t*>(weight.data()),
+            compressed_data, scale_data, zero_point_data,
+            out_features, in_features, packed_in_features, num_groups, group_size);
+    } else {
+        throw std::runtime_error("Unsupported tensor dtype for quantization");
+    }
+    
+    QuantizedWeight result;
+    result.compressed = compressed;
+    result.scale = scale;
+    result.zero_point = zero_point;
+    result.has_zero_point = true;
     return result;
 }
 

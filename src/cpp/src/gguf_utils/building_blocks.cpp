@@ -851,20 +851,26 @@ std::vector<ov::Output<ov::Node>> make_int4_weights_for_moe(
 }
 
 /**
- * @brief Create weight subgraph for in-flight symmetric INT4 quantized weights
+ * @brief Create weight subgraph for in-flight INT4 quantized weights (sym/asym)
  * 
- * This function handles the format produced by our C++ RTN quantization:
+ * Handles the RTN format produced by C++ quantization:
  * - Weight: [out_features, packed_in_features] where packed_in_features = (in_features + 1) / 2
  *           Each byte contains 2 INT4 values packed as (high nibble, low nibble)
- *           Values are stored as unsigned [0, 15] representing signed [-8, 7]
+ *           Symmetric stored as signed i4 [-8,7]; asymmetric stored as unsigned u4 [0,15]
  * - Scales: [out_features, num_groups] in FP16
+ * - Zero-point: [out_features, num_groups] in U8 (asymmetric only, stored at key + ".biases")
  * 
- * Dequantization: weight_fp = int4_val * scale (symmetric quantization)
+ * Dequantization:
+ *   symmetric   -> weight_fp = int4_val * scale
+ *   asymmetric -> weight_fp = (u4_val - zero_point) * scale
  */
-ov::Output<ov::Node> make_inflight_int4_weights_sym(
+ov::Output<ov::Node> make_inflight_int4_weights(
     const std::string& key,
     const std::unordered_map<std::string, ov::Tensor>& consts,
+    int qtype_int,
     size_t group_size = 128) {
+
+    bool symmetric = ov_extended_types::is_symmetric_type(qtype_int);
 
     ov::Tensor weight = get_tensor(consts, key + ".weight");
     ov::Tensor scales = get_tensor(consts, key + ".scales");
@@ -877,7 +883,6 @@ ov::Output<ov::Node> make_inflight_int4_weights_sym(
     size_t in_features = packed_in_features * 2;  // 2 int4 values per byte
     size_t num_groups = scales_shape[1];
     
-    // Create weight constant with I4 type (signed 4-bit, range [-8, 7])
     // Shape: [out_features, num_groups, group_size] for broadcast with scales
     ov::Shape unpacked_shape = {out_features, num_groups, group_size};
     
@@ -887,29 +892,45 @@ ov::Output<ov::Node> make_inflight_int4_weights_sym(
         unpacked_shape = {out_features, num_groups, actual_group_size};
     }
     
-    // Use i4 (signed 4-bit) instead of u4 to match GGUF pattern
+    // Use i4 for symmetric (-8..7) or u4 for asymmetric (0..15)
+    auto elem_type = symmetric ? ov::element::i4 : ov::element::u4;
     auto weights_node = std::make_shared<v0::Constant>(
-        ov::element::i4, unpacked_shape, static_cast<uint8_t*>(weight.data()), nullptr);
+        elem_type, unpacked_shape, static_cast<uint8_t*>(weight.data()), nullptr);
     weights_node->get_rt_info()["__inflight_tensor_holder"] = weight;
     
-    // Convert I4 to F16 for arithmetic (values are [-8,7])
     auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
     
     // Reshape scales from [out_features, num_groups] to [out_features, num_groups, 1] for broadcast
     ov::Shape scales_broadcast_shape = {out_features, num_groups, 1};
     scales.set_shape(scales_broadcast_shape);
     auto scales_node = std::make_shared<ov::op::v0::Constant>(scales);
-    
-    // Symmetric dequantization: weight_fp = signed_weight * scale
-    // No Subtract needed since weights are already signed i4
-    auto w_scaled = std::make_shared<ov::op::v1::Multiply>(
-        weights_f16, scales_node, ov::op::AutoBroadcastType::NUMPY);
+
+    std::shared_ptr<ov::Node> dequantized;
+    if (symmetric) {
+        // Symmetric: weight_fp = signed_weight * scale
+        dequantized = std::make_shared<ov::op::v1::Multiply>(
+            weights_f16, scales_node, ov::op::AutoBroadcastType::NUMPY);
+    } else {
+        // Asymmetric: weight_fp = (u4_weight - zero_point) * scale
+        auto zp_it = consts.find(key + ".biases");
+        if (zp_it == consts.end()) {
+            throw std::runtime_error("Zero point tensor not found for asymmetric INT4 weight: " + key);
+        }
+        ov::Tensor zero_point = zp_it->second;
+        zero_point.set_shape(scales_broadcast_shape);
+        auto zero_point_node = std::make_shared<ov::op::v0::Constant>(zero_point);
+        auto zero_point_f16 = std::make_shared<ov::op::v0::Convert>(zero_point_node, ov::element::f16);
+        auto shifted = std::make_shared<ov::op::v1::Subtract>(
+            weights_f16, zero_point_f16, ov::op::AutoBroadcastType::NUMPY);
+        dequantized = std::make_shared<ov::op::v1::Multiply>(
+            shifted, scales_node, ov::op::AutoBroadcastType::NUMPY);
+    }
     
     // Reshape back to [out_features, in_features]
     ov::Shape output_shape = {out_features, in_features};
     auto final_shape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64, ov::Shape{output_shape.size()}, output_shape);
-    auto w_reshaped = std::make_shared<ov::op::v1::Reshape>(w_scaled, final_shape, false);
+    auto w_reshaped = std::make_shared<ov::op::v1::Reshape>(dequantized, final_shape, false);
     
     return std::make_shared<ov::op::v0::Convert>(w_reshaped, ov::element::f32);
 }
@@ -972,9 +993,9 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
         // For in-flight types, use dedicated functions that handle our RTN format
         // Note: reorder is not supported for in-flight quantization yet
         if (ov_extended_types::is_int4_type(qtype_int)) {
-            return make_inflight_int4_weights_sym(key, consts, 128);
+            return make_inflight_int4_weights(key, consts, qtype_int);
         } else {
-            return make_inflight_int8_weights_sym(key, consts, 128);
+            return make_inflight_int8_weights_sym(key, consts);
         }
     }
     
