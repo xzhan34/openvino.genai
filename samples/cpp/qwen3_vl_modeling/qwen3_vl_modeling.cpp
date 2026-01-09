@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -124,6 +126,11 @@ std::string resolve_pos_embed_name(ov::genai::modeling::weights::WeightSource& s
     throw std::runtime_error("Failed to locate visual.pos_embed.weight in safetensors");
 }
 
+double elapsed_ms(const std::chrono::steady_clock::time_point& start,
+                  const std::chrono::steady_clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) try {
@@ -164,7 +171,9 @@ int main(int argc, char* argv[]) try {
     const ov::Tensor pos_embed_weight = source.get_tensor(pos_embed_name);
 
     ov::genai::modeling::models::Qwen3VLVisionPreprocessor preprocessor(cfg.vision, pre_cfg);
+    const auto preprocess_start = std::chrono::steady_clock::now();
     auto vision_inputs = preprocessor.preprocess(image, pos_embed_weight);
+    const auto preprocess_end = std::chrono::steady_clock::now();
 
     auto vision_request = compiled_vision.create_infer_request();
     vision_request.set_tensor(ov::genai::modeling::models::Qwen3VLVisionIO::kPixelValues, vision_inputs.pixel_values);
@@ -172,7 +181,9 @@ int main(int argc, char* argv[]) try {
     vision_request.set_tensor(ov::genai::modeling::models::Qwen3VLVisionIO::kPosEmbeds, vision_inputs.pos_embeds);
     vision_request.set_tensor(ov::genai::modeling::models::Qwen3VLVisionIO::kRotaryCos, vision_inputs.rotary_cos);
     vision_request.set_tensor(ov::genai::modeling::models::Qwen3VLVisionIO::kRotarySin, vision_inputs.rotary_sin);
+    const auto vision_start = std::chrono::steady_clock::now();
     vision_request.infer();
+    const auto vision_end = std::chrono::steady_clock::now();
 
     ov::Tensor visual_embeds =
         vision_request.get_tensor(ov::genai::modeling::models::Qwen3VLVisionIO::kVisualEmbeds);
@@ -222,10 +233,12 @@ int main(int argc, char* argv[]) try {
             std::to_string(i);
         text_request.set_tensor(name, deepstack_padded[i]);
     }
+    const auto prefill_start = std::chrono::steady_clock::now();
     text_request.infer();
 
     ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3VLTextIO::kLogits);
     int64_t next_id = argmax_last_token(logits);
+    const auto prefill_end = std::chrono::steady_clock::now();
     std::vector<int64_t> generated;
     generated.reserve(static_cast<size_t>(max_new_tokens));
     generated.push_back(next_id);
@@ -249,6 +262,8 @@ int main(int argc, char* argv[]) try {
     }
 
     int64_t past_len = prompt_len;
+    size_t decode_steps = 0;
+    const auto decode_start = std::chrono::steady_clock::now();
     for (int step = 1; step < max_new_tokens; ++step) {
         if (eos_token_id >= 0 && next_id == eos_token_id) {
             break;
@@ -279,10 +294,35 @@ int main(int argc, char* argv[]) try {
         logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3VLTextIO::kLogits);
         next_id = argmax_last_token(logits);
         generated.push_back(next_id);
+        decode_steps += 1;
         past_len += 1;
     }
+    const auto decode_end = std::chrono::steady_clock::now();
 
     std::string output = tokenizer.decode(generated, ov::genai::skip_special_tokens(true));
+    const double preprocess_ms = elapsed_ms(preprocess_start, preprocess_end);
+    const double vision_ms = elapsed_ms(vision_start, vision_end);
+    const double ttft_ms = elapsed_ms(prefill_start, prefill_end);
+    const double decode_ms = elapsed_ms(decode_start, decode_end);
+    const double tpot_ms = decode_steps > 0 ? (decode_ms / static_cast<double>(decode_steps)) : 0.0;
+    const double throughput = decode_steps > 0 && decode_ms > 0.0
+                                  ? (static_cast<double>(decode_steps) * 1000.0 / decode_ms)
+                                  : 0.0;
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Prompt token size: " << prompt_len << std::endl;
+    std::cout << "Output token size: " << generated.size() << std::endl;
+    std::cout << "Preprocess time: " << preprocess_ms << " ms" << std::endl;
+    std::cout << "Vision encode time: " << vision_ms << " ms" << std::endl;
+    std::cout << "TTFT: " << ttft_ms << " ms" << std::endl;
+    std::cout << "Decode time: " << decode_ms << " ms" << std::endl;
+    if (decode_steps > 0) {
+        std::cout << "TPOT: " << tpot_ms << " ms/token" << std::endl;
+        std::cout << "Throughput: " << throughput << " tokens/s" << std::endl;
+    } else {
+        std::cout << "TPOT: N/A" << std::endl;
+        std::cout << "Throughput: N/A" << std::endl;
+    }
     std::cout << output << std::endl;
     return 0;
 } catch (const std::exception& error) {
