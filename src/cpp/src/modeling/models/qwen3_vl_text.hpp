@@ -12,6 +12,7 @@
 #include "modeling/layers/lm_head.hpp"
 #include "modeling/layers/rms_norm.hpp"
 #include "modeling/layers/vocab_embedding.hpp"
+#include "modeling/models/qwen3_vl_fusion.hpp"
 #include "modeling/models/qwen3_vl_spec.hpp"
 #include "modeling/module.hpp"
 #include "modeling/ops/tensor.hpp"
@@ -110,11 +111,17 @@ public:
 
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
-                   const Tensor& beam_idx);
+                   const Tensor& beam_idx,
+                   const Tensor* visual_embeds = nullptr,
+                   const Tensor* visual_pos_mask = nullptr,
+                   const std::vector<Tensor>* deepstack_embeds = nullptr);
 
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
-                          const Tensor& beam_idx);
+                          const Tensor& beam_idx,
+                          const Tensor* visual_embeds = nullptr,
+                          const Tensor* visual_pos_mask = nullptr,
+                          const std::vector<Tensor>* deepstack_embeds = nullptr);
 
     VocabEmbedding& embed_tokens();
     RMSNorm& norm();
@@ -124,6 +131,8 @@ private:
 
     Qwen3VLTextConfig cfg_;
     VocabEmbedding embed_tokens_;
+    EmbeddingInjector embedding_injector_;
+    DeepstackInjector deepstack_injector_;
     std::vector<Qwen3VLTextDecoderLayer> layers_;
     RMSNorm norm_;
     int32_t head_dim_ = 0;
@@ -135,11 +144,17 @@ public:
 
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
-                   const Tensor& beam_idx);
+                   const Tensor& beam_idx,
+                   const Tensor* visual_embeds = nullptr,
+                   const Tensor* visual_pos_mask = nullptr,
+                   const std::vector<Tensor>* deepstack_embeds = nullptr);
 
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
-                          const Tensor& beam_idx);
+                          const Tensor& beam_idx,
+                          const Tensor* visual_embeds = nullptr,
+                          const Tensor* visual_pos_mask = nullptr,
+                          const std::vector<Tensor>* deepstack_embeds = nullptr);
 
     Qwen3VLTextModel& model();
     LMHead& lm_head();

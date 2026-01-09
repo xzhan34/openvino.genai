@@ -267,10 +267,14 @@ Qwen3VLTextModel::Qwen3VLTextModel(BuilderContext& ctx, const Qwen3VLTextConfig&
     : Module(Qwen3VLModuleNames::kText, ctx, parent),
       cfg_(cfg),
       embed_tokens_(ctx, "embed_tokens", this),
+      embedding_injector_(ctx, "embedding_injector", this),
+      deepstack_injector_(ctx, "deepstack_injector", this),
       layers_(),
       norm_(ctx, "norm", cfg.rms_norm_eps, this),
       head_dim_(cfg.resolved_head_dim()) {
     register_module("embed_tokens", &embed_tokens_);
+    register_module("embedding_injector", &embedding_injector_);
+    register_module("deepstack_injector", &deepstack_injector_);
     register_module("norm", &norm_);
 
     if (!cfg_.rope.rope_type.empty() && cfg_.rope.rope_type != "default") {
@@ -316,18 +320,32 @@ std::pair<Tensor, Tensor> Qwen3VLTextModel::build_mrope_cos_sin(const Tensor& po
 
 Tensor Qwen3VLTextModel::forward(const Tensor& input_ids,
                                  const Tensor& position_ids,
-                                 const Tensor& beam_idx) {
+                                 const Tensor& beam_idx,
+                                 const Tensor* visual_embeds,
+                                 const Tensor* visual_pos_mask,
+                                 const std::vector<Tensor>* deepstack_embeds) {
     auto hidden_states = embed_tokens_.forward(input_ids);
-    return forward_embeds(hidden_states, position_ids, beam_idx);
+    return forward_embeds(hidden_states, position_ids, beam_idx, visual_embeds, visual_pos_mask, deepstack_embeds);
 }
 
 Tensor Qwen3VLTextModel::forward_embeds(const Tensor& inputs_embeds,
                                         const Tensor& position_ids,
-                                        const Tensor& beam_idx) {
+                                        const Tensor& beam_idx,
+                                        const Tensor* visual_embeds,
+                                        const Tensor* visual_pos_mask,
+                                        const std::vector<Tensor>* deepstack_embeds) {
     auto cos_sin = build_mrope_cos_sin(position_ids);
-    auto hidden_states = inputs_embeds;
-    for (auto& layer : layers_) {
-        hidden_states = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second);
+    Tensor hidden_states = inputs_embeds;
+    if (visual_embeds && visual_pos_mask) {
+        hidden_states = embedding_injector_.forward(hidden_states, *visual_embeds, *visual_pos_mask);
+    }
+    for (size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
+        hidden_states = layers_[layer_idx].forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second);
+        if (deepstack_embeds && visual_pos_mask && layer_idx < deepstack_embeds->size()) {
+            hidden_states = deepstack_injector_.forward(hidden_states,
+                                                       *visual_pos_mask,
+                                                       (*deepstack_embeds)[layer_idx]);
+        }
     }
     return norm_.forward(hidden_states);
 }
@@ -357,15 +375,26 @@ Qwen3VLTextForCausalLM::Qwen3VLTextForCausalLM(BuilderContext& ctx,
 
 Tensor Qwen3VLTextForCausalLM::forward(const Tensor& input_ids,
                                        const Tensor& position_ids,
-                                       const Tensor& beam_idx) {
-    auto hidden = model_.forward(input_ids, position_ids, beam_idx);
+                                       const Tensor& beam_idx,
+                                       const Tensor* visual_embeds,
+                                       const Tensor* visual_pos_mask,
+                                       const std::vector<Tensor>* deepstack_embeds) {
+    auto hidden = model_.forward(input_ids, position_ids, beam_idx, visual_embeds, visual_pos_mask, deepstack_embeds);
     return lm_head_.forward(hidden);
 }
 
 Tensor Qwen3VLTextForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                               const Tensor& position_ids,
-                                              const Tensor& beam_idx) {
-    auto hidden = model_.forward_embeds(inputs_embeds, position_ids, beam_idx);
+                                              const Tensor& beam_idx,
+                                              const Tensor* visual_embeds,
+                                              const Tensor* visual_pos_mask,
+                                              const std::vector<Tensor>* deepstack_embeds) {
+    auto hidden = model_.forward_embeds(inputs_embeds,
+                                        position_ids,
+                                        beam_idx,
+                                        visual_embeds,
+                                        visual_pos_mask,
+                                        deepstack_embeds);
     return lm_head_.forward(hidden);
 }
 
