@@ -4,9 +4,25 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace ov {
+class Model;
+}  // namespace ov
+
+namespace ov {
+namespace genai {
+namespace modeling {
+namespace weights {
+class WeightFinalizer;
+class WeightSource;
+}  // namespace weights
+}  // namespace modeling
+}  // namespace genai
+}  // namespace ov
 
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_vl_spec.hpp"
@@ -169,6 +185,11 @@ private:
     std::vector<Qwen3VLVisionPatchMerger> deepstack_mergers_;
     std::vector<int32_t> deepstack_indexes_;
 };
+
+std::shared_ptr<ov::Model> create_qwen3_vl_vision_model(
+    const Qwen3VLConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
 
 }  // namespace models
 }  // namespace modeling

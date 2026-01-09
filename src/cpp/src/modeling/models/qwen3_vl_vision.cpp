@@ -6,11 +6,14 @@
 #include <algorithm>
 #include <cmath>
 
+#include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
+#include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/llm.hpp"
 #include "modeling/ops/nn.hpp"
 #include "modeling/ops/ops.hpp"
+#include "modeling/weights/weight_loader.hpp"
 
 namespace {
 
@@ -21,6 +24,11 @@ ov::genai::modeling::Tensor add_bias_if_present(const ov::genai::modeling::Tenso
     }
     return x + *bias;
 }
+
+auto set_name = [](auto node, const std::string& name) {
+    node->output(0).set_names({name});
+    node->set_friendly_name(name);
+};
 
 }  // namespace
 
@@ -382,6 +390,61 @@ Qwen3VLVisionPatchEmbed& Qwen3VLVisionModel::patch_embed() {
 
 Qwen3VLVisionPatchMerger& Qwen3VLVisionModel::merger() {
     return merger_;
+}
+
+std::shared_ptr<ov::Model> create_qwen3_vl_vision_model(
+    const Qwen3VLConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3VLVisionModel model(ctx, cfg.vision);
+    model.packed_mapping().rules.push_back({"model.", "", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_missing = true;
+    options.report_unmatched = true;
+    auto report = ov::genai::modeling::weights::load_model(model, source, finalizer, options);
+    (void)report;
+
+    auto pixel_values = ctx.parameter(Qwen3VLVisionIO::kPixelValues,
+                                      ov::element::f32,
+                                      ov::PartialShape{-1,
+                                                       cfg.vision.in_channels,
+                                                       cfg.vision.temporal_patch_size,
+                                                       cfg.vision.patch_size,
+                                                       cfg.vision.patch_size});
+    auto grid_thw = ctx.parameter(Qwen3VLVisionIO::kGridThw,
+                                  ov::element::i64,
+                                  ov::PartialShape{-1, 3});
+    auto pos_embeds = ctx.parameter(Qwen3VLVisionIO::kPosEmbeds,
+                                    ov::element::f32,
+                                    ov::PartialShape{-1, cfg.vision.hidden_size});
+    auto rotary_cos = ctx.parameter(Qwen3VLVisionIO::kRotaryCos,
+                                    ov::element::f32,
+                                    ov::PartialShape{-1, cfg.vision.head_dim()});
+    auto rotary_sin = ctx.parameter(Qwen3VLVisionIO::kRotarySin,
+                                    ov::element::f32,
+                                    ov::PartialShape{-1, cfg.vision.head_dim()});
+
+    auto output = model.forward(pixel_values, grid_thw, pos_embeds, rotary_cos, rotary_sin);
+
+    ov::OutputVector results;
+    results.reserve(1 + output.deepstack_embeds.size());
+
+    auto visual = std::make_shared<ov::op::v0::Result>(output.visual_embeds.output());
+    set_name(visual, Qwen3VLVisionIO::kVisualEmbeds);
+    results.push_back(visual->output(0));
+
+    for (size_t i = 0; i < output.deepstack_embeds.size(); ++i) {
+        auto ds_result = std::make_shared<ov::op::v0::Result>(output.deepstack_embeds[i].output());
+        std::string name = std::string(Qwen3VLVisionIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i);
+        set_name(ds_result, name);
+        results.push_back(ds_result->output(0));
+    }
+
+    return ctx.build_model(results);
 }
 
 }  // namespace models

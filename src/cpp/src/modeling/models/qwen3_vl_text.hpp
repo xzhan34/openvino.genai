@@ -4,9 +4,25 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace ov {
+class Model;
+}  // namespace ov
+
+namespace ov {
+namespace genai {
+namespace modeling {
+namespace weights {
+class WeightFinalizer;
+class WeightSource;
+}  // namespace weights
+}  // namespace modeling
+}  // namespace genai
+}  // namespace ov
 
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
@@ -164,6 +180,13 @@ private:
     Qwen3VLTextModel model_;
     LMHead lm_head_;
 };
+
+std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
+    const Qwen3VLConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    bool use_inputs_embeds = false,
+    bool enable_visual_inputs = true);
 
 }  // namespace models
 }  // namespace modeling

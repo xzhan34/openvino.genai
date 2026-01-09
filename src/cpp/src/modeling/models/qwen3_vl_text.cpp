@@ -5,6 +5,7 @@
 
 #include <cmath>
 
+#include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
 #include <openvino/op/util/variable.hpp>
 #include <openvino/opsets/opset13.hpp>
@@ -14,6 +15,7 @@
 #include "modeling/ops/rope.hpp"
 #include "modeling/ops/shape.hpp"
 #include "modeling/ops/tensor_ops.hpp"
+#include "modeling/weights/weight_loader.hpp"
 
 namespace {
 
@@ -24,6 +26,11 @@ ov::genai::modeling::Tensor add_bias_if_present(const ov::genai::modeling::Tenso
     }
     return x + *bias;
 }
+
+auto set_name = [](auto node, const std::string& name) {
+    node->output(0).set_names({name});
+    node->set_friendly_name(name);
+};
 
 }  // namespace
 
@@ -404,6 +411,96 @@ Qwen3VLTextModel& Qwen3VLTextForCausalLM::model() {
 
 LMHead& Qwen3VLTextForCausalLM::lm_head() {
     return lm_head_;
+}
+
+std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
+    const Qwen3VLConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    bool use_inputs_embeds,
+    bool enable_visual_inputs) {
+    BuilderContext ctx;
+    Qwen3VLTextForCausalLM model(ctx, cfg.text);
+    model.packed_mapping().rules.push_back({"model.", "", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_missing = true;
+    options.report_unmatched = true;
+    auto report = ov::genai::modeling::weights::load_model(model, source, finalizer, options);
+    (void)report;
+
+    const auto float_type = ov::element::f32;
+
+    auto attention_mask = ctx.parameter(Qwen3VLTextIO::kAttentionMask,
+                                        ov::element::i64,
+                                        ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter(Qwen3VLTextIO::kPositionIds,
+                                      ov::element::i64,
+                                      ov::PartialShape{3, -1, -1});
+    auto beam_idx = ctx.parameter(Qwen3VLTextIO::kBeamIdx,
+                                  ov::element::i32,
+                                  ov::PartialShape{-1});
+
+    (void)attention_mask;
+
+    const Tensor* visual_embeds_ptr = nullptr;
+    const Tensor* visual_pos_mask_ptr = nullptr;
+    std::vector<Tensor> deepstack_inputs;
+    const std::vector<Tensor>* deepstack_ptr = nullptr;
+
+    Tensor visual_embeds;
+    Tensor visual_pos_mask;
+    if (enable_visual_inputs) {
+        visual_embeds = ctx.parameter(Qwen3VLTextIO::kVisualEmbeds,
+                                      float_type,
+                                      ov::PartialShape{-1, cfg.text.hidden_size});
+        visual_pos_mask = ctx.parameter(Qwen3VLTextIO::kVisualPosMask,
+                                        ov::element::boolean,
+                                        ov::PartialShape{-1, -1});
+        visual_embeds_ptr = &visual_embeds;
+        visual_pos_mask_ptr = &visual_pos_mask;
+
+        const size_t deepstack_count = cfg.vision.deepstack_visual_indexes.size();
+        deepstack_inputs.reserve(deepstack_count);
+        for (size_t i = 0; i < deepstack_count; ++i) {
+            std::string name = std::string(Qwen3VLTextIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i);
+            deepstack_inputs.emplace_back(ctx.parameter(name,
+                                                        float_type,
+                                                        ov::PartialShape{-1, cfg.text.hidden_size}));
+        }
+        if (!deepstack_inputs.empty()) {
+            deepstack_ptr = &deepstack_inputs;
+        }
+    }
+
+    Tensor logits;
+    if (use_inputs_embeds) {
+        auto inputs_embeds = ctx.parameter(Qwen3VLTextIO::kInputsEmbeds,
+                                           float_type,
+                                           ov::PartialShape{-1, -1, cfg.text.hidden_size});
+        logits = model.forward_embeds(inputs_embeds,
+                                      position_ids,
+                                      beam_idx,
+                                      visual_embeds_ptr,
+                                      visual_pos_mask_ptr,
+                                      deepstack_ptr);
+    } else {
+        auto input_ids = ctx.parameter(Qwen3VLTextIO::kInputIds,
+                                       ov::element::i64,
+                                       ov::PartialShape{-1, -1});
+        logits = model.forward(input_ids,
+                               position_ids,
+                               beam_idx,
+                               visual_embeds_ptr,
+                               visual_pos_mask_ptr,
+                               deepstack_ptr);
+    }
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, Qwen3VLTextIO::kLogits);
+    return ctx.build_model({result->output(0)});
 }
 
 }  // namespace models
