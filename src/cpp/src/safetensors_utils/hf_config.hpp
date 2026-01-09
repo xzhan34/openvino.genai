@@ -80,6 +80,90 @@ HFConfig load_hf_config(const std::filesystem::path& model_dir);
 using ConfigValue = std::variant<std::monostate, float, int, std::string, std::vector<std::string>>;
 std::map<std::string, ConfigValue> config_to_map(const HFConfig& config);
 
+/**
+ * @brief In-Flight weight compression configuration
+ * 
+ * Used to configure dynamic weight quantization during model loading.
+ * The quantization is applied on-the-fly as weights are loaded from
+ * safetensors files, minimizing peak memory usage.
+ */
+struct InFlightCompressionConfig {
+    /**
+     * @brief Compression mode enumeration
+     */
+    enum class Mode {
+        NONE,       ///< No compression (keep original precision)
+        INT4_SYM,   ///< 4-bit symmetric quantization
+        INT4_ASYM,  ///< 4-bit asymmetric quantization  
+        INT8_SYM,   ///< 8-bit symmetric quantization
+        INT8_ASYM,  ///< 8-bit asymmetric quantization
+    };
+    
+    /// Enable/disable compression
+    bool enabled = false;
+    
+    /// Compression mode
+    Mode mode = Mode::INT4_SYM;
+    
+    /// Quantization bit width (4 or 8)
+    int bits() const {
+        switch (mode) {
+            case Mode::INT4_SYM:
+            case Mode::INT4_ASYM:
+                return 4;
+            case Mode::INT8_SYM:
+            case Mode::INT8_ASYM:
+                return 8;
+            default:
+                return 16;  // No compression
+        }
+    }
+    
+    /// Is symmetric quantization
+    bool symmetric() const {
+        return mode == Mode::INT4_SYM || mode == Mode::INT8_SYM;
+    }
+    
+    /// Group size for grouped quantization (-1 = per-channel)
+    int group_size = 128;
+    
+    /// Ratio of weights to compress (1.0 = all, 0.0 = none)
+    /// Weights below sensitivity threshold may skip compression
+    float ratio = 1.0f;
+    
+    /**
+     * @brief Parse compression mode from string
+     * @param mode_str Mode string: "int4_sym", "int4_asym", "int8_sym", "int8_asym"
+     * @return Compression mode
+     */
+    static Mode parse_mode(const std::string& mode_str) {
+        if (mode_str == "int4_sym" || mode_str == "INT4_SYM") return Mode::INT4_SYM;
+        if (mode_str == "int4_asym" || mode_str == "INT4_ASYM") return Mode::INT4_ASYM;
+        if (mode_str == "int8_sym" || mode_str == "INT8_SYM") return Mode::INT8_SYM;
+        if (mode_str == "int8_asym" || mode_str == "INT8_ASYM") return Mode::INT8_ASYM;
+        return Mode::NONE;
+    }
+    
+    /**
+     * @brief Get mode string representation
+     */
+    std::string mode_string() const {
+        switch (mode) {
+            case Mode::INT4_SYM: return "int4_sym";
+            case Mode::INT4_ASYM: return "int4_asym";
+            case Mode::INT8_SYM: return "int8_sym";
+            case Mode::INT8_ASYM: return "int8_asym";
+            default: return "none";
+        }
+    }
+    
+    /**
+     * @brief Convert compression mode to GGUF tensor type
+     * @return Corresponding GGUF type for the compression mode, or 0 if NONE
+     */
+    int to_gguf_type() const;
+};
+
 }  // namespace safetensors
 }  // namespace genai
 }  // namespace ov
