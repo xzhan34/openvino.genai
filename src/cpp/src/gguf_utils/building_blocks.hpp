@@ -127,22 +127,3 @@ ov::Output<ov::Node> make_inflight_int8_weights(
     const ov::Shape& original_shape,
     size_t group_size = 128,
     const std::string& name = "");
-
-/**
- * @brief Perform in-flight quantization on FP16 weights and create dequantization subgraph
- * 
- * This is the main entry point for in-flight quantization. It:
- * 1. Calls NNCF to quantize the FP16 weight
- * 2. Builds the appropriate dequantization subgraph
- * 
- * @param weight_fp16 Original FP16 weight tensor
- * @param mode Quantization mode (INT4_SYM, INT4_ASYM, INT8_SYM, INT8_ASYM)
- * @param group_size Number of elements per quantization group (default: 128)
- * @param name Friendly name prefix for the nodes
- * @return Output node producing FP32 dequantized weights
- */
-ov::Output<ov::Node> make_inflight_quantized_weights(
-    const ov::Tensor& weight_fp16,
-    int mode,  // Use ov_extended_types constants
-    size_t group_size = 128,
-    const std::string& name = "");

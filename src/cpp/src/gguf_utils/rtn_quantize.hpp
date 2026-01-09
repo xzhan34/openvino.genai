@@ -13,6 +13,10 @@
  * NNCF Algorithm Reference (weight_lowering.py):
  *   - _calculate_signed_scale(): scale = max(|min|, -max) / 2^(bits-1)
  *   - _calculate_integer_quantized_weight(): round(weight / scale), clip to range
+ * 
+ * Performance optimizations:
+ *   - Type dispatch outside hot loops
+ *   - Precomputed inverse scale (multiply instead of divide)
  */
 
 #include <algorithm>
@@ -85,6 +89,25 @@ inline float fp16_to_float(uint16_t fp16_val) {
 }
 
 /**
+ * @brief Convert float to FP16
+ */
+inline uint16_t float_to_fp16(float value) {
+    uint32_t fp32_bits;
+    std::memcpy(&fp32_bits, &value, sizeof(float));
+    uint32_t sign = (fp32_bits >> 31) & 0x1;
+    int32_t exp = ((fp32_bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (fp32_bits >> 13) & 0x3FF;
+    
+    if (exp <= 0) {
+        return static_cast<uint16_t>(sign << 15);  // Underflow to zero
+    } else if (exp >= 31) {
+        return static_cast<uint16_t>((sign << 15) | 0x7C00);  // Overflow to inf
+    } else {
+        return static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
+    }
+}
+
+/**
  * @brief Get float value from tensor at given index
  */
 inline float get_float_value(const ov::Tensor& tensor, size_t idx) {
@@ -100,6 +123,76 @@ inline float get_float_value(const ov::Tensor& tensor, size_t idx) {
 }
 
 /**
+ * @brief Templated quantization for INT4 symmetric - optimized inner loop
+ */
+template<typename DataType, float (*ConvertFunc)(DataType)>
+void quantize_int4_sym_typed(
+    const DataType* src_data,
+    uint8_t* compressed_data,
+    uint16_t* scale_data,
+    size_t out_features,
+    size_t in_features,
+    size_t packed_in_features,
+    size_t num_groups,
+    int group_size
+) {
+    constexpr float factor = 8.0f;  // 2^(4-1) = 8
+    constexpr int8_t level_low = -8;
+    constexpr int8_t level_high = 7;
+    constexpr float eps = 1.1920929e-7f;
+    
+    for (size_t row = 0; row < out_features; row++) {
+        const DataType* row_data = src_data + row * in_features;
+        uint8_t* row_compressed = compressed_data + row * packed_in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            
+            // Single pass: find min/max
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t col = group_start; col < group_end; col++) {
+                float val = ConvertFunc(row_data[col]);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            // Compute scale
+            float max_abs = std::max(std::abs(w_min), std::abs(w_max));
+            float scale_val = max_abs / factor;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            // Store scale
+            row_scale[g] = float_to_fp16(scale_val);
+            
+            // Quantize elements
+            for (size_t col = group_start; col < group_end; col++) {
+                float val = ConvertFunc(row_data[col]);
+                int8_t quantized = static_cast<int8_t>(std::round(val * inv_scale));
+                quantized = std::max(level_low, std::min(level_high, quantized));
+                
+                uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
+                size_t byte_idx = col / 2;
+                if (col % 2 == 0) {
+                    row_compressed[byte_idx] = packed;
+                } else {
+                    row_compressed[byte_idx] |= (packed << 4);
+                }
+            }
+        }
+    }
+}
+
+// Conversion function wrappers for template
+inline float convert_f32(float val) { return val; }
+inline float convert_f16(uint16_t val) { return fp16_to_float(val); }
+inline float convert_bf16(uint16_t val) { return bf16_to_float(val); }
+
+/**
  * @brief Quantize weights using symmetric INT4 RTN algorithm (NNCF-compatible)
  * 
  * NNCF Algorithm:
@@ -107,6 +200,10 @@ inline float get_float_value(const ov::Tensor& tensor, size_t idx) {
  *   scale = max(|min|, |max|) / factor
  *   quantized = round(weight / scale)
  *   quantized = clamp(quantized, -8, 7)
+ * 
+ * Optimized version with:
+ *   - Type dispatch outside hot loops
+ *   - Precomputed inverse scale (multiply instead of divide)
  * 
  * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features]
  * @param group_size Number of elements per quantization group (default: 128)
@@ -120,95 +217,37 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
     
     size_t out_features = shape[0];
     size_t in_features = shape[1];
-    size_t total_elements = out_features * in_features;
-    
-    // Calculate number of groups
     size_t num_groups = (in_features + group_size - 1) / group_size;
-    
-    // Allocate output tensors
-    // INT4 weights: pack 2 values per byte
     size_t packed_in_features = (in_features + 1) / 2;
+    
     ov::Tensor compressed(ov::element::u8, {out_features, packed_in_features});
     ov::Tensor scale(ov::element::f16, {out_features, num_groups});
     
     auto* compressed_data = static_cast<uint8_t*>(compressed.data());
     auto* scale_data = static_cast<uint16_t*>(scale.data());
     
-    // NNCF constants for INT4 symmetric quantization
-    constexpr int num_bits = 4;
-    constexpr float factor = static_cast<float>(1 << (num_bits - 1));  // 2^3 = 8
-    constexpr int8_t level_low = -(1 << (num_bits - 1));   // -8
-    constexpr int8_t level_high = (1 << (num_bits - 1)) - 1;  // 7
-    constexpr float eps = 1.1920929e-7f;  // FP32 machine epsilon
+    // Initialize compressed data to zero (important for proper nibble packing)
+    std::memset(compressed_data, 0, out_features * packed_in_features);
     
-    // Quantize each row
-    for (size_t row = 0; row < out_features; row++) {
-        for (size_t g = 0; g < num_groups; g++) {
-            size_t group_start = g * group_size;
-            size_t group_end = std::min(group_start + group_size, in_features);
-            
-            // Find min and max in this group (NNCF style)
-            float w_min = std::numeric_limits<float>::max();
-            float w_max = std::numeric_limits<float>::lowest();
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = get_float_value(weight, row * in_features + col);
-                w_min = std::min(w_min, val);
-                w_max = std::max(w_max, val);
-            }
-            
-            // NNCF: scale = max(|min|, |max|) / factor
-            // Using absolute values to match NNCF's signed scale calculation
-            float w_abs_min = std::abs(w_min);
-            float w_abs_max = std::abs(w_max);
-            float max_abs = std::max(w_abs_min, w_abs_max);
-            float scale_val = max_abs / factor;
-            
-            // Avoid division by zero (NNCF uses machine epsilon)
-            if (scale_val < eps) {
-                scale_val = eps;
-            }
-            
-            // Store scale as FP16
-            // Simple FP32 to FP16 conversion
-            uint32_t fp32_bits;
-            std::memcpy(&fp32_bits, &scale_val, sizeof(float));
-            uint32_t sign = (fp32_bits >> 31) & 0x1;
-            int32_t exp = ((fp32_bits >> 23) & 0xFF) - 127 + 15;
-            uint32_t mant = (fp32_bits >> 13) & 0x3FF;
-            
-            uint16_t fp16_bits;
-            if (exp <= 0) {
-                fp16_bits = static_cast<uint16_t>(sign << 15);  // Underflow to zero
-            } else if (exp >= 31) {
-                fp16_bits = static_cast<uint16_t>((sign << 15) | 0x7C00);  // Overflow to inf
-            } else {
-                fp16_bits = static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
-            }
-            scale_data[row * num_groups + g] = fp16_bits;
-            
-            // Quantize each element in the group
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = get_float_value(weight, row * in_features + col);
-                
-                // NNCF: quantized = round(weight / scale), clip to [level_low, level_high]
-                float scaled = val / scale_val;
-                int8_t quantized = static_cast<int8_t>(std::round(scaled));
-                quantized = std::max(level_low, std::min(level_high, quantized));
-                
-                // Pack into 4 bits as signed i4 (range [-8, 7])
-                // Store as signed 4-bit value in the low 4 bits of a byte
-                // Two's complement for negative values
-                uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
-                
-                // Pack two 4-bit values per byte
-                size_t byte_idx = row * packed_in_features + col / 2;
-                if (col % 2 == 0) {
-                    compressed_data[byte_idx] = packed;  // Low nibble
-                } else {
-                    compressed_data[byte_idx] |= (packed << 4);  // High nibble
-                }
-            }
-        }
+    // Dispatch based on dtype - type check happens ONCE, not per element
+    auto dtype = weight.get_element_type();
+    if (dtype == ov::element::f32) {
+        quantize_int4_sym_typed<float, convert_f32>(
+            static_cast<const float*>(weight.data()),
+            compressed_data, scale_data,
+            out_features, in_features, packed_in_features, num_groups, group_size);
+    } else if (dtype == ov::element::f16) {
+        quantize_int4_sym_typed<uint16_t, convert_f16>(
+            static_cast<const uint16_t*>(weight.data()),
+            compressed_data, scale_data,
+            out_features, in_features, packed_in_features, num_groups, group_size);
+    } else if (dtype == ov::element::bf16) {
+        quantize_int4_sym_typed<uint16_t, convert_bf16>(
+            static_cast<const uint16_t*>(weight.data()),
+            compressed_data, scale_data,
+            out_features, in_features, packed_in_features, num_groups, group_size);
+    } else {
+        throw std::runtime_error("Unsupported tensor dtype for quantization");
     }
     
     QuantizedWeight result;
@@ -219,6 +258,63 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
 }
 
 /**
+ * @brief Templated quantization for INT8 symmetric - optimized inner loop
+ */
+template<typename DataType, float (*ConvertFunc)(DataType)>
+void quantize_int8_sym_typed(
+    const DataType* src_data,
+    int8_t* compressed_data,
+    uint16_t* scale_data,
+    size_t out_features,
+    size_t in_features,
+    size_t num_groups,
+    int group_size
+) {
+    constexpr float factor = 128.0f;  // 2^(8-1) = 128
+    constexpr int32_t level_low = -128;
+    constexpr int32_t level_high = 127;
+    constexpr float eps = 1.1920929e-7f;
+    
+    for (size_t row = 0; row < out_features; row++) {
+        const DataType* row_data = src_data + row * in_features;
+        int8_t* row_compressed = compressed_data + row * in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            
+            // Single pass: find min/max
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t col = group_start; col < group_end; col++) {
+                float val = ConvertFunc(row_data[col]);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            // Compute scale
+            float max_abs = std::max(std::abs(w_min), std::abs(w_max));
+            float scale_val = max_abs / factor;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            // Store scale
+            row_scale[g] = float_to_fp16(scale_val);
+            
+            // Quantize elements
+            for (size_t col = group_start; col < group_end; col++) {
+                float val = ConvertFunc(row_data[col]);
+                int32_t quantized = static_cast<int32_t>(std::round(val * inv_scale));
+                quantized = std::max(level_low, std::min(level_high, quantized));
+                row_compressed[col] = static_cast<int8_t>(quantized);
+            }
+        }
+    }
+}
+
+/**
  * @brief Quantize weights using symmetric INT8 RTN algorithm (NNCF-compatible)
  * 
  * NNCF Algorithm:
@@ -226,6 +322,10 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
  *   scale = max(|min|, |max|) / factor
  *   quantized = round(weight / scale)
  *   quantized = clamp(quantized, -128, 127)
+ * 
+ * Optimized version with:
+ *   - Type dispatch outside hot loops
+ *   - Precomputed inverse scale (multiply instead of divide)
  * 
  * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features]
  * @param group_size Number of elements per quantization group (default: 128)
@@ -239,79 +339,33 @@ inline QuantizedWeight quantize_int8_sym(const ov::Tensor& weight, int group_siz
     
     size_t out_features = shape[0];
     size_t in_features = shape[1];
-    
-    // Calculate number of groups
     size_t num_groups = (in_features + group_size - 1) / group_size;
     
-    // Allocate output tensors
     ov::Tensor compressed(ov::element::i8, {out_features, in_features});
     ov::Tensor scale(ov::element::f16, {out_features, num_groups});
     
     auto* compressed_data = static_cast<int8_t*>(compressed.data());
     auto* scale_data = static_cast<uint16_t*>(scale.data());
     
-    // NNCF constants for INT8 symmetric quantization
-    constexpr int num_bits = 8;
-    constexpr float factor = static_cast<float>(1 << (num_bits - 1));  // 2^7 = 128
-    constexpr int32_t level_low = -(1 << (num_bits - 1));   // -128
-    constexpr int32_t level_high = (1 << (num_bits - 1)) - 1;  // 127
-    constexpr float eps = 1.1920929e-7f;  // FP32 machine epsilon
-    
-    // Quantize each row
-    for (size_t row = 0; row < out_features; row++) {
-        for (size_t g = 0; g < num_groups; g++) {
-            size_t group_start = g * group_size;
-            size_t group_end = std::min(group_start + group_size, in_features);
-            
-            // Find min and max in this group (NNCF style)
-            float w_min = std::numeric_limits<float>::max();
-            float w_max = std::numeric_limits<float>::lowest();
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = get_float_value(weight, row * in_features + col);
-                w_min = std::min(w_min, val);
-                w_max = std::max(w_max, val);
-            }
-            
-            // NNCF: scale = max(|min|, |max|) / factor
-            float w_abs_min = std::abs(w_min);
-            float w_abs_max = std::abs(w_max);
-            float max_abs = std::max(w_abs_min, w_abs_max);
-            float scale_val = max_abs / factor;
-            
-            // Avoid division by zero (NNCF uses machine epsilon)
-            if (scale_val < eps) {
-                scale_val = eps;
-            }
-            
-            // Store scale as FP16
-            uint32_t fp32_bits;
-            std::memcpy(&fp32_bits, &scale_val, sizeof(float));
-            uint32_t sign = (fp32_bits >> 31) & 0x1;
-            int32_t exp = ((fp32_bits >> 23) & 0xFF) - 127 + 15;
-            uint32_t mant = (fp32_bits >> 13) & 0x3FF;
-            
-            uint16_t fp16_bits;
-            if (exp <= 0) {
-                fp16_bits = static_cast<uint16_t>(sign << 15);
-            } else if (exp >= 31) {
-                fp16_bits = static_cast<uint16_t>((sign << 15) | 0x7C00);
-            } else {
-                fp16_bits = static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
-            }
-            scale_data[row * num_groups + g] = fp16_bits;
-            
-            // Quantize each element in the group
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = get_float_value(weight, row * in_features + col);
-                
-                // NNCF: quantized = round(weight / scale), clip to [level_low, level_high]
-                float scaled = val / scale_val;
-                int32_t quantized = static_cast<int32_t>(std::round(scaled));
-                quantized = std::max(level_low, std::min(level_high, quantized));
-                
-                compressed_data[row * in_features + col] = static_cast<int8_t>(quantized);
-            }
-        }
+    // Dispatch based on dtype - type check happens ONCE, not per element
+    auto dtype = weight.get_element_type();
+    if (dtype == ov::element::f32) {
+        quantize_int8_sym_typed<float, convert_f32>(
+            static_cast<const float*>(weight.data()),
+            compressed_data, scale_data,
+            out_features, in_features, num_groups, group_size);
+    } else if (dtype == ov::element::f16) {
+        quantize_int8_sym_typed<uint16_t, convert_f16>(
+            static_cast<const uint16_t*>(weight.data()),
+            compressed_data, scale_data,
+            out_features, in_features, num_groups, group_size);
+    } else if (dtype == ov::element::bf16) {
+        quantize_int8_sym_typed<uint16_t, convert_bf16>(
+            static_cast<const uint16_t*>(weight.data()),
+            compressed_data, scale_data,
+            out_features, in_features, num_groups, group_size);
+    } else {
+        throw std::runtime_error("Unsupported tensor dtype for quantization");
     }
     
     QuantizedWeight result;
