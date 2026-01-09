@@ -20,6 +20,7 @@
 #include <ov_ops/rotary_positional_embeddings.hpp>
 
 #include "gguf_utils/building_blocks.hpp"
+#include "gguf_utils/gguf.hpp"  // For ov_extended_types
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -849,11 +850,134 @@ std::vector<ov::Output<ov::Node>> make_int4_weights_for_moe(
     return {weights_node, scales_transposed, zero_points_transposed};
 }
 
+/**
+ * @brief Create weight subgraph for in-flight symmetric INT4 quantized weights
+ * 
+ * This function handles the format produced by our C++ RTN quantization:
+ * - Weight: [out_features, packed_in_features] where packed_in_features = (in_features + 1) / 2
+ *           Each byte contains 2 INT4 values packed as (high nibble, low nibble)
+ *           Values are stored as unsigned [0, 15] representing signed [-8, 7]
+ * - Scales: [out_features, num_groups] in FP16
+ * 
+ * Dequantization: weight_fp = int4_val * scale (symmetric quantization)
+ */
+ov::Output<ov::Node> make_inflight_int4_weights_sym(
+    const std::string& key,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    size_t group_size = 128) {
+
+    ov::Tensor weight = get_tensor(consts, key + ".weight");
+    ov::Tensor scales = get_tensor(consts, key + ".scales");
+
+    ov::Shape weight_shape = weight.get_shape();  // [out_features, packed_in_features]
+    ov::Shape scales_shape = scales.get_shape();  // [out_features, num_groups]
+    
+    size_t out_features = weight_shape[0];
+    size_t packed_in_features = weight_shape[1];
+    size_t in_features = packed_in_features * 2;  // 2 int4 values per byte
+    size_t num_groups = scales_shape[1];
+    
+    // Create weight constant with I4 type (signed 4-bit, range [-8, 7])
+    // Shape: [out_features, num_groups, group_size] for broadcast with scales
+    ov::Shape unpacked_shape = {out_features, num_groups, group_size};
+    
+    // Adjust if in_features doesn't divide evenly by group_size
+    size_t actual_group_size = in_features / num_groups;
+    if (actual_group_size != group_size) {
+        unpacked_shape = {out_features, num_groups, actual_group_size};
+    }
+    
+    // Use i4 (signed 4-bit) instead of u4 to match GGUF pattern
+    auto weights_node = std::make_shared<v0::Constant>(
+        ov::element::i4, unpacked_shape, static_cast<uint8_t*>(weight.data()), nullptr);
+    weights_node->get_rt_info()["__inflight_tensor_holder"] = weight;
+    
+    // Convert I4 to F16 for arithmetic (values are [-8,7])
+    auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
+    
+    // Reshape scales from [out_features, num_groups] to [out_features, num_groups, 1] for broadcast
+    ov::Shape scales_broadcast_shape = {out_features, num_groups, 1};
+    scales.set_shape(scales_broadcast_shape);
+    auto scales_node = std::make_shared<ov::op::v0::Constant>(scales);
+    
+    // Symmetric dequantization: weight_fp = signed_weight * scale
+    // No Subtract needed since weights are already signed i4
+    auto w_scaled = std::make_shared<ov::op::v1::Multiply>(
+        weights_f16, scales_node, ov::op::AutoBroadcastType::NUMPY);
+    
+    // Reshape back to [out_features, in_features]
+    ov::Shape output_shape = {out_features, in_features};
+    auto final_shape = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{output_shape.size()}, output_shape);
+    auto w_reshaped = std::make_shared<ov::op::v1::Reshape>(w_scaled, final_shape, false);
+    
+    return std::make_shared<ov::op::v0::Convert>(w_reshaped, ov::element::f32);
+}
+
+/**
+ * @brief Create weight subgraph for in-flight symmetric INT8 quantized weights
+ */
+ov::Output<ov::Node> make_inflight_int8_weights_sym(
+    const std::string& key,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    size_t group_size = 128) {
+
+    ov::Tensor weight = get_tensor(consts, key + ".weight");
+    ov::Tensor scales = get_tensor(consts, key + ".scales");
+
+    ov::Shape weight_shape = weight.get_shape();  // [out_features, in_features]
+    ov::Shape scales_shape = scales.get_shape();  // [out_features, num_groups]
+    
+    size_t out_features = weight_shape[0];
+    size_t in_features = weight_shape[1];
+    size_t num_groups = scales_shape[1];
+    size_t actual_group_size = in_features / num_groups;
+    
+    // Reshape weights to [out_features, num_groups, group_size]
+    ov::Shape grouped_shape = {out_features, num_groups, actual_group_size};
+    
+    auto weights_node = std::make_shared<v0::Constant>(
+        ov::element::i8, grouped_shape, static_cast<int8_t*>(weight.data()), nullptr);
+    weights_node->get_rt_info()["__inflight_tensor_holder"] = weight;
+    
+    // Convert I8 to F16 for arithmetic
+    auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_node, ov::element::f16);
+    
+    // Reshape scales from [out_features, num_groups] to [out_features, num_groups, 1] for broadcast
+    ov::Shape scales_broadcast_shape = {out_features, num_groups, 1};
+    scales.set_shape(scales_broadcast_shape);
+    auto scales_node = std::make_shared<ov::op::v0::Constant>(scales);
+    
+    // Dequantize: weight_fp = int8_weight * scale
+    auto w_scaled = std::make_shared<ov::op::v1::Multiply>(
+        weights_f16, scales_node, ov::op::AutoBroadcastType::NUMPY);
+    
+    // Reshape back to [out_features, in_features]
+    ov::Shape output_shape = {out_features, in_features};
+    auto final_shape = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{output_shape.size()}, output_shape);
+    auto w_reshaped = std::make_shared<ov::op::v1::Reshape>(w_scaled, final_shape, false);
+    
+    return std::make_shared<ov::op::v0::Convert>(w_reshaped, ov::element::f32);
+}
+
 ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
                                            const std::unordered_map<std::string, ov::Tensor>& consts,
                                            gguf_tensor_type qtype,
                                            bool reorder,
                                            int head_size) {
+    // Check for in-flight quantization types (using int cast for comparison)
+    int qtype_int = static_cast<int>(qtype);
+    if (ov_extended_types::is_inflight_type(qtype_int)) {
+        // For in-flight types, use dedicated functions that handle our RTN format
+        // Note: reorder is not supported for in-flight quantization yet
+        if (ov_extended_types::is_int4_type(qtype_int)) {
+            return make_inflight_int4_weights_sym(key, consts, 128);
+        } else {
+            return make_inflight_int8_weights_sym(key, consts, 128);
+        }
+    }
+    
     switch (qtype) {
     case gguf_tensor_type::GGUF_TYPE_F16:
     case gguf_tensor_type::GGUF_TYPE_BF16:
@@ -869,7 +993,7 @@ ov::Output<ov::Node> make_weights_subgraph(const std::string& key,
     case gguf_tensor_type::GGUF_TYPE_Q6_K:
         return make_int8_weights(key, consts, reorder, head_size, 16);
     default:
-        OPENVINO_THROW("Unsupported quantization type");
+        OPENVINO_THROW("Unsupported quantization type: ", static_cast<int>(qtype));
     }
 }
 
@@ -928,7 +1052,7 @@ make_qkv_fused_fc(
     // Handle biases if they exist
     ov::Output<ov::Node> qkv_bias;
     bool has_bias = consts.count(layer_prefix + ".self_attn.q_proj.bias") > 0;
-    
+
     if (has_bias) {
         auto q_bias_tensor = get_tensor(consts, layer_prefix + ".self_attn.q_proj.bias");
         auto k_bias_tensor = get_tensor(consts, layer_prefix + ".self_attn.k_proj.bias");
@@ -940,13 +1064,13 @@ make_qkv_fused_fc(
             std::make_shared<v0::Constant>(k_bias_tensor), ov::element::f32);
         auto v_bias = std::make_shared<ov::op::v0::Convert>(
             std::make_shared<v0::Constant>(v_bias_tensor), ov::element::f32);
-        
+
         qkv_bias = std::make_shared<v0::Concat>(
             ov::OutputVector{q_bias, k_bias, v_bias}, 0);
     } else {
         qkv_bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
     }
-    
+
     // Single fused FC operation
     auto qkv_output = std::make_shared<ov::op::internal::FullyConnected>(
         input, qkv_weights, qkv_bias);
