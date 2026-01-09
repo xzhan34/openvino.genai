@@ -64,14 +64,14 @@ const std::unordered_map<std::string, std::string>& WeightNameMapper::gguf_to_ca
 }
 
 const std::regex& WeightNameMapper::hf_layer_pattern() {
-    // Matches: model.layers.0.xxx or model.layers.10.xxx
-    static const std::regex pattern(R"(model\.layers\.(\d+)\.)");
+    // Matches: model.layers.0.xxx or model.layers.10.xxx (segment boundary-aware)
+    static const std::regex pattern(R"((^|\.)model\.layers\.(\d+)\.)");
     return pattern;
 }
 
 const std::regex& WeightNameMapper::canonical_layer_pattern() {
-    // Matches: model.layers[0].xxx or model.layers[10].xxx
-    static const std::regex pattern(R"(model\.layers\[(\d+)\]\.)");
+    // Matches: model.layers[0].xxx or model.layers[10].xxx (segment boundary-aware)
+    static const std::regex pattern(R"((^|\.)model\.layers\[(\d+)\]\.)");
     return pattern;
 }
 
@@ -112,13 +112,10 @@ std::string WeightNameMapper::from_hf(const std::string& hf_name) {
     
     std::smatch match;
     if (std::regex_search(result, match, hf_layer_pattern())) {
-        int layer_num = std::stoi(match[1].str());
-        std::stringstream replacement;
-        replacement << "model.layers[" << layer_num << "].";
-        
-        // Replace the matched portion
-        result = std::regex_replace(result, hf_layer_pattern(), replacement.str(), 
-                                   std::regex_constants::format_first_only);
+        result = std::regex_replace(result,
+                                    hf_layer_pattern(),
+                                    "$1model.layers[$2].",
+                                    std::regex_constants::format_first_only);
     }
     
     return result;
@@ -168,12 +165,10 @@ std::string WeightNameMapper::to_hf(const std::string& canonical_name) {
     
     std::smatch match;
     if (std::regex_search(result, match, canonical_layer_pattern())) {
-        int layer_num = std::stoi(match[1].str());
-        std::stringstream replacement;
-        replacement << "model.layers." << layer_num << ".";
-        
-        result = std::regex_replace(result, canonical_layer_pattern(), replacement.str(),
-                                   std::regex_constants::format_first_only);
+        result = std::regex_replace(result,
+                                    canonical_layer_pattern(),
+                                    "$1model.layers.$2.",
+                                    std::regex_constants::format_first_only);
     }
     
     return result;
@@ -187,7 +182,7 @@ bool WeightNameMapper::is_gguf_format(const std::string& name) {
 }
 
 bool WeightNameMapper::is_hf_format(const std::string& name) {
-    static const std::regex hf_pattern(R"(model\.layers\.\d+\.)");
+    static const std::regex hf_pattern(R"((^|\.)model\.layers\.\d+\.)");
     return std::regex_search(name, hf_pattern);
 }
 
