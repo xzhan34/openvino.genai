@@ -33,6 +33,7 @@ public:
     Tensor cos() const;
     Tensor exp() const;
     Tensor log() const;
+    Tensor tanh() const;
     Tensor softmax(int64_t axis) const;
     Tensor reshape(const ov::Output<ov::Node>& shape, bool special_zero = true) const;
     Tensor reshape(const std::vector<int64_t>& shape, bool special_zero = true) const;

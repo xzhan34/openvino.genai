@@ -108,6 +108,11 @@ Tensor Tensor::log() const {
     return Tensor(node, ctx_);
 }
 
+Tensor Tensor::tanh() const {
+    auto node = std::make_shared<ov::op::v0::Tanh>(value_);
+    return Tensor(node, ctx_);
+}
+
 Tensor Tensor::softmax(int64_t axis) const {
     auto node = std::make_shared<ov::op::v1::Softmax>(value_, axis);
     return Tensor(node, ctx_);

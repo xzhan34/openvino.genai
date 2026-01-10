@@ -29,6 +29,21 @@ Tensor conv3d(const Tensor& input,
               const std::vector<int64_t>& pads_end,
               const std::vector<int64_t>& dilations = {1, 1, 1});
 
+Tensor conv2d(const Tensor& input,
+              const Tensor& weight,
+              const std::vector<int64_t>& strides,
+              const std::vector<int64_t>& pads_begin,
+              const std::vector<int64_t>& pads_end,
+              const std::vector<int64_t>& dilations = {1, 1});
+
+Tensor conv2d(const Tensor& input,
+              const Tensor& weight,
+              const Tensor& bias,
+              const std::vector<int64_t>& strides,
+              const std::vector<int64_t>& pads_begin,
+              const std::vector<int64_t>& pads_end,
+              const std::vector<int64_t>& dilations = {1, 1});
+
 Tensor layer_norm(const Tensor& input,
                   const Tensor& weight,
                   const Tensor* bias,
@@ -40,7 +55,20 @@ Tensor layer_norm(const Tensor& input,
                   float eps,
                   int64_t axis = -1);
 
+Tensor group_norm(const Tensor& input,
+                  const Tensor& weight,
+                  const Tensor* bias,
+                  int64_t num_groups,
+                  float eps);
+
+Tensor group_norm(const Tensor& input,
+                  const Tensor& weight,
+                  int64_t num_groups,
+                  float eps);
+
 Tensor gelu(const Tensor& input, bool approximate = true);
+
+Tensor upsample_nearest(const Tensor& input, int64_t scale_h, int64_t scale_w);
 
 }  // namespace nn
 }  // namespace ops

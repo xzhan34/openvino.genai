@@ -61,6 +61,10 @@ public:
                    const Tensor& rope_cos,
                    const Tensor& rope_sin,
                    const Tensor& causal_mask) const;
+    Tensor forward_no_cache(const Tensor& hidden_states,
+                            const Tensor& rope_cos,
+                            const Tensor& rope_sin,
+                            const Tensor& causal_mask) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -119,6 +123,11 @@ public:
                                       const Tensor& rope_sin,
                                       const Tensor& causal_mask,
                                       const std::optional<Tensor>& residual) const;
+    std::pair<Tensor, Tensor> forward_no_cache(const Tensor& hidden_states,
+                                               const Tensor& rope_cos,
+                                               const Tensor& rope_sin,
+                                               const Tensor& causal_mask,
+                                               const std::optional<Tensor>& residual) const;
 
 private:
     Qwen3Attention self_attn_;
@@ -134,6 +143,13 @@ public:
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
                    const Tensor& beam_idx);
+    std::pair<Tensor, Tensor> forward_with_penultimate(const Tensor& input_ids,
+                                                       const Tensor& position_ids,
+                                                       const Tensor& beam_idx);
+    Tensor forward_no_cache(const Tensor& input_ids,
+                            const Tensor& position_ids);
+    std::pair<Tensor, Tensor> forward_with_penultimate_no_cache(const Tensor& input_ids,
+                                                                const Tensor& position_ids);
 
     VocabEmbedding& embed_tokens();
     RMSNorm& norm();
@@ -164,6 +180,11 @@ private:
 };
 
 std::shared_ptr<ov::Model> create_qwen3_dense_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_text_encoder_model(
     const Qwen3DenseConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);

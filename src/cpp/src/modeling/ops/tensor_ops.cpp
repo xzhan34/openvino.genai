@@ -67,6 +67,29 @@ Tensor masked_add(const Tensor& input, const Tensor& mask, const Tensor& updates
     return ops::where(mask_bool, added, input);
 }
 
+Tensor masked_fill(const Tensor& input, const Tensor& mask, float value) {
+    auto mask_bool = ensure_bool(mask);
+    auto* ctx = input.context();
+    auto fill = std::make_shared<ov::op::v0::Constant>(input.dtype(), ov::Shape{}, std::vector<float>{value});
+    return ops::where(mask_bool, Tensor(fill, ctx), input);
+}
+
+Tensor pad(const Tensor& input,
+           const std::vector<int64_t>& pads_begin,
+           const std::vector<int64_t>& pads_end,
+           float value) {
+    auto* ctx = input.context();
+    auto pads_begin_node = ops::const_vec(ctx, pads_begin);
+    auto pads_end_node = ops::const_vec(ctx, pads_end);
+    auto pad_value = std::make_shared<ov::op::v0::Constant>(input.dtype(), ov::Shape{}, std::vector<float>{value});
+    auto node = std::make_shared<ov::op::v1::Pad>(input.output(),
+                                                  pads_begin_node,
+                                                  pads_end_node,
+                                                  pad_value,
+                                                  ov::op::PadMode::CONSTANT);
+    return Tensor(node, ctx);
+}
+
 }  // namespace tensor
 }  // namespace ops
 }  // namespace modeling
