@@ -30,8 +30,7 @@ class WeightSource;
 #include "modeling/layers/lm_head.hpp"
 #include "modeling/layers/rms_norm.hpp"
 #include "modeling/layers/vocab_embedding.hpp"
-#include "modeling/models/qwen3_vl_fusion.hpp"
-#include "modeling/models/qwen3_vl_spec.hpp"
+#include "modeling/models/qwen3_vl_utils.hpp"
 #include "modeling/module.hpp"
 #include "modeling/ops/tensor.hpp"
 
@@ -39,6 +38,26 @@ namespace ov {
 namespace genai {
 namespace modeling {
 namespace models {
+
+class OPENVINO_GENAI_EXPORTS EmbeddingInjector : public Module {
+public:
+    EmbeddingInjector(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
+
+    // visual_embeds is expected to be aligned with inputs_embeds (e.g., [B, S, H]).
+    Tensor forward(const Tensor& inputs_embeds,
+                   const Tensor& visual_embeds,
+                   const Tensor& visual_pos_mask) const;
+};
+
+class OPENVINO_GENAI_EXPORTS DeepstackInjector : public Module {
+public:
+    DeepstackInjector(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
+
+    // deepstack_embeds is expected to be aligned with hidden_states (e.g., [B, S, H]).
+    Tensor forward(const Tensor& hidden_states,
+                   const Tensor& visual_pos_mask,
+                   const Tensor& deepstack_embeds) const;
+};
 
 class OPENVINO_GENAI_EXPORTS Qwen3VLTextAttention : public Module {
 public:

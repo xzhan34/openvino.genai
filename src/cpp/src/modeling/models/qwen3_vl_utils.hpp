@@ -3,13 +3,15 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "openvino/genai/visibility.hpp"
-
+#include <openvino/openvino.hpp>
 #include <nlohmann/json.hpp>
 
 namespace ov {
@@ -124,6 +126,76 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLGraphSpec {
     static std::vector<std::string> vision_outputs(const Qwen3VLVisionConfig& cfg);
     static std::vector<std::string> text_required_inputs(bool use_inputs_embeds);
     static std::vector<std::string> text_optional_inputs();
+};
+
+struct OPENVINO_GENAI_EXPORTS Qwen3VLInputPlan {
+    ov::Tensor position_ids;
+    ov::Tensor visual_pos_mask;
+    ov::Tensor rope_deltas;
+};
+
+class OPENVINO_GENAI_EXPORTS Qwen3VLInputPlanner {
+public:
+    explicit Qwen3VLInputPlanner(const Qwen3VLConfig& cfg);
+
+    Qwen3VLInputPlan build_plan(const ov::Tensor& input_ids,
+                                const ov::Tensor* attention_mask = nullptr,
+                                const ov::Tensor* image_grid_thw = nullptr) const;
+
+    ov::Tensor build_visual_pos_mask(const ov::Tensor& input_ids,
+                                     const ov::Tensor* attention_mask = nullptr) const;
+
+    static ov::Tensor scatter_visual_embeds(const ov::Tensor& visual_embeds,
+                                            const ov::Tensor& visual_pos_mask);
+
+    static std::vector<ov::Tensor> scatter_deepstack_embeds(const std::vector<ov::Tensor>& deepstack_embeds,
+                                                            const ov::Tensor& visual_pos_mask);
+
+    static ov::Tensor build_decode_position_ids(const ov::Tensor& rope_deltas,
+                                                int64_t past_length,
+                                                int64_t seq_len);
+
+private:
+    int64_t image_token_id_ = 0;
+    int64_t vision_start_token_id_ = 0;
+    int32_t spatial_merge_size_ = 1;
+};
+
+struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionPreprocessConfig {
+    int64_t min_pixels = 56 * 56;
+    int64_t max_pixels = 28 * 28 * 1280;
+    int32_t patch_size = 16;
+    int32_t temporal_patch_size = 2;
+    int32_t merge_size = 2;
+    std::array<float, 3> image_mean = {0.5f, 0.5f, 0.5f};
+    std::array<float, 3> image_std = {0.5f, 0.5f, 0.5f};
+    bool do_resize = true;
+
+    static Qwen3VLVisionPreprocessConfig from_json_file(const std::filesystem::path& path);
+};
+
+struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionInputs {
+    ov::Tensor pixel_values;
+    ov::Tensor grid_thw;
+    ov::Tensor pos_embeds;
+    ov::Tensor rotary_cos;
+    ov::Tensor rotary_sin;
+};
+
+class OPENVINO_GENAI_EXPORTS Qwen3VLVisionPreprocessor {
+public:
+    Qwen3VLVisionPreprocessor(const Qwen3VLVisionConfig& vision_cfg,
+                              const Qwen3VLVisionPreprocessConfig& preprocess_cfg);
+
+    Qwen3VLVisionInputs preprocess(const ov::Tensor& images,
+                                   const ov::Tensor& pos_embed_weight) const;
+
+    static int64_t count_visual_tokens(const ov::Tensor& grid_thw,
+                                       int32_t spatial_merge_size);
+
+private:
+    Qwen3VLVisionConfig vision_cfg_;
+    Qwen3VLVisionPreprocessConfig preprocess_cfg_;
 };
 
 }  // namespace models

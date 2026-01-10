@@ -9,9 +9,8 @@
 #include <openvino/openvino.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_vl_fusion.hpp"
-#include "modeling/models/qwen3_vl_input_planner.hpp"
-#include "modeling/models/qwen3_vl_spec.hpp"
+#include "modeling/models/qwen3_vl_text.hpp"
+#include "modeling/models/qwen3_vl_utils.hpp"
 #include "modeling/tests/test_utils.hpp"
 
 namespace test_utils = ov::genai::modeling::tests;

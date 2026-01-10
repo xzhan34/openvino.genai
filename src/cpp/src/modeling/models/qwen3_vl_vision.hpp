@@ -27,7 +27,7 @@ class WeightSource;
 }  // namespace ov
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_vl_spec.hpp"
+#include "modeling/models/qwen3_vl_utils.hpp"
 #include "modeling/module.hpp"
 #include "modeling/ops/tensor.hpp"
 
