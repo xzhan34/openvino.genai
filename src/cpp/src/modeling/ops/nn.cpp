@@ -30,6 +30,24 @@ ov::genai::modeling::OpContext* resolve_context(const ov::genai::modeling::Tenso
     return a_ctx ? a_ctx : b_ctx;
 }
 
+ov::genai::modeling::Tensor reshape_conv_bias(const ov::genai::modeling::Tensor& bias, size_t target_rank) {
+    auto rank = bias.output().get_partial_shape().rank();
+    if (!rank.is_static()) {
+        return bias;
+    }
+    auto rank_len = static_cast<size_t>(rank.get_length());
+    if (rank_len == target_rank) {
+        return bias;
+    }
+    if (rank_len == 1 && target_rank == 4) {
+        return bias.unsqueeze({0, 2, 3});
+    }
+    if (rank_len == 1 && target_rank == 5) {
+        return bias.unsqueeze({0, 2, 3, 4});
+    }
+    return bias;
+}
+
 }  // namespace
 
 namespace ov {
@@ -62,7 +80,10 @@ Tensor conv3d(const Tensor& input,
               const std::vector<int64_t>& pads_end,
               const std::vector<int64_t>& dilations) {
     auto conv = conv3d(input, weight, strides, pads_begin, pads_end, dilations);
-    auto node = std::make_shared<ov::op::v1::Add>(conv.output(), bias.output(), ov::op::AutoBroadcastType::NUMPY);
+    auto bias_reshaped = reshape_conv_bias(bias, 5);
+    auto node = std::make_shared<ov::op::v1::Add>(conv.output(),
+                                                  bias_reshaped.output(),
+                                                  ov::op::AutoBroadcastType::NUMPY);
     return Tensor(node, conv.context());
 }
 
@@ -90,7 +111,10 @@ Tensor conv2d(const Tensor& input,
               const std::vector<int64_t>& pads_end,
               const std::vector<int64_t>& dilations) {
     auto conv = conv2d(input, weight, strides, pads_begin, pads_end, dilations);
-    auto node = std::make_shared<ov::op::v1::Add>(conv.output(), bias.output(), ov::op::AutoBroadcastType::NUMPY);
+    auto bias_reshaped = reshape_conv_bias(bias, 4);
+    auto node = std::make_shared<ov::op::v1::Add>(conv.output(),
+                                                  bias_reshaped.output(),
+                                                  ov::op::AutoBroadcastType::NUMPY);
     return Tensor(node, conv.context());
 }
 

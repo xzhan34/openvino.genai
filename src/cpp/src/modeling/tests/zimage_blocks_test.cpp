@@ -30,6 +30,8 @@ TEST(ZImageBlocks, AttentionZeroWeights) {
     constexpr int32_t dim = 8;
     constexpr int32_t heads = 2;
     constexpr int32_t kv_heads = 2;
+    constexpr int32_t head_dim = dim / heads;
+    constexpr int32_t rope_dim = head_dim / 2;
 
     ov::genai::modeling::models::ZImageAttention attn(ctx, "attn", dim, heads, kv_heads, 1e-5f, false);
 
@@ -46,8 +48,8 @@ TEST(ZImageBlocks, AttentionZeroWeights) {
 
     auto hidden = ctx.parameter("hidden", ov::element::f32, {1, 4, dim});
     auto mask = ctx.parameter("mask", ov::element::boolean, {1, 4});
-    auto rope_cos = ctx.parameter("rope_cos", ov::element::f32, {1, 4, dim / 2});
-    auto rope_sin = ctx.parameter("rope_sin", ov::element::f32, {1, 4, dim / 2});
+    auto rope_cos = ctx.parameter("rope_cos", ov::element::f32, {1, 4, rope_dim});
+    auto rope_sin = ctx.parameter("rope_sin", ov::element::f32, {1, 4, rope_dim});
 
     auto out = attn.forward(hidden, mask, rope_cos, rope_sin);
     auto model = build_model_from_output(out.output(), ctx.parameters());
@@ -58,13 +60,13 @@ TEST(ZImageBlocks, AttentionZeroWeights) {
 
     std::vector<float> hidden_data(1 * 4 * dim, 1.0f);
     std::vector<char> mask_data(4, 1);
-    std::vector<float> cos_data(1 * 4 * (dim / 2), 1.0f);
-    std::vector<float> sin_data(1 * 4 * (dim / 2), 0.0f);
+    std::vector<float> cos_data(1 * 4 * rope_dim, 1.0f);
+    std::vector<float> sin_data(1 * 4 * rope_dim, 0.0f);
 
     ov::Tensor hidden_tensor(ov::element::f32, {1, 4, dim});
     ov::Tensor mask_tensor(ov::element::boolean, {1, 4});
-    ov::Tensor cos_tensor(ov::element::f32, {1, 4, dim / 2});
-    ov::Tensor sin_tensor(ov::element::f32, {1, 4, dim / 2});
+    ov::Tensor cos_tensor(ov::element::f32, {1, 4, rope_dim});
+    ov::Tensor sin_tensor(ov::element::f32, {1, 4, rope_dim});
 
     std::memcpy(hidden_tensor.data(), hidden_data.data(), hidden_data.size() * sizeof(float));
     std::memcpy(mask_tensor.data(), mask_data.data(), mask_data.size() * sizeof(char));

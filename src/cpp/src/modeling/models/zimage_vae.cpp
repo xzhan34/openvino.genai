@@ -27,6 +27,16 @@ ov::genai::modeling::Tensor add_bias_if_present(const ov::genai::modeling::Tenso
     return x + *bias;
 }
 
+ov::genai::modeling::Tensor linear_mm(const ov::genai::modeling::Tensor& x,
+                                      const ov::genai::modeling::Tensor& weight,
+                                      const ov::genai::modeling::Tensor* bias) {
+    auto out = ov::genai::modeling::ops::matmul(x, weight, false, true);
+    if (bias) {
+        out = out + *bias;
+    }
+    return out;
+}
+
 auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
@@ -133,12 +143,18 @@ Tensor VAEAttention::forward(const Tensor& input) const {
     auto flat = normed.reshape({0, channels_, -1}).permute({0, 2, 1});
     flat = flat.to(q_weight_->value().dtype());
 
-    auto q = add_bias_if_present(ops::linear(flat, q_weight_->value()),
-                                 q_bias_ ? &q_bias_->value() : nullptr);
-    auto k = add_bias_if_present(ops::linear(flat, k_weight_->value()),
-                                 k_bias_ ? &k_bias_->value() : nullptr);
-    auto v = add_bias_if_present(ops::linear(flat, v_weight_->value()),
-                                 v_bias_ ? &v_bias_->value() : nullptr);
+    auto q = linear_mm(flat, q_weight_->value(), nullptr);
+    if (q_bias_) {
+        q = q + q_bias_->value();
+    }
+    auto k = linear_mm(flat, k_weight_->value(), nullptr);
+    if (k_bias_) {
+        k = k + k_bias_->value();
+    }
+    auto v = linear_mm(flat, v_weight_->value(), nullptr);
+    if (v_bias_) {
+        v = v + v_bias_->value();
+    }
 
     const int32_t num_heads = 1;
     const int32_t head_dim = channels_;
@@ -152,8 +168,10 @@ Tensor VAEAttention::forward(const Tensor& input) const {
     auto context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling, 3, nullptr, false, policy);
 
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, channels_});
-    auto out = add_bias_if_present(ops::linear(merged, o_weight_->value()),
-                                   o_bias_ ? &o_bias_->value() : nullptr);
+    auto out = linear_mm(merged, o_weight_->value(), nullptr);
+    if (o_bias_) {
+        out = out + o_bias_->value();
+    }
 
     auto out_chw = out.permute({0, 2, 1});
     auto target_shape = shape::make({shape::dim(input, 0),
