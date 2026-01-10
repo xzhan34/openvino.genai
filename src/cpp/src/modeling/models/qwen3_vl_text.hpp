@@ -9,8 +9,6 @@
 #include <utility>
 #include <vector>
 
-#include "openvino/genai/visibility.hpp"
-
 namespace ov {
 class Model;
 }  // namespace ov
@@ -39,7 +37,7 @@ namespace genai {
 namespace modeling {
 namespace models {
 
-class OPENVINO_GENAI_EXPORTS EmbeddingInjector : public Module {
+class EmbeddingInjector : public Module {
 public:
     EmbeddingInjector(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
 
@@ -49,7 +47,7 @@ public:
                    const Tensor& visual_pos_mask) const;
 };
 
-class OPENVINO_GENAI_EXPORTS DeepstackInjector : public Module {
+class DeepstackInjector : public Module {
 public:
     DeepstackInjector(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
 
@@ -59,7 +57,7 @@ public:
                    const Tensor& deepstack_embeds) const;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLTextAttention : public Module {
+class Qwen3VLTextAttention : public Module {
 public:
     Qwen3VLTextAttention(BuilderContext& ctx,
                          const std::string& name,
@@ -106,7 +104,7 @@ private:
     WeightParameter* o_bias_param_ = nullptr;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLTextMLP : public Module {
+class Qwen3VLTextMLP : public Module {
 public:
     Qwen3VLTextMLP(BuilderContext& ctx, const std::string& name, const Qwen3VLTextConfig& cfg,
                    Module* parent = nullptr);
@@ -123,7 +121,7 @@ private:
     WeightParameter* down_proj_param_ = nullptr;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLTextDecoderLayer : public Module {
+class Qwen3VLTextDecoderLayer : public Module {
 public:
     Qwen3VLTextDecoderLayer(BuilderContext& ctx,
                             const std::string& name,
@@ -142,7 +140,7 @@ private:
     RMSNorm post_attention_layernorm_;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLTextModel : public Module {
+class Qwen3VLTextModel : public Module {
 public:
     Qwen3VLTextModel(BuilderContext& ctx, const Qwen3VLTextConfig& cfg, Module* parent = nullptr);
 
@@ -175,7 +173,7 @@ private:
     int32_t head_dim_ = 0;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLTextForCausalLM : public Module {
+class Qwen3VLTextForCausalLM : public Module {
 public:
     Qwen3VLTextForCausalLM(BuilderContext& ctx, const Qwen3VLTextConfig& cfg, Module* parent = nullptr);
 
@@ -202,7 +200,7 @@ private:
     LMHead lm_head_;
 };
 
-OPENVINO_GENAI_EXPORTS std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
+std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
     const Qwen3VLConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
@@ -213,3 +211,4 @@ OPENVINO_GENAI_EXPORTS std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
+

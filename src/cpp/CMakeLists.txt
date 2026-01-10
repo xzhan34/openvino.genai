@@ -4,7 +4,9 @@
 
 file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
 file(GLOB modeling_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/tests/*.cpp")
+file(GLOB modeling_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/samples/*.cpp")
 list(REMOVE_ITEM SOURCE_FILES ${modeling_tests_src})
+list(REMOVE_ITEM SOURCE_FILES ${modeling_samples_src})
 list(APPEND SOURCE_FILES "${CMAKE_CURRENT_BINARY_DIR}/version.cpp")
 
 # Dependencies

@@ -6,7 +6,6 @@ if(ENABLE_SAMPLES)
     add_subdirectory(cpp/image_generation)
     add_subdirectory(cpp/speech_generation)
     add_subdirectory(cpp/visual_language_chat)
-    add_subdirectory(cpp/qwen3_vl_modeling)
     add_subdirectory(cpp/whisper_speech_recognition)
     add_subdirectory(cpp/rag)
     add_subdirectory(c/text_generation)
@@ -26,7 +25,6 @@ install(DIRECTORY
             cpp/image_generation
             cpp/speech_generation
             cpp/visual_language_chat
-            cpp/qwen3_vl_modeling
             cpp/whisper_speech_recognition
             cpp/rag
         DESTINATION samples/cpp COMPONENT cpp_samples_genai)

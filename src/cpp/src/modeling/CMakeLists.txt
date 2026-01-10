@@ -42,3 +42,7 @@ install(TARGETS ${TEST_MODELING_TARGET}
         RUNTIME DESTINATION tests/
         COMPONENT tests
         EXCLUDE_FROM_ALL)
+
+if(ENABLE_SAMPLES)
+  add_subdirectory(samples)
+endif()

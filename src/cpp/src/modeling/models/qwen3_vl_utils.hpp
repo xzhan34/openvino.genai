@@ -10,7 +10,6 @@
 #include <utility>
 #include <vector>
 
-#include "openvino/genai/visibility.hpp"
 #include <openvino/openvino.hpp>
 #include <nlohmann/json.hpp>
 
@@ -19,13 +18,13 @@ namespace genai {
 namespace modeling {
 namespace models {
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLRopeConfig {
+struct Qwen3VLRopeConfig {
     bool mrope_interleaved = false;
     std::vector<int32_t> mrope_section = {24, 20, 20};
     std::string rope_type = "default";
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLTextConfig {
+struct Qwen3VLTextConfig {
     std::string model_type = "qwen3_vl_text";
     int32_t vocab_size = 0;
     int32_t hidden_size = 0;
@@ -50,7 +49,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLTextConfig {
     void validate() const;
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionConfig {
+struct Qwen3VLVisionConfig {
     std::string model_type = "qwen3_vl";
     int32_t depth = 0;
     int32_t hidden_size = 0;
@@ -71,7 +70,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionConfig {
     void validate() const;
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLConfig {
+struct Qwen3VLConfig {
     std::string model_type = "qwen3_vl";
     std::vector<std::string> architectures;
     Qwen3VLTextConfig text;
@@ -89,7 +88,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLConfig {
     static Qwen3VLConfig from_json_file(const std::filesystem::path& config_path);
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLModuleNames {
+struct Qwen3VLModuleNames {
     static constexpr const char* kRoot = "model";
     static constexpr const char* kVision = "visual";
     static constexpr const char* kText = "language_model";
@@ -99,7 +98,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLModuleNames {
     static std::string text_layer(int32_t index);
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionIO {
+struct Qwen3VLVisionIO {
     static constexpr const char* kPixelValues = "pixel_values";
     static constexpr const char* kGridThw = "grid_thw";
     static constexpr const char* kPosEmbeds = "pos_embeds";
@@ -109,7 +108,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionIO {
     static constexpr const char* kDeepstackEmbedsPrefix = "deepstack_embeds";
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLTextIO {
+struct Qwen3VLTextIO {
     static constexpr const char* kInputIds = "input_ids";
     static constexpr const char* kInputsEmbeds = "inputs_embeds";
     static constexpr const char* kAttentionMask = "attention_mask";
@@ -121,20 +120,20 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLTextIO {
     static constexpr const char* kLogits = "logits";
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLGraphSpec {
+struct Qwen3VLGraphSpec {
     static std::vector<std::string> vision_required_inputs(bool use_external_pos_embeds);
     static std::vector<std::string> vision_outputs(const Qwen3VLVisionConfig& cfg);
     static std::vector<std::string> text_required_inputs(bool use_inputs_embeds);
     static std::vector<std::string> text_optional_inputs();
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLInputPlan {
+struct Qwen3VLInputPlan {
     ov::Tensor position_ids;
     ov::Tensor visual_pos_mask;
     ov::Tensor rope_deltas;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLInputPlanner {
+class Qwen3VLInputPlanner {
 public:
     explicit Qwen3VLInputPlanner(const Qwen3VLConfig& cfg);
 
@@ -161,7 +160,7 @@ private:
     int32_t spatial_merge_size_ = 1;
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionPreprocessConfig {
+struct Qwen3VLVisionPreprocessConfig {
     int64_t min_pixels = 56 * 56;
     int64_t max_pixels = 28 * 28 * 1280;
     int32_t patch_size = 16;
@@ -174,7 +173,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionPreprocessConfig {
     static Qwen3VLVisionPreprocessConfig from_json_file(const std::filesystem::path& path);
 };
 
-struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionInputs {
+struct Qwen3VLVisionInputs {
     ov::Tensor pixel_values;
     ov::Tensor grid_thw;
     ov::Tensor pos_embeds;
@@ -182,7 +181,7 @@ struct OPENVINO_GENAI_EXPORTS Qwen3VLVisionInputs {
     ov::Tensor rotary_sin;
 };
 
-class OPENVINO_GENAI_EXPORTS Qwen3VLVisionPreprocessor {
+class Qwen3VLVisionPreprocessor {
 public:
     Qwen3VLVisionPreprocessor(const Qwen3VLVisionConfig& vision_cfg,
                               const Qwen3VLVisionPreprocessConfig& preprocess_cfg);
@@ -202,3 +201,4 @@ private:
 }  // namespace modeling
 }  // namespace genai
 }  // namespace ov
+
