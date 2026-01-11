@@ -335,16 +335,15 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
         return;
     }
     
-    // Check if this is a safetensors model that needs tokenizer conversion
-    bool is_safetensors = std::filesystem::exists(models_path / "tokenizer.json") &&
-                          (std::filesystem::exists(models_path / "model.safetensors") ||
-                           std::filesystem::exists(models_path / "model.safetensors.index.json"));
-    
-    if (is_safetensors && 
-        (!std::filesystem::exists(models_path / "openvino_tokenizer.xml") ||
-         !std::filesystem::exists(models_path / "openvino_detokenizer.xml"))) {
+    // Check if we need to convert a HuggingFace tokenizer (tokenizer.json is enough).
+    bool has_tokenizer_json = std::filesystem::exists(models_path / "tokenizer.json");
+    bool has_ov_tokenizer = std::filesystem::exists(models_path / "openvino_tokenizer.xml");
+    bool has_ov_detokenizer = std::filesystem::exists(models_path / "openvino_detokenizer.xml");
+    bool needs_tokenizer_conversion = has_tokenizer_json && (!has_ov_tokenizer || !has_ov_detokenizer);
+
+    if (needs_tokenizer_conversion) {
         // Convert HuggingFace tokenizer to OpenVINO format
-        std::cout << "[Safetensors] Converting HuggingFace tokenizer to OpenVINO format..." << std::endl;
+        std::cout << "[Tokenizer] Converting HuggingFace tokenizer to OpenVINO format..." << std::endl;
         
         std::string model_dir_str = models_path.string();
         std::string tokenizer_path_str = (models_path / "openvino_tokenizer.xml").string();
@@ -368,9 +367,9 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
         
         int result = std::system(python_cmd.c_str());
         if (result != 0) {
-            std::cerr << "[Safetensors] Warning: Tokenizer conversion failed" << std::endl;
+            std::cerr << "[Tokenizer] Warning: Tokenizer conversion failed" << std::endl;
         } else {
-            std::cout << "[Safetensors] Tokenizer conversion completed successfully" << std::endl;
+            std::cout << "[Tokenizer] Tokenizer conversion completed successfully" << std::endl;
         }
     }
     

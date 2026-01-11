@@ -764,8 +764,10 @@ int main(int argc, char* argv[]) try {
     FlowMatchEulerDiscreteScheduler scheduler(sched_cfg);
     scheduler.set_timesteps(steps, mu);
 
-    if (!std::filesystem::exists(tokenizer_dir / "openvino_tokenizer.xml")) {
-        throw std::runtime_error("Missing openvino_tokenizer.xml in tokenizer folder");
+    const bool has_ov_tokenizer = std::filesystem::exists(tokenizer_dir / "openvino_tokenizer.xml");
+    const bool has_hf_tokenizer = std::filesystem::exists(tokenizer_dir / "tokenizer.json");
+    if (!has_ov_tokenizer && !has_hf_tokenizer) {
+        throw std::runtime_error("Missing tokenizer.json or openvino_tokenizer.xml in tokenizer folder");
     }
 
     ov::genai::Tokenizer tokenizer(tokenizer_dir);
