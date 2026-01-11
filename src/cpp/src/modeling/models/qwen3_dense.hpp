@@ -150,6 +150,8 @@ public:
                             const Tensor& position_ids);
     std::pair<Tensor, Tensor> forward_with_penultimate_no_cache(const Tensor& input_ids,
                                                                 const Tensor& position_ids);
+    std::pair<Tensor, Tensor> forward_with_pre_norm_no_cache(const Tensor& input_ids,
+                                                             const Tensor& position_ids);
 
     VocabEmbedding& embed_tokens();
     RMSNorm& norm();

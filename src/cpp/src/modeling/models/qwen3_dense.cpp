@@ -377,6 +377,24 @@ std::pair<Tensor, Tensor> Qwen3Model::forward_with_penultimate_no_cache(const Te
     return {final_out, penultimate};
 }
 
+std::pair<Tensor, Tensor> Qwen3Model::forward_with_pre_norm_no_cache(const Tensor& input_ids,
+                                                                     const Tensor& position_ids) {
+    auto hidden_states = embed_tokens_.forward(input_ids);
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    auto seq_len = Tensor(shape::dim(position_ids, 1), position_ids.context()).squeeze(0);
+    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
+    std::optional<Tensor> residual;
+    for (auto& layer : layers_) {
+        auto layer_out = layer.forward_no_cache(hidden_states, cos_sin.first, cos_sin.second, causal_mask, residual);
+        hidden_states = layer_out.first;
+        residual = layer_out.second;
+    }
+    Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
+    Tensor final_out = residual ? norm_.forward(hidden_states, *residual).first : norm_.forward(hidden_states);
+    return {final_out, pre_norm};
+}
+
 VocabEmbedding& Qwen3Model::embed_tokens() {
     return embed_tokens_;
 }
@@ -446,7 +464,7 @@ std::shared_ptr<ov::Model> create_qwen3_text_encoder_model(
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
 
     (void)attention_mask;
-    auto outputs = model.forward_with_penultimate_no_cache(input_ids, position_ids);
+    auto outputs = model.forward_with_pre_norm_no_cache(input_ids, position_ids);
 
     auto result = std::make_shared<ov::op::v0::Result>(outputs.second.output());
     set_name(result, "hidden_states");
