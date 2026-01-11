@@ -132,17 +132,19 @@ ZImageAttention::ZImageAttention(BuilderContext& ctx,
 
 Tensor ZImageAttention::build_attention_bias(const Tensor& attention_mask) const {
     auto* ctx = attention_mask.context();
-    auto mask_bool = attention_mask.to(ov::element::boolean);
+    auto batch = shape::dim(attention_mask, 0);
+    auto seq = shape::dim(attention_mask, 1);
+    auto one = ops::const_scalar(ctx, static_cast<int64_t>(1));
+    auto target = shape::make({batch, one, one, seq});
     auto zero = Tensor(ops::const_scalar(ctx, 0.0f), ctx);
-    auto neg = Tensor(ops::const_scalar(ctx, -65504.0f), ctx);
-    auto bias = ops::where(mask_bool, zero, neg);
-    return bias.unsqueeze({1, 2});
+    return shape::broadcast_to(zero, target);
 }
 
 Tensor ZImageAttention::forward(const Tensor& hidden_states,
                                 const Tensor& attention_mask,
                                 const Tensor& rope_cos,
                                 const Tensor& rope_sin) const {
+    (void)attention_mask;
     auto q = ops::linear(hidden_states, q_weight_->value());
     auto k = ops::linear(hidden_states, k_weight_->value());
     auto v = ops::linear(hidden_states, v_weight_->value());
@@ -161,9 +163,8 @@ Tensor ZImageAttention::forward(const Tensor& hidden_states,
     auto q_rot = ops::llm::apply_rope_interleave(q_heads, rope_cos, rope_sin, head_dim_);
     auto k_rot = ops::llm::apply_rope_interleave(k_heads, rope_cos, rope_sin, head_dim_);
 
-    auto mask = build_attention_bias(attention_mask);
     auto* policy = &ctx().op_policy();
-    auto context = ops::llm::sdpa(q_rot, k_rot, v_heads, scaling_, 3, &mask, false, policy);
+    auto context = ops::llm::sdpa(q_rot, k_rot, v_heads, scaling_, 3, nullptr, false, policy);
 
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, num_heads_ * head_dim_});
     return ops::linear(merged, o_weight_->value());

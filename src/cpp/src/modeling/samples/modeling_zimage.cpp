@@ -8,9 +8,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -81,6 +83,11 @@ struct PromptContext {
     ov::Tensor x_rope_sin;
     size_t cap_len = 0;
     size_t cap_len_padded = 0;
+};
+
+struct DumpContext {
+    bool enabled = false;
+    std::filesystem::path dir;
 };
 
 nlohmann::json load_json(const std::filesystem::path& path) {
@@ -383,6 +390,209 @@ std::vector<float> copy_rows_to_float(const ov::Tensor& src,
     throw std::runtime_error("Unsupported hidden_states dtype");
 }
 
+std::vector<float> tensor_to_float_vector(const ov::Tensor& src) {
+    const size_t count = src.get_size();
+    std::vector<float> out(count, 0.0f);
+    if (count == 0) {
+        return out;
+    }
+    const auto type = src.get_element_type();
+    if (type == ov::element::f32) {
+        std::memcpy(out.data(), src.data<const float>(), count * sizeof(float));
+        return out;
+    }
+    if (type == ov::element::f16) {
+        const auto* data = src.data<const ov::float16>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(data[i]);
+        }
+        return out;
+    }
+    if (type == ov::element::bf16) {
+        const auto* data = src.data<const ov::bfloat16>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(data[i]);
+        }
+        return out;
+    }
+    throw std::runtime_error("Unsupported tensor dtype for conversion");
+}
+
+std::vector<int64_t> tensor_to_int64_vector(const ov::Tensor& src) {
+    const size_t count = src.get_size();
+    std::vector<int64_t> out(count, 0);
+    if (count == 0) {
+        return out;
+    }
+    const auto type = src.get_element_type();
+    if (type == ov::element::i64) {
+        std::memcpy(out.data(), src.data<const int64_t>(), count * sizeof(int64_t));
+        return out;
+    }
+    if (type == ov::element::i32) {
+        const auto* data = src.data<const int32_t>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<int64_t>(data[i]);
+        }
+        return out;
+    }
+    if (type == ov::element::boolean) {
+        const auto* data = src.data<const char>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = data[i] ? 1 : 0;
+        }
+        return out;
+    }
+    throw std::runtime_error("Unsupported tensor dtype for int64 conversion");
+}
+
+std::string element_type_to_string(const ov::element::Type& type) {
+    if (type == ov::element::f32) {
+        return "f32";
+    }
+    if (type == ov::element::f16) {
+        return "f16";
+    }
+    if (type == ov::element::bf16) {
+        return "bf16";
+    }
+    if (type == ov::element::i64) {
+        return "i64";
+    }
+    if (type == ov::element::i32) {
+        return "i32";
+    }
+    if (type == ov::element::boolean) {
+        return "bool";
+    }
+    return "unknown";
+}
+
+void write_json_file(const std::filesystem::path& path, const nlohmann::json& data) {
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to write JSON file: " + path.string());
+    }
+    file << data.dump(2);
+}
+
+template <typename T>
+void write_binary_file(const std::filesystem::path& path, const std::vector<T>& data) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to write binary file: " + path.string());
+    }
+    if (!data.empty()) {
+        file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(T)));
+    }
+}
+
+template <typename T>
+nlohmann::json compute_stats(const std::vector<T>& data) {
+    nlohmann::json stats;
+    if (data.empty()) {
+        stats["count"] = 0;
+        return stats;
+    }
+    T min_val = data.front();
+    T max_val = data.front();
+    long double sum = 0.0;
+    for (const auto& v : data) {
+        if (v < min_val) {
+            min_val = v;
+        }
+        if (v > max_val) {
+            max_val = v;
+        }
+        sum += static_cast<long double>(v);
+    }
+    stats["count"] = data.size();
+    stats["min"] = min_val;
+    stats["max"] = max_val;
+    stats["mean"] = static_cast<double>(sum / static_cast<long double>(data.size()));
+    return stats;
+}
+
+nlohmann::json compute_bool_stats(const std::vector<int64_t>& data) {
+    nlohmann::json stats;
+    size_t count_true = 0;
+    for (auto v : data) {
+        if (v != 0) {
+            ++count_true;
+        }
+    }
+    stats["count"] = data.size();
+    stats["count_true"] = count_true;
+    stats["count_false"] = data.size() - count_true;
+    return stats;
+}
+
+std::filesystem::path ensure_dump_dir(const DumpContext& dump, const std::string& name) {
+    auto dir = dump.dir / name;
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+void dump_tensor(const DumpContext& dump, const std::string& name, const ov::Tensor& tensor) {
+    if (!dump.enabled) {
+        return;
+    }
+    nlohmann::json meta;
+    meta["name"] = name;
+    meta["shape"] = tensor.get_shape();
+    meta["dtype"] = element_type_to_string(tensor.get_element_type());
+    meta["element_count"] = tensor.get_size();
+
+    const auto type = tensor.get_element_type();
+    if (type == ov::element::f32 || type == ov::element::f16 || type == ov::element::bf16) {
+        auto data = tensor_to_float_vector(tensor);
+        meta["data_dtype"] = "f32";
+        meta["stats"] = compute_stats(data);
+        write_binary_file(dump.dir / (name + ".bin"), data);
+    } else if (type == ov::element::i64 || type == ov::element::i32) {
+        auto data = tensor_to_int64_vector(tensor);
+        meta["data_dtype"] = "i64";
+        meta["stats"] = compute_stats(data);
+        write_binary_file(dump.dir / (name + ".bin"), data);
+    } else if (type == ov::element::boolean) {
+        auto data = tensor_to_int64_vector(tensor);
+        meta["data_dtype"] = "i64";
+        meta["stats"] = compute_bool_stats(data);
+        write_binary_file(dump.dir / (name + ".bin"), data);
+    } else {
+        meta["data_dtype"] = "unsupported";
+    }
+    write_json_file(dump.dir / (name + ".json"), meta);
+}
+
+void dump_f32_vector(const DumpContext& dump,
+                     const std::string& name,
+                     const std::vector<float>& data,
+                     const ov::Shape& shape) {
+    if (!dump.enabled) {
+        return;
+    }
+    nlohmann::json meta;
+    meta["name"] = name;
+    meta["shape"] = shape;
+    meta["dtype"] = "f32";
+    meta["element_count"] = data.size();
+    meta["stats"] = compute_stats(data);
+    write_binary_file(dump.dir / (name + ".bin"), data);
+    write_json_file(dump.dir / (name + ".json"), meta);
+}
+
+void dump_text_file(const DumpContext& dump, const std::string& name, const std::string& text) {
+    if (!dump.enabled) {
+        return;
+    }
+    std::ofstream file(dump.dir / (name + ".txt"));
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to write text file: " + name);
+    }
+    file << text;
+}
+
 ov::Tensor make_f32_tensor(const std::vector<float>& data, const ov::Shape& shape) {
     ov::Tensor tensor(ov::element::f32, shape);
     if (!data.empty()) {
@@ -622,7 +832,9 @@ PromptContext build_prompt_context(const std::string& prompt,
                                    int32_t cap_feat_dim,
                                    const DiTRopeConfig& rope_cfg,
                                    const ImageTokensMeta& image_meta,
-                                   size_t max_seq_len) {
+                                   size_t max_seq_len,
+                                   const DumpContext* dump_ctx,
+                                   const std::string& tag) {
     ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
     ov::genai::JsonContainer extra({{"enable_thinking", true}});
     const std::string formatted = tokenizer.apply_chat_template(history, true, {}, std::nullopt, extra);
@@ -631,6 +843,13 @@ PromptContext build_prompt_context(const std::string& prompt,
     encode_opts["add_special_tokens"] = false;
     encode_opts["max_length"] = static_cast<int32_t>(max_seq_len);
     auto tokenized = tokenizer.encode(formatted, encode_opts);
+    if (dump_ctx && dump_ctx->enabled) {
+        auto dir = ensure_dump_dir(*dump_ctx, "prompt_" + tag);
+        DumpContext local{true, dir};
+        dump_text_file(local, "formatted_prompt", formatted);
+        dump_tensor(local, "input_ids", tokenized.input_ids);
+        dump_tensor(local, "attention_mask", tokenized.attention_mask);
+    }
 
     const auto input_shape = tokenized.input_ids.get_shape();
     if (input_shape.size() != 2 || input_shape[0] != 1) {
@@ -646,6 +865,12 @@ PromptContext build_prompt_context(const std::string& prompt,
     request.infer();
 
     ov::Tensor hidden_states = request.get_tensor("hidden_states");
+    if (dump_ctx && dump_ctx->enabled) {
+        auto dir = ensure_dump_dir(*dump_ctx, "text_encoder_" + tag);
+        DumpContext local{true, dir};
+        dump_tensor(local, "hidden_states", hidden_states);
+        dump_tensor(local, "position_ids", position_ids);
+    }
     const auto hs_shape = hidden_states.get_shape();
     if (hs_shape.size() != 3 || hs_shape[0] != 1) {
         throw std::runtime_error("hidden_states must have shape [1, seq, dim]");
@@ -694,6 +919,16 @@ PromptContext build_prompt_context(const std::string& prompt,
     ctx.cap_rope_sin = make_f32_tensor(cap_cos_sin.second, {1, cap_len_padded, head_dim_half});
     ctx.x_rope_cos = make_f32_tensor(x_cos_sin.first, {1, image_meta.padded_len, head_dim_half});
     ctx.x_rope_sin = make_f32_tensor(x_cos_sin.second, {1, image_meta.padded_len, head_dim_half});
+    if (dump_ctx && dump_ctx->enabled) {
+        auto dir = ensure_dump_dir(*dump_ctx, "prompt_context_" + tag);
+        DumpContext local{true, dir};
+        dump_f32_vector(local, "cap_feats_padded", cap_feats_padded, {1, cap_len_padded, hidden});
+        dump_tensor(local, "cap_mask", ctx.cap_mask);
+        dump_tensor(local, "cap_rope_cos", ctx.cap_rope_cos);
+        dump_tensor(local, "cap_rope_sin", ctx.cap_rope_sin);
+        dump_tensor(local, "x_rope_cos", ctx.x_rope_cos);
+        dump_tensor(local, "x_rope_sin", ctx.x_rope_sin);
+    }
     return ctx;
 }
 
@@ -707,7 +942,8 @@ double elapsed_ms(const std::chrono::steady_clock::time_point& start,
 int main(int argc, char* argv[]) try {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <PROMPT> [OUTPUT_BMP] [DEVICE] [HEIGHT] [WIDTH] [STEPS] [SEED] [GUIDANCE]\n";
+                  << " <MODEL_DIR> <PROMPT> [OUTPUT_BMP] [DEVICE] [HEIGHT] [WIDTH] [STEPS] [SEED] [GUIDANCE]"
+                  << " [DUMP_DIR|none]\n";
         return 1;
     }
 
@@ -720,7 +956,15 @@ int main(int argc, char* argv[]) try {
     const int32_t steps = (argc > 7) ? std::stoi(argv[7]) : 8;
     const int32_t seed_arg = (argc > 8) ? std::stoi(argv[8]) : 0;
     const float guidance_scale = (argc > 9) ? std::stof(argv[9]) : 0.0f;
+    const std::string dump_dir_arg = (argc > 10) ? argv[10] : "zimage_dump";
     const float cfg_truncation = 1.0f;
+
+    DumpContext dump;
+    dump.enabled = !dump_dir_arg.empty() && dump_dir_arg != "none";
+    if (dump.enabled) {
+        dump.dir = std::filesystem::path(dump_dir_arg);
+        std::filesystem::create_directories(dump.dir);
+    }
 
     const std::filesystem::path text_dir = model_dir / "text_encoder";
     const std::filesystem::path dit_dir = model_dir / "transformer";
@@ -788,18 +1032,43 @@ int main(int argc, char* argv[]) try {
     auto vae_model = ov::genai::modeling::models::create_zimage_vae_decoder_model(vae_cfg, vae_source, vae_finalizer);
 
     ov::Core core;
-    auto compiled_text = core.compile_model(text_model, device);
-    auto compiled_dit = core.compile_model(dit_model, device);
-    auto compiled_vae = core.compile_model(vae_model, device);
+    ov::AnyMap compile_props;
+    if (device.find("GPU") != std::string::npos) {
+        compile_props[ov::hint::inference_precision.name()] = ov::element::f32;
+    }
+    auto compiled_text = compile_props.empty()
+                             ? core.compile_model(text_model, device)
+                             : core.compile_model(text_model, device, compile_props);
+    auto compiled_dit = compile_props.empty()
+                            ? core.compile_model(dit_model, device)
+                            : core.compile_model(dit_model, device, compile_props);
+    auto compiled_vae = compile_props.empty()
+                            ? core.compile_model(vae_model, device)
+                            : core.compile_model(vae_model, device, compile_props);
 
     auto prompt_start = std::chrono::steady_clock::now();
     PromptContext pos_ctx =
-        build_prompt_context(prompt, tokenizer, compiled_text, dit_cfg.cap_feat_dim, rope_cfg, image_meta, kDefaultMaxSeqLen);
+        build_prompt_context(prompt,
+                             tokenizer,
+                             compiled_text,
+                             dit_cfg.cap_feat_dim,
+                             rope_cfg,
+                             image_meta,
+                             kDefaultMaxSeqLen,
+                             &dump,
+                             "pos");
     PromptContext neg_ctx;
     const bool do_cfg = guidance_scale > 1.0f;
     if (do_cfg) {
-        neg_ctx = build_prompt_context("", tokenizer, compiled_text, dit_cfg.cap_feat_dim, rope_cfg, image_meta,
-                                       kDefaultMaxSeqLen);
+        neg_ctx = build_prompt_context("",
+                                       tokenizer,
+                                       compiled_text,
+                                       dit_cfg.cap_feat_dim,
+                                       rope_cfg,
+                                       image_meta,
+                                       kDefaultMaxSeqLen,
+                                       &dump,
+                                       "neg");
     }
     auto prompt_end = std::chrono::steady_clock::now();
 
@@ -808,6 +1077,9 @@ int main(int argc, char* argv[]) try {
         x_mask_vec[i] = 1;
     }
     ov::Tensor x_mask = make_bool_tensor(x_mask_vec, {1, image_meta.padded_len});
+    if (dump.enabled) {
+        dump_tensor(dump, "x_mask", x_mask);
+    }
 
     std::mt19937 rng(seed_arg < 0 ? std::random_device{}() : static_cast<uint32_t>(seed_arg));
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -815,6 +1087,15 @@ int main(int argc, char* argv[]) try {
         static_cast<size_t>(dit_cfg.in_channels) * image_meta.frames * height_latent * width_latent);
     for (auto& v : latents) {
         v = dist(rng);
+    }
+    if (dump.enabled) {
+        dump_f32_vector(dump,
+                        "latents_init",
+                        latents,
+                        {1,
+                         static_cast<size_t>(dit_cfg.in_channels),
+                         static_cast<size_t>(height_latent),
+                         static_cast<size_t>(width_latent)});
     }
 
     ov::Tensor x_tokens_tensor(ov::element::f32, {1, image_meta.padded_len, static_cast<size_t>(image_meta.patch_dim)});
@@ -853,8 +1134,8 @@ int main(int argc, char* argv[]) try {
         dit_request.infer();
 
         ov::Tensor output = dit_request.get_output_tensor();
-        const auto* out_data = output.data<const float>();
-        unpatchify_tokens(out_data, image_meta, model_out_latents);
+        auto out_data = tensor_to_float_vector(output);
+        unpatchify_tokens(out_data.data(), image_meta, model_out_latents);
         noise_pred.resize(model_out_latents.size());
         for (size_t j = 0; j < model_out_latents.size(); ++j) {
             noise_pred[j] = -model_out_latents[j];
@@ -874,8 +1155,8 @@ int main(int argc, char* argv[]) try {
             dit_request.set_tensor("cap_rope_sin", neg_ctx.cap_rope_sin);
             dit_request.infer();
             ov::Tensor neg_output = dit_request.get_output_tensor();
-            const auto* neg_data = neg_output.data<const float>();
-            unpatchify_tokens(neg_data, image_meta, model_out_latents);
+            auto neg_data = tensor_to_float_vector(neg_output);
+            unpatchify_tokens(neg_data.data(), image_meta, model_out_latents);
             noise_pred_neg.resize(model_out_latents.size());
             for (size_t j = 0; j < model_out_latents.size(); ++j) {
                 noise_pred_neg[j] = -model_out_latents[j];
@@ -892,12 +1173,72 @@ int main(int argc, char* argv[]) try {
         for (size_t j = 0; j < latents.size(); ++j) {
             latents[j] += dt * noise_pred[j];
         }
+
+        if (dump.enabled) {
+            std::ostringstream step_name;
+            step_name << "denoise_step_" << std::setw(2) << std::setfill('0') << i;
+            auto step_dir = ensure_dump_dir(dump, step_name.str());
+            DumpContext step_dump{true, step_dir};
+
+            nlohmann::json step_meta;
+            step_meta["step"] = i;
+            step_meta["t"] = t;
+            step_meta["t_norm"] = t_norm;
+            step_meta["sigma"] = sigma;
+            step_meta["sigma_next"] = sigma_next;
+            step_meta["dt"] = dt;
+            write_json_file(step_dir / "meta.json", step_meta);
+
+            dump_f32_vector(step_dump,
+                            "latents",
+                            latents,
+                            {1,
+                             static_cast<size_t>(dit_cfg.in_channels),
+                             static_cast<size_t>(height_latent),
+                             static_cast<size_t>(width_latent)});
+            dump_f32_vector(step_dump,
+                            "x_tokens",
+                            x_tokens,
+                            {1, image_meta.padded_len, static_cast<size_t>(image_meta.patch_dim)});
+            dump_f32_vector(step_dump,
+                            "model_out_latents",
+                            model_out_latents,
+                            {1,
+                             static_cast<size_t>(dit_cfg.in_channels),
+                             static_cast<size_t>(height_latent),
+                             static_cast<size_t>(width_latent)});
+            dump_f32_vector(step_dump,
+                            "noise_pred",
+                            noise_pred,
+                            {1,
+                             static_cast<size_t>(dit_cfg.in_channels),
+                             static_cast<size_t>(height_latent),
+                             static_cast<size_t>(width_latent)});
+            if (do_cfg && current_guidance > 0.0f) {
+                dump_f32_vector(step_dump,
+                                "noise_pred_neg",
+                                noise_pred_neg,
+                                {1,
+                                 static_cast<size_t>(dit_cfg.in_channels),
+                                 static_cast<size_t>(height_latent),
+                                 static_cast<size_t>(width_latent)});
+            }
+        }
     }
     auto denoise_end = std::chrono::steady_clock::now();
 
     std::vector<float> scaled_latents(latents.size());
     for (size_t i = 0; i < latents.size(); ++i) {
         scaled_latents[i] = latents[i] / vae_cfg.scaling_factor + vae_cfg.shift_factor;
+    }
+    if (dump.enabled) {
+        dump_f32_vector(dump,
+                        "scaled_latents",
+                        scaled_latents,
+                        {1,
+                         static_cast<size_t>(vae_cfg.latent_channels),
+                         static_cast<size_t>(height_latent),
+                         static_cast<size_t>(width_latent)});
     }
 
     ov::Tensor latents_tensor(ov::element::f32,
@@ -914,6 +1255,9 @@ int main(int argc, char* argv[]) try {
     auto vae_end = std::chrono::steady_clock::now();
 
     ov::Tensor image = vae_request.get_tensor("sample");
+    if (dump.enabled) {
+        dump_tensor(dump, "vae_output", image);
+    }
     const auto image_shape = image.get_shape();
     if (image_shape.size() != 4 || image_shape[1] != 3) {
         throw std::runtime_error("VAE output must have shape [B, 3, H, W]");
@@ -924,7 +1268,8 @@ int main(int argc, char* argv[]) try {
 
     ov::Tensor image_u8(ov::element::u8, {batch, out_h, out_w, 3});
     auto* dst = image_u8.data<uint8_t>();
-    const float* src = image.data<const float>();
+    auto image_data = tensor_to_float_vector(image);
+    const float* src = image_data.data();
     const size_t hw = out_h * out_w;
     for (size_t b = 0; b < batch; ++b) {
         const float* base = src + b * 3 * hw;
@@ -940,6 +1285,9 @@ int main(int argc, char* argv[]) try {
                 }
             }
         }
+    }
+    if (dump.enabled) {
+        dump_tensor(dump, "image_u8", image_u8);
     }
 
     imwrite(output_path, image_u8, false);
