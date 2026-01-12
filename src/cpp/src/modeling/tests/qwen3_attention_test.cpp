@@ -21,10 +21,10 @@ TEST(Qwen3Attention, MatchesReference) {
 
     const size_t batch = 1;
     const size_t seq_len = 2;
-    const size_t hidden = 4;
-    const size_t num_heads = 2;
+    const size_t hidden = 64;
+    const size_t num_heads = 4;
     const size_t num_kv_heads = 1;
-    const size_t head_dim = 2;
+    const size_t head_dim = 16;
     const float rope_theta = 10000.0f;
     const size_t kv_hidden = num_kv_heads * head_dim;
 
@@ -84,10 +84,7 @@ TEST(Qwen3Attention, MatchesReference) {
     auto compiled = core.compile_model(ov_model, "GPU");
     auto request = compiled.create_infer_request();
 
-    const std::vector<float> hidden_data = {
-        0.1f, 0.2f, 0.3f, 0.4f,
-        0.5f, 0.6f, 0.7f, 0.8f,
-    };
+    const std::vector<float> hidden_data = test_utils::make_seq(batch * seq_len * hidden, 0.01f, 0.01f);
     const std::vector<int64_t> position_ids = {0, 1};
 
     ov::Tensor hidden_tensor(ov::element::f32, {batch, seq_len, hidden});
