@@ -956,7 +956,7 @@ int main(int argc, char* argv[]) try {
     const int32_t steps = (argc > 7) ? std::stoi(argv[7]) : 8;
     const int32_t seed_arg = (argc > 8) ? std::stoi(argv[8]) : 0;
     const float guidance_scale = (argc > 9) ? std::stof(argv[9]) : 0.0f;
-    const std::string dump_dir_arg = (argc > 10) ? argv[10] : "zimage_dump";
+    const std::string dump_dir_arg = (argc > 10) ? argv[10] : "";
     const float cfg_truncation = 1.0f;
 
     DumpContext dump;
