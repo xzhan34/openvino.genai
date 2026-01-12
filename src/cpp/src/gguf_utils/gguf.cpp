@@ -195,6 +195,8 @@ void gguf_load_moe_weights(std::unordered_map<std::string, ov::Tensor>& a,
         }
     });
 
+    free(weights_f32);
+
     a.emplace(name, std::move(weights));
 
     auto check_insert = [](const auto& inserted) {
