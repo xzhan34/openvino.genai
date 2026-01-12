@@ -12,6 +12,11 @@
 #include "openvino/genai/visibility.hpp"
 #include "openvino/openvino.hpp"
 
+// Forward declare safetensors_t to avoid including the large header
+namespace safetensors {
+struct safetensors_t;
+}
+
 namespace ov {
 namespace genai {
 namespace safetensors {
@@ -28,12 +33,82 @@ struct OPENVINO_GENAI_EXPORTS TensorInfo {
 };
 
 /**
- * @brief Result of loading safetensors files
+ * @brief Holder for mmap'ed safetensors file
+ * 
+ * This class owns the mmap lifetime. When destroyed, it will unmap the file.
+ * Multiple tensors can reference the same MmapHolder through shared_ptr,
+ * ensuring the mmap stays valid as long as any tensor needs it.
+ */
+class OPENVINO_GENAI_EXPORTS MmapHolder {
+public:
+    MmapHolder();
+    ~MmapHolder();
+    
+    // Non-copyable
+    MmapHolder(const MmapHolder&) = delete;
+    MmapHolder& operator=(const MmapHolder&) = delete;
+    
+    // Movable
+    MmapHolder(MmapHolder&& other) noexcept;
+    MmapHolder& operator=(MmapHolder&& other) noexcept;
+    
+    /**
+     * @brief Load safetensors file via mmap
+     * @param file_path Path to .safetensors file
+     * @throws std::runtime_error on failure
+     */
+    void load(const std::filesystem::path& file_path);
+    
+    /**
+     * @brief Check if loaded successfully
+     */
+    bool is_valid() const { return m_valid; }
+    
+    /**
+     * @brief Get the data buffer address (start of tensor data)
+     */
+    const uint8_t* data_buffer() const { return m_data_buffer; }
+    
+    /**
+     * @brief Get safetensors_t reference for tensor iteration
+     */
+    const ::safetensors::safetensors_t& get_st() const;
+    
+private:
+    std::unique_ptr<::safetensors::safetensors_t> m_st;
+    const uint8_t* m_data_buffer = nullptr;  // Points into mmap
+    bool m_valid = false;
+};
+
+/**
+ * @brief Mmap info for a single tensor
+ */
+struct OPENVINO_GENAI_EXPORTS TensorMmapInfo {
+    std::shared_ptr<MmapHolder> holder;  // Keeps mmap alive
+    size_t offset;                        // Offset from data_buffer
+    size_t size;                          // Size in bytes
+};
+
+/**
+ * @brief Result of loading safetensors files (Zero-Copy version)
+ * 
+ * This structure holds references to mmap'ed data instead of copying tensors.
+ * The mmap is kept alive by shared_ptr<MmapHolder> in tensor_mmap_info.
  */
 struct OPENVINO_GENAI_EXPORTS SafetensorsData {
-    std::unordered_map<std::string, ov::Tensor> tensors;
+    // Zero-copy: Only store tensor metadata, not actual tensor data
     std::unordered_map<std::string, TensorInfo> tensor_infos;
     std::map<std::string, std::string> metadata;
+    
+    // Mmap holders - keeps mmap files alive
+    std::vector<std::shared_ptr<MmapHolder>> mmap_holders;
+    
+    // Tensor name -> mmap info (for zero-copy access)
+    std::unordered_map<std::string, TensorMmapInfo> tensor_mmap_info;
+    
+    // Legacy: tensor data (only populated when using legacy API)
+    // Will be empty when using zero-copy mode
+    std::unordered_map<std::string, ov::Tensor> tensors;
 };
 
 /**
@@ -45,24 +120,27 @@ struct OPENVINO_GENAI_EXPORTS SafetensorsData {
 OPENVINO_GENAI_EXPORTS bool is_safetensors_model(const std::filesystem::path& model_dir);
 
 /**
- * @brief Load all safetensors files from a HuggingFace model directory
+ * @brief Load all safetensors files from a HuggingFace model directory (Zero-Copy)
  * 
  * This function:
  * 1. Reads model.safetensors.index.json to find all shard files
  * 2. Loads each shard file using mmap for efficiency
- * 3. Converts tensors to ov::Tensor format
+ * 3. Stores tensor metadata WITHOUT copying data (zero-copy)
+ * 
+ * Use SafetensorsWeightSource::get_shared_buffer() to create SharedBuffer
+ * for ov::Constant construction.
  * 
  * @param model_dir Path to the model directory
- * @return SafetensorsData containing all loaded tensors
+ * @return SafetensorsData containing tensor metadata and mmap holders
  * @throws std::runtime_error if loading fails
  */
 OPENVINO_GENAI_EXPORTS SafetensorsData load_safetensors(const std::filesystem::path& model_dir);
 
 /**
- * @brief Load a single safetensors file
+ * @brief Load a single safetensors file (Zero-Copy)
  * 
  * @param file_path Path to the .safetensors file
- * @return SafetensorsData containing loaded tensors
+ * @return SafetensorsData containing tensor metadata
  */
 OPENVINO_GENAI_EXPORTS SafetensorsData load_safetensors_file(const std::filesystem::path& file_path);
 

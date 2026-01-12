@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
+#include "safetensors_utils/safetensors_weight_source.hpp"
 
 #include <openvino/core/except.hpp>
 #include <openvino/op/constant.hpp>
@@ -27,19 +28,34 @@ ov::genai::modeling::Tensor SafetensorsWeightFinalizer::finalize(
         return ov::genai::modeling::Tensor(it_cached->second, &ctx);
     }
 
-    // Get the tensor from source
-    const ov::Tensor& tensor = source.get_tensor(name);
-
-    // Create a constant node from the tensor
-    auto constant = std::make_shared<ov::op::v0::Constant>(tensor);
+    std::shared_ptr<ov::op::v0::Constant> constant;
+    ov::element::Type element_type;
+    
+    // Try zero-copy path first
+    auto* st_source = dynamic_cast<SafetensorsWeightSource*>(&source);
+    if (st_source && st_source->is_zero_copy_mode()) {
+        // Zero-copy: use SharedBuffer directly
+        const auto& info = st_source->get_info(name);
+        auto shared_buffer = st_source->get_shared_buffer(name);
+        
+        constant = std::make_shared<ov::op::v0::Constant>(
+            info.dtype, info.shape, shared_buffer);
+        element_type = info.dtype;
+    } else {
+        // Legacy path: copy from tensor
+        const ov::Tensor& tensor = source.get_tensor(name);
+        constant = std::make_shared<ov::op::v0::Constant>(tensor);
+        element_type = tensor.get_element_type();
+    }
+    
     constant->set_friendly_name(name);
     constant->output(0).set_names({name});
 
     // Convert to F32 if needed (matching GGUF behavior)
     // This ensures consistency with how GGUF weights are processed
     ov::Output<ov::Node> output;
-    if (tensor.get_element_type() == ov::element::bf16 || 
-        tensor.get_element_type() == ov::element::f16) {
+    if (element_type == ov::element::bf16 || 
+        element_type == ov::element::f16) {
         auto converted = std::make_shared<ov::op::v0::Convert>(constant, ov::element::f32);
         output = converted->output(0);
     } else {

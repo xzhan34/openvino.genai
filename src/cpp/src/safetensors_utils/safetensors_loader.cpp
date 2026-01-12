@@ -18,6 +18,68 @@ namespace ov {
 namespace genai {
 namespace safetensors {
 
+// =============================================================================
+// MmapHolder Implementation
+// =============================================================================
+
+MmapHolder::MmapHolder() = default;
+
+MmapHolder::~MmapHolder() = default;
+
+MmapHolder::MmapHolder(MmapHolder&& other) noexcept
+    : m_st(std::move(other.m_st))
+    , m_data_buffer(other.m_data_buffer)
+    , m_valid(other.m_valid) {
+    other.m_data_buffer = nullptr;
+    other.m_valid = false;
+}
+
+MmapHolder& MmapHolder::operator=(MmapHolder&& other) noexcept {
+    if (this != &other) {
+        m_st = std::move(other.m_st);
+        m_data_buffer = other.m_data_buffer;
+        m_valid = other.m_valid;
+        other.m_data_buffer = nullptr;
+        other.m_valid = false;
+    }
+    return *this;
+}
+
+void MmapHolder::load(const std::filesystem::path& file_path) {
+    m_st = std::make_unique<::safetensors::safetensors_t>();
+    std::string warn, err;
+    
+    bool success = ::safetensors::mmap_from_file(file_path.string(), m_st.get(), &warn, &err);
+    
+    if (!success) {
+        throw std::runtime_error("Failed to mmap safetensors file: " + file_path.string() + 
+                                 ", error: " + err);
+    }
+    
+    if (!warn.empty()) {
+        std::cerr << "Warning loading " << file_path << ": " << warn << std::endl;
+    }
+    
+    // Validate data offsets
+    if (!::safetensors::validate_data_offsets(*m_st, err)) {
+        throw std::runtime_error("Invalid data offsets in " + file_path.string() + ": " + err);
+    }
+    
+    m_data_buffer = m_st->databuffer_addr;
+    m_valid = true;
+}
+
+const ::safetensors::safetensors_t& MmapHolder::get_st() const {
+    if (!m_valid || !m_st) {
+        throw std::runtime_error("MmapHolder not loaded");
+    }
+    return *m_st;
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
 namespace {
 
 // Parse model.safetensors.index.json to get shard file list
@@ -105,27 +167,16 @@ bool is_safetensors_model(const std::filesystem::path& model_dir) {
 SafetensorsData load_safetensors_file(const std::filesystem::path& file_path) {
     SafetensorsData result;
     
-    ::safetensors::safetensors_t st;
-    std::string warn, err;
+    // Create mmap holder
+    auto holder = std::make_shared<MmapHolder>();
+    holder->load(file_path);
     
-    // Use mmap for efficient loading
-    bool success = ::safetensors::mmap_from_file(file_path.string(), &st, &warn, &err);
+    // Keep holder alive
+    result.mmap_holders.push_back(holder);
     
-    if (!success) {
-        throw std::runtime_error("Failed to load safetensors file: " + file_path.string() + 
-                                 ", error: " + err);
-    }
+    const auto& st = holder->get_st();
     
-    if (!warn.empty()) {
-        std::cerr << "Warning loading " << file_path << ": " << warn << std::endl;
-    }
-    
-    // Validate data offsets
-    if (!::safetensors::validate_data_offsets(st, err)) {
-        throw std::runtime_error("Invalid data offsets in " + file_path.string() + ": " + err);
-    }
-    
-    // Convert tensors to ov::Tensor
+    // Process tensors - store metadata only, no memcpy!
     const auto& keys = st.tensors.keys();
     for (size_t i = 0; i < keys.size(); i++) {
         const std::string& name = keys[i];
@@ -135,34 +186,27 @@ SafetensorsData load_safetensors_file(const std::filesystem::path& file_path) {
             continue;
         }
         
-        // Convert dtype
-        ov::element::Type ov_dtype = convert_dtype(static_cast<int>(tensor.dtype));
-        
-        // Convert shape
-        ov::Shape ov_shape(tensor.shape.begin(), tensor.shape.end());
-        
-        // Calculate data pointer
-        const uint8_t* data_ptr = st.databuffer_addr + tensor.data_offsets[0];
-        size_t data_size = tensor.data_offsets[1] - tensor.data_offsets[0];
-        
-        // Create ov::Tensor
-        // Note: We need to copy data since mmap will be released
-        ov::Tensor ov_tensor(ov_dtype, ov_shape);
-        std::memcpy(ov_tensor.data(), data_ptr, data_size);
-        
-        result.tensors[name] = std::move(ov_tensor);
-        
-        // Store tensor info
+        // Store tensor info (metadata only)
         TensorInfo info;
         info.name = name;
-        info.dtype = ov_dtype;
-        info.shape = ov_shape;
+        info.dtype = convert_dtype(static_cast<int>(tensor.dtype));
+        info.shape = ov::Shape(tensor.shape.begin(), tensor.shape.end());
         info.data_offset_start = tensor.data_offsets[0];
         info.data_offset_end = tensor.data_offsets[1];
         result.tensor_infos[name] = info;
+        
+        // Store mmap info for zero-copy access
+        TensorMmapInfo mmap_info;
+        mmap_info.holder = holder;
+        mmap_info.offset = tensor.data_offsets[0];
+        mmap_info.size = tensor.data_offsets[1] - tensor.data_offsets[0];
+        result.tensor_mmap_info[name] = mmap_info;
+        
+        // Note: We do NOT create ov::Tensor here - zero copy!
+        // Tensor data will be accessed via get_shared_buffer() in SafetensorsWeightSource
     }
     
-    // Copy metadata
+    // Copy metadata (small strings, not a concern)
     const auto& meta_keys = st.metadata.keys();
     for (size_t i = 0; i < meta_keys.size(); i++) {
         const std::string& key = meta_keys[i];
@@ -209,23 +253,28 @@ SafetensorsData load_safetensors(const std::filesystem::path& model_dir) {
     // Sort files for deterministic loading order
     std::sort(files_to_load.begin(), files_to_load.end());
     
-    std::cout << "[Safetensors] Loading " << files_to_load.size() << " file(s)..." << std::endl;
+    std::cout << "[Safetensors Zero-Copy] Loading " << files_to_load.size() << " file(s)..." << std::endl;
     
-    // Load each file
+    // Load each file (zero-copy mode)
     for (const auto& file_path : files_to_load) {
-        std::cout << "[Safetensors] Loading " << file_path.filename() << "..." << std::endl;
+        std::cout << "[Safetensors Zero-Copy] Mapping " << file_path.filename() << "..." << std::endl;
         
         SafetensorsData file_data = load_safetensors_file(file_path);
         
-        // Merge tensors
-        for (auto& [name, tensor] : file_data.tensors) {
-            if (result.tensors.count(name)) {
-                std::cerr << "Warning: Duplicate tensor name: " << name << std::endl;
-            }
-            result.tensors[name] = std::move(tensor);
+        // Merge mmap holders (keeps mmap alive)
+        for (auto& holder : file_data.mmap_holders) {
+            result.mmap_holders.push_back(std::move(holder));
         }
         
-        // Merge tensor infos
+        // Merge tensor mmap info (zero-copy references)
+        for (auto& [name, mmap_info] : file_data.tensor_mmap_info) {
+            if (result.tensor_mmap_info.count(name)) {
+                std::cerr << "Warning: Duplicate tensor name: " << name << std::endl;
+            }
+            result.tensor_mmap_info[name] = std::move(mmap_info);
+        }
+        
+        // Merge tensor infos (metadata only)
         for (auto& [name, info] : file_data.tensor_infos) {
             result.tensor_infos[name] = std::move(info);
         }
@@ -238,7 +287,8 @@ SafetensorsData load_safetensors(const std::filesystem::path& model_dir) {
         }
     }
     
-    std::cout << "[Safetensors] Loaded " << result.tensors.size() << " tensors" << std::endl;
+    std::cout << "[Safetensors Zero-Copy] Mapped " << result.tensor_infos.size() 
+              << " tensors (no memory copy)" << std::endl;
     
     return result;
 }
