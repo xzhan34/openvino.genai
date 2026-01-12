@@ -3,8 +3,13 @@
 
 #include "modeling/tests/test_utils.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <numeric>
+#include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -211,6 +216,236 @@ std::vector<float> mlp_ref(const std::vector<float>& x,
     auto up = linear_ref_3d(x, up_w, batch, seq_len, hidden, intermediate);
     auto gated = mul_ref(silu_ref(gate), up);
     return linear_ref_3d(gated, down_w, batch, seq_len, intermediate, hidden);
+}
+
+std::vector<float> random_f32(size_t count, float low, float high, uint32_t seed) {
+    std::vector<float> data(count);
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dist(low, high);
+    std::generate(data.begin(), data.end(), [&]() { return dist(gen); });
+    return data;
+}
+
+namespace {
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+float swish(float x) {
+    return x * sigmoid(x);
+}
+
+void topk_softmax(const float* logits,
+                  size_t num_experts,
+                  size_t top_k,
+                  std::vector<size_t>& indices,
+                  std::vector<float>& weights) {
+    indices.resize(top_k);
+    weights.resize(top_k);
+    std::vector<size_t> order(num_experts);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                      [&](size_t a, size_t b) { return logits[a] > logits[b]; });
+
+    float max_v = logits[order[0]];
+    for (size_t i = 1; i < top_k; ++i) {
+        max_v = std::max(max_v, logits[order[i]]);
+    }
+    float sum = 0.0f;
+    for (size_t i = 0; i < top_k; ++i) {
+        const float v = std::exp(logits[order[i]] - max_v);
+        weights[i] = v;
+        sum += v;
+    }
+    for (size_t i = 0; i < top_k; ++i) {
+        weights[i] /= sum;
+        indices[i] = order[i];
+    }
+}
+
+void set_u4(uint8_t* packed, size_t idx, uint8_t v) {
+    const size_t byte_idx = idx / 2;
+    const uint8_t val = static_cast<uint8_t>(v & 0x0F);
+    if ((idx & 1) == 0) {
+        packed[byte_idx] = static_cast<uint8_t>((packed[byte_idx] & 0xF0) | val);
+    } else {
+        packed[byte_idx] = static_cast<uint8_t>((packed[byte_idx] & 0x0F) | (val << 4));
+    }
+}
+
+uint8_t get_u4(const uint8_t* packed, size_t idx) {
+    const size_t byte_idx = idx / 2;
+    const uint8_t byte_val = packed[byte_idx];
+    return (idx & 1) == 0 ? (byte_val & 0x0F) : (byte_val >> 4);
+}
+
+}  // namespace
+
+Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
+                          size_t num_experts,
+                          size_t n,
+                          size_t k,
+                          size_t group_size) {
+    Q41Quantized q;
+    q.group_size = group_size;
+    q.k = k;
+    q.group_num = k / group_size;
+
+    ov::Shape weights_shape{num_experts, n, k};
+    ov::Tensor weights(ov::element::u4, weights_shape);
+    auto weights_ptr = static_cast<uint8_t*>(weights.data());
+    std::memset(weights_ptr, 0, weights.get_byte_size());
+
+    ov::Shape scale_zp_shape{num_experts, q.group_num, n};
+    ov::Tensor scales(ov::element::f16, scale_zp_shape);
+    ov::Tensor zps(ov::element::u4, scale_zp_shape);
+
+    auto scales_ptr = scales.data<ov::float16>();
+    auto zps_ptr = static_cast<uint8_t*>(zps.data());
+    std::memset(zps_ptr, 0, zps.get_byte_size());
+
+    for (size_t e = 0; e < num_experts; ++e) {
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t g = 0; g < q.group_num; ++g) {
+                const size_t start_idx = ((e * n + row) * k) + g * group_size;
+                float min_v = std::numeric_limits<float>::max();
+                float max_v = std::numeric_limits<float>::lowest();
+                for (size_t i = 0; i < group_size; ++i) {
+                    const float v = weights_f32[start_idx + i];
+                    min_v = std::min(min_v, v);
+                    max_v = std::max(max_v, v);
+                }
+
+                const float d = (max_v - min_v) / 15.0f;
+                const float inv = d ? 1.0f / d : 0.0f;
+                int zp = 0;
+                if (d != 0.0f) {
+                    zp = static_cast<int>(std::round(-min_v / d));
+                }
+                zp = std::max(0, std::min(15, zp));
+
+                const size_t scale_idx = (e * q.group_num + g) * n + row;
+                scales_ptr[scale_idx] = ov::float16(d);
+                set_u4(zps_ptr, scale_idx, static_cast<uint8_t>(zp));
+
+                for (size_t i = 0; i < group_size; ++i) {
+                    float q_f = (weights_f32[start_idx + i] - min_v) * inv;
+                    int q_i = static_cast<int>(std::round(q_f));
+                    q_i = std::max(0, std::min(15, q_i));
+                    set_u4(weights_ptr, start_idx + i, static_cast<uint8_t>(q_i));
+                }
+            }
+        }
+    }
+
+    q.weights_u4 = weights;
+    q.scales_f16 = scales;
+    q.zps_u4 = zps;
+
+    q.weights_packed.resize(weights.get_byte_size());
+    std::memcpy(q.weights_packed.data(), weights.data(), q.weights_packed.size());
+
+    q.zps_packed.resize(zps.get_byte_size());
+    std::memcpy(q.zps_packed.data(), zps.data(), q.zps_packed.size());
+
+    q.scales.resize(scales.get_size());
+    std::memcpy(q.scales.data(), scales.data<ov::float16>(), q.scales.size() * sizeof(ov::float16));
+
+    return q;
+}
+
+std::vector<float> dequantize_q41(const Q41Quantized& q,
+                                  size_t num_experts,
+                                  size_t n,
+                                  size_t k) {
+    std::vector<float> deq(num_experts * n * k, 0.0f);
+    const uint8_t* weights_packed = q.weights_packed.data();
+    const uint8_t* zps_packed = q.zps_packed.data();
+
+    for (size_t e = 0; e < num_experts; ++e) {
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t g = 0; g < q.group_num; ++g) {
+                const size_t scale_idx = (e * q.group_num + g) * n + row;
+                const float scale = static_cast<float>(q.scales[scale_idx]);
+                const int zp = static_cast<int>(get_u4(zps_packed, scale_idx));
+                for (size_t kk = 0; kk < q.group_size; ++kk) {
+                    const size_t w_idx = ((e * n + row) * q.group_num + g) * q.group_size + kk;
+                    const int qv = static_cast<int>(get_u4(weights_packed, w_idx));
+                    const float v = (static_cast<float>(qv - zp)) * scale;
+                    const size_t out_idx = ((e * n + row) * k) + g * q.group_size + kk;
+                    deq[out_idx] = v;
+                }
+            }
+        }
+    }
+    return deq;
+}
+
+std::vector<float> moe_ref(const std::vector<float>& hidden_states,
+                           const std::vector<float>& gate_inp,
+                           const std::vector<float>& gate_w,
+                           const std::vector<float>& up_w,
+                           const std::vector<float>& down_w,
+                           size_t batch,
+                           size_t seq_len,
+                           size_t hidden_size,
+                           size_t inter_size,
+                           size_t num_experts,
+                           size_t top_k) {
+    const size_t tokens = batch * seq_len;
+    std::vector<float> output(tokens * hidden_size, 0.0f);
+    std::vector<size_t> topk_idx;
+    std::vector<float> topk_w;
+    std::vector<float> logits(num_experts, 0.0f);
+
+    for (size_t t = 0; t < tokens; ++t) {
+        const float* x = &hidden_states[t * hidden_size];
+        for (size_t e = 0; e < num_experts; ++e) {
+            float acc = 0.0f;
+            const size_t base = e * hidden_size;
+            for (size_t h = 0; h < hidden_size; ++h) {
+                acc += x[h] * gate_inp[base + h];
+            }
+            logits[e] = acc;
+        }
+        topk_softmax(logits.data(), num_experts, top_k, topk_idx, topk_w);
+
+        for (size_t k = 0; k < top_k; ++k) {
+            const size_t e = topk_idx[k];
+            const float w = topk_w[k];
+
+            std::vector<float> gate(inter_size, 0.0f);
+            std::vector<float> up(inter_size, 0.0f);
+            for (size_t i = 0; i < inter_size; ++i) {
+                float acc_g = 0.0f;
+                float acc_u = 0.0f;
+                const size_t base = (e * inter_size + i) * hidden_size;
+                for (size_t h = 0; h < hidden_size; ++h) {
+                    acc_g += x[h] * gate_w[base + h];
+                    acc_u += x[h] * up_w[base + h];
+                }
+                gate[i] = swish(acc_g);
+                up[i] = acc_u;
+            }
+
+            std::vector<float> hidden(inter_size, 0.0f);
+            for (size_t i = 0; i < inter_size; ++i) {
+                hidden[i] = gate[i] * up[i];
+            }
+
+            float* out = &output[t * hidden_size];
+            for (size_t h = 0; h < hidden_size; ++h) {
+                float acc = 0.0f;
+                const size_t base = (e * hidden_size + h) * inter_size;
+                for (size_t i = 0; i < inter_size; ++i) {
+                    acc += hidden[i] * down_w[base + i];
+                }
+                out[h] += w * acc;
+            }
+        }
+    }
+    return output;
 }
 
 std::vector<float> to_heads_ref(const std::vector<float>& x,

@@ -226,3 +226,92 @@ TEST(Ops, Rms) {
     auto expected = test_utils::rms_ref(x_data, w_data, 2, 3, eps);
     test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
+
+TEST(Ops, Moe3GemmFusedCompressed) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    constexpr size_t batch = 1;
+    constexpr size_t seq_len = 2;
+    constexpr size_t hidden_size = 128;
+    constexpr size_t inter_size = 256;
+    constexpr size_t num_experts = 8;
+    constexpr size_t top_k = 2;
+    constexpr size_t group_size = 128;
+
+    static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
+    static_assert(inter_size % group_size == 0, "inter_size must be divisible by group_size");
+
+    const size_t tokens = batch * seq_len;
+    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{tokens, hidden_size});
+
+    auto hidden_states = test_utils::random_f32(tokens * hidden_size, -0.5f, 0.5f, 11);
+    auto gate_inp = test_utils::random_f32(num_experts * hidden_size, -0.5f, 0.5f, 23);
+
+    auto gate_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 31);
+    auto up_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 37);
+    auto down_w_f32 = test_utils::random_f32(num_experts * hidden_size * inter_size, -0.5f, 0.5f, 41);
+
+    auto q_gate = test_utils::quantize_q41(gate_w_f32, num_experts, inter_size, hidden_size, group_size);
+    auto q_up = test_utils::quantize_q41(up_w_f32, num_experts, inter_size, hidden_size, group_size);
+    auto q_down = test_utils::quantize_q41(down_w_f32, num_experts, hidden_size, inter_size, group_size);
+
+    auto gate_w_deq = test_utils::dequantize_q41(q_gate, num_experts, inter_size, hidden_size);
+    auto up_w_deq = test_utils::dequantize_q41(q_up, num_experts, inter_size, hidden_size);
+    auto down_w_deq = test_utils::dequantize_q41(q_down, num_experts, hidden_size, inter_size);
+
+    auto* op_ctx = &ctx.op_context();
+    auto gate_inp_tensor = test_utils::make_tensor(gate_inp, {num_experts, hidden_size});
+
+    auto gate_inp_const = ov::genai::modeling::ops::constant(gate_inp_tensor, op_ctx);
+    auto gate_exps_weight = ov::genai::modeling::ops::constant(q_gate.weights_u4, op_ctx);
+    auto gate_exps_scales = ov::genai::modeling::ops::constant(q_gate.scales_f16, op_ctx);
+    auto gate_exps_zps = ov::genai::modeling::ops::constant(q_gate.zps_u4, op_ctx);
+    auto up_exps_weight = ov::genai::modeling::ops::constant(q_up.weights_u4, op_ctx);
+    auto up_exps_scales = ov::genai::modeling::ops::constant(q_up.scales_f16, op_ctx);
+    auto up_exps_zps = ov::genai::modeling::ops::constant(q_up.zps_u4, op_ctx);
+    auto down_exps_weight = ov::genai::modeling::ops::constant(q_down.weights_u4, op_ctx);
+    auto down_exps_scales = ov::genai::modeling::ops::constant(q_down.scales_f16, op_ctx);
+    auto down_exps_zps = ov::genai::modeling::ops::constant(q_down.zps_u4, op_ctx);
+
+    auto out = ov::genai::modeling::ops::moe3gemm_fused_compressed(
+        hidden_param,
+        gate_inp_const,
+        gate_exps_weight,
+        gate_exps_scales,
+        gate_exps_zps,
+        up_exps_weight,
+        up_exps_scales,
+        up_exps_zps,
+        down_exps_weight,
+        down_exps_scales,
+        down_exps_zps,
+        static_cast<int32_t>(hidden_size),
+        static_cast<int32_t>(inter_size),
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(top_k),
+        static_cast<int32_t>(group_size),
+        ov::element::f16);
+
+    auto model = ctx.build_model({out.output()});
+
+    ov::Core core;
+    auto compiled = core.compile_model(model, "GPU");
+    auto request = compiled.create_infer_request();
+
+    auto hidden_tensor = test_utils::make_tensor(hidden_states, {tokens, hidden_size});
+    request.set_input_tensor(0, hidden_tensor);
+    request.infer();
+
+    auto expected = test_utils::moe_ref(hidden_states,
+                                        gate_inp,
+                                        gate_w_deq,
+                                        up_w_deq,
+                                        down_w_deq,
+                                        batch,
+                                        seq_len,
+                                        hidden_size,
+                                        inter_size,
+                                        num_experts,
+                                        top_k);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-1f);
+}

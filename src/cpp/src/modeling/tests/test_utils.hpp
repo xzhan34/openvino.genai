@@ -74,6 +74,38 @@ std::vector<float> mlp_ref(const std::vector<float>& x,
                            size_t seq_len,
                            size_t hidden,
                            size_t intermediate);
+std::vector<float> random_f32(size_t count, float low, float high, uint32_t seed);
+struct Q41Quantized {
+    ov::Tensor weights_u4;
+    ov::Tensor scales_f16;
+    ov::Tensor zps_u4;
+    std::vector<uint8_t> weights_packed;
+    std::vector<uint8_t> zps_packed;
+    std::vector<ov::float16> scales;
+    size_t group_num = 0;
+    size_t group_size = 0;
+    size_t k = 0;
+};
+Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
+                          size_t num_experts,
+                          size_t n,
+                          size_t k,
+                          size_t group_size);
+std::vector<float> dequantize_q41(const Q41Quantized& q,
+                                  size_t num_experts,
+                                  size_t n,
+                                  size_t k);
+std::vector<float> moe_ref(const std::vector<float>& hidden_states,
+                           const std::vector<float>& gate_inp,
+                           const std::vector<float>& gate_w,
+                           const std::vector<float>& up_w,
+                           const std::vector<float>& down_w,
+                           size_t batch,
+                           size_t seq_len,
+                           size_t hidden_size,
+                           size_t inter_size,
+                           size_t num_experts,
+                           size_t top_k);
 std::vector<float> to_heads_ref(const std::vector<float>& x,
                                 size_t batch,
                                 size_t seq_len,
