@@ -966,11 +966,13 @@ int main(int argc, char* argv[]) try {
         std::filesystem::create_directories(dump.dir);
     }
 
+    // setup huggingface safetensors model and config files path
     const std::filesystem::path text_dir = model_dir / "text_encoder";
     const std::filesystem::path dit_dir = model_dir / "transformer";
     const std::filesystem::path vae_dir = model_dir / "vae";
     const std::filesystem::path tokenizer_dir = model_dir / "tokenizer";
 
+    // read config.json files to get model config parameters
     auto text_cfg = read_qwen3_config(text_dir / "config.json");
     DiTRopeConfig rope_cfg;
     auto dit_cfg = read_dit_config(dit_dir / "config.json", rope_cfg);
@@ -1008,6 +1010,7 @@ int main(int argc, char* argv[]) try {
     FlowMatchEulerDiscreteScheduler scheduler(sched_cfg);
     scheduler.set_timesteps(steps, mu);
 
+    // initialize tokenizer (convert json to xml at first time if no xml exists)
     const bool has_ov_tokenizer = std::filesystem::exists(tokenizer_dir / "openvino_tokenizer.xml");
     const bool has_hf_tokenizer = std::filesystem::exists(tokenizer_dir / "tokenizer.json");
     if (!has_ov_tokenizer && !has_hf_tokenizer) {
@@ -1016,21 +1019,25 @@ int main(int argc, char* argv[]) try {
 
     ov::genai::Tokenizer tokenizer(tokenizer_dir);
 
+    // create text_encoder model
     auto text_data = ov::genai::safetensors::load_safetensors(text_dir);
     ov::genai::safetensors::SafetensorsWeightSource text_source(std::move(text_data));
     ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer;
     auto text_model = ov::genai::modeling::models::create_qwen3_text_encoder_model(text_cfg, text_source, text_finalizer);
 
+    // create DiT model
     auto dit_data = ov::genai::safetensors::load_safetensors(dit_dir);
     ov::genai::safetensors::SafetensorsWeightSource dit_source(std::move(dit_data));
     ov::genai::safetensors::SafetensorsWeightFinalizer dit_finalizer;
     auto dit_model = create_zimage_dit_model(dit_cfg, dit_source, dit_finalizer);
 
+    // create VAE decoder model
     auto vae_data = ov::genai::safetensors::load_safetensors(vae_dir);
     ov::genai::safetensors::SafetensorsWeightSource vae_source(std::move(vae_data));
     ov::genai::safetensors::SafetensorsWeightFinalizer vae_finalizer;
     auto vae_model = ov::genai::modeling::models::create_zimage_vae_decoder_model(vae_cfg, vae_source, vae_finalizer);
 
+    // compile the 3 models
     ov::Core core;
     ov::AnyMap compile_props;
     if (device.find("GPU") != std::string::npos) {
@@ -1046,6 +1053,7 @@ int main(int argc, char* argv[]) try {
                             ? core.compile_model(vae_model, device)
                             : core.compile_model(vae_model, device, compile_props);
 
+    // build chat template, tokenize, text encoder model inference
     auto prompt_start = std::chrono::steady_clock::now();
     PromptContext pos_ctx =
         build_prompt_context(prompt,
@@ -1105,6 +1113,8 @@ int main(int argc, char* argv[]) try {
     std::vector<float> noise_pred;
     std::vector<float> noise_pred_neg;
 
+
+    // DiT denoise loop
     auto dit_request = compiled_dit.create_infer_request();
     dit_request.set_tensor("x_mask", x_mask);
 
@@ -1117,12 +1127,14 @@ int main(int argc, char* argv[]) try {
             continue;
         }
 
+        // patchify latents: latents[16, 1, 64, 64] (C, F, H, W) -> tokens[4096, 16] (seq, patch_dim)
         patchify_latents(latents, image_meta, x_tokens);
         std::memcpy(x_tokens_tensor.data(), x_tokens.data(), x_tokens.size() * sizeof(float));
 
         const float t_norm = (1000.0f - t) / 1000.0f;
         t_tensor.data<float>()[0] = t_norm;
 
+        // DiT inference
         dit_request.set_tensor("x_tokens", x_tokens_tensor);
         dit_request.set_tensor("timesteps", t_tensor);
         dit_request.set_tensor("cap_feats", pos_ctx.cap_feats);
@@ -1133,9 +1145,12 @@ int main(int argc, char* argv[]) try {
         dit_request.set_tensor("cap_rope_sin", pos_ctx.cap_rope_sin);
         dit_request.infer();
 
+        // unpatchify tokens: tokens tokens[4096, 16] (seq, patch_dim) -> latents[16, 1, 64, 64] (C, F, H, W)
         ov::Tensor output = dit_request.get_output_tensor();
         auto out_data = tensor_to_float_vector(output);
         unpatchify_tokens(out_data.data(), image_meta, model_out_latents);
+
+        // noise prediction processing
         noise_pred.resize(model_out_latents.size());
         for (size_t j = 0; j < model_out_latents.size(); ++j) {
             noise_pred[j] = -model_out_latents[j];
@@ -1146,6 +1161,7 @@ int main(int argc, char* argv[]) try {
             current_guidance = 0.0f;
         }
 
+        // Classifier - Free Guidance(CFG)
         if (do_cfg && current_guidance > 0.0f) {
             dit_request.set_tensor("cap_feats", neg_ctx.cap_feats);
             dit_request.set_tensor("cap_mask", neg_ctx.cap_mask);
@@ -1167,6 +1183,7 @@ int main(int argc, char* argv[]) try {
             }
         }
 
+        // Euler step update latents
         const float sigma = sigmas[i];
         const float sigma_next = sigmas[i + 1];
         const float dt = sigma_next - sigma;
@@ -1248,6 +1265,7 @@ int main(int argc, char* argv[]) try {
                                static_cast<size_t>(width_latent)});
     std::memcpy(latents_tensor.data(), scaled_latents.data(), scaled_latents.size() * sizeof(float));
 
+    // VAE inference
     auto vae_request = compiled_vae.create_infer_request();
     vae_request.set_tensor("latents", latents_tensor);
     auto vae_start = std::chrono::steady_clock::now();
@@ -1266,6 +1284,7 @@ int main(int argc, char* argv[]) try {
     const size_t out_h = image_shape[2];
     const size_t out_w = image_shape[3];
 
+    // convert to RGB image
     ov::Tensor image_u8(ov::element::u8, {batch, out_h, out_w, 3});
     auto* dst = image_u8.data<uint8_t>();
     auto image_data = tensor_to_float_vector(image);
