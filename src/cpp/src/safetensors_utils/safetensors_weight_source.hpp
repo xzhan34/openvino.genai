@@ -111,8 +111,14 @@ public:
     
     /**
      * @brief Check if running in zero-copy mode
+     * 
+     * Zero-copy mode is active when:
+     * 1. Not using legacy tensors_ref, AND
+     * 2. tensor_mmap_info is populated (mmap data available)
      */
-    bool is_zero_copy_mode() const { return m_tensors_ref == nullptr; }
+    bool is_zero_copy_mode() const { 
+        return m_tensors_ref == nullptr && !m_data.tensor_mmap_info.empty(); 
+    }
 
 private:
     /**
