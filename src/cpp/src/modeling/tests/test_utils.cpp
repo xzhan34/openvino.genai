@@ -687,10 +687,43 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
 }
 
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
+    // ASSERT_EQ(output.get_size(), expected.size());
+    // const float* out_data = output.data<const float>();
+    // for (size_t i = 0; i < expected.size(); ++i) {
+    //     EXPECT_NEAR(out_data[i], expected[i], tol);
+    // }
+    const float abs_tol = 1e-5f;
+    const float rel_tol = 0.005f;
+    const float threshold = abs_tol / rel_tol;
     ASSERT_EQ(output.get_size(), expected.size());
     const float* out_data = output.data<const float>();
     for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], tol);
+        float actual = out_data[i];
+        float expected_val = expected[i];
+        float diff = std::abs(actual - expected_val);
+
+        float expected_magnitude = std::abs(expected_val);
+        float threshold = abs_tol / rel_tol;  // Threshold value to decide which method to use
+
+        if (expected_magnitude > threshold) {
+            // For larger values (far from zero): use relative error comparison
+            // Calculate relative error as diff/expected and compare with rel_tol
+            // rel_tol is in decimal form (e.g., 0.005 = 0.5%)
+            float rel_error = expected_magnitude > 0.0f ? diff / expected_magnitude : 0.0f;
+            EXPECT_LE(rel_error, rel_tol) << "Element " << i 
+                                          << ": Relative error " << (rel_error * 100.0f) 
+                                          << "% exceeds tolerance " << (rel_tol * 100.0f) << "%"
+                                          << " (actual=" << actual 
+                                          << ", expected=" << expected_val 
+                                          << ", diff=" << diff << ")";
+        } else {
+            // For near-zero values (close to zero): use absolute error comparison
+            EXPECT_LE(diff, abs_tol) << "Element " << i 
+                                     << ": Absolute error " << diff 
+                                     << " exceeds tolerance " << abs_tol
+                                     << " (actual=" << actual 
+                                     << ", expected=" << expected_val << ")";
+        }
     }
 }
 
