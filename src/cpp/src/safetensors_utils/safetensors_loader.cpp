@@ -13,6 +13,8 @@
 #include <iostream>
 #include <algorithm>
 #include <set>
+#include <cstdlib>
+#include <cstring>
 
 namespace ov {
 namespace genai {
@@ -81,6 +83,22 @@ const ::safetensors::safetensors_t& MmapHolder::get_st() const {
 // =============================================================================
 
 namespace {
+
+/**
+ * @brief Check if zero-copy mode is enabled via environment variable
+ * 
+ * Environment variable: OV_GENAI_USE_ZERO_COPY
+ * - "0" or "false" or "FALSE": Disable zero-copy (use memcpy)
+ * - "1" or "true" or "TRUE" or unset: Enable zero-copy (default)
+ */
+bool is_zero_copy_enabled() {
+    const char* env = std::getenv("OV_GENAI_USE_ZERO_COPY");
+    if (env == nullptr) {
+        return true;  // Default: enabled
+    }
+    std::string val(env);
+    return !(val == "0" || val == "false" || val == "FALSE");
+}
 
 // Parse model.safetensors.index.json to get shard file list
 std::vector<std::string> parse_index_json(const std::filesystem::path& index_path) {
@@ -167,6 +185,8 @@ bool is_safetensors_model(const std::filesystem::path& model_dir) {
 SafetensorsData load_safetensors_file(const std::filesystem::path& file_path) {
     SafetensorsData result;
     
+    const bool zero_copy = is_zero_copy_enabled();
+    
     // Create mmap holder
     auto holder = std::make_shared<MmapHolder>();
     holder->load(file_path);
@@ -176,7 +196,7 @@ SafetensorsData load_safetensors_file(const std::filesystem::path& file_path) {
     
     const auto& st = holder->get_st();
     
-    // Process tensors - store metadata only, no memcpy!
+    // Process tensors
     const auto& keys = st.tensors.keys();
     for (size_t i = 0; i < keys.size(); i++) {
         const std::string& name = keys[i];
@@ -186,24 +206,35 @@ SafetensorsData load_safetensors_file(const std::filesystem::path& file_path) {
             continue;
         }
         
-        // Store tensor info (metadata only)
+        // Convert dtype and shape
+        ov::element::Type ov_dtype = convert_dtype(static_cast<int>(tensor.dtype));
+        ov::Shape ov_shape(tensor.shape.begin(), tensor.shape.end());
+        
+        // Store tensor info (metadata)
         TensorInfo info;
         info.name = name;
-        info.dtype = convert_dtype(static_cast<int>(tensor.dtype));
-        info.shape = ov::Shape(tensor.shape.begin(), tensor.shape.end());
+        info.dtype = ov_dtype;
+        info.shape = ov_shape;
         info.data_offset_start = tensor.data_offsets[0];
         info.data_offset_end = tensor.data_offsets[1];
         result.tensor_infos[name] = info;
         
-        // Store mmap info for zero-copy access
-        TensorMmapInfo mmap_info;
-        mmap_info.holder = holder;
-        mmap_info.offset = tensor.data_offsets[0];
-        mmap_info.size = tensor.data_offsets[1] - tensor.data_offsets[0];
-        result.tensor_mmap_info[name] = mmap_info;
-        
-        // Note: We do NOT create ov::Tensor here - zero copy!
-        // Tensor data will be accessed via get_shared_buffer() in SafetensorsWeightSource
+        if (zero_copy) {
+            // Zero-copy mode: Store mmap info for later SharedBuffer creation
+            TensorMmapInfo mmap_info;
+            mmap_info.holder = holder;
+            mmap_info.offset = tensor.data_offsets[0];
+            mmap_info.size = tensor.data_offsets[1] - tensor.data_offsets[0];
+            result.tensor_mmap_info[name] = mmap_info;
+        } else {
+            // Legacy mode: Copy data to ov::Tensor
+            const uint8_t* data_ptr = st.databuffer_addr + tensor.data_offsets[0];
+            size_t data_size = tensor.data_offsets[1] - tensor.data_offsets[0];
+            
+            ov::Tensor ov_tensor(ov_dtype, ov_shape);
+            std::memcpy(ov_tensor.data(), data_ptr, data_size);
+            result.tensors[name] = std::move(ov_tensor);
+        }
     }
     
     // Copy metadata (small strings, not a concern)
@@ -253,11 +284,15 @@ SafetensorsData load_safetensors(const std::filesystem::path& model_dir) {
     // Sort files for deterministic loading order
     std::sort(files_to_load.begin(), files_to_load.end());
     
-    std::cout << "[Safetensors Zero-Copy] Loading " << files_to_load.size() << " file(s)..." << std::endl;
+    const bool zero_copy = is_zero_copy_enabled();
+    const char* mode_str = zero_copy ? "Zero-Copy" : "Copy";
     
-    // Load each file (zero-copy mode)
+    std::cout << "[Safetensors " << mode_str << "] Loading " << files_to_load.size() << " file(s)..." << std::endl;
+    
+    // Load each file
     for (const auto& file_path : files_to_load) {
-        std::cout << "[Safetensors Zero-Copy] Mapping " << file_path.filename() << "..." << std::endl;
+        std::cout << "[Safetensors " << mode_str << "] " 
+                  << (zero_copy ? "Mapping" : "Loading") << " " << file_path.filename() << "..." << std::endl;
         
         SafetensorsData file_data = load_safetensors_file(file_path);
         
@@ -274,6 +309,14 @@ SafetensorsData load_safetensors(const std::filesystem::path& model_dir) {
             result.tensor_mmap_info[name] = std::move(mmap_info);
         }
         
+        // Merge tensors (legacy mode)
+        for (auto& [name, tensor] : file_data.tensors) {
+            if (result.tensors.count(name)) {
+                std::cerr << "Warning: Duplicate tensor name: " << name << std::endl;
+            }
+            result.tensors[name] = std::move(tensor);
+        }
+        
         // Merge tensor infos (metadata only)
         for (auto& [name, info] : file_data.tensor_infos) {
             result.tensor_infos[name] = std::move(info);
@@ -287,8 +330,13 @@ SafetensorsData load_safetensors(const std::filesystem::path& model_dir) {
         }
     }
     
-    std::cout << "[Safetensors Zero-Copy] Mapped " << result.tensor_infos.size() 
-              << " tensors (no memory copy)" << std::endl;
+    if (zero_copy) {
+        std::cout << "[Safetensors Zero-Copy] Mapped " << result.tensor_infos.size() 
+                  << " tensors (no memory copy)" << std::endl;
+    } else {
+        std::cout << "[Safetensors Copy] Loaded " << result.tensors.size() 
+                  << " tensors (with memory copy)" << std::endl;
+    }
     
     return result;
 }
