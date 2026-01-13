@@ -260,6 +260,14 @@ HFConfig load_hf_config(const std::filesystem::path& model_dir) {
     config.head_dim = extract_int(json, "head_dim", 0);
     config.vocab_size = extract_int(json, "vocab_size");
     config.max_position_embeddings = extract_int(json, "max_position_embeddings", 2048);
+    config.expert_count = extract_int(json, "expert_count",
+                                      extract_int(json, "num_experts",
+                                                  extract_int(json, "expert_num", 0)));
+    config.expert_used_count = extract_int(json, "expert_used_count",
+                                           extract_int(json, "num_experts_per_tok",
+                                                       extract_int(json, "router_top_k", 0)));
+    config.moe_intermediate_size = extract_int(json, "moe_intermediate_size",
+                                               extract_int(json, "moe_inter_size", 0));
     
     // Normalization
     config.rms_norm_eps = extract_float(json, "rms_norm_eps", 1e-6f);
@@ -336,6 +344,15 @@ std::map<std::string, ConfigValue> config_to_map(const HFConfig& config) {
     result["rms_norm_eps"] = config.rms_norm_eps;
     result["rope_freq_base"] = config.rope_theta;
     result["tie_word_embeddings"] = config.tie_word_embeddings ? 1 : 0;
+    if (config.expert_count > 0) {
+        result["expert_count"] = config.expert_count;
+    }
+    if (config.expert_used_count > 0) {
+        result["expert_used_count"] = config.expert_used_count;
+    }
+    if (config.moe_intermediate_size > 0) {
+        result["moe_inter_size"] = config.moe_intermediate_size;
+    }
     
     return result;
 }

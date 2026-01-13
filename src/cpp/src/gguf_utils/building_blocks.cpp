@@ -760,18 +760,30 @@ std::vector<ov::Output<ov::Node>> make_int4_weights_for_moe(
     ov::Tensor weight = get_tensor(consts, key + ".weight");
 
     // Convert weight to uint8 view and adjust shape
+    ov::element::Type weight_type = weight.get_element_type();
     ov::Shape orig_weight_shape = weight.get_shape();
     bool has_expert_dim = (orig_weight_shape.size() == 3);  // [num_experts, rows, cols_bytes] vs [rows, cols_bytes]
-    
     size_t rows_idx = has_expert_dim ? 1 : 0;
     size_t cols_idx = has_expert_dim ? 2 : 1;
-    
-    // Unpack u32 packed format: each cols value contains 8 x 4-bit values
-    orig_weight_shape[cols_idx] *= sizeof(uint32_t) / sizeof(uint8_t) * 2;
+    // packed int4 (u32)
+    if (weight_type == ov::element::u32) {
+        // Unpack u32 packed format: each cols value contains 8 x 4-bit values
+        orig_weight_shape[cols_idx] *= sizeof(uint32_t) / sizeof(uint8_t) * 2;
+    } else if (weight_type == ov::element::u8) {
+        orig_weight_shape[cols_idx] *= 2;
+    }
 
     // Retrieve scales and biases
     ov::Tensor scales = get_tensor(consts, key + ".scales");
-    ov::Tensor biases = get_tensor(consts, key + ".biases");
+    ov::Tensor biases;
+    auto bias_it = consts.find(key + ".biases");
+    if (bias_it != consts.end()) {
+        biases = bias_it->second;
+    } else {
+        // Create zero bias tensor with same shape and type as scales
+        biases = ov::Tensor(scales.get_element_type(), scales.get_shape());
+        std::memset(biases.data(), 0, biases.get_byte_size());
+    }
 
     // Expand dimensions for scales and biases (add group_size=1 dimension at the end)
     ov::Shape scale_bias_shape = scales.get_shape();
@@ -809,14 +821,26 @@ std::vector<ov::Output<ov::Node>> make_int4_weights_for_moe(
     weights_node->get_rt_info()["__gguf_tensor_holde"] = weight;
 
     // Pack zero points: two subsequent values into one
-    const ov::float16* bias_data = biases.data<ov::element_type_traits<ov::element::f16>::value_type>();
-    const ov::float16* scale_data = scales.data<ov::element_type_traits<ov::element::f16>::value_type>();
+    ov::element::Type bias_type = biases.get_element_type();
     ov::Tensor zero_point_tensor(ov::element::u4, scale_bias_shape);
     uint8_t* zero_point_data = static_cast<uint8_t*>(zero_point_tensor.data());
-    for (size_t i = 0; i < zero_point_tensor.get_byte_size(); ++i) {
-        uint8_t bias1 = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i * 2]) / static_cast<float>(scale_data[i * 2]));
-        uint8_t bias2 = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i * 2 + 1]) / static_cast<float>(scale_data[i * 2 + 1]));
-        zero_point_data[i] = (bias2 << 4) | (bias1 & 0x0F);
+    if (bias_type == ov::element::u8) {
+        const uint8_t* bias_data = biases.data<uint8_t>();
+        for (size_t i = 0; i < zero_point_tensor.get_byte_size(); ++i) {
+            uint8_t bias1 = bias_data[i * 2];
+            uint8_t bias2 = bias_data[i * 2 + 1];
+            zero_point_data[i] = (bias2 << 4) | (bias1 & 0x0F);
+        }
+    } else if (bias_type == ov::element::f16) {
+        const ov::float16* bias_data = biases.data<ov::element_type_traits<ov::element::f16>::value_type>();
+        const ov::float16* scale_data = scales.data<ov::element_type_traits<ov::element::f16>::value_type>();
+        for (size_t i = 0; i < zero_point_tensor.get_byte_size(); ++i) {
+            uint8_t bias1 = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i * 2]) / static_cast<float>(scale_data[i * 2]));
+            uint8_t bias2 = (uint8_t)std::round(-1.f * static_cast<float>(bias_data[i * 2 + 1]) / static_cast<float>(scale_data[i * 2 + 1]));
+            zero_point_data[i] = (bias2 << 4) | (bias1 & 0x0F);
+        }
+    } else {
+        throw std::runtime_error("Unsupported bias type in make_int4_weights_for_moe: only u8 and f16 supported");
     }
 
     auto zero_points_node = std::make_shared<ov::op::v0::Constant>(zero_point_tensor);
@@ -1134,6 +1158,102 @@ ov::Output<ov::Node> make_fc(
     return output;
 }
 
+ov::Output<ov::Node> make_inflight_moe(
+    const std::string& key,
+    const ov::Output<ov::Node>& input,
+    const std::map<std::string, GGUFMetaData>& configs,
+    const std::unordered_map<std::string, ov::Tensor>& consts,
+    std::unordered_map<std::string, gguf_tensor_type>& qtypes,
+    std::string name_prefix,
+    std::string name_suffix,
+    bool reorder = false,
+    int head_size = -1) {
+    auto gate_inp_key = key + ".moe.gate_inp";
+    auto gate_exps_key = key + ".moe.gate_exps";
+    auto up_exps_key = key + ".moe.up_exps";
+    auto down_exps_key = key + ".moe.down_exps";
+
+    auto gate_inp_type = qtypes.at(gate_inp_key + ".qtype");
+    auto gate_exps_type = qtypes.at(gate_exps_key + ".qtype");
+    auto up_exps_type = qtypes.at(up_exps_key + ".qtype");
+    auto down_exps_type = qtypes.at(down_exps_key + ".qtype");
+
+    // TODO: support other types
+    if (gate_inp_type != gguf_tensor_type::GGUF_TYPE_F32 && gate_inp_type != gguf_tensor_type::GGUF_TYPE_BF16) {
+        std::cout << "gate_inp_type != f32 " << gate_inp_type << std::endl;
+        exit(0);
+    }
+
+    if (gate_exps_type != up_exps_type || gate_exps_type != down_exps_type ||
+        !ov_extended_types::is_int4_type(gate_exps_type)) {
+        std::cout << "gate/up/down exps type should be q4" << std::endl;
+        exit(0);
+    }
+
+    auto hidden_f16 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f16);
+    auto gate_inp_w_f32 = make_fp16_weights(gate_inp_key, consts, false, -1, true);
+    auto gate_inp_w_f16 = std::make_shared<ov::op::v0::Convert>(gate_inp_w_f32, ov::element::f16);
+    auto router_f16 = std::make_shared<ov::op::v0::MatMul>(hidden_f16, gate_inp_w_f16, false, true);
+
+    // Load concatenated expert weights (already in correct layout)    
+    auto fused_gate_weights = make_int4_weights_for_moe(gate_exps_key, consts, false, -1, 128);
+    auto fused_up_weights = make_int4_weights_for_moe(up_exps_key, consts, false, -1, 128);
+    auto fused_down_weights = make_int4_weights_for_moe(down_exps_key, consts, false, -1, 128);
+
+    // Create MOE internal op
+    ov::OutputVector moe_inputs = {
+        hidden_f16,
+        router_f16,
+        fused_gate_weights[0], 
+        fused_gate_weights[1], 
+        fused_gate_weights[2], 
+        fused_up_weights[0], 
+        fused_up_weights[1],
+        fused_up_weights[2],
+        fused_down_weights[0],
+        fused_down_weights[1],
+        fused_down_weights[2]
+    };
+    
+    int cfg_num_expert = 0;
+    int cfg_top_k = 0;
+    int cfg_inter_size = 0;
+    if (configs.count("expert_count")) {
+        cfg_num_expert = std::get<int>(configs.at("expert_count"));
+    }
+    if (configs.count("expert_used_count")) {
+        cfg_top_k = std::get<int>(configs.at("expert_used_count"));
+    }
+    if (configs.count("moe_inter_size")) {
+        cfg_inter_size = std::get<int>(configs.at("moe_inter_size"));
+    }
+
+    ov::op::internal::MOE3GemmFusedCompressed::Config config;
+    config.hidden_size = fused_down_weights[0].get_partial_shape()[1].get_length();
+    config.inter_size = fused_gate_weights[0].get_partial_shape()[1].get_length();
+    config.num_expert = fused_gate_weights[0].get_partial_shape()[0].get_length();
+    config.top_k = cfg_top_k > 0 ? cfg_top_k : 1;
+    config.group_size = 128;
+    config.out_type = ov::element::f16;
+
+    if (config.inter_size != cfg_inter_size) {
+        std::cout << "inter size is not matched!" << std::endl;
+        exit(0);
+    }
+
+    if (config.num_expert != cfg_num_expert) {
+        std::cout << "expert num is not matched!" << std::endl;
+        exit(0);
+    }
+
+    auto moe_node = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(moe_inputs, config);
+    auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe_node, ov::element::f32);
+    moe_f32->set_friendly_name(name_prefix + ".moe" + name_suffix);
+
+    return moe_f32->output(0);
+}
+
+
 ov::Output<ov::Node> make_moe(
     const std::string& key,
     const ov::Output<ov::Node>& input,
@@ -1153,6 +1273,10 @@ ov::Output<ov::Node> make_moe(
     auto gate_exps_type = qtypes.at(gate_exps_key + ".qtype");
     auto up_exps_type = qtypes.at(up_exps_key + ".qtype");
     auto down_exps_type = qtypes.at(down_exps_key + ".qtype");
+
+    if (ov_extended_types::is_inflight_type(gate_exps_type)) {
+        return make_inflight_moe(key, input, configs, consts, qtypes, name_prefix, name_suffix, reorder, head_size);
+    }
 
     // TODO: support other types
     if (gate_inp_type != gguf_tensor_type::GGUF_TYPE_F32) {
@@ -1588,7 +1712,8 @@ std::tuple<ov::Output<ov::Node>,
 
     ov::Output<ov::Node> output;
 
-    if (std::get<std::string>(configs.at("architecture")) == "qwen3moe") {
+    if (std::get<std::string>(configs.at("architecture")) == "qwen3moe" ||
+        std::get<std::string>(configs.at("architecture")) == "qwen3_moe") {
         // MoE block
         auto moe_out = make_moe(
             layer_prefix, post_attn_norm, configs, consts, qtypes, name_prefix, name_suffix, reorder

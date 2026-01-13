@@ -53,80 +53,18 @@ int main(int argc, char* argv[]) {
     
     std::cout << "\nCreating synthetic deterministic weights..." << std::endl;
     
-    // 1. Create router weights [num_experts, hidden_dim] - deterministic pattern
-    // Each expert gets a unique but predictable bias when all inputs are 1.0
-    if (weight_type == "q4_0" || weight_type == "q4") {
-        // Q4_0: 4-bit quantization with FP16 scale per 32 values
-        const int block_size = 32;
-        
-        // Allocate Q4 weight in packed uint32 format
-        // Each uint32 stores 8 x 4-bit values, so we need cols_bytes = (hidden_dim / 8)
-        size_t cols_bytes = (hidden_dim + 7) / 8;  // Round up to nearest byte group
-        ov::Tensor router_weight(ov::element::u32, {static_cast<size_t>(num_experts), cols_bytes});
-        uint32_t* weight_data = router_weight.data<uint32_t>();
-        std::memset(weight_data, 0, router_weight.get_byte_size());
-        
-        // Allocate scales and biases (FP16) - shape must be [num_experts, hidden_dim/block_size]
-        // make_int4_weights() expects 2D shape matching the weight matrix structure
-        size_t blocks_per_row = (hidden_dim + block_size - 1) / block_size;
-        ov::Tensor router_scales(ov::element::f16, {static_cast<size_t>(num_experts), blocks_per_row});
-        ov::Tensor router_biases(ov::element::f16, {static_cast<size_t>(num_experts), blocks_per_row});
-        ov::float16* scale_data = router_scales.data<ov::float16>();
-        ov::float16* bias_data = router_biases.data<ov::float16>();
-        
-        // Quantize deterministically per expert
-        for (int e = 0; e < num_experts; e++) {
-            for (size_t block = 0; block < blocks_per_row; block++) {
-                size_t start_col = block * block_size;
-                size_t end_col = std::min(start_col + block_size, static_cast<size_t>(hidden_dim));
-                
-                // Find min/max in this block for scaling
-                float block_max = 0.0f;
-                for (size_t col = start_col; col < end_col; col++) {
-                    float val = static_cast<float>(e) / hidden_dim;
-                    block_max = std::max(block_max, std::abs(val));
-                }
-                
-                float scale = block_max / 7.5f;  // Map to [-7.5, 7.5] range (4-bit signed)
-                scale_data[e * blocks_per_row + block] = ov::float16(scale);
-                
-                // For Q4_0, zero bias means symmetric quantization
-                bias_data[e * blocks_per_row + block] = ov::float16(0.0f);
-                
-                // Quantize values in this block
-                for (size_t col = start_col; col < end_col; col++) {
-                    float val = static_cast<float>(e) / hidden_dim;
-                    int8_t quantized = static_cast<int8_t>(std::round(val / scale));
-                    quantized = std::max(int8_t(-8), std::min(int8_t(7), quantized));
-                    
-                    // Pack into uint32 (8 values per uint32)
-                    size_t linear_idx = e * hidden_dim + col;
-                    size_t uint32_idx = linear_idx / 8;
-                    size_t bit_offset = (linear_idx % 8) * 4;
-                    weight_data[uint32_idx] |= (static_cast<uint32_t>(quantized & 0x0F) << bit_offset);
-                }
-            }
+
+    // 1. Create router weights [num_experts, hidden_dim] - always FP16, no quantization
+    ov::Tensor router_weight(ov::element::f16, {static_cast<size_t>(num_experts), static_cast<size_t>(hidden_dim)});
+    ov::float16* router_data = router_weight.data<ov::float16>();
+    for (int e = 0; e < num_experts; e++) {
+        for (int h = 0; h < hidden_dim; h++) {
+            router_data[e * hidden_dim + h] = ov::float16(static_cast<float>(e) / hidden_dim);
         }
-        
-        remapped_consts[layer_prefix + ".router.weight"] = router_weight;
-        remapped_consts[layer_prefix + ".router.scales"] = router_scales;
-        remapped_consts[layer_prefix + ".router.biases"] = router_biases;
-        remapped_qtypes[layer_prefix + ".router.qtype"] = gguf_tensor_type::GGUF_TYPE_Q4_0;
-        std::cout << "  ✓ Created router.weight (Q4_0): [" << num_experts << ", " << hidden_dim << "]" << std::endl;
-        std::cout << "    " << (num_experts * blocks_per_row) << " blocks ([" << num_experts << ", " << blocks_per_row << "]) with FP16 scales and biases" << std::endl;
-    } else {
-        // Default FP16 weights
-        ov::Tensor router_weight(ov::element::f16, {static_cast<size_t>(num_experts), static_cast<size_t>(hidden_dim)});
-        ov::float16* router_data = router_weight.data<ov::float16>();
-        for (int e = 0; e < num_experts; e++) {
-            for (int h = 0; h < hidden_dim; h++) {
-                router_data[e * hidden_dim + h] = ov::float16(static_cast<float>(e) / hidden_dim);
-            }
-        }
-        remapped_consts[layer_prefix + ".router.weight"] = router_weight;
-        remapped_qtypes[layer_prefix + ".router.qtype"] = gguf_tensor_type::GGUF_TYPE_F16;
-        std::cout << "  ✓ Created router.weight (F16): [" << num_experts << ", " << hidden_dim << "]" << std::endl;
     }
+    remapped_consts[layer_prefix + ".router.weight"] = router_weight;
+    remapped_qtypes[layer_prefix + ".router.qtype"] = gguf_tensor_type::GGUF_TYPE_F16;
+    std::cout << "  ✓ Created router.weight (F16): [" << num_experts << ", " << hidden_dim << "]" << std::endl;
     std::cout << "    Router pattern: Expert e gets score = e (when input is all 1s)" << std::endl;
     
     // 2. Create expert weights for each expert - deterministic identity-like mappings
@@ -134,50 +72,94 @@ int main(int argc, char* argv[]) {
     
     // Helper lambda for creating uniform weights
     auto create_uniform_weight = [&](size_t rows, size_t cols, float value, const std::string& name) {
-        if (weight_type == "q4_0" || weight_type == "q4") {
-            // Q4_0 quantization
+        if (weight_type == "q4_0" || weight_type == "q4" || weight_type == "q4_1") {
             const int block_size = 32;
-            
-            // Pack as uint32 (8 x 4-bit values per uint32)
             size_t cols_bytes = (cols + 7) / 8;
             ov::Tensor weight(ov::element::u32, {rows, cols_bytes});
             uint32_t* weight_data = weight.data<uint32_t>();
-            std::memset(weight_data, 0, weight.get_byte_size());  // Initialize to zero
-            
-            // Scales/biases shape must be 2D: [rows, cols/block_size]
+            std::memset(weight_data, 0, weight.get_byte_size());
+
             size_t blocks_per_row = (cols + block_size - 1) / block_size;
             ov::Tensor scales(ov::element::f16, {rows, blocks_per_row});
             ov::Tensor biases(ov::element::f16, {rows, blocks_per_row});
             ov::float16* scale_data = scales.data<ov::float16>();
             ov::float16* bias_data = biases.data<ov::float16>();
-            
-            // Uniform quantization
-            float scale = std::abs(value) / 7.5f;
-            int8_t quantized = static_cast<int8_t>(std::round(value / scale));
-            quantized = std::max(int8_t(-8), std::min(int8_t(7), quantized));
-            
-            // Fill all blocks with same scale/bias (uniform quantization)
+
             for (size_t r = 0; r < rows; r++) {
                 for (size_t block = 0; block < blocks_per_row; block++) {
-                    scale_data[r * blocks_per_row + block] = ov::float16(scale);
-                    bias_data[r * blocks_per_row + block] = ov::float16(0.0f);  // Symmetric quantization
-                    
                     size_t start_col = block * block_size;
                     size_t end_col = std::min(start_col + block_size, cols);
-                    
-                    for (size_t c = start_col; c < end_col; c++) {
-                        size_t linear_idx = r * cols + c;
-                        size_t uint32_idx = linear_idx / 8;
-                        size_t bit_offset = (linear_idx % 8) * 4;
-                        weight_data[uint32_idx] |= (static_cast<uint32_t>(quantized & 0x0F) << bit_offset);
+                    if (weight_type == "q4_1") {
+                        float block_min = std::numeric_limits<float>::max();
+                        float block_max = std::numeric_limits<float>::lowest();
+                        for (size_t c = start_col; c < end_col; c++) {
+                            float val = value;
+                            block_min = std::min(block_min, val);
+                            block_max = std::max(block_max, val);
+                        }
+                        float scale;
+                        if (block_max == block_min) {
+                            scale = 1.0f;
+                        } else {
+                            scale = (block_max - block_min) / 15.0f;
+                        }
+                        scale_data[r * blocks_per_row + block] = ov::float16(scale);
+                        bias_data[r * blocks_per_row + block] = ov::float16(block_min);
+                        // Print debug info for first row and first block
+                        if (r == 0 && block == 0) {
+                            std::cout << "[Expert Weight Q4_1] " << name << " row 0 block 0: scale=" << scale << ", bias=" << block_min << std::endl;
+                            std::cout << "[Expert Weight Q4_1] Quantized values: ";
+                        }
+                        for (size_t c = start_col; c < end_col; c++) {
+                            float val = value;
+                            int8_t quantized;
+                            if (block_max == block_min) {
+                                quantized = 0;
+                            } else {
+                                quantized = static_cast<int8_t>(std::round((val - block_min) / scale));
+                                quantized = std::max(int8_t(0), std::min(int8_t(15), quantized));
+                            }
+                            size_t linear_idx = r * cols + c;
+                            size_t uint32_idx = linear_idx / 8;
+                            size_t bit_offset = (linear_idx % 8) * 4;
+                            weight_data[uint32_idx] |= (static_cast<uint32_t>(quantized & 0x0F) << bit_offset);
+                            if (r == 0 && block == 0) {
+                                std::cout << (int)quantized << " ";
+                            }
+                        }
+                        if (r == 0 && block == 0) {
+                            std::cout << std::endl;
+                        }
+                    } else {
+                        float scale = std::abs(value) / 7.5f;
+                        int8_t quantized = static_cast<int8_t>(std::round(value / scale));
+                        quantized = std::max(int8_t(-8), std::min(int8_t(7), quantized));
+                        scale_data[r * blocks_per_row + block] = ov::float16(scale);
+                        bias_data[r * blocks_per_row + block] = ov::float16(0.0f);
+                        // Print debug info for first row and first block
+                        if (r == 0 && block == 0) {
+                            std::cout << "[Expert Weight Q4_0] " << name << " row 0 block 0: scale=" << scale << ", bias=0" << std::endl;
+                            std::cout << "[Expert Weight Q4_0] Quantized values: ";
+                        }
+                        for (size_t c = start_col; c < end_col; c++) {
+                            size_t linear_idx = r * cols + c;
+                            size_t uint32_idx = linear_idx / 8;
+                            size_t bit_offset = (linear_idx % 8) * 4;
+                            weight_data[uint32_idx] |= (static_cast<uint32_t>(quantized & 0x0F) << bit_offset);
+                            if (r == 0 && block == 0) {
+                                std::cout << (int)quantized << " ";
+                            }
+                        }
+                        if (r == 0 && block == 0) {
+                            std::cout << std::endl;
+                        }
                     }
                 }
             }
-            
             remapped_consts[name + ".weight"] = weight;
             remapped_consts[name + ".scales"] = scales;
             remapped_consts[name + ".biases"] = biases;
-            remapped_qtypes[name + ".qtype"] = gguf_tensor_type::GGUF_TYPE_Q4_0;
+            remapped_qtypes[name + ".qtype"] = (weight_type == "q4_1") ? gguf_tensor_type::GGUF_TYPE_Q4_1 : gguf_tensor_type::GGUF_TYPE_Q4_0;
         } else {
             // FP16
             ov::Tensor weight(ov::element::f16, {rows, cols});
@@ -212,54 +194,46 @@ int main(int argc, char* argv[]) {
     std::cout << "  Concatenating expert weights with preserved expert dimension..." << std::endl;
     
     auto concat_expert_weights = [&](const std::string& weight_name, size_t rows, size_t cols) {
-        if (weight_type == "q4_0" || weight_type == "q4") {
-            // Create 3D tensors: [num_experts, rows, cols_bytes/blocks_per_row]
-            // make_int4_weights_concat() will convert to 4D: [num_experts, rows, group_num, group_size]
+        if (weight_type == "q4_0" || weight_type == "q4" || weight_type == "q4_1") {
             const int block_size = 32;
             size_t blocks_per_row = (cols + block_size - 1) / block_size;
             size_t cols_bytes = (cols + 7) / 8;
-            
-            // Allocate 3D tensors with expert dimension as first axis
+
             ov::Tensor concat_weight(ov::element::u32, {static_cast<size_t>(num_experts), rows, cols_bytes});
             ov::Tensor concat_scales(ov::element::f16, {static_cast<size_t>(num_experts), rows, blocks_per_row});
             ov::Tensor concat_biases(ov::element::f16, {static_cast<size_t>(num_experts), rows, blocks_per_row});
-            
+
             uint32_t* concat_weight_data = concat_weight.data<uint32_t>();
             ov::float16* concat_scale_data = concat_scales.data<ov::float16>();
             ov::float16* concat_bias_data = concat_biases.data<ov::float16>();
-            
+
             std::memset(concat_weight_data, 0, concat_weight.get_byte_size());
-            
-            // Copy each expert's weight into the [expert_id, :, :] slice
+
             for (int e = 0; e < num_experts; e++) {
                 std::string expert_key = layer_prefix + ".experts." + std::to_string(e) + "." + weight_name;
                 auto& weight = remapped_consts[expert_key + ".weight"];
                 auto& scales = remapped_consts[expert_key + ".scales"];
                 auto& biases = remapped_consts[expert_key + ".biases"];
-                
+
                 uint32_t* src_weight = weight.data<uint32_t>();
                 ov::float16* src_scales = scales.data<ov::float16>();
                 ov::float16* src_biases = biases.data<ov::float16>();
-                
-                // Copy into [e, :, :] slice
+
                 size_t expert_weight_offset = e * rows * cols_bytes;
                 size_t expert_scale_offset = e * rows * blocks_per_row;
-                
-                std::memcpy(concat_weight_data + expert_weight_offset, 
-                           src_weight, weight.get_byte_size());
-                std::memcpy(concat_scale_data + expert_scale_offset,
-                           src_scales, scales.get_byte_size());
-                std::memcpy(concat_bias_data + expert_scale_offset,
-                           src_biases, biases.get_byte_size());
+
+                std::memcpy(concat_weight_data + expert_weight_offset, src_weight, weight.get_byte_size());
+                std::memcpy(concat_scale_data + expert_scale_offset, src_scales, scales.get_byte_size());
+                std::memcpy(concat_bias_data + expert_scale_offset, src_biases, biases.get_byte_size());
             }
-            
+
             std::string fused_key = layer_prefix + ".experts." + weight_name + "_fused";
             remapped_consts[fused_key + ".weight"] = concat_weight;
             remapped_consts[fused_key + ".scales"] = concat_scales;
             remapped_consts[fused_key + ".biases"] = concat_biases;
-            remapped_qtypes[fused_key + ".qtype"] = gguf_tensor_type::GGUF_TYPE_Q4_0;
-            
-            std::cout << "    " << weight_name << " 3D: weight[" << num_experts << "," << rows << "," << cols_bytes << "] scales[" << num_experts << "," << rows << "," << blocks_per_row << "] (Q4 packed)" << std::endl;
+            remapped_qtypes[fused_key + ".qtype"] = (weight_type == "q4_1") ? gguf_tensor_type::GGUF_TYPE_Q4_1 : gguf_tensor_type::GGUF_TYPE_Q4_0;
+
+            std::cout << "    " << weight_name << " 3D: weight[" << num_experts << "," << rows << "," << cols_bytes << "] scales[" << num_experts << "," << rows << "," << blocks_per_row << "] (" << (weight_type == "q4_1" ? "Q4_1" : "Q4 packed") << ")" << std::endl;
         } else {
             // Concatenate FP16 weights: [num_experts, rows, cols]
             ov::Tensor concat_weight(ov::element::f16, {static_cast<size_t>(num_experts), rows, cols});

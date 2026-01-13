@@ -39,6 +39,10 @@ struct HFConfig {
     int qk_nope_head_dim = 0;
     int qk_head_dim = 0;
     int v_head_dim = 0;
+
+    int expert_count = 0;             // MoE: number of experts
+    int expert_used_count = 0;        // MoE: top-k experts per token
+    int moe_intermediate_size = 0;    // MoE FFN hidden size (if different)
     
     // Normalization
     float rms_norm_eps = 1e-6f;       // RMS normalization epsilon
