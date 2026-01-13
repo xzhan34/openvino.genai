@@ -224,13 +224,24 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
  * @brief Create model using new modeling API
  *
  * This uses the Qwen3ForCausalLM class from modeling/models/qwen3_dense.hpp
+ * Supports both zero-copy mode (SafetensorsData with mmap) and legacy mode (tensors map)
  */
 std::shared_ptr<ov::Model> create_model_with_modeling_api(
     const HFConfig& hf_config,
-    std::unordered_map<std::string, ov::Tensor>& tensors) {
-    SafetensorsWeightSource source(tensors);
+    SafetensorsData& st_data) {
+    // Create weight source that supports both zero-copy and legacy modes
+    SafetensorsWeightSource source(st_data);
     SafetensorsWeightFinalizer finalizer;
+    
+    // For checking bias/lm_head presence, use tensor_infos (always populated)
+    auto& tensor_infos = st_data.tensor_infos;
+    auto& tensors = st_data.tensors;  // May be empty in zero-copy mode
 
+    // Helper to check if a key exists (supports both modes)
+    auto has_key = [&](const std::string& key) {
+        return tensor_infos.count(key) > 0 || tensors.count(key) > 0;
+    };
+    
     std::shared_ptr<ov::Model> ov_model;
     if (hf_config.model_type == "qwen3") {
         ov::genai::modeling::models::Qwen3DenseConfig cfg;
@@ -241,9 +252,9 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.num_key_value_heads = hf_config.kv_heads();
         cfg.head_dim = hf_config.head_size();
         cfg.rope_theta = hf_config.rope_theta;
-        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.attention_bias = has_key("model.layers[0].self_attn.q_proj.bias");
         cfg.rms_norm_eps = hf_config.rms_norm_eps;
-        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        cfg.tie_word_embeddings = !has_key("lm_head.weight");
         ov_model = ov::genai::modeling::models::create_qwen3_dense_model(cfg, source, finalizer);
     } else if (hf_config.model_type == "smollm3") {
         ov::genai::modeling::models::SmolLM3Config cfg;
@@ -255,9 +266,9 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.head_dim = hf_config.head_size();
         cfg.rope_theta = hf_config.rope_theta;
         cfg.rms_norm_eps = hf_config.rms_norm_eps;
-        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
-        cfg.mlp_bias = tensors.count("model.layers[0].mlp.gate_proj.bias") > 0;
-        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        cfg.attention_bias = has_key("model.layers[0].self_attn.q_proj.bias");
+        cfg.mlp_bias = has_key("model.layers[0].mlp.gate_proj.bias");
+        cfg.tie_word_embeddings = !has_key("lm_head.weight");
         ov_model = ov::genai::modeling::models::create_smollm3_model(cfg, source, finalizer);
     } else if (hf_config.model_type == "youtu_llm") {
         ov::genai::modeling::models::YoutuConfig cfg;
@@ -277,9 +288,9 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.rope_interleave = hf_config.rope_interleave;
         cfg.rms_norm_eps = hf_config.rms_norm_eps;
         cfg.hidden_act = hf_config.hidden_act;
-        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_a_proj.bias") > 0;
-        cfg.mlp_bias = tensors.count("model.layers[0].mlp.gate_proj.bias") > 0;
-        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        cfg.attention_bias = has_key("model.layers[0].self_attn.q_a_proj.bias");
+        cfg.mlp_bias = has_key("model.layers[0].mlp.gate_proj.bias");
+        cfg.tie_word_embeddings = !has_key("lm_head.weight");
         ov_model = ov::genai::modeling::models::create_youtu_llm_model(cfg, source, finalizer);
     } else {
         throw std::runtime_error("Unsupported model architecture '" + hf_config.model_type + "'");
@@ -521,28 +532,61 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     // Debug: Print first few weight names
     std::cout << "[Safetensors] First 10 weight names:" << std::endl;
     int count = 0;
-    for (const auto& [name, tensor] : st_data.tensors) {
-        if (count++ < 10) {
-            std::cout << "  - " << name << " (shape: ";
-            for (size_t i = 0; i < tensor.get_shape().size(); ++i) {
-                std::cout << tensor.get_shape()[i];
-                if (i < tensor.get_shape().size() - 1) std::cout << "x";
+    // Print from tensors (non-zero-copy) or tensor_infos (zero-copy)
+    if (!st_data.tensors.empty()) {
+        for (const auto& [name, tensor] : st_data.tensors) {
+            if (count++ < 10) {
+                std::cout << "  - " << name << " (shape: ";
+                for (size_t i = 0; i < tensor.get_shape().size(); ++i) {
+                    std::cout << tensor.get_shape()[i];
+                    if (i < tensor.get_shape().size() - 1) std::cout << "x";
+                }
+                std::cout << ")" << std::endl;
             }
-            std::cout << ")" << std::endl;
         }
+        std::cout << "[Safetensors] Loaded " << st_data.tensors.size() << " weight tensors" << std::endl;
+    } else {
+        for (const auto& [name, info] : st_data.tensor_infos) {
+            if (count++ < 10) {
+                std::cout << "  - " << name << " (shape: ";
+                for (size_t i = 0; i < info.shape.size(); ++i) {
+                    std::cout << info.shape[i];
+                    if (i < info.shape.size() - 1) std::cout << "x";
+                }
+                std::cout << ")" << std::endl;
+            }
+        }
+        std::cout << "[Safetensors] Mapped " << st_data.tensor_infos.size() << " weight tensors (zero-copy)" << std::endl;
     }
-    
-    std::cout << "[Safetensors] Loaded " << st_data.tensors.size() << " weight tensors" << std::endl;
 
     // Step 2.5: Convert weight names from HF format to internal format
     // HF uses: model.layers.0.xxx, internal uses: model.layers[0].xxx
     // This conversion is required for both modeling API and building_blocks paths
+    
+    // Convert tensors map (non-zero-copy mode)
     std::unordered_map<std::string, ov::Tensor> converted_weights;
     for (auto& [name, tensor] : st_data.tensors) {
         std::string converted_name = convert_weight_name(name);
         converted_weights[converted_name] = std::move(tensor);
     }
     st_data.tensors = std::move(converted_weights);
+    
+    // Convert tensor_infos (both modes, always populated)
+    std::unordered_map<std::string, TensorInfo> converted_infos;
+    for (auto& [name, info] : st_data.tensor_infos) {
+        std::string converted_name = convert_weight_name(name);
+        info.name = converted_name;
+        converted_infos[converted_name] = std::move(info);
+    }
+    st_data.tensor_infos = std::move(converted_infos);
+    
+    // Convert tensor_mmap_info (zero-copy mode)
+    std::unordered_map<std::string, TensorMmapInfo> converted_mmap;
+    for (auto& [name, mmap_info] : st_data.tensor_mmap_info) {
+        std::string converted_name = convert_weight_name(name);
+        converted_mmap[converted_name] = std::move(mmap_info);
+    }
+    st_data.tensor_mmap_info = std::move(converted_mmap);
 
     auto load_finish_time = std::chrono::high_resolution_clock::now();
     auto load_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -558,11 +602,15 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     // Check if new modeling API should be used
     if ((model_type == "qwen3" || model_type == "smollm3" || model_type == "youtu_llm") && use_modeling_api()) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
-        model = create_model_with_modeling_api(config, st_data.tensors);
+        model = create_model_with_modeling_api(config, st_data);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
                model_type == "mistral" || model_type == "mixtral") {
         std::cout << "[Safetensors] Using legacy building_blocks" << std::endl;
         // Create qtype entries for building_blocks compatibility (only needed for legacy path)
+        // Note: Legacy path requires non-zero-copy mode (tensors populated)
+        if (st_data.tensors.empty()) {
+            throw std::runtime_error("Legacy building_blocks path requires OV_GENAI_USE_ZERO_COPY=0");
+        }
         std::unordered_map<std::string, gguf_tensor_type> qtypes;
         create_qtype_entries(qtypes, st_data.tensors, config.num_hidden_layers);
         model = create_language_model(config, st_data.tensors, qtypes);
