@@ -85,16 +85,31 @@ const ::safetensors::safetensors_t& MmapHolder::get_st() const {
 namespace {
 
 /**
+ * @brief Check if modeling API is enabled via environment variable
+ */
+bool is_modeling_api_enabled() {
+    const char* env = std::getenv("OV_GENAI_USE_MODELING_API");
+    if (env == nullptr) {
+        return false;  // Default: disabled
+    }
+    std::string val(env);
+    return (val == "1" || val == "true" || val == "TRUE");
+}
+
+/**
  * @brief Check if zero-copy mode is enabled via environment variable
  * 
  * Environment variable: OV_GENAI_USE_ZERO_COPY
  * - "0" or "false" or "FALSE": Disable zero-copy (use memcpy)
- * - "1" or "true" or "TRUE" or unset: Enable zero-copy (default)
+ * - "1" or "true" or "TRUE": Enable zero-copy
+ * - unset: Enable zero-copy only if modeling API is enabled (building_blocks doesn't support zero-copy)
  */
 bool is_zero_copy_enabled() {
     const char* env = std::getenv("OV_GENAI_USE_ZERO_COPY");
     if (env == nullptr) {
-        return true;  // Default: enabled
+        // Default: enable only if modeling API is enabled
+        // Building blocks path doesn't support zero-copy
+        return is_modeling_api_enabled();
     }
     std::string val(env);
     return !(val == "0" || val == "false" || val == "FALSE");
