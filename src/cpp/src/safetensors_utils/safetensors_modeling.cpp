@@ -69,11 +69,9 @@ auto set_name = [](auto node, const std::string& name) {
 };
 
 /**
- * @brief Check if new modeling API should be used
- *
- * Controlled by OV_GENAI_USE_MODELING_API environment variable
+ * @brief Helper to check if environment variable is truthy
  */
-bool use_modeling_api() {
+bool is_env_truthy(const char* env_name) {
     auto is_truthy = [](std::string v) {
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
@@ -81,10 +79,29 @@ bool use_modeling_api() {
         return v == "1" || v == "true" || v == "on" || v == "yes";
     };
 
-    if (const char* v = std::getenv("OV_GENAI_USE_MODELING_API")) {
+    if (const char* v = std::getenv(env_name)) {
         return is_truthy(v);
     }
     return false;
+}
+
+/**
+ * @brief Check if new modeling API should be used
+ *
+ * Controlled by OV_GENAI_USE_MODELING_API environment variable
+ */
+bool use_modeling_api() {
+    return is_env_truthy("OV_GENAI_USE_MODELING_API");
+}
+
+/**
+ * @brief Check if IR model should be saved after building
+ *
+ * Controlled by OV_GENAI_SAVE_OV_MODEL environment variable
+ * This provides a convenient way to enable model saving without passing parameters
+ */
+bool should_save_ov_model_from_env() {
+    return is_env_truthy("OV_GENAI_SAVE_OV_MODEL");
 }
 
 /**
@@ -623,8 +640,9 @@ std::shared_ptr<ov::Model> create_from_safetensors(
         build_finish_time - load_finish_time).count();
     std::cout << "[Safetensors] Model building done. Time: " << build_duration << "ms" << std::endl;
     
-    // Step 5: Optionally save the model
-    if (enable_save_ov_model) {
+    // Step 5: Optionally save the model (via parameter or environment variable)
+    bool should_save = enable_save_ov_model || should_save_ov_model_from_env();
+    if (should_save) {
         std::filesystem::path save_path = model_dir / "openvino_model.xml";
         std::cout << "[Safetensors] Saving OpenVINO model to: " << save_path << std::endl;
         ov::genai::utils::save_openvino_model(model, save_path.string(), true);
@@ -802,8 +820,9 @@ std::shared_ptr<ov::Model> create_from_safetensors_compressed(
         build_finish_time - load_finish_time).count();
     std::cout << "[Safetensors] Model building done. Time: " << build_duration << "ms" << std::endl;
     
-    // Step 5: Optionally save the model
-    if (enable_save_ov_model) {
+    // Step 5: Optionally save the model (via parameter or environment variable)
+    bool should_save = enable_save_ov_model || should_save_ov_model_from_env();
+    if (should_save) {
         std::filesystem::path save_path = model_dir / "openvino_model.xml";
         std::cout << "[Safetensors] Saving OpenVINO model to: " << save_path << std::endl;
         ov::genai::utils::save_openvino_model(model, save_path.string(), true);
