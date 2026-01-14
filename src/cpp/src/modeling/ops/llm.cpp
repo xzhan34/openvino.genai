@@ -72,6 +72,19 @@ Tensor apply_rope_interleave(const Tensor& x,
     return apply_rope(interleaved, cos, sin, head_dim, policy);
 }
 
+Tensor rope_tail(const Tensor& cos_or_sin, const Tensor& q) {
+    auto* ctx = cos_or_sin.context();
+    auto total_len = shape::dim(cos_or_sin, 1);
+    auto q_len = shape::dim(q, 2);
+
+    auto total_len_scalar = Tensor(total_len, ctx).squeeze(0);
+    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
+    auto start = total_len_scalar - q_len_scalar;
+
+    auto indices = range(start, total_len_scalar, 1, ov::element::i64);
+    return gather(cos_or_sin, indices, 1);
+}
+
 Tensor pad_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim) {
     if (target_head_dim <= head_dim) {
         return x;

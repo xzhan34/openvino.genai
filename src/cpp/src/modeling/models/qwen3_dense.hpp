@@ -146,12 +146,19 @@ public:
     std::pair<Tensor, Tensor> forward_with_penultimate(const Tensor& input_ids,
                                                        const Tensor& position_ids,
                                                        const Tensor& beam_idx);
+    std::pair<Tensor, Tensor> forward_with_selected_layers(const Tensor& input_ids,
+                                                           const Tensor& position_ids,
+                                                           const Tensor& beam_idx,
+                                                           const std::vector<int32_t>& layer_ids);
     Tensor forward_no_cache(const Tensor& input_ids,
                             const Tensor& position_ids);
     std::pair<Tensor, Tensor> forward_with_penultimate_no_cache(const Tensor& input_ids,
                                                                 const Tensor& position_ids);
     std::pair<Tensor, Tensor> forward_with_pre_norm_no_cache(const Tensor& input_ids,
                                                              const Tensor& position_ids);
+    std::pair<Tensor, Tensor> forward_with_selected_layers_no_cache(const Tensor& input_ids,
+                                                                    const Tensor& position_ids,
+                                                                    const std::vector<int32_t>& layer_ids);
 
     VocabEmbedding& embed_tokens();
     RMSNorm& norm();
@@ -190,6 +197,29 @@ std::shared_ptr<ov::Model> create_qwen3_text_encoder_model(
     const Qwen3DenseConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_dflash_target_model(
+    const Qwen3DenseConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_dflash_target_model_no_cache(
+    const Qwen3DenseConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_embedding_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_lm_head_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& input_type = ov::element::f32);
 
 }  // namespace models
 }  // namespace modeling

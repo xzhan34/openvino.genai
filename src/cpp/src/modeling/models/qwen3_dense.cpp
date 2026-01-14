@@ -3,6 +3,7 @@
 
 #include "modeling/models/qwen3_dense.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
@@ -337,6 +338,42 @@ std::pair<Tensor, Tensor> Qwen3Model::forward_with_penultimate(const Tensor& inp
     return {final_out, penultimate};
 }
 
+std::pair<Tensor, Tensor> Qwen3Model::forward_with_selected_layers(const Tensor& input_ids,
+                                                                   const Tensor& position_ids,
+                                                                   const Tensor& beam_idx,
+                                                                   const std::vector<int32_t>& layer_ids) {
+    auto hidden_states = embed_tokens_.forward(input_ids);
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    auto seq_len = Tensor(shape::dim(position_ids, 1), position_ids.context()).squeeze(0);
+    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
+    std::optional<Tensor> residual;
+
+    std::vector<int32_t> sorted_ids = layer_ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    size_t capture_idx = 0;
+    std::vector<Tensor> captures;
+    captures.reserve(sorted_ids.size());
+
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        auto layer_out = layers_[i].forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, causal_mask, residual);
+        hidden_states = layer_out.first;
+        residual = layer_out.second;
+        if (capture_idx < sorted_ids.size() && static_cast<int32_t>(i) == sorted_ids[capture_idx]) {
+            Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
+            captures.push_back(pre_norm);
+            ++capture_idx;
+        }
+    }
+
+    Tensor final_out = residual ? norm_.forward(hidden_states, *residual).first : norm_.forward(hidden_states);
+    if (captures.empty()) {
+        return {final_out, final_out};
+    }
+    auto concat_hidden = ops::concat(captures, 2);
+    return {final_out, concat_hidden};
+}
+
 Tensor Qwen3Model::forward_no_cache(const Tensor& input_ids, const Tensor& position_ids) {
     auto hidden_states = embed_tokens_.forward(input_ids);
     auto* policy = &ctx().op_policy();
@@ -393,6 +430,41 @@ std::pair<Tensor, Tensor> Qwen3Model::forward_with_pre_norm_no_cache(const Tenso
     Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
     Tensor final_out = residual ? norm_.forward(hidden_states, *residual).first : norm_.forward(hidden_states);
     return {final_out, pre_norm};
+}
+
+std::pair<Tensor, Tensor> Qwen3Model::forward_with_selected_layers_no_cache(const Tensor& input_ids,
+                                                                            const Tensor& position_ids,
+                                                                            const std::vector<int32_t>& layer_ids) {
+    auto hidden_states = embed_tokens_.forward(input_ids);
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    auto seq_len = Tensor(shape::dim(position_ids, 1), position_ids.context()).squeeze(0);
+    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
+    std::optional<Tensor> residual;
+
+    std::vector<int32_t> sorted_ids = layer_ids;
+    std::sort(sorted_ids.begin(), sorted_ids.end());
+    size_t capture_idx = 0;
+    std::vector<Tensor> captures;
+    captures.reserve(sorted_ids.size());
+
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        auto layer_out = layers_[i].forward_no_cache(hidden_states, cos_sin.first, cos_sin.second, causal_mask, residual);
+        hidden_states = layer_out.first;
+        residual = layer_out.second;
+        if (capture_idx < sorted_ids.size() && static_cast<int32_t>(i) == sorted_ids[capture_idx]) {
+            Tensor pre_norm = residual ? (hidden_states + *residual) : hidden_states;
+            captures.push_back(pre_norm);
+            ++capture_idx;
+        }
+    }
+
+    Tensor final_out = residual ? norm_.forward(hidden_states, *residual).first : norm_.forward(hidden_states);
+    if (captures.empty()) {
+        return {final_out, final_out};
+    }
+    auto concat_hidden = ops::concat(captures, 2);
+    return {final_out, concat_hidden};
 }
 
 VocabEmbedding& Qwen3Model::embed_tokens() {
@@ -468,6 +540,109 @@ std::shared_ptr<ov::Model> create_qwen3_text_encoder_model(
 
     auto result = std::make_shared<ov::op::v0::Result>(outputs.second.output());
     set_name(result, "hidden_states");
+    return ctx.build_model({result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_dflash_target_model(
+    const Qwen3DenseConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3ForCausalLM model(ctx, cfg);
+
+    ov::genai::modeling::weights::load_model(model, source, finalizer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
+
+    (void)attention_mask;
+    auto outputs = model.model().forward_with_selected_layers(input_ids, position_ids, beam_idx, target_layer_ids);
+    auto logits = model.lm_head().forward(outputs.first);
+
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(outputs.second.output());
+    set_name(hidden_result, "target_hidden");
+
+    return ctx.build_model({logits_result->output(0), hidden_result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_dflash_target_model_no_cache(
+    const Qwen3DenseConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3ForCausalLM model(ctx, cfg);
+
+    ov::genai::modeling::weights::load_model(model, source, finalizer);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    (void)attention_mask;
+    auto outputs = model.model().forward_with_selected_layers_no_cache(input_ids, position_ids, target_layer_ids);
+    auto logits = model.lm_head().forward(outputs.first);
+
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(outputs.second.output());
+    set_name(hidden_result, "target_hidden");
+
+    return ctx.build_model({logits_result->output(0), hidden_result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_embedding_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    (void)cfg;
+    BuilderContext ctx;
+
+    Module root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &root);
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(root, source, finalizer, options);
+
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto output = embed.forward(input_ids);
+
+    auto result = std::make_shared<ov::op::v0::Result>(output.output());
+    set_name(result, "embeddings");
+    return ctx.build_model({result->output(0)});
+}
+
+std::shared_ptr<ov::Model> create_qwen3_lm_head_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& input_type) {
+    BuilderContext ctx;
+
+    Module root("", ctx);
+    LMHead head(ctx, "lm_head", &root);
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(root, source, finalizer, options);
+
+    auto hidden = ctx.parameter("hidden_states", input_type, ov::PartialShape{-1, -1, cfg.hidden_size});
+    auto logits = head.forward(hidden);
+
+    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(result, "logits");
     return ctx.build_model({result->output(0)});
 }
 

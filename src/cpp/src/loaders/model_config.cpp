@@ -200,7 +200,8 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     std::string arch = extract_json_string(json, "architectures");
     if (!arch.empty()) {
         // First architecture in the list
-        if (arch.find("Qwen3") != std::string::npos) config.architecture = "qwen3";
+        if (arch.find("DFlashDraftModel") != std::string::npos) config.architecture = "dflash";
+        else if (arch.find("Qwen3") != std::string::npos) config.architecture = "qwen3";
         else if (arch.find("Qwen2") != std::string::npos) config.architecture = "qwen2";
         else if (arch.find("Llama") != std::string::npos) config.architecture = "llama";
         else if (arch.find("Mistral") != std::string::npos) config.architecture = "mistral";
@@ -225,6 +226,10 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     config.head_dim = extract_json_int(json, "head_dim", 0);
     config.vocab_size = extract_json_int(json, "vocab_size");
     config.max_position_embeddings = extract_json_int(json, "max_position_embeddings");
+
+    // DFlash-specific
+    config.block_size = extract_json_int(json, "block_size", 0);
+    config.num_target_layers = extract_json_int(json, "num_target_layers", 0);
     
     // Normalization
     config.rms_norm_eps = extract_json_float(json, "rms_norm_eps", 1e-6f);
@@ -250,8 +255,11 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
         config.head_dim = config.hidden_size / config.num_attention_heads;
     }
     
-    // Parse torch_dtype
+    // Parse torch_dtype (fallback to "dtype")
     std::string dtype_str = extract_json_string(json, "torch_dtype");
+    if (dtype_str.empty()) {
+        dtype_str = extract_json_string(json, "dtype");
+    }
     if (dtype_str == "bfloat16") config.dtype = ov::element::bf16;
     else if (dtype_str == "float16") config.dtype = ov::element::f16;
     else if (dtype_str == "float32") config.dtype = ov::element::f32;
@@ -287,6 +295,10 @@ void ModelConfig::validate() const {
     if (num_hidden_layers <= 0) missing.push_back("num_hidden_layers");
     if (num_attention_heads <= 0) missing.push_back("num_attention_heads");
     if (vocab_size <= 0) missing.push_back("vocab_size");
+    if (architecture == "dflash") {
+        if (block_size <= 0) missing.push_back("block_size");
+        if (num_target_layers <= 0) missing.push_back("num_target_layers");
+    }
     
     if (!missing.empty()) {
         std::string msg = "Missing required config fields: ";
@@ -311,6 +323,8 @@ std::string ModelConfig::summary() const {
        << "  head_dim: " << head_dim << "\n"
        << "  vocab_size: " << vocab_size << "\n"
        << "  max_position_embeddings: " << max_position_embeddings << "\n"
+       << "  block_size: " << block_size << "\n"
+       << "  num_target_layers: " << num_target_layers << "\n"
        << "  rms_norm_eps: " << rms_norm_eps << "\n"
        << "  rope_theta: " << rope_theta << "\n"
        << "  tie_word_embeddings: " << (tie_word_embeddings ? "true" : "false") << "\n"

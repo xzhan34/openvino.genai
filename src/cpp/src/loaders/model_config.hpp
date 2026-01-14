@@ -84,6 +84,14 @@ struct ModelConfig {
     
     /// Maximum sequence length
     int32_t max_position_embeddings = 0;
+
+    // ========== DFlash draft-specific ==========
+
+    /// Block size for DFlash draft generation
+    int32_t block_size = 0;
+
+    /// Number of layers in target model (for DFlash conditioning)
+    int32_t num_target_layers = 0;
     
     // ========== Normalization ==========
     
