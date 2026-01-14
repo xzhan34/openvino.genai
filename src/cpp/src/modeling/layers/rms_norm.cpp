@@ -43,7 +43,8 @@ Tensor RMSNorm::forward(const Tensor& x) const {
     auto xf = x.to(ov::element::f32);
     auto var = xf.pow(2.0f).mean(-1, true);
     auto norm = xf * (var + eps_).rsqrt();
-    return norm.to(orig_dtype) * weight();
+    auto w = weight().to(orig_dtype);
+    return norm.to(orig_dtype) * w;
 }
 
 std::pair<Tensor, Tensor> RMSNorm::forward(const Tensor& x, const Tensor& residual) const {
@@ -54,7 +55,8 @@ std::pair<Tensor, Tensor> RMSNorm::forward(const Tensor& x, const Tensor& residu
     auto residual_out = sum.to(orig_dtype);
     auto var = sum.pow(2.0f).mean(-1, true);
     auto norm = sum * (var + eps_).rsqrt();
-    auto out = norm.to(orig_dtype) * weight();
+    auto w = weight().to(orig_dtype);
+    auto out = norm.to(orig_dtype) * w;
     return {out, residual_out};
 }
 

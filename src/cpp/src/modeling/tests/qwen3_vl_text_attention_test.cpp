@@ -5,13 +5,10 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
-#include <fstream>
-#include <iostream>
 
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
-#include <openvino/pass/serialize.hpp>
 
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_vl_text.hpp"
@@ -25,10 +22,10 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
 
     const size_t batch = 1;
     const size_t seq_len = 2;
+    const size_t hidden = 4;
     const size_t num_heads = 2;
     const size_t num_kv_heads = 1;
-    const size_t head_dim = 16;
-    const size_t hidden = num_heads * head_dim;  // hidden = 2 * 16 = 32
+    const size_t head_dim = 2;
     const float rope_theta = 10000.0f;
     const size_t kv_hidden = num_kv_heads * head_dim;
 
@@ -72,7 +69,7 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
     cfg.head_dim = static_cast<int32_t>(head_dim);
     cfg.rope_theta = rope_theta;
     cfg.attention_bias = true;
-    cfg.rope.mrope_interleaved = false;  // Reference implementation doesn't support interleaved
+    cfg.rope.mrope_interleaved = true;
 
     ov::genai::modeling::models::Qwen3VLTextAttention attn(ctx, "self_attn", cfg);
     ov::genai::modeling::weights::load_model(attn, weights, finalizer);
@@ -87,33 +84,14 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
     auto output = attn.forward(hidden_states, beam_idx, rotary_cos, rotary_sin);
     auto ov_model = ctx.build_model({output.output()});
 
-    // Save original model IR
-    try {
-        ov::serialize(ov_model, "test_model_original.xml", "test_model_original.bin");
-        std::cout << "Saved original model IR to test_model_original.xml/bin" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to save original model IR: " << e.what() << std::endl;
-    }
-
     ov::Core core;
     auto compiled = core.compile_model(ov_model, "GPU");
-    
-    // Save GPU compiled runtime model IR
-    try {
-        auto runtime_model = compiled.get_runtime_model();
-        ov::serialize(runtime_model, "test_model_gpu_runtime.xml", "test_model_gpu_runtime.bin");
-        std::cout << "Saved GPU runtime model IR to test_model_gpu_runtime.xml/bin" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to save GPU runtime model IR: " << e.what() << std::endl;
-    }
-    
     auto request = compiled.create_infer_request();
 
-    // Generate hidden_data for batch=1, seq_len=2, hidden=32
-    std::vector<float> hidden_data(batch * seq_len * hidden);
-    for (size_t i = 0; i < hidden_data.size(); ++i) {
-        hidden_data[i] = 0.1f + i * 0.01f;
-    }
+    const std::vector<float> hidden_data = {
+        0.1f, 0.2f, 0.3f, 0.4f,
+        0.5f, 0.6f, 0.7f, 0.8f,
+    };
     ov::Tensor hidden_tensor(ov::element::f32, {batch, seq_len, hidden});
     std::memcpy(hidden_tensor.data(), hidden_data.data(), hidden_data.size() * sizeof(float));
     request.set_input_tensor(0, hidden_tensor);

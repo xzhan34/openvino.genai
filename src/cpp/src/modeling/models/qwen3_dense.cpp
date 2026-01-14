@@ -561,10 +561,14 @@ std::shared_ptr<ov::Model> create_qwen3_dflash_target_model(
     (void)attention_mask;
     auto outputs = model.model().forward_with_selected_layers(input_ids, position_ids, beam_idx, target_layer_ids);
     auto logits = model.lm_head().forward(outputs.first);
+    auto hidden_out = outputs.second;
+    if (hidden_out.dtype() != logits.dtype()) {
+        hidden_out = hidden_out.to(logits.dtype());
+    }
 
     auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(logits_result, "logits");
-    auto hidden_result = std::make_shared<ov::op::v0::Result>(outputs.second.output());
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(hidden_out.output());
     set_name(hidden_result, "target_hidden");
 
     return ctx.build_model({logits_result->output(0), hidden_result->output(0)});
@@ -587,10 +591,14 @@ std::shared_ptr<ov::Model> create_qwen3_dflash_target_model_no_cache(
     (void)attention_mask;
     auto outputs = model.model().forward_with_selected_layers_no_cache(input_ids, position_ids, target_layer_ids);
     auto logits = model.lm_head().forward(outputs.first);
+    auto hidden_out = outputs.second;
+    if (hidden_out.dtype() != logits.dtype()) {
+        hidden_out = hidden_out.to(logits.dtype());
+    }
 
     auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(logits_result, "logits");
-    auto hidden_result = std::make_shared<ov::op::v0::Result>(outputs.second.output());
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(hidden_out.output());
     set_name(hidden_result, "target_hidden");
 
     return ctx.build_model({logits_result->output(0), hidden_result->output(0)});
@@ -630,6 +638,16 @@ std::shared_ptr<ov::Model> create_qwen3_lm_head_model(
 
     Module root("", ctx);
     LMHead head(ctx, "lm_head", &root);
+
+    // Some HF shards omit lm_head.weight when embeddings are tied.
+    if (!source.has("lm_head.weight") && cfg.tie_word_embeddings) {
+        const std::string embed_weight = "model.embed_tokens.weight";
+        if (!source.has(embed_weight)) {
+            OPENVINO_THROW("Missing lm_head.weight and no embedding weight available to tie.");
+        }
+        auto tied = finalizer.finalize(embed_weight, source, ctx.op_context());
+        head.weight_param().bind(tied);
+    }
 
     ov::genai::modeling::weights::LoadOptions options;
     options.allow_unmatched = true;

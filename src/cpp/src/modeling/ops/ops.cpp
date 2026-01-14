@@ -88,9 +88,8 @@ Tensor matmul(const Tensor& a, const Tensor& b, bool ta, bool tb) {
 
 Tensor linear(const Tensor& x, const Tensor& weight) {
     auto* ctx = resolve_context(x, weight);
-    // Use standard MatMul with transpose_b=true instead of internal FullyConnected
-    // MatMul is serializable to IR, GPU will convert it back to FullyConnected at compile time
-    auto node = std::make_shared<ov::op::v0::MatMul>(x.output(), weight.output(), false, true);
+    auto no_bias = std::make_shared<ov::op::internal::PlaceholderExtension>();
+    auto node = std::make_shared<ov::op::internal::FullyConnected>(x.output(), weight.output(), no_bias);
     return Tensor(node, ctx);
 }
 

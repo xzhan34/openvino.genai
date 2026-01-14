@@ -7,7 +7,6 @@
 #include <vector>
 
 #include <openvino/opsets/opset13.hpp>
-#include <ov_ops/rotary_positional_embeddings.hpp>
 
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
@@ -48,31 +47,18 @@ Tensor apply_rope(const Tensor& x,
                   int32_t head_dim,
                   const OpPolicy* policy) {
     (void)policy;
-    // Use internal RoPE op directly for optimal GPU performance.
-    // This avoids relying on RoPEFusion transformation to match patterns.
-    //
-    // Input shapes:
-    //   x: [batch, heads, seq, head_dim]
-    //   cos/sin: [batch, seq, half_dim] where half_dim = head_dim / 2
-    //
-    // RoPE op expects cos/sin with shape [batch, seq, rotary_ndims] and will
-    // handle the rotation internally.
+    // Align rotary factors with activation dtype to avoid mixed-type multiplies.
+    auto dtype = x.dtype();
+    auto cos_unsq = cos.to(dtype).unsqueeze(1);
+    auto sin_unsq = sin.to(dtype).unsqueeze(1);
+    int64_t half_dim = head_dim / 2;
 
-    op::internal::RoPE::Config config;
-    config.rotary_ndims = static_cast<size_t>(head_dim);
-    config.is_interleaved = false;
-    config.input_trans0213 = false;
-    config.output_trans0213 = false;
+    auto x1 = slice(x, 0, half_dim, 1, 3);
+    auto x2 = slice(x, half_dim, head_dim, 1, 3);
 
-    // Expand cos/sin from half_dim to head_dim by concatenating with themselves
-    auto cos_full = concat({cos, cos}, 2);  // [batch, seq, head_dim]
-    auto sin_full = concat({sin, sin}, 2);  // [batch, seq, head_dim]
-
-    auto rope_node = std::make_shared<op::internal::RoPE>(
-        ov::OutputVector{x.output(), cos_full.output(), sin_full.output()},
-        config);
-
-    return Tensor(rope_node, x.context());
+    auto rot1 = x1 * cos_unsq - x2 * sin_unsq;
+    auto rot2 = x1 * sin_unsq + x2 * cos_unsq;
+    return concat({rot1, rot2}, 3);
 }
 
 Tensor apply_rope_interleave(const Tensor& x,

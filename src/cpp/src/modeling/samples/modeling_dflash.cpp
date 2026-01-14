@@ -123,10 +123,19 @@ int64_t argmax_last_token(const ov::Tensor& logits) {
 int64_t resolve_mask_token_id(const ov::genai::Tokenizer& tokenizer) {
     const auto vocab = tokenizer.get_vocab();
     const auto it = vocab.find("<|MASK|>");
-    if (it == vocab.end()) {
-        throw std::runtime_error("Tokenizer vocab does not contain <|MASK|> token");
+    if (it != vocab.end()) {
+        return it->second;
     }
-    return it->second;
+    // Fallback: use pad token if defined, otherwise eos as a safe placeholder.
+    const int64_t pad_id = tokenizer.get_pad_token_id();
+    if (pad_id != -1) {
+        return pad_id;
+    }
+    const int64_t eos_id = tokenizer.get_eos_token_id();
+    if (eos_id != -1) {
+        return eos_id;
+    }
+    throw std::runtime_error("Tokenizer has no <|MASK|>, pad, or eos token to use as mask placeholder");
 }
 
 }  // namespace
@@ -204,12 +213,14 @@ int main(int argc, char* argv[]) try {
 
     auto target_model = ov::genai::modeling::models::create_qwen3_dflash_target_model_no_cache(
         qwen_cfg, target_layer_ids, target_source, target_finalizer);
+    const auto target_hidden_type = target_model->output("target_hidden").get_element_type();
+    auto draft_model = ov::genai::modeling::models::create_dflash_draft_model(
+        dflash_cfg, draft_source, draft_finalizer, target_hidden_type);
+    auto draft_hidden_type = draft_model->output("draft_hidden").get_element_type();
     auto embed_model = ov::genai::modeling::models::create_qwen3_embedding_model(
         qwen_cfg, target_source, target_finalizer);
     auto lm_head_model = ov::genai::modeling::models::create_qwen3_lm_head_model(
-        qwen_cfg, target_source, target_finalizer, target_cfg.dtype);
-    auto draft_model = ov::genai::modeling::models::create_dflash_draft_model(
-        dflash_cfg, draft_source, draft_finalizer, draft_cfg.dtype);
+        qwen_cfg, target_source, target_finalizer, draft_hidden_type);
 
     ov::Core core;
     auto compiled_target = core.compile_model(target_model, device);
@@ -266,6 +277,13 @@ int main(int argc, char* argv[]) try {
         draft_request.infer();
         auto draft_hidden = draft_request.get_tensor("draft_hidden");
 
+        // Align dtype for lm_head input if needed.
+        const auto& lm_head_port = compiled_lm_head.input("hidden_states");
+        if (draft_hidden.get_element_type() != lm_head_port.get_element_type()) {
+            ov::Tensor converted(lm_head_port.get_element_type(), draft_hidden.get_shape());
+            draft_hidden.copy_to(converted);
+            draft_hidden = converted;
+        }
         lm_head_request.set_tensor("hidden_states", draft_hidden);
         lm_head_request.infer();
         auto draft_logits = lm_head_request.get_tensor("logits");
@@ -281,6 +299,7 @@ int main(int argc, char* argv[]) try {
         target_request.set_tensor("position_ids", make_position_ids(verify_ids.size()));
         target_request.infer();
         logits = target_request.get_tensor("logits");
+        auto target_hidden_verify = target_request.get_tensor("target_hidden");
 
         const size_t start = output_ids.size() - 1;
         auto posterior = argmax_logits_slice(logits, start, block_ids.size());
