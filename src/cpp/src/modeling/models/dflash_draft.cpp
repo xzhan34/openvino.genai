@@ -258,16 +258,19 @@ std::shared_ptr<ov::Model> create_dflash_draft_model(
     const DFlashDraftConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
-    const ov::element::Type& input_type) {
+    const ov::element::Type& /*input_type*/) {
     BuilderContext ctx;
     DFlashDraftModel model(ctx, cfg);
 
     ov::genai::modeling::weights::load_model(model, source, finalizer);
 
+    // Force FP32 compute for draft path to avoid BF16 instability.
+    const ov::element::Type dtype = ov::element::f32;
+
     const int64_t ctx_dim = static_cast<int64_t>(cfg.hidden_size) *
                             static_cast<int64_t>(cfg.num_hidden_layers);
-    auto target_hidden = ctx.parameter("target_hidden", input_type, ov::PartialShape{-1, -1, ctx_dim});
-    auto noise_embedding = ctx.parameter("noise_embedding", input_type, ov::PartialShape{-1, -1, cfg.hidden_size});
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+    auto noise_embedding = ctx.parameter("noise_embedding", dtype, ov::PartialShape{-1, -1, cfg.hidden_size});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
 
     auto hidden = model.forward(target_hidden, noise_embedding, position_ids);
@@ -335,7 +338,7 @@ std::shared_ptr<ov::Model> build_dflash_model(
     cfg.hidden_act = config.hidden_act;
     cfg.attention_bias = config.attention_bias;
 
-    return create_dflash_draft_model(cfg, weight_source, weight_finalizer, config.dtype);
+    return create_dflash_draft_model(cfg, weight_source, weight_finalizer, ov::element::f32);
 }
 
 static bool dflash_registered = []() {

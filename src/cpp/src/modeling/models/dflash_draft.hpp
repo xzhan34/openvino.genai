@@ -147,6 +147,8 @@ std::shared_ptr<ov::Model> create_dflash_draft_model(
     const DFlashDraftConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    // NOTE: Draft is always constructed in FP32 to avoid BF16 instabilities; the
+    // type argument is kept for API compatibility only.
     const ov::element::Type& input_type = ov::element::f32);
 
 std::vector<int32_t> build_target_layer_ids(int32_t num_target_layers, int32_t num_draft_layers);
