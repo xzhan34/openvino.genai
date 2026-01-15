@@ -536,7 +536,7 @@ std::map<std::string, GGUFMetaData> config_from_meta(const std::unordered_map<st
     if (metadata.count(arch + ".expert_count")) {
         config["expert_count"] = metadata_to_int(metadata, arch + ".expert_count");
         config["expert_used_count"] = metadata_to_int(metadata, arch + ".expert_used_count");
-        config["moe_inter_size"] = metadata_to_int(metadata, arch + ".feed_forward_length");
+        config["moe_inter_size"] = metadata_to_int(metadata, arch + ".expert_feed_forward_length");
     } else {
         config["expert_count"] = 0;
         config["expert_used_count"] = 0;

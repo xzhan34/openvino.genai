@@ -1337,6 +1337,9 @@ ov::Output<ov::Node> make_moe(
     config.top_k = cfg_top_k > 0 ? cfg_top_k : 1;
     config.group_size = static_cast<int>(group_size);
     config.out_type = ov::element::f16;
+    // TODO: design issue
+    bool is_pa = true;
+    config.has_batch_dim = is_pa ? 0 : 1;
 
     ov::OutputVector args = {
         hidden_f16,
@@ -1624,17 +1627,17 @@ std::tuple<ov::Output<ov::Node>,
     int num_heads_kv = std::get<int>(configs.at("head_num_kv"));
     
     // Option 1: Use fused QKV FC (recommended for performance)
-    auto [q, k, v] = make_qkv_fused_fc(
-        layer_prefix,
-        input_layernorm,
-        consts,
-        qtypes,
-        reorder,
-        head_size,
-        num_heads,
-        num_heads_kv);
+    // auto [q, k, v] = make_qkv_fused_fc(
+    //     layer_prefix,
+    //     input_layernorm,
+    //     consts,
+    //     qtypes,
+    //     reorder,
+    //     head_size,
+    //     num_heads,
+    //     num_heads_kv);
     
-    /* Option 2: Use separate FCs (original approach)
+    // Option 2: Use separate FCs (original approach)
     auto q = make_fc(
         layer_prefix + ".self_attn.q_proj",
         input_layernorm,
@@ -1656,7 +1659,6 @@ std::tuple<ov::Output<ov::Node>,
         input_layernorm,
         consts,
         qtypes.at(layer_prefix + ".self_attn.v_proj.qtype"));
-    */
 
     // Handle output shape
     std::shared_ptr<ov::Node> final_output_shape = output_shape;
