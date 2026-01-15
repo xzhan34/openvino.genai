@@ -223,8 +223,8 @@ TEST(DFlashDraft, ForwardMatchesReference) {
             GTEST_SKIP() << "GPU device is required for this test (CPU plugin lacks PlaceholderExtension support)";
         }
     }
-
-    auto compiled = core.compile_model(model, device);
+    ov::AnyMap compile_cfg = {{ov::hint::inference_precision.name(), ov::element::f32}};
+    auto compiled = core.compile_model(model, device, compile_cfg);
     auto request = compiled.create_infer_request();
     request.set_tensor("target_hidden", target_tensor);
     request.set_tensor("noise_embedding", noise_tensor);

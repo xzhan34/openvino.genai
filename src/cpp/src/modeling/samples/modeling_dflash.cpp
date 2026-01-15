@@ -460,10 +460,14 @@ int main(int argc, char* argv[]) try {
         qwen_cfg, target_source, target_finalizer, draft_compute_type);
 
     ov::Core core;
-    auto compiled_target = core.compile_model(target_model, device);
-    auto compiled_embed = core.compile_model(embed_model, device);
-    auto compiled_lm_head = core.compile_model(lm_head_model, device);
-    auto compiled_draft = core.compile_model(draft_model, device);
+    // Force all sub-models to run in FP32 to rule out BF16/F16 precision issues.
+    ov::AnyMap compile_cfg = {
+        {ov::hint::inference_precision.name(), ov::element::f32}
+    };
+    auto compiled_target = core.compile_model(target_model, device, compile_cfg);
+    auto compiled_embed = core.compile_model(embed_model, device, compile_cfg);
+    auto compiled_lm_head = core.compile_model(lm_head_model, device, compile_cfg);
+    auto compiled_draft = core.compile_model(draft_model, device, compile_cfg);
 
     auto target_request = compiled_target.create_infer_request();
     auto embed_request = compiled_embed.create_infer_request();
