@@ -47,22 +47,27 @@ std::string GGUFWeightFinalizer::base_key_from_name(const std::string& name) con
     return name;
 }
 
-ov::genai::modeling::Tensor GGUFWeightFinalizer::finalize(const std::string& name,
-                                                          ov::genai::modeling::weights::WeightSource& source,
-                                                          ov::genai::modeling::OpContext& ctx) {
+ov::genai::modeling::weights::FinalizedWeight GGUFWeightFinalizer::finalize(const std::string& name,
+                                                                            ov::genai::modeling::weights::WeightSource& source,
+                                                                            ov::genai::modeling::OpContext& ctx) {
     if (!source.has(name)) {
         OPENVINO_THROW("Missing GGUF tensor: ", name);
     }
     const std::string base_key = base_key_from_name(name);
     const auto it_cached = cache_.find(base_key);
+    std::unordered_map<std::string, ov::genai::modeling::Tensor> empty_auxiliary;
     if (it_cached != cache_.end()) {
-        return ov::genai::modeling::Tensor(it_cached->second, &ctx);
+        return ov::genai::modeling::weights::FinalizedWeight(
+            ov::genai::modeling::Tensor(it_cached->second, &ctx),
+            empty_auxiliary);
     }
 
     const auto qtype = resolve_qtype(base_key);
     auto node = make_weights_subgraph(base_key, consts_, qtype, /*reorder=*/false, /*head_size=*/-1);
     cache_.emplace(base_key, node);
-    return ov::genai::modeling::Tensor(node, &ctx);
+    return ov::genai::modeling::weights::FinalizedWeight(
+        ov::genai::modeling::Tensor(node, &ctx),
+        empty_auxiliary);
 }
 
 }  // namespace gguf

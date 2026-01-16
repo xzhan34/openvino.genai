@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <openvino/opsets/opset13.hpp>
+#include <ov_ops/rotary_positional_embeddings.hpp>
 
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
@@ -47,18 +48,39 @@ Tensor apply_rope(const Tensor& x,
                   int32_t head_dim,
                   const OpPolicy* policy) {
     (void)policy;
-    // Align rotary factors with activation dtype to avoid mixed-type multiplies.
-    auto dtype = x.dtype();
-    auto cos_unsq = cos.to(dtype).unsqueeze(1);
-    auto sin_unsq = sin.to(dtype).unsqueeze(1);
-    int64_t half_dim = head_dim / 2;
+    // Use internal RoPE op directly for optimal GPU performance.
+    // This avoids relying on RoPEFusion transformation to match patterns.
+    //
+    // Input shapes:
+    //   x: [batch, heads, seq, head_dim]
+    //   cos/sin: [batch, seq, half_dim] where half_dim = head_dim / 2
+    //
+    // RoPE op expects cos/sin with shape [batch, seq, rotary_ndims] and will
+    // handle the rotation internally.
 
-    auto x1 = slice(x, 0, half_dim, 1, 3);
-    auto x2 = slice(x, half_dim, head_dim, 1, 3);
+    op::internal::RoPE::Config config;
+    config.rotary_ndims = static_cast<size_t>(head_dim);
+    config.is_interleaved = false;
+    config.input_trans0213 = false;
+    config.output_trans0213 = false;
 
-    auto rot1 = x1 * cos_unsq - x2 * sin_unsq;
-    auto rot2 = x1 * sin_unsq + x2 * cos_unsq;
-    return concat({rot1, rot2}, 3);
+    // Expand cos/sin from half_dim to head_dim by concatenating with themselves
+    auto cos_full = concat({cos, cos}, 2);  // [batch, seq, head_dim]
+    auto sin_full = concat({sin, sin}, 2);  // [batch, seq, head_dim]
+
+    // Unsqueeze to 4D: [batch, 1, seq, head_dim] to use GPU's 4D RoPE path
+    // which is more thoroughly tested than the 3D path that has indexing bugs
+    auto cos_4d = cos_full.unsqueeze(1);  // [batch, 1, seq, head_dim]
+    auto sin_4d = sin_full.unsqueeze(1);  // [batch, 1, seq, head_dim]
+
+    // Since we expanded cos/sin to full head_dim, set cos_sin_ndims accordingly
+    config.cos_sin_ndims = static_cast<size_t>(head_dim);
+
+    auto rope_node = std::make_shared<op::internal::RoPE>(
+        ov::OutputVector{x.output(), cos_4d.output(), sin_4d.output()},
+        config);
+
+    return Tensor(rope_node, x.context());
 }
 
 Tensor apply_rope_interleave(const Tensor& x,
@@ -72,19 +94,6 @@ Tensor apply_rope_interleave(const Tensor& x,
                            .permute({0, 1, 2, 4, 3})
                            .reshape({0, 0, 0, head_dim});
     return apply_rope(interleaved, cos, sin, head_dim, policy);
-}
-
-Tensor rope_tail(const Tensor& cos_or_sin, const Tensor& q) {
-    auto* ctx = cos_or_sin.context();
-    auto total_len = shape::dim(cos_or_sin, 1);
-    auto q_len = shape::dim(q, 2);
-
-    auto total_len_scalar = Tensor(total_len, ctx).squeeze(0);
-    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
-    auto start = total_len_scalar - q_len_scalar;
-
-    auto indices = range(start, total_len_scalar, 1, ov::element::i64);
-    return gather(cos_or_sin, indices, 1);
 }
 
 Tensor pad_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim) {

@@ -191,9 +191,9 @@ private:
 
 class DummyWeightFinalizer : public weights::WeightFinalizer {
 public:
-    Tensor finalize(const std::string& name, weights::WeightSource& source, OpContext& ctx) override {
+    weights::FinalizedWeight finalize(const std::string& name, weights::WeightSource& source, OpContext& ctx) override {
         const auto& tensor = source.get_tensor(name);
-        return ops::constant(tensor, &ctx);
+        return weights::FinalizedWeight(ops::constant(tensor, &ctx), {});
     }
 };
 

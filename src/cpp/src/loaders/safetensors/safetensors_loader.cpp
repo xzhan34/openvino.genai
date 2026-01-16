@@ -23,8 +23,13 @@
 #include "safetensors_utils/safetensors_weight_source.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 
+// Modeling API quantization support
+#include "modeling/weights/quantization_config.hpp"
+
 // JSON parsing
 #include <nlohmann/json.hpp>
+#include <sstream>
+#include <cstdlib>
 
 namespace ov {
 namespace genai {
@@ -93,8 +98,13 @@ std::shared_ptr<WeightSource> SafetensorsLoader::create_weight_source(
 std::shared_ptr<WeightFinalizer> SafetensorsLoader::create_weight_finalizer(
     const ModelConfig& config) const {
     
-    // Reuse existing SafetensorsWeightFinalizer which handles BF16/F16 -> F32 conversion
-    return std::make_shared<safetensors::SafetensorsWeightFinalizer>();
+    using namespace ov::genai::modeling::weights;
+    
+    // Parse quantization configuration from environment variables
+    auto quant_config = parse_quantization_config_from_env();
+    
+    // Create finalizer with quantization config
+    return std::make_shared<safetensors::SafetensorsWeightFinalizer>(quant_config);
 }
 
 TokenizerPair SafetensorsLoader::load_tokenizer(const std::string& path) const {

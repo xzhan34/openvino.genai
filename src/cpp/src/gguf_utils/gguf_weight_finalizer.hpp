@@ -21,9 +21,9 @@ public:
     GGUFWeightFinalizer(const std::unordered_map<std::string, ov::Tensor>& consts,
                         const std::unordered_map<std::string, gguf_tensor_type>& qtypes);
 
-    ov::genai::modeling::Tensor finalize(const std::string& name,
-                                         ov::genai::modeling::weights::WeightSource& source,
-                                         ov::genai::modeling::OpContext& ctx) override;
+    ov::genai::modeling::weights::FinalizedWeight finalize(const std::string& name,
+                                                           ov::genai::modeling::weights::WeightSource& source,
+                                                           ov::genai::modeling::OpContext& ctx) override;
 
 private:
     gguf_tensor_type resolve_qtype(const std::string& base_key) const;

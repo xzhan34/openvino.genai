@@ -29,7 +29,6 @@ Tensor apply_rope_interleave(const Tensor& x,
                              const Tensor& sin,
                              int32_t head_dim,
                              const OpPolicy* policy = nullptr);
-Tensor rope_tail(const Tensor& cos_or_sin, const Tensor& q);
 Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32_t head_dim);
 Tensor causal_mask_from_seq_len(const Tensor& seq_len);
 Tensor causal_mask(const Tensor& scores);

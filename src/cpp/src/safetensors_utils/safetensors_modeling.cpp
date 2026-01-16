@@ -36,6 +36,7 @@
 #include "modeling/models/qwen3_moe.hpp"
 #include "modeling/models/smollm3.hpp"
 #include "modeling/models/youtu_llm.hpp"
+#include "modeling/weights/quantization_config.hpp"
 
 using namespace ov;
 using namespace ov::op::v13;
@@ -153,49 +154,174 @@ std::string convert_weight_name(const std::string& name) {
 // Output names:
 //   model.layers[X].moe.{gate_exps,up_exps,down_exps}.(weight|scales|biases|zps)
 // Also rewrites router gate to gate_inp: model.layers[X].mlp.gate.(*) -> model.layers[X].moe.gate_inp.(*)
-void fuse_moe_tensors(std::unordered_map<std::string, ov::Tensor>& tensors) {
+//
+// Supports both zero-copy and non-zero-copy modes:
+// - Non-zero-copy: Fuses tensors in memory
+// - Zero-copy: Skips fusion (handled by weight loaders using fuse_expert_weights)
+// Helper for output name
+static std::string proj_out_name(const std::string& proj) {
+    if (proj == "gate_proj") return std::string("gate_exps");
+    if (proj == "up_proj") return std::string("up_exps");
+    return std::string("down_exps");
+}
+
+// Zero-copy mode: rename router and stack experts in memory (since they are not contiguous)
+void fuse_moe_tensors_zero_copy(SafetensorsData& st_data) {
     struct ExpertRef {
         int expert_id;
-        std::string base_key;  // without suffix
+        std::string base_key;
     };
 
-    // Map: layer -> proj -> list of experts
-    std::map<int, std::map<std::string, std::vector<ExpertRef>>> per_layer;
+    auto rename_meta = [&](const std::string& old_base, const std::string& new_base) {
+        std::vector<std::string> suffixes = {".weight", ".scales", ".biases", ".zps"};
+        for (const auto& suffix : suffixes) {
+            std::string old_name = old_base + suffix;
+            std::string new_name = new_base + suffix;
+            auto it = st_data.tensor_infos.find(old_name);
+            if (it != st_data.tensor_infos.end()) {
+                TensorInfo info = it->second;
+                info.name = new_name;
+                st_data.tensor_infos[new_name] = info;
+                st_data.tensor_infos.erase(it);
 
-    for (const auto& [name, tensor] : tensors) {
-        // Look for pattern: model.layers[X].mlp.experts.Y.<proj>.<suffix>
+                auto m_it = st_data.tensor_mmap_info.find(old_name);
+                if (m_it != st_data.tensor_mmap_info.end()) {
+                    st_data.tensor_mmap_info[new_name] = m_it->second;
+                    st_data.tensor_mmap_info.erase(m_it);
+                }
+            }
+        }
+    };
+
+    auto stack_experts_from_mmap = [&](const std::vector<std::string>& expert_keys) -> ov::Tensor {
+        if (expert_keys.empty()) return {};
+
+        auto it_info = st_data.tensor_infos.find(expert_keys[0]);
+        if (it_info == st_data.tensor_infos.end()) return {};
+
+        ov::element::Type element_type = it_info->second.dtype;
+        ov::Shape part_shape = it_info->second.shape;
+        ov::Shape fused_shape = part_shape;
+        fused_shape.insert(fused_shape.begin(), expert_keys.size());
+
+        ov::Tensor fused(element_type, fused_shape);
+        uint8_t* dst = static_cast<uint8_t*>(fused.data());
+
+        for (size_t i = 0; i < expert_keys.size(); ++i) {
+            auto it_m = st_data.tensor_mmap_info.find(expert_keys[i]);
+            if (it_m == st_data.tensor_mmap_info.end()) return {};
+
+            const uint8_t* src = it_m->second.holder->data_buffer() + it_m->second.offset;
+            size_t bytes = it_m->second.size;
+            std::memcpy(dst + i * bytes, src, bytes);
+        }
+        return fused;
+    };
+
+    std::map<int, std::map<std::string, std::vector<ExpertRef>>> per_layer;
+    for (const auto& [name, info] : st_data.tensor_infos) {
         const std::string marker = ".mlp.experts.";
         auto pos = name.find(marker);
         if (pos == std::string::npos) continue;
 
-        // Parse layer id
         auto layer_start = name.find("model.layers[");
         if (layer_start == std::string::npos) continue;
         auto layer_bracket = name.find(']', layer_start);
         if (layer_bracket == std::string::npos) continue;
         int layer_id = std::stoi(name.substr(layer_start + 13, layer_bracket - (layer_start + 13)));
 
-        // Parse expert id
         size_t expert_start = pos + marker.size();
         size_t expert_end = name.find('.', expert_start);
         if (expert_end == std::string::npos) continue;
         int expert_id = std::stoi(name.substr(expert_start, expert_end - expert_start));
 
-        // Parse projection name
         size_t proj_start = expert_end + 1;
         size_t proj_end = name.find('.', proj_start);
         if (proj_end == std::string::npos) continue;
         std::string proj = name.substr(proj_start, proj_end - proj_start);
+
         if (proj != "gate_proj" && proj != "up_proj" && proj != "down_proj") continue;
+        if (name.substr(proj_end + 1) != "weight") continue;
 
-        // Only seed once per expert/proj using the weight tensor; skip scales/biases/zps
-        std::string suffix = name.substr(proj_end + 1);
-        if (suffix != "weight") continue;
-
-        // Base key without suffix
-        std::string base_key = name.substr(0, proj_end);
-        per_layer[layer_id][proj].push_back({expert_id, base_key});
+        per_layer[layer_id][proj].push_back({expert_id, name.substr(0, proj_end)});
     }
+
+    for (auto& [layer_id, proj_map] : per_layer) {
+        std::string layer_prefix = "model.layers[" + std::to_string(layer_id) + "]";
+        
+        // Router rename
+        rename_meta(layer_prefix + ".mlp.gate", layer_prefix + ".moe.gate_inp");
+
+        // Experts fusion
+        for (auto& [proj, refs] : proj_map) {
+            std::sort(refs.begin(), refs.end(), [](const ExpertRef& a, const ExpertRef& b){ return a.expert_id < b.expert_id; });
+
+            std::vector<std::string> suffixes = {".weight", ".scales", ".biases", ".zps"};
+            for (const auto& suffix : suffixes) {
+                std::vector<std::string> expert_keys;
+                for (const auto& ref : refs) {
+                    std::string key = ref.base_key + suffix;
+                    if (st_data.tensor_infos.count(key)) expert_keys.push_back(key);
+                }
+
+                if (expert_keys.size() == refs.size()) {
+                    ov::Tensor fused = stack_experts_from_mmap(expert_keys);
+                    if (fused) {
+                        std::string out_name = layer_prefix + ".moe." + proj_out_name(proj) + suffix;
+                        st_data.tensors[out_name] = fused;
+                        
+                        TensorInfo info;
+                        info.name = out_name;
+                        info.dtype = fused.get_element_type();
+                        info.shape = fused.get_shape();
+                        st_data.tensor_infos[out_name] = info;
+
+                        for (const auto& key : expert_keys) {
+                            st_data.tensor_infos.erase(key);
+                            st_data.tensor_mmap_info.erase(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Non-zero-copy mode: in-memory stacking
+void fuse_moe_tensors_in_memory(SafetensorsData& st_data) {
+    std::unordered_map<std::string, ov::Tensor>& tensors = st_data.tensors;
+    struct ExpertRef {
+        int expert_id;
+        std::string base_key;
+    };
+
+    auto rename_in_memory = [&](const std::string& old_base, const std::string& new_base) {
+        std::vector<std::string> suffixes = {".weight", ".scales", ".biases", ".zps"};
+        for (const auto& suffix : suffixes) {
+            std::string old_name = old_base + suffix;
+            std::string new_name = new_base + suffix;
+            
+            auto it_t = tensors.find(old_name);
+            if (it_t != tensors.end()) {
+                tensors[new_name] = it_t->second;
+                tensors.erase(it_t);
+            }
+
+            auto it_meta = st_data.tensor_infos.find(old_name);
+            if (it_meta != st_data.tensor_infos.end()) {
+                TensorInfo info = it_meta->second;
+                info.name = new_name;
+                st_data.tensor_infos[new_name] = info;
+                st_data.tensor_infos.erase(it_meta);
+
+                auto it_m = st_data.tensor_mmap_info.find(old_name);
+                if (it_m != st_data.tensor_mmap_info.end()) {
+                    st_data.tensor_mmap_info[new_name] = it_m->second;
+                    st_data.tensor_mmap_info.erase(it_m);
+                }
+            }
+        }
+    };
 
     auto stack_tensors = [](const std::vector<ov::Tensor>& parts) -> ov::Tensor {
         if (parts.empty()) return {};
@@ -204,102 +330,82 @@ void fuse_moe_tensors(std::unordered_map<std::string, ov::Tensor>& tensors) {
         shape.insert(shape.begin(), parts.size());
         ov::Tensor fused(first.get_element_type(), shape);
         size_t bytes_per = first.get_byte_size();
-        void* dst_raw = fused.data();
-        uint8_t* dst = static_cast<uint8_t*>(dst_raw);
+        uint8_t* dst = static_cast<uint8_t*>(fused.data());
         for (size_t i = 0; i < parts.size(); ++i) {
-            const void* src_raw = parts[i].data();
-            std::memcpy(dst + i * bytes_per, src_raw, bytes_per);
+            std::memcpy(dst + i * bytes_per, parts[i].data(), bytes_per);
         }
         return fused;
     };
 
-    auto proj_out_name = [](const std::string& proj) {
-        if (proj == "gate_proj") return std::string("gate_exps");
-        if (proj == "up_proj") return std::string("up_exps");
-        return std::string("down_exps");
-    };
+    std::map<int, std::map<std::string, std::vector<ExpertRef>>> per_layer;
+    for (const auto& [name, tensor] : tensors) {
+        const std::string marker = ".mlp.experts.";
+        auto pos = name.find(marker);
+        if (pos == std::string::npos) continue;
+
+        auto layer_start = name.find("model.layers[");
+        if (layer_start == std::string::npos) continue;
+        auto layer_bracket = name.find(']', layer_start);
+        if (layer_bracket == std::string::npos) continue;
+        int layer_id = std::stoi(name.substr(layer_start + 13, layer_bracket - (layer_start + 13)));
+
+        size_t expert_start = pos + marker.size();
+        size_t expert_end = name.find('.', expert_start);
+        if (expert_end == std::string::npos) continue;
+        int expert_id = std::stoi(name.substr(expert_start, expert_end - expert_start));
+
+        size_t proj_start = expert_end + 1;
+        size_t proj_end = name.find('.', proj_start);
+        if (proj_end == std::string::npos) continue;
+        std::string proj = name.substr(proj_start, proj_end - proj_start);
+
+        if (proj != "gate_proj" && proj != "up_proj" && proj != "down_proj") continue;
+        if (name.substr(proj_end + 1) != "weight") continue;
+
+        per_layer[layer_id][proj].push_back({expert_id, name.substr(0, proj_end)});
+    }
 
     for (auto& [layer_id, proj_map] : per_layer) {
         std::string layer_prefix = "model.layers[" + std::to_string(layer_id) + "]";
 
+        // Router rename
+        rename_in_memory(layer_prefix + ".mlp.gate", layer_prefix + ".moe.gate_inp");
+
+        // Experts fusion
         for (auto& [proj, refs] : proj_map) {
-            // Sort by expert id to maintain order
             std::sort(refs.begin(), refs.end(), [](const ExpertRef& a, const ExpertRef& b){ return a.expert_id < b.expert_id; });
 
-            // Collect per-expert tensors
-            std::vector<ov::Tensor> weights;
-            std::vector<ov::Tensor> scales;
-            std::vector<ov::Tensor> biases;
-            std::vector<ov::Tensor> zps;
-
-            bool has_bias = true;
-            bool has_zp = true;
-
-            for (const auto& ref : refs) {
-                auto w_it = tensors.find(ref.base_key + ".weight");
-                auto s_it = tensors.find(ref.base_key + ".scales");
-                auto b_it = tensors.find(ref.base_key + ".biases");
-                auto z_it = tensors.find(ref.base_key + ".zps");
-
-                if (w_it == tensors.end() || s_it == tensors.end()) {
-                    has_bias = false;
-                    has_zp = false;
-                    weights.clear();
-                    break;
+            std::vector<std::string> suffixes = {".weight", ".scales", ".biases", ".zps"};
+            for (const auto& suffix : suffixes) {
+                std::vector<ov::Tensor> parts;
+                std::vector<std::string> expert_keys;
+                for (const auto& ref : refs) {
+                    std::string key = ref.base_key + suffix;
+                    auto it = tensors.find(key);
+                    if (it != tensors.end()) {
+                        parts.push_back(it->second);
+                        expert_keys.push_back(key);
+                    }
                 }
-                weights.push_back(w_it->second);
-                scales.push_back(s_it->second);
-                if (b_it != tensors.end()) {
-                    biases.push_back(b_it->second);
-                } else {
-                    has_bias = false;
-                }
-                if (z_it != tensors.end()) {
-                    zps.push_back(z_it->second);
-                } else {
-                    has_zp = false;
+
+                if (parts.size() == refs.size()) {
+                    ov::Tensor fused = stack_tensors(parts);
+                    std::string out_name = layer_prefix + ".moe." + proj_out_name(proj) + suffix;
+                    tensors[out_name] = fused;
+                    
+                    TensorInfo info;
+                    info.name = out_name;
+                    info.dtype = fused.get_element_type();
+                    info.shape = fused.get_shape();
+                    st_data.tensor_infos[out_name] = info;
+
+                    for (const auto& key : expert_keys) {
+                        tensors.erase(key);
+                        st_data.tensor_infos.erase(key);
+                        st_data.tensor_mmap_info.erase(key);
+                    }
                 }
             }
-
-            if (weights.empty()) {
-                continue;  // missing data, skip
-            }
-
-            // Stack tensors
-            ov::Tensor fused_w = stack_tensors(weights);
-            ov::Tensor fused_s = stack_tensors(scales);
-            ov::Tensor fused_b;
-            ov::Tensor fused_z;
-            if (has_bias && !biases.empty()) fused_b = stack_tensors(biases);
-            if (has_zp && !zps.empty()) fused_z = stack_tensors(zps);
-
-            std::string out_base = layer_prefix + ".moe." + proj_out_name(proj);
-            tensors[out_base + ".weight"] = fused_w;
-            tensors[out_base + ".scales"] = fused_s;
-            if (fused_b) tensors[out_base + ".biases"] = fused_b;
-            if (fused_z) tensors[out_base + ".zps"] = fused_z;
-
-            // Remove per-expert entries to save memory
-            for (const auto& ref : refs) {
-                tensors.erase(ref.base_key + ".weight");
-                tensors.erase(ref.base_key + ".scales");
-                tensors.erase(ref.base_key + ".biases");
-                tensors.erase(ref.base_key + ".zps");
-            }
-        }
-
-        // Handle router/gate -> gate_inp rename
-        std::string gate_base = layer_prefix + ".mlp.gate";
-        auto gate_w = tensors.find(gate_base + ".weight");
-        if (gate_w != tensors.end()) {
-            tensors[layer_prefix + ".moe.gate_inp.weight"] = gate_w->second;
-            tensors.erase(gate_w);
-            auto g_s = tensors.find(gate_base + ".scales");
-            if (g_s != tensors.end()) { tensors[layer_prefix + ".moe.gate_inp.scales"] = g_s->second; tensors.erase(g_s); }
-            auto g_b = tensors.find(gate_base + ".biases");
-            if (g_b != tensors.end()) { tensors[layer_prefix + ".moe.gate_inp.biases"] = g_b->second; tensors.erase(g_b); }
-            auto g_z = tensors.find(gate_base + ".zps");
-            if (g_z != tensors.end()) { tensors[layer_prefix + ".moe.gate_inp.zps"] = g_z->second; tensors.erase(g_z); }
         }
     }
 }
@@ -421,9 +527,15 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
     SafetensorsData& st_data) {
     // Create weight source
     SafetensorsWeightSource source(st_data);
-    SafetensorsWeightFinalizer finalizer;
-    
     // Helper to check if a key exists (tensor_infos is always populated)
+    auto quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
+    SafetensorsWeightFinalizer finalizer(quant_config);
+
+    // For checking bias/lm_head presence, use tensor_infos (always populated)
+    auto& tensor_infos = st_data.tensor_infos;
+    auto& tensors = st_data.tensors;  // May be empty in zero-copy mode
+
+    // Helper to check if a key exists (supports both modes)
     auto has_key = [&](const std::string& key) {
         return st_data.tensor_infos.count(key) > 0;
     };
@@ -704,7 +816,7 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     
     // Check if in-flight compression is enabled via environment variable
     auto compression_config = get_compression_config_from_env();
-    if (compression_config.enabled) {
+    if (!use_modeling_api() && compression_config.enabled) {
         std::cout << "[Safetensors] In-flight compression enabled via OV_GENAI_INFLIGHT_QUANT_MODE" << std::endl;
         return create_from_safetensors_compressed(model_dir, compression_config, enable_save_ov_model);
     }
@@ -794,6 +906,15 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     }
     st_data.tensor_mmap_info = std::move(converted_mmap);
 
+    if (config.model_type == "qwen3_moe") {
+        bool is_zero_copy_enabled = st_data.tensors.empty() && !st_data.tensor_infos.empty();
+        if (is_zero_copy_enabled) {
+            fuse_moe_tensors_zero_copy(st_data);
+        } else {
+            fuse_moe_tensors_in_memory(st_data);
+        }
+    }
+
     auto load_finish_time = std::chrono::high_resolution_clock::now();
     auto load_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         load_finish_time - start_time).count();
@@ -806,7 +927,7 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    if ((model_type == "qwen3" || model_type == "smollm3" || model_type == "youtu_llm") && use_modeling_api()) {
+    if ((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "smollm3" || model_type == "youtu_llm") && use_modeling_api()) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
         model = create_model_with_modeling_api(config, st_data);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
@@ -1031,7 +1152,7 @@ std::shared_ptr<ov::Model> create_from_safetensors_compressed(
     if (model_type == "qwen3_moe") {
         // Fuse HF per-expert MoE tensors into GGUF-style fused tensors if present
         std::cout << "[Safetensors] Fusing MoE expert tensors if present..." << std::endl;
-        fuse_moe_tensors(st_data.tensors);
+        fuse_moe_tensors_in_memory(st_data);
     }
 
     // Create qtype entries with compression enabled

@@ -195,59 +195,121 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
     up_exps_param_ = &register_parameter("up_exps.weight");
     down_exps_param_ = &register_parameter("down_exps.weight");
 
-    gate_exps_param_->set_weight_loader([this](WeightParameter& param,
-                                               weights::WeightSource& source,
-                                               weights::WeightFinalizer& finalizer,
-                                               const std::string& weight_name,
-                                               const std::optional<int>& shard_id) {
-        (void)finalizer;
-        (void)shard_id;
-        load_raw_weight(param, source, weight_name);
-        const std::string base_key = base_key_from_weight(weight_name);
-        const std::string scales_key = base_key + ".scales";
-        const std::string zps_key = base_key + ".zps";
-        if (!source.has(scales_key) || !source.has(zps_key)) {
-            OPENVINO_THROW("Missing MoE quantization params for ", base_key);
-        }
-        gate_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
-        gate_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
-    });
+    if (cfg.architecture == "qwen3_moe") {
+        gate_exps_param_->set_weight_loader([this](WeightParameter& param,
+                                                   weights::WeightSource& source,
+                                                   weights::WeightFinalizer& finalizer,
+                                                   const std::string& weight_name,
+                                                   const std::optional<int>& shard_id) {
+            (void)finalizer;
+            (void)shard_id;
+            if (!param.context()) {
+                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+            }
+            auto weight = finalizer.finalize(weight_name, source, *param.context());
+            param.bind(weight);
+            if (weight.get_auxiliary("scales") == std::nullopt ||
+                weight.get_auxiliary("zps") == std::nullopt) {
+                OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+            }
+            gate_exps_scales_ = weight.auxiliary.at("scales");
+            gate_exps_zps_ = weight.auxiliary.at("zps");
+        });
 
-    up_exps_param_->set_weight_loader([this](WeightParameter& param,
-                                             weights::WeightSource& source,
-                                             weights::WeightFinalizer& finalizer,
-                                             const std::string& weight_name,
-                                             const std::optional<int>& shard_id) {
-        (void)finalizer;
-        (void)shard_id;
-        load_raw_weight(param, source, weight_name);
-        const std::string base_key = base_key_from_weight(weight_name);
-        const std::string scales_key = base_key + ".scales";
-        const std::string zps_key = base_key + ".zps";
-        if (!source.has(scales_key) || !source.has(zps_key)) {
-            OPENVINO_THROW("Missing MoE quantization params for ", base_key);
-        }
-        up_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
-        up_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
-    });
+        up_exps_param_->set_weight_loader([this](WeightParameter& param,
+                                                 weights::WeightSource& source,
+                                                 weights::WeightFinalizer& finalizer,
+                                                 const std::string& weight_name,
+                                                 const std::optional<int>& shard_id) {
+            (void)finalizer;
+            (void)shard_id;
+            if (!param.context()) {
+                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+            }
+            auto weight = finalizer.finalize(weight_name, source, *param.context());
+            param.bind(weight);
+            if (weight.get_auxiliary("scales") == std::nullopt ||
+                weight.get_auxiliary("zps") == std::nullopt) {
+                OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+            }
+            up_exps_scales_ = weight.auxiliary.at("scales");
+            up_exps_zps_ = weight.auxiliary.at("zps");
+        });
 
-    down_exps_param_->set_weight_loader([this](WeightParameter& param,
-                                               weights::WeightSource& source,
-                                               weights::WeightFinalizer& finalizer,
-                                               const std::string& weight_name,
-                                               const std::optional<int>& shard_id) {
-        (void)finalizer;
-        (void)shard_id;
-        load_raw_weight(param, source, weight_name);
-        const std::string base_key = base_key_from_weight(weight_name);
-        const std::string scales_key = base_key + ".scales";
-        const std::string zps_key = base_key + ".zps";
-        if (!source.has(scales_key) || !source.has(zps_key)) {
-            OPENVINO_THROW("Missing MoE quantization params for ", base_key);
-        }
-        down_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
-        down_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
-    });
+        down_exps_param_->set_weight_loader([this](WeightParameter& param,
+                                                   weights::WeightSource& source,
+                                                   weights::WeightFinalizer& finalizer,
+                                                   const std::string& weight_name,
+                                                   const std::optional<int>& shard_id) {
+            (void)finalizer;
+            (void)shard_id;
+            if (!param.context()) {
+                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+            }
+            auto weight = finalizer.finalize(weight_name, source, *param.context());
+            param.bind(weight);
+            if (weight.get_auxiliary("scales") == std::nullopt ||
+                weight.get_auxiliary("zps") == std::nullopt) {
+                OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+            }
+            down_exps_scales_ = weight.auxiliary.at("scales");
+            down_exps_zps_ = weight.auxiliary.at("zps");
+        });
+    } else {
+        gate_exps_param_->set_weight_loader([this](WeightParameter& param,
+                                                   weights::WeightSource& source,
+                                                   weights::WeightFinalizer& finalizer,
+                                                   const std::string& weight_name,
+                                                   const std::optional<int>& shard_id) {
+            (void)finalizer;
+            (void)shard_id;
+            load_raw_weight(param, source, weight_name);
+            const std::string base_key = base_key_from_weight(weight_name);
+            const std::string scales_key = base_key + ".scales";
+            const std::string zps_key = base_key + ".zps";
+            if (!source.has(scales_key) || !source.has(zps_key)) {
+                OPENVINO_THROW("Missing MoE quantization params for ", base_key);
+            }
+            gate_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
+            gate_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
+        });
+
+        up_exps_param_->set_weight_loader([this](WeightParameter& param,
+                                                 weights::WeightSource& source,
+                                                 weights::WeightFinalizer& finalizer,
+                                                 const std::string& weight_name,
+                                                 const std::optional<int>& shard_id) {
+            (void)finalizer;
+            (void)shard_id;
+            load_raw_weight(param, source, weight_name);
+            const std::string base_key = base_key_from_weight(weight_name);
+            const std::string scales_key = base_key + ".scales";
+            const std::string zps_key = base_key + ".zps";
+            if (!source.has(scales_key) || !source.has(zps_key)) {
+                OPENVINO_THROW("Missing MoE quantization params for ", base_key);
+            }
+            up_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
+            up_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
+        });
+
+        down_exps_param_->set_weight_loader([this](WeightParameter& param,
+                                                   weights::WeightSource& source,
+                                                   weights::WeightFinalizer& finalizer,
+                                                   const std::string& weight_name,
+                                                   const std::optional<int>& shard_id) {
+            (void)finalizer;
+            (void)shard_id;
+            load_raw_weight(param, source, weight_name);
+            const std::string base_key = base_key_from_weight(weight_name);
+            const std::string scales_key = base_key + ".scales";
+            const std::string zps_key = base_key + ".zps";
+            if (!source.has(scales_key) || !source.has(zps_key)) {
+                OPENVINO_THROW("Missing MoE quantization params for ", base_key);
+            }
+            down_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
+            down_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
+        });
+    }
 }
 
 const Tensor& Qwen3MoE::gate_inp_weight() const {

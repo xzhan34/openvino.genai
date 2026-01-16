@@ -272,23 +272,32 @@ void quantize_int4_asym_typed(
  *   - Type dispatch outside hot loops
  *   - Precomputed inverse scale (multiply instead of divide)
  * 
- * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features]
+ * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features] or [batch, out_features, in_features]
  * @param group_size Number of elements per quantization group (default: 128)
  * @return QuantizedWeight with INT4 weights packed as U8 and FP16 scales
  */
 inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2) {
-        throw std::runtime_error("Weight tensor must be 2D for quantization");
+    if (shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
     }
     
-    size_t out_features = shape[0];
-    size_t in_features = shape[1];
+    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    // For 3D, treat as [batch * out_features, in_features]
+    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
+    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
+    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
     size_t num_groups = (in_features + group_size - 1) / group_size;
     size_t packed_in_features = (in_features + 1) / 2;
     
-    ov::Tensor compressed(ov::element::u8, {out_features, packed_in_features});
-    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    // Output shapes: append packed_in_features or num_groups to output_shape
+    ov::Shape compressed_shape = output_shape;
+    compressed_shape.push_back(packed_in_features);
+    ov::Shape scale_shape = output_shape;
+    scale_shape.push_back(num_groups);
+    
+    ov::Tensor compressed(ov::element::u8, compressed_shape);
+    ov::Tensor scale(ov::element::f16, scale_shape);
     
     auto* compressed_data = static_cast<uint8_t*>(compressed.data());
     auto* scale_data = static_cast<uint16_t*>(scale.data());
@@ -338,24 +347,33 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
  *   - Type dispatch outside hot loops
  *   - Precomputed inverse scale (multiply instead of divide)
  * 
- * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features]
+ * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features] or [batch, out_features, in_features]
  * @param group_size Number of elements per quantization group (default: 128)
  * @return QuantizedWeight with INT4 weights packed as U8, FP16 scales, and U8 zero points
  */
 inline QuantizedWeight quantize_int4_asym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2) {
-        throw std::runtime_error("Weight tensor must be 2D for quantization");
+    if (shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
     }
     
-    size_t out_features = shape[0];
-    size_t in_features = shape[1];
+    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    // For 3D, treat as [batch * out_features, in_features]
+    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
+    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
+    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
     size_t num_groups = (in_features + group_size - 1) / group_size;
     size_t packed_in_features = (in_features + 1) / 2;
     
-    ov::Tensor compressed(ov::element::u8, {out_features, packed_in_features});
-    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
-    ov::Tensor zero_point(ov::element::u8, {out_features, num_groups});
+    // Output shapes: append packed_in_features or num_groups to output_shape
+    ov::Shape compressed_shape = output_shape;
+    compressed_shape.push_back(packed_in_features);
+    ov::Shape scale_shape = output_shape;
+    scale_shape.push_back(num_groups);
+    
+    ov::Tensor compressed(ov::element::u8, compressed_shape);
+    ov::Tensor scale(ov::element::f16, scale_shape);
+    ov::Tensor zero_point(ov::element::u8, scale_shape);
     
     auto* compressed_data = static_cast<uint8_t*>(compressed.data());
     auto* scale_data = static_cast<uint16_t*>(scale.data());
@@ -462,22 +480,31 @@ void quantize_int8_sym_typed(
  *   - Type dispatch outside hot loops
  *   - Precomputed inverse scale (multiply instead of divide)
  * 
- * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features]
+ * @param weight Input weight tensor (FP16 or BF16), shape [out_features, in_features] or [batch, out_features, in_features]
  * @param group_size Number of elements per quantization group (default: 128)
  * @return QuantizedWeight with INT8 weights and FP16 scales
  */
 inline QuantizedWeight quantize_int8_sym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2) {
-        throw std::runtime_error("Weight tensor must be 2D for quantization");
+    if (shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
     }
     
-    size_t out_features = shape[0];
-    size_t in_features = shape[1];
+    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    // For 3D, treat as [batch * out_features, in_features]
+    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
+    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
+    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
     size_t num_groups = (in_features + group_size - 1) / group_size;
     
-    ov::Tensor compressed(ov::element::i8, {out_features, in_features});
-    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    // Output shapes: append in_features or num_groups to output_shape
+    ov::Shape compressed_shape = output_shape;
+    compressed_shape.push_back(in_features);
+    ov::Shape scale_shape = output_shape;
+    scale_shape.push_back(num_groups);
+    
+    ov::Tensor compressed(ov::element::i8, compressed_shape);
+    ov::Tensor scale(ov::element::f16, scale_shape);
     
     auto* compressed_data = static_cast<int8_t*>(compressed.data());
     auto* scale_data = static_cast<uint16_t*>(scale.data());
