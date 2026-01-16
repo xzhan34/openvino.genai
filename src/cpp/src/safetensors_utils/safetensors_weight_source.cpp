@@ -119,15 +119,31 @@ const ov::Tensor& SafetensorsWeightSource::get_tensor(const std::string& name) c
         }
     }
     
-    // Zero-copy mode: create tensor by copying from mmap (cache it)
-    auto [ptr, size] = get_data_ptr(name);
-    const auto& info = get_info(name);
+    // Zero-copy mode: create tensor pointing to mmap memory (no copy!)
+    // Key: use Tensor(tensor, shared_ptr<void>) constructor to keep mmap alive
+    std::string hf_name = get_hf_name(name);
+    auto it = m_data.tensor_mmap_info.find(hf_name);
+    if (it == m_data.tensor_mmap_info.end()) {
+        it = m_data.tensor_mmap_info.find(name);
+    }
+    if (it == m_data.tensor_mmap_info.end()) {
+        throw std::runtime_error("Weight mmap info not found: " + name);
+    }
     
-    ov::Tensor tensor(info.dtype, info.shape);
-    std::memcpy(tensor.data(), ptr, size);
+    const auto& mmap_info = it->second;
+    const auto& info = get_info(name);
+    const uint8_t* data_ptr = mmap_info.holder->data_buffer() + mmap_info.offset;
+    
+    // Create view tensor pointing to mmap data
+    ov::Tensor view_tensor(info.dtype, info.shape, const_cast<void*>(static_cast<const void*>(data_ptr)));
+    
+    // CRITICAL: Use Tensor(tensor, shared_ptr<void>) to bind mmap lifetime to tensor!
+    // When this tensor is used in Constant(tensor), the SharedBuffer<Tensor> will
+    // hold this tensor, which holds mmap_holder, keeping mmap alive!
+    ov::Tensor tensor(view_tensor, mmap_info.holder);
     
     // Cache the tensor
-    m_tensor_cache[name] = std::move(tensor);
+    m_tensor_cache[name] = tensor;
     return m_tensor_cache[name];
 }
 
