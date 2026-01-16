@@ -22,14 +22,12 @@ namespace genai {
 namespace safetensors {
 
 /**
- * @brief Information about a loaded tensor
+ * @brief Tensor metadata
  */
 struct OPENVINO_GENAI_EXPORTS TensorInfo {
     std::string name;
     ov::element::Type dtype;
     ov::Shape shape;
-    size_t data_offset_start;
-    size_t data_offset_end;
 };
 
 /**
@@ -90,24 +88,24 @@ struct OPENVINO_GENAI_EXPORTS TensorMmapInfo {
 };
 
 /**
- * @brief Result of loading safetensors files (Zero-Copy version)
+ * @brief Result of loading safetensors files
  * 
- * This structure holds references to mmap'ed data instead of copying tensors.
- * The mmap is kept alive by shared_ptr<MmapHolder> in tensor_mmap_info.
+ * Two modes based on OV_GENAI_USE_ZERO_COPY environment variable:
+ * - Mmap mode (zero_copy=1): tensor_infos + tensor_mmap_info (no data copy)
+ * - Copy mode (zero_copy=0): tensor_infos + tensors (data copied to ov::Tensor)
  */
 struct OPENVINO_GENAI_EXPORTS SafetensorsData {
-    // Zero-copy: Only store tensor metadata, not actual tensor data
+    // Tensor metadata (always populated)
     std::unordered_map<std::string, TensorInfo> tensor_infos;
     std::map<std::string, std::string> metadata;
     
-    // Mmap holders - keeps mmap files alive
+    // Mmap mode: keeps mmap files alive
     std::vector<std::shared_ptr<MmapHolder>> mmap_holders;
     
-    // Tensor name -> mmap info (for zero-copy access)
+    // Mmap mode: tensor name -> mmap pointer info
     std::unordered_map<std::string, TensorMmapInfo> tensor_mmap_info;
     
-    // Legacy: tensor data (only populated when using legacy API)
-    // Will be empty when using zero-copy mode
+    // Copy mode: tensor data (empty in mmap mode)
     std::unordered_map<std::string, ov::Tensor> tensors;
 };
 

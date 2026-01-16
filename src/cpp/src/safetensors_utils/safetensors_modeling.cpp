@@ -419,17 +419,13 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
 std::shared_ptr<ov::Model> create_model_with_modeling_api(
     const HFConfig& hf_config,
     SafetensorsData& st_data) {
-    // Create weight source that supports both zero-copy and legacy modes
+    // Create weight source
     SafetensorsWeightSource source(st_data);
     SafetensorsWeightFinalizer finalizer;
     
-    // For checking bias/lm_head presence, use tensor_infos (always populated)
-    auto& tensor_infos = st_data.tensor_infos;
-    auto& tensors = st_data.tensors;  // May be empty in zero-copy mode
-
-    // Helper to check if a key exists (supports both modes)
+    // Helper to check if a key exists (tensor_infos is always populated)
     auto has_key = [&](const std::string& key) {
-        return tensor_infos.count(key) > 0 || tensors.count(key) > 0;
+        return st_data.tensor_infos.count(key) > 0;
     };
     
     std::shared_ptr<ov::Model> ov_model;

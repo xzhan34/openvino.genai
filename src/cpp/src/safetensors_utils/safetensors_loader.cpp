@@ -225,13 +225,11 @@ SafetensorsData load_safetensors_file(const std::filesystem::path& file_path) {
         ov::element::Type ov_dtype = convert_dtype(static_cast<int>(tensor.dtype));
         ov::Shape ov_shape(tensor.shape.begin(), tensor.shape.end());
         
-        // Store tensor info (metadata)
+        // Store tensor metadata
         TensorInfo info;
         info.name = name;
         info.dtype = ov_dtype;
         info.shape = ov_shape;
-        info.data_offset_start = tensor.data_offsets[0];
-        info.data_offset_end = tensor.data_offsets[1];
         result.tensor_infos[name] = info;
         
         if (zero_copy) {
