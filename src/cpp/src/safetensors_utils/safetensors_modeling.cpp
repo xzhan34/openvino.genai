@@ -454,8 +454,8 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.rms_norm_eps = hf_config.rms_norm_eps;
         cfg.rope_theta = hf_config.rope_theta;
         cfg.hidden_act = hf_config.hidden_act;
-        cfg.attention_bias = tensors.count("model.layers[0].self_attn.q_proj.bias") > 0;
-        cfg.tie_word_embeddings = tensors.count("lm_head.weight") == 0;
+        cfg.attention_bias = has_key("model.layers[0].self_attn.q_proj.bias");
+        cfg.tie_word_embeddings = !has_key("lm_head.weight");
         cfg.expert_count = hf_config.expert_count;
         cfg.expert_used_count = hf_config.expert_used_count;
         cfg.moe_intermediate_size = hf_config.moe_intermediate_size > 0
