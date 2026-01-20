@@ -43,7 +43,7 @@ ov::genai::modeling::Tensor slice_to(const ov::genai::modeling::Tensor& data,
     auto start = ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{0});
     auto step = ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{1});
     auto axes = ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{axis});
-    auto stop_vec = ov::genai::modeling::Tensor(stop, ctx).unsqueeze(0);
+    auto stop_vec = ov::genai::modeling::Tensor(stop, ctx);
     auto node = std::make_shared<ov::opset13::Slice>(data.output(),
                                                      start,
                                                      stop_vec.output(),
