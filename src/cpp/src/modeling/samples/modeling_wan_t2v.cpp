@@ -158,14 +158,17 @@ ov::Tensor decode_to_u8_frames(const ov::Tensor& video) {
     ov::Tensor out_u8(ov::element::u8, {frames, height, width, 3});
     auto* dst = out_u8.data<uint8_t>();
 
-    const size_t frame_stride = channels * height * width;
+    const size_t stride_w = 1;
+    const size_t stride_h = width;
+    const size_t stride_f = height * width;
+    const size_t stride_c = frames * stride_f;
+
     for (size_t f = 0; f < frames; ++f) {
-        const float* src = data.data() + f * frame_stride;
         for (size_t h = 0; h < height; ++h) {
             for (size_t w = 0; w < width; ++w) {
-                const size_t hw = h * width + w;
                 for (size_t c = 0; c < 3; ++c) {
-                    float val = src[c * height * width + hw];
+                    const size_t src_idx = c * stride_c + f * stride_f + h * stride_h + w * stride_w;
+                    float val = data[src_idx];
                     val = val / 2.0f + 0.5f;
                     val = std::min(std::max(val, 0.0f), 1.0f);
                     dst[((f * height + h) * width + w) * 3 + c] =
@@ -351,10 +354,10 @@ int main(int argc, char* argv[]) try {
         for (size_t b = 0; b < batch; ++b) {
             for (size_t c = 0; c < z_dim; ++c) {
                 const float mean = vae_cfg.latents_mean[c];
-                const float inv_std = 1.0f / vae_cfg.latents_std[c];
+                const float std = vae_cfg.latents_std[c];
                 const size_t base = (b * z_dim + c) * spatial;
                 for (size_t i = 0; i < spatial; ++i) {
-                    latents_out[base + i] = latents_out[base + i] * inv_std + mean;
+                    latents_out[base + i] = latents_out[base + i] * std + mean;
                 }
             }
         }
