@@ -182,7 +182,8 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
       hidden_size_(cfg.hidden_size),
       inter_size_(cfg.moe_intermediate_size > 0 ? cfg.moe_intermediate_size : cfg.intermediate_size),
       num_experts_(cfg.expert_count),
-      top_k_(cfg.expert_used_count > 0 ? cfg.expert_used_count : 1) {
+      top_k_(cfg.expert_used_count > 0 ? cfg.expert_used_count : 1),
+      group_size_((cfg.group_size > 0) ? static_cast<size_t>(cfg.group_size) : std::numeric_limits<size_t>::max()) {
     if (!cfg.hidden_act.empty() && cfg.hidden_act != "silu") {
         OPENVINO_THROW("Unsupported Qwen3 MoE activation: ", cfg.hidden_act);
     }

@@ -38,7 +38,7 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  int32_t inter_size,
                                  int32_t num_experts,
                                  int32_t top_k,
-                                 int32_t group_size,
+                                 size_t group_size,
                                  const ov::element::Type& out_type);
 Tensor silu(const Tensor& x);
 Tensor reduce_mean(const Tensor& x, int64_t axis, bool keepdim = true);

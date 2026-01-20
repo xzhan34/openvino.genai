@@ -573,6 +573,7 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.moe_intermediate_size = hf_config.moe_intermediate_size > 0
             ? hf_config.moe_intermediate_size
             : hf_config.intermediate_size;
+        cfg.group_size = quant_config.group_size;
         ov_model = ov::genai::modeling::models::create_qwen3_moe_model(cfg, source, finalizer);
     } else if (hf_config.model_type == "smollm3") {
         ov::genai::modeling::models::SmolLM3Config cfg;

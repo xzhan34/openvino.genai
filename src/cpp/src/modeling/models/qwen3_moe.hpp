@@ -53,6 +53,7 @@ struct Qwen3MoeConfig {
     int32_t expert_count = 0;
     int32_t expert_used_count = 0;
     int32_t moe_intermediate_size = 0;
+    int32_t group_size = 128;
 };
 
 class Qwen3MoeAttention : public Module {
@@ -132,7 +133,7 @@ private:
     int32_t inter_size_ = 0;
     int32_t num_experts_ = 0;
     int32_t top_k_ = 1;
-    int32_t group_size_ = 128;
+    size_t  group_size_ = 128;
 };
 
 class Qwen3MoeDecoderLayer : public Module {

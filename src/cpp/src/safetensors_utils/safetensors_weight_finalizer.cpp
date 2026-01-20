@@ -149,9 +149,7 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
             break;
             
         case Mode::INT8_ASYM:
-            // INT8_ASYM not implemented in RTN, fall back to INT8_SYM
-            quant_result = rtn::quantize_int8_sym(tensor, config.group_size);
-            std::cerr << "[Warning] INT8_ASYM not implemented, using INT8_SYM for: " << name << std::endl;
+            quant_result = rtn::quantize_int8_asym(tensor, config.group_size);
             break;
             
         default:
@@ -166,39 +164,47 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     const rtn::QuantizedWeight& quant_result,
     const ov::Shape& original_shape) {
     
-    OPENVINO_ASSERT(original_shape.size() == 2, "Original shape must be 2D for dequantization");
+    // Support 2D [out, in] and 3D [batch, out, in] weights
+    OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3, 
+                    "Original shape must be 2D or 3D for dequantization");
     
-    size_t out_features = original_shape[0];
-    size_t in_features = original_shape[1];
+    size_t out_features = (original_shape.size() == 3) ? (original_shape[0] * original_shape[1]) : original_shape[0];
+    size_t in_features = (original_shape.size() == 3) ? original_shape[2] : original_shape[1];
     
     // Create scale constant
     auto scale_const = std::make_shared<ov::op::v0::Constant>(quant_result.scale);
     scale_const->set_friendly_name(name + "_scale");
     
     const ov::Shape& scale_shape = scale_const->get_shape();
-    OPENVINO_ASSERT(scale_shape.size() == 2 && scale_shape[0] == out_features, 
-                    "Scale shape must be [out_features, num_groups]");
-    
-    size_t num_groups = scale_shape[1];
+    // For 3D, scale_shape will be [batch, out, num_groups]
+    // For 2D, scale_shape will be [out, num_groups]
+    size_t num_groups = scale_shape.back();
     size_t group_size = in_features / num_groups;
     
-    // Determine element type based on compressed type
+    // Determine element type based on compressed type and size
     ov::element::Type compressed_type = quant_result.compressed.get_element_type();
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
     ov::element::Type elem_type;
     
+    size_t num_elements = out_features * in_features;
+    
     if (compressed_type == ov::element::u8) {
-        // INT4 packed in U8: use i4 for symmetric, u4 for asymmetric
-        elem_type = has_zero_point ? ov::element::u4 : ov::element::i4;
+        if (quant_result.compressed.get_size() == num_elements) {
+            // INT8 Asymmetric
+            elem_type = ov::element::u8;
+        } else {
+            // INT4 (packed in U8)
+            elem_type = has_zero_point ? ov::element::u4 : ov::element::i4;
+        }
     } else if (compressed_type == ov::element::i8) {
-        // INT8: always i8
+        // INT8 Symmetric
         elem_type = ov::element::i8;
     } else {
         OPENVINO_THROW("Unsupported compressed type for dequantization: ", compressed_type);
     }
     
     // Step 1: Create grouped constant with appropriate element type
-    // For INT4: reinterpret packed U8 as i4/u4, for INT8: use i8 directly
+    // We treat everything as [out_features, num_groups, group_size] for logic simplicity
     ov::Shape grouped_shape = {out_features, num_groups, group_size};
     const void* data_ptr = quant_result.compressed.data();
     auto grouped_const = std::make_shared<ov::op::v0::Constant>(elem_type, grouped_shape, data_ptr);
@@ -207,7 +213,7 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     // Step 2: Convert to F16 for arithmetic operations
     auto weights_f16 = std::make_shared<ov::op::v0::Convert>(grouped_const, ov::element::f16);
     
-    // Step 3: Reshape scale from [out_features, num_groups] to [out_features, num_groups, 1] for broadcasting
+    // Step 3: Reshape scale to [out_features, num_groups, 1] for broadcasting
     ov::Shape scale_broadcast_shape = {out_features, num_groups, 1};
     auto scale_reshape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64,
@@ -234,7 +240,7 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
             weights_f16, scale_reshaped, ov::op::AutoBroadcastType::NUMPY);
     }
     
-    // Step 5: Reshape back to original shape [out_features, in_features]
+    // Step 5: Reshape back to original shape [out_features, in_features] or [batch, out, in]
     auto final_shape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64,
         ov::Shape{original_shape.size()},

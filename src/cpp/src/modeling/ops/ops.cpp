@@ -109,7 +109,7 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  int32_t inter_size,
                                  int32_t num_experts,
                                  int32_t top_k,
-                                 int32_t group_size,
+                                 size_t group_size,
                                  const ov::element::Type& out_type) {
     auto* ctx = input.context();
     auto hidden_f16 = input.to(ov::element::f16);
