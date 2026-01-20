@@ -8,6 +8,7 @@
 
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
+#include "modeling/ops/tensor_ops.hpp"
 
 namespace {
 
@@ -85,6 +86,35 @@ Tensor conv3d(const Tensor& input,
                                                   bias_reshaped.output(),
                                                   ov::op::AutoBroadcastType::NUMPY);
     return Tensor(node, conv.context());
+}
+
+Tensor causal_conv3d(const Tensor& input,
+                     const Tensor& weight,
+                     const std::vector<int64_t>& strides,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilations) {
+    if (padding.size() != 3) {
+        OPENVINO_THROW("causal_conv3d requires padding with 3 values");
+    }
+    std::vector<int64_t> pad_begin = {0, 0, padding[0] * 2, padding[1], padding[2]};
+    std::vector<int64_t> pad_end = {0, 0, 0, padding[1], padding[2]};
+    auto padded = ops::tensor::pad(input, pad_begin, pad_end, 0.0f);
+    return conv3d(padded, weight, strides, {0, 0, 0}, {0, 0, 0}, dilations);
+}
+
+Tensor causal_conv3d(const Tensor& input,
+                     const Tensor& weight,
+                     const Tensor& bias,
+                     const std::vector<int64_t>& strides,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilations) {
+    if (padding.size() != 3) {
+        OPENVINO_THROW("causal_conv3d requires padding with 3 values");
+    }
+    std::vector<int64_t> pad_begin = {0, 0, padding[0] * 2, padding[1], padding[2]};
+    std::vector<int64_t> pad_end = {0, 0, 0, padding[1], padding[2]};
+    auto padded = ops::tensor::pad(input, pad_begin, pad_end, 0.0f);
+    return conv3d(padded, weight, bias, strides, {0, 0, 0}, {0, 0, 0}, dilations);
 }
 
 Tensor conv2d(const Tensor& input,
@@ -200,6 +230,33 @@ Tensor upsample_nearest(const Tensor& input, int64_t scale_h, int64_t scale_w) {
     auto out_w = std::make_shared<ov::op::v1::Multiply>(w, w_scale);
     auto sizes = shape::make({out_h, out_w});
     auto axes = ops::const_vec(ctx, std::vector<int64_t>{2, 3});
+
+    ov::op::v11::Interpolate::InterpolateAttrs attrs;
+    attrs.mode = ov::op::v11::Interpolate::InterpolateMode::NEAREST;
+    attrs.shape_calculation_mode = ov::op::v11::Interpolate::ShapeCalcMode::SIZES;
+    attrs.coordinate_transformation_mode = ov::op::v11::Interpolate::CoordinateTransformMode::ASYMMETRIC;
+    attrs.nearest_mode = ov::op::v11::Interpolate::NearestMode::FLOOR;
+
+    auto interp = std::make_shared<ov::op::v11::Interpolate>(input.output(), sizes, axes, attrs);
+    return Tensor(interp, ctx);
+}
+
+Tensor upsample_nearest_3d(const Tensor& input, int64_t scale_t, int64_t scale_h, int64_t scale_w) {
+    if (scale_t <= 0 || scale_h <= 0 || scale_w <= 0) {
+        OPENVINO_THROW("upsample_nearest_3d requires positive scales");
+    }
+    auto* ctx = input.context();
+    auto t = shape::dim(input, 2);
+    auto h = shape::dim(input, 3);
+    auto w = shape::dim(input, 4);
+    auto t_scale = ops::const_scalar(ctx, static_cast<int64_t>(scale_t));
+    auto h_scale = ops::const_scalar(ctx, static_cast<int64_t>(scale_h));
+    auto w_scale = ops::const_scalar(ctx, static_cast<int64_t>(scale_w));
+    auto out_t = std::make_shared<ov::op::v1::Multiply>(t, t_scale);
+    auto out_h = std::make_shared<ov::op::v1::Multiply>(h, h_scale);
+    auto out_w = std::make_shared<ov::op::v1::Multiply>(w, w_scale);
+    auto sizes = shape::make({out_t, out_h, out_w});
+    auto axes = ops::const_vec(ctx, std::vector<int64_t>{2, 3, 4});
 
     ov::op::v11::Interpolate::InterpolateAttrs attrs;
     attrs.mode = ov::op::v11::Interpolate::InterpolateMode::NEAREST;

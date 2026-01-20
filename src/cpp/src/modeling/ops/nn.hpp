@@ -29,6 +29,19 @@ Tensor conv3d(const Tensor& input,
               const std::vector<int64_t>& pads_end,
               const std::vector<int64_t>& dilations = {1, 1, 1});
 
+Tensor causal_conv3d(const Tensor& input,
+                     const Tensor& weight,
+                     const std::vector<int64_t>& strides,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilations = {1, 1, 1});
+
+Tensor causal_conv3d(const Tensor& input,
+                     const Tensor& weight,
+                     const Tensor& bias,
+                     const std::vector<int64_t>& strides,
+                     const std::vector<int64_t>& padding,
+                     const std::vector<int64_t>& dilations = {1, 1, 1});
+
 Tensor conv2d(const Tensor& input,
               const Tensor& weight,
               const std::vector<int64_t>& strides,
@@ -69,6 +82,8 @@ Tensor group_norm(const Tensor& input,
 Tensor gelu(const Tensor& input, bool approximate = true);
 
 Tensor upsample_nearest(const Tensor& input, int64_t scale_h, int64_t scale_w);
+
+Tensor upsample_nearest_3d(const Tensor& input, int64_t scale_t, int64_t scale_h, int64_t scale_w);
 
 }  // namespace nn
 }  // namespace ops
