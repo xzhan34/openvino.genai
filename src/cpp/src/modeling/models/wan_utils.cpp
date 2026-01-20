@@ -3,7 +3,10 @@
 
 #include "modeling/models/wan_utils.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <random>
+#include <regex>
 
 #include <openvino/core/except.hpp>
 
@@ -24,6 +27,47 @@ std::filesystem::path resolve_config_path(const std::filesystem::path& path) {
         return path / "config.json";
     }
     return path;
+}
+
+void replace_all(std::string& text, const std::string& from, const std::string& to) {
+    if (from.empty()) {
+        return;
+    }
+    size_t start = 0;
+    while ((start = text.find(from, start)) != std::string::npos) {
+        text.replace(start, from.size(), to);
+        start += to.size();
+    }
+}
+
+std::string html_unescape(std::string text) {
+    replace_all(text, "&lt;", "<");
+    replace_all(text, "&gt;", ">");
+    replace_all(text, "&quot;", "\"");
+    replace_all(text, "&#39;", "'");
+    replace_all(text, "&nbsp;", " ");
+    replace_all(text, "&amp;", "&");
+    return text;
+}
+
+std::string trim(const std::string& text) {
+    auto start = text.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return std::string();
+    }
+    auto end = text.find_last_not_of(" \t\r\n");
+    return text.substr(start, end - start + 1);
+}
+
+template <typename T>
+void fill_row(ov::Tensor& tensor, size_t row, T pad_value, const T* src, size_t count) {
+    auto* data = tensor.data<T>();
+    size_t stride = tensor.get_shape().at(1);
+    T* row_ptr = data + row * stride;
+    std::fill_n(row_ptr, stride, pad_value);
+    if (src && count > 0) {
+        std::copy_n(src, count, row_ptr);
+    }
 }
 
 void parse_transformer_config(const nlohmann::json& data, ov::genai::modeling::models::WanTransformer3DConfig& cfg) {
@@ -211,6 +255,101 @@ WanVAEConfig WanVAEConfig::from_json_file(const std::filesystem::path& config_pa
     nlohmann::json data;
     read_config_json_file(resolve_config_path(config_path), data);
     return from_json(data);
+}
+
+std::string prompt_clean(const std::string& text) {
+    std::string cleaned = html_unescape(html_unescape(text));
+    cleaned = trim(cleaned);
+    cleaned = std::regex_replace(cleaned, std::regex(R"(\s+)"), " ");
+    return cleaned;
+}
+
+std::vector<std::string> prompt_clean(const std::vector<std::string>& texts) {
+    std::vector<std::string> cleaned;
+    cleaned.reserve(texts.size());
+    for (const auto& text : texts) {
+        cleaned.push_back(prompt_clean(text));
+    }
+    return cleaned;
+}
+
+WanTextInputs tokenize_prompts(ov::genai::Tokenizer& tokenizer,
+                               const std::vector<std::string>& prompts,
+                               int32_t max_sequence_length,
+                               bool add_special_tokens) {
+    if (max_sequence_length <= 0) {
+        OPENVINO_THROW("max_sequence_length must be > 0");
+    }
+    auto cleaned_prompts = prompt_clean(prompts);
+    auto tokenization = tokenizer.encode(cleaned_prompts, ov::genai::add_special_tokens(add_special_tokens));
+
+    const auto& ids = tokenization.input_ids;
+    const auto& mask = tokenization.attention_mask;
+    const auto ids_type = ids.get_element_type();
+    const auto mask_type = mask.get_element_type();
+
+    size_t batch = cleaned_prompts.size();
+    size_t max_len = static_cast<size_t>(max_sequence_length);
+
+    ov::Tensor out_ids(ids_type, {batch, max_len});
+    ov::Tensor out_mask(mask_type, {batch, max_len});
+
+    int64_t pad_id = tokenizer.get_pad_token_id();
+
+    for (size_t i = 0; i < batch; ++i) {
+        auto ids_row = ov::Tensor(ids, {i, 0}, {i + 1, ids.get_shape().at(1)});
+        auto mask_row = ov::Tensor(mask, {i, 0}, {i + 1, mask.get_shape().at(1)});
+        size_t seq_len = ids_row.get_shape().at(1);
+        size_t copy_len = std::min(seq_len, max_len);
+
+        if (ids_type == ov::element::i32) {
+            fill_row<int32_t>(out_ids, i, static_cast<int32_t>(pad_id),
+                              ids_row.data<int32_t>(), copy_len);
+        } else {
+            fill_row<int64_t>(out_ids, i, static_cast<int64_t>(pad_id),
+                              ids_row.data<int64_t>(), copy_len);
+        }
+
+        if (mask_type == ov::element::i32) {
+            fill_row<int32_t>(out_mask, i, 0, mask_row.data<int32_t>(), copy_len);
+        } else {
+            fill_row<int64_t>(out_mask, i, 0, mask_row.data<int64_t>(), copy_len);
+        }
+    }
+
+    return WanTextInputs{out_ids, out_mask};
+}
+
+ov::Tensor prepare_latents(size_t batch,
+                           size_t channels,
+                           size_t frames,
+                           size_t height,
+                           size_t width,
+                           int32_t seed) {
+    ov::Tensor latents(ov::element::f32, {batch, channels, frames, height, width});
+    auto* data = latents.data<float>();
+
+    std::mt19937 rng(seed < 0 ? std::random_device{}() : static_cast<uint32_t>(seed));
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    for (size_t i = 0; i < latents.get_size(); ++i) {
+        data[i] = dist(rng);
+    }
+
+    return latents;
+}
+
+std::vector<float> apply_cfg(const std::vector<float>& noise_pred,
+                             const std::vector<float>& noise_pred_uncond,
+                             float guidance_scale) {
+    if (noise_pred.size() != noise_pred_uncond.size()) {
+        OPENVINO_THROW("CFG tensors size mismatch");
+    }
+    std::vector<float> out(noise_pred.size(), 0.0f);
+    for (size_t i = 0; i < noise_pred.size(); ++i) {
+        out[i] = noise_pred_uncond[i] + guidance_scale * (noise_pred[i] - noise_pred_uncond[i]);
+    }
+    return out;
 }
 
 void WanWeightMapping::apply_transformer_packed_mapping(ov::genai::modeling::Module& model) {

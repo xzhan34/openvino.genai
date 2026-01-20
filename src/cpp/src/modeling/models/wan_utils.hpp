@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -10,7 +11,9 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <openvino/runtime/tensor.hpp>
 
+#include "openvino/genai/tokenizer.hpp"
 #include "modeling/module.hpp"
 
 namespace ov {
@@ -74,6 +77,30 @@ struct WanVAEConfig {
     static WanVAEConfig from_json(const nlohmann::json& data);
     static WanVAEConfig from_json_file(const std::filesystem::path& config_path);
 };
+
+struct WanTextInputs {
+    ov::Tensor input_ids;
+    ov::Tensor attention_mask;
+};
+
+std::string prompt_clean(const std::string& text);
+std::vector<std::string> prompt_clean(const std::vector<std::string>& texts);
+
+WanTextInputs tokenize_prompts(ov::genai::Tokenizer& tokenizer,
+                               const std::vector<std::string>& prompts,
+                               int32_t max_sequence_length,
+                               bool add_special_tokens = true);
+
+ov::Tensor prepare_latents(size_t batch,
+                           size_t channels,
+                           size_t frames,
+                           size_t height,
+                           size_t width,
+                           int32_t seed);
+
+std::vector<float> apply_cfg(const std::vector<float>& noise_pred,
+                             const std::vector<float>& noise_pred_uncond,
+                             float guidance_scale);
 
 struct WanWeightMapping {
     static void apply_transformer_packed_mapping(ov::genai::modeling::Module& model);
