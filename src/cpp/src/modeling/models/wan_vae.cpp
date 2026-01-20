@@ -53,7 +53,7 @@ ov::genai::modeling::Tensor patchify(const ov::genai::modeling::Tensor& input, i
     auto frames = ov::genai::modeling::shape::dim(input, 2);
     auto height = ov::genai::modeling::shape::dim(input, 3);
     auto width = ov::genai::modeling::shape::dim(input, 4);
-    auto p = ov::genai::modeling::ops::const_scalar(ctx, static_cast<int64_t>(patch_size));
+    auto p = ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{patch_size});
     auto h_div = div_dim(height, patch_size, ctx);
     auto w_div = div_dim(width, patch_size, ctx);
 
@@ -77,7 +77,7 @@ ov::genai::modeling::Tensor unpatchify(const ov::genai::modeling::Tensor& input,
     auto frames = ov::genai::modeling::shape::dim(input, 2);
     auto height = ov::genai::modeling::shape::dim(input, 3);
     auto width = ov::genai::modeling::shape::dim(input, 4);
-    auto p = ov::genai::modeling::ops::const_scalar(ctx, static_cast<int64_t>(patch_size));
+    auto p = ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{patch_size});
     auto p2 = mul_dim(p, p);
     ov::Output<ov::Node> channels = std::make_shared<ov::op::v1::Divide>(channels_p, p2, ov::op::AutoBroadcastType::NUMPY);
     channels = std::make_shared<ov::op::v0::Convert>(channels, ov::element::i64);
@@ -243,7 +243,7 @@ Tensor WanAttentionBlock::forward(const Tensor& input) const {
                                {0, 0},
                                {0, 0});
 
-    auto three = ops::const_scalar(ctx, static_cast<int64_t>(3));
+    auto three = ops::const_vec(ctx, std::vector<int64_t>{3});
     auto qkv_shape = shape::make({bt, three, channels, hw});
     auto qkv_reshaped = qkv.reshape(qkv_shape).permute({0, 1, 3, 2});
 
@@ -322,7 +322,7 @@ Tensor WanResample::forward(const Tensor& input) const {
     auto time = shape::dim(input, 2);
     auto height = shape::dim(input, 3);
     auto width = shape::dim(input, 4);
-    auto two = ops::const_scalar(ctx, static_cast<int64_t>(2));
+    auto two = ops::const_vec(ctx, std::vector<int64_t>{2});
 
     auto x = input;
     if (mode_ == "upsample3d") {
