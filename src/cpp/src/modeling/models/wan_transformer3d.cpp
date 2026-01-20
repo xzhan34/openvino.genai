@@ -697,7 +697,7 @@ std::shared_ptr<ov::Model> create_wan_transformer3d_model(
     auto latents = ctx.parameter("hidden_states",
                                  ov::element::f32,
                                  ov::PartialShape{-1, cfg.in_channels, -1, -1, -1});
-    auto timesteps = ctx.parameter("timestep", ov::element::i64, ov::PartialShape{-1});
+    auto timesteps = ctx.parameter("timestep", ov::element::f32, ov::PartialShape{-1});
     auto text = ctx.parameter("encoder_hidden_states",
                               ov::element::f32,
                               ov::PartialShape{-1, -1, cfg.text_dim});

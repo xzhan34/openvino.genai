@@ -313,12 +313,11 @@ int main(int argc, char* argv[]) try {
     auto timesteps = scheduler.get_float_timesteps();
 
     auto transformer_request = compiled_transformer.create_infer_request();
-    ov::Tensor timestep_tensor(ov::element::i64, {batch});
+    ov::Tensor timestep_tensor(ov::element::f32, {batch});
 
     for (size_t i = 0; i < timesteps.size(); ++i) {
         const float t = timesteps[i];
-        const int64_t t_value = static_cast<int64_t>(std::llround(t));
-        timestep_tensor.data<int64_t>()[0] = t_value;
+        timestep_tensor.data<float>()[0] = t;
 
         transformer_request.set_tensor("hidden_states", latents_tensor);
         transformer_request.set_tensor("timestep", timestep_tensor);

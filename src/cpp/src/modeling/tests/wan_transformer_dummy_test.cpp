@@ -134,7 +134,7 @@ TEST(WanTransformer3DDummyTest, BuildsAndRuns) {
     auto latents = ctx.parameter("hidden_states",
                                  ov::element::f32,
                                  ov::PartialShape{1, cfg.in_channels, 2, 4, 4});
-    auto timesteps = ctx.parameter("timestep", ov::element::i64, ov::PartialShape{1});
+    auto timesteps = ctx.parameter("timestep", ov::element::f32, ov::PartialShape{1});
     auto text = ctx.parameter("encoder_hidden_states",
                               ov::element::f32,
                               ov::PartialShape{1, 3, cfg.text_dim});
@@ -156,8 +156,8 @@ TEST(WanTransformer3DDummyTest, BuildsAndRuns) {
     std::memcpy(latents_tensor.data(), latents_data.data(), latents_data.size() * sizeof(float));
     request.set_input_tensor(0, latents_tensor);
 
-    ov::Tensor timestep_tensor(ov::element::i64, {1});
-    timestep_tensor.data<int64_t>()[0] = 0;
+    ov::Tensor timestep_tensor(ov::element::f32, {1});
+    timestep_tensor.data<float>()[0] = 0.0f;
     request.set_input_tensor(1, timestep_tensor);
 
     std::vector<float> text_data(static_cast<size_t>(1 * 3 * cfg.text_dim), 0.0f);
