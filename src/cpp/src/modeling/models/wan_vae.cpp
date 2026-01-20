@@ -705,7 +705,12 @@ std::shared_ptr<ov::Model> create_wan_vae_encoder_model(
     WanVAEEncoderModel model(ctx, cfg);
 
     WanWeightMapping::apply_vae_packed_mapping(model);
-    ov::genai::modeling::weights::load_model(model, source, finalizer);
+    ov::genai::modeling::weights::LoadOptions load_opts;
+    load_opts.allow_unmatched = true;
+    load_opts.allow_missing = true;
+    load_opts.report_missing = false;
+    load_opts.report_unmatched = false;
+    ov::genai::modeling::weights::load_model(model, source, finalizer, load_opts);
 
     auto sample = ctx.parameter("sample",
                                 ov::element::f32,
@@ -724,7 +729,12 @@ std::shared_ptr<ov::Model> create_wan_vae_decoder_model(
     WanVAEDecoderModel model(ctx, cfg);
 
     WanWeightMapping::apply_vae_packed_mapping(model);
-    ov::genai::modeling::weights::load_model(model, source, finalizer);
+    ov::genai::modeling::weights::LoadOptions load_opts;
+    load_opts.allow_unmatched = true;
+    load_opts.allow_missing = true;
+    load_opts.report_missing = false;
+    load_opts.report_unmatched = false;
+    ov::genai::modeling::weights::load_model(model, source, finalizer, load_opts);
 
     auto latents = ctx.parameter("latents",
                                  ov::element::f32,
