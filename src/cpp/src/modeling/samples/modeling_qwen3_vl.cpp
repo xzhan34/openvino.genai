@@ -157,7 +157,9 @@ int main(int argc, char* argv[]) try {
     ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer;
     auto vision_model = ov::genai::modeling::models::create_qwen3_vl_vision_model(cfg, source, vision_finalizer);
 
-    ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer;
+    // only do quantization for LLM backbone to keep precision
+    auto quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
+    ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(quant_config);
     auto text_model = ov::genai::modeling::models::create_qwen3_vl_text_model(cfg, source, text_finalizer, false, true);
 
     ov::Core core;
