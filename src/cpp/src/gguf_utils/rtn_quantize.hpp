@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "openvino/openvino.hpp"
+#include "openvino/core/parallel.hpp"
 
 namespace ov {
 namespace genai {
@@ -123,11 +124,96 @@ inline float get_float_value(const ov::Tensor& tensor, size_t idx) {
     throw std::runtime_error("Unsupported tensor dtype for quantization");
 }
 
+// Check for AVX2 support
+#if defined(__AVX2__) || (defined(_MSC_VER) && !defined(_M_ARM64))
+#   define OV_GENAI_RTN_AVX2 1
+#   include <immintrin.h>
+#endif
+
+// Conversion function wrappers
+inline float convert_f32(float val) { return val; }
+inline float convert_f16(uint16_t val) { return fp16_to_float(val); }
+inline float convert_bf16(uint16_t val) { return bf16_to_float(val); }
+
+enum class InputType { F32, F16, BF16 };
+
+/**
+ * @brief Optimized Min/Max finder with AVX2 support
+ */
+template<typename DataType, InputType InType>
+inline void find_min_max(const DataType* data, size_t count, float& min_val, float& max_val) {
+    size_t i = 0;
+    float l_min = min_val;
+    float l_max = max_val;
+
+#ifdef OV_GENAI_RTN_AVX2
+    size_t simd_step = 8; // Process 8 floats at a time (AVX2 256-bit)
+    if (count >= simd_step) {
+        __m256 v_min = _mm256_set1_ps(l_min);
+        __m256 v_max = _mm256_set1_ps(l_max);
+        
+        size_t count_aligned = count - (count % simd_step);
+        for (; i < count_aligned; i += simd_step) {
+            __m256 vals;
+            
+            if constexpr (InType == InputType::F32) {
+                vals = _mm256_loadu_ps(reinterpret_cast<const float*>(data + i));
+            } 
+            else if constexpr (InType == InputType::F16) {
+                // Load 8 FP16 (128-bit), convert to FP32 (256-bit)
+                __m128i v_fp16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+                vals = _mm256_cvtph_ps(v_fp16);
+            } 
+            else if constexpr (InType == InputType::BF16) {
+                // Load 8 BF16 (128-bit)
+                __m128i v_bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+                // Reshuffle/unpack to get to upper 16 bits of 32-bit integers
+                // BF16: [b0, b1, b2... b7] -> FP32: [b0<<16, b1<<16... ]
+                
+                // Convert to 32-bit int (zero extended)
+                __m256i v_32 = _mm256_cvtepu16_epi32(v_bf16);
+                // Shift left by 16
+                v_32 = _mm256_slli_epi32(v_32, 16);
+                // Cast to float
+                vals = _mm256_castsi256_ps(v_32);
+            }
+            
+            v_min = _mm256_min_ps(v_min, vals);
+            v_max = _mm256_max_ps(v_max, vals);
+        }
+        
+        // Horizontal reduction
+        float tmp_min[8], tmp_max[8];
+        _mm256_storeu_ps(tmp_min, v_min);
+        _mm256_storeu_ps(tmp_max, v_max);
+        
+        for (int k = 0; k < 8; ++k) {
+            l_min = std::min(l_min, tmp_min[k]);
+            l_max = std::max(l_max, tmp_max[k]);
+        }
+    }
+#endif
+
+    // Scalar fallback/remainder
+    for (; i < count; ++i) {
+        float val;
+        if constexpr (InType == InputType::F32) val = convert_f32(data[i]);
+        else if constexpr (InType == InputType::F16) val = convert_f16(data[i]);
+        else if constexpr (InType == InputType::BF16) val = convert_bf16(data[i]);
+        
+        l_min = std::min(l_min, val);
+        l_max = std::max(l_max, val);
+    }
+    
+    min_val = l_min;
+    max_val = l_max;
+}
+
 /**
  * @brief Templated quantization for INT4 symmetric - optimized inner loop
  */
-template<typename DataType, float (*ConvertFunc)(DataType)>
-void quantize_int4_sym_typed(
+template<typename DataType, InputType InType, float (*ConvertFunc)(DataType)>
+inline void quantize_int4_sym_typed(
     const DataType* src_data,
     uint8_t* compressed_data,
     uint16_t* scale_data,
@@ -142,7 +228,7 @@ void quantize_int4_sym_typed(
     constexpr int8_t level_high = 7;
     constexpr float eps = 1.1920929e-7f;
     
-    for (size_t row = 0; row < out_features; row++) {
+    ov::parallel_for(out_features, [&](size_t row) {
         const DataType* row_data = src_data + row * in_features;
         uint8_t* row_compressed = compressed_data + row * packed_in_features;
         uint16_t* row_scale = scale_data + row * num_groups;
@@ -155,11 +241,7 @@ void quantize_int4_sym_typed(
             float w_min = std::numeric_limits<float>::max();
             float w_max = std::numeric_limits<float>::lowest();
             
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = ConvertFunc(row_data[col]);
-                w_min = std::min(w_min, val);
-                w_max = std::max(w_max, val);
-            }
+            find_min_max<DataType, InType>(row_data + group_start, group_end - group_start, w_min, w_max);
             
             // Compute scale
             float max_abs = std::max(std::abs(w_min), std::abs(w_max));
@@ -170,34 +252,97 @@ void quantize_int4_sym_typed(
             // Store scale
             row_scale[g] = float_to_fp16(scale_val);
             
-            // Quantize elements
-            for (size_t col = group_start; col < group_end; col++) {
+            // Quantize elements with loop unrolling
+            size_t col = group_start;
+            
+#ifdef OV_GENAI_RTN_AVX2
+            if (col + 7 < group_end) {
+                __m256 v_inv_scale = _mm256_set1_ps(inv_scale);
+                __m256i v_low = _mm256_set1_epi32(level_low);
+                __m256i v_high = _mm256_set1_epi32(level_high);
+
+                for (; col + 7 < group_end; col += 8) {
+                    __m256 vals;
+                    if constexpr (InType == InputType::F32) {
+                        vals = _mm256_loadu_ps(reinterpret_cast<const float*>(row_data + col));
+                    } else if constexpr (InType == InputType::F16) {
+                        __m128i v_fp16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        vals = _mm256_cvtph_ps(v_fp16);
+                    } else if constexpr (InType == InputType::BF16) {
+                        __m128i v_bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        __m256i v_32 = _mm256_cvtepu16_epi32(v_bf16);
+                        v_32 = _mm256_slli_epi32(v_32, 16);
+                        vals = _mm256_castsi256_ps(v_32);
+                    }
+
+                    // Quantize
+                    vals = _mm256_mul_ps(vals, v_inv_scale);
+                    vals = _mm256_round_ps(vals, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    __m256i v_q = _mm256_cvtps_epi32(vals);
+                    
+                    // Clamp
+                    v_q = _mm256_max_epi32(v_q, v_low);
+                    v_q = _mm256_min_epi32(v_q, v_high);
+
+                    // Store temp to pack scalar-wise (faster than complex AVX bit packing for 4-bit)
+                    int32_t tmp[8];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tmp), v_q);
+                    
+                    uint8_t* d = row_compressed + col / 2;
+                    d[0] = (tmp[0] & 0x0F) | ((tmp[1] & 0x0F) << 4);
+                    d[1] = (tmp[2] & 0x0F) | ((tmp[3] & 0x0F) << 4);
+                    d[2] = (tmp[4] & 0x0F) | ((tmp[5] & 0x0F) << 4);
+                    d[3] = (tmp[6] & 0x0F) | ((tmp[7] & 0x0F) << 4);
+                }
+            }
+#endif
+
+            // Handle start alignment if off-boundary (odd)
+            if (col % 2 != 0 && col < group_end) {
+                float val = ConvertFunc(row_data[col]);
+                int8_t quantized = static_cast<int8_t>(std::round(val * inv_scale));
+                quantized = std::max(level_low, std::min(level_high, quantized));
+                uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
+                row_compressed[col / 2] |= (packed << 4);
+                col++;
+            }
+            
+            // Process pairs (unrolled)
+            for (; col + 1 < group_end; col += 2) {
+                float val0 = ConvertFunc(row_data[col]);
+                float val1 = ConvertFunc(row_data[col + 1]);
+                
+                int8_t q0 = static_cast<int8_t>(std::round(val0 * inv_scale));
+                q0 = std::max(level_low, std::min(level_high, q0));
+                
+                int8_t q1 = static_cast<int8_t>(std::round(val1 * inv_scale));
+                q1 = std::max(level_low, std::min(level_high, q1));
+                
+                uint8_t packed = (static_cast<uint8_t>(q0) & 0x0F) | ((static_cast<uint8_t>(q1) & 0x0F) << 4);
+                row_compressed[col / 2] = packed;
+            }
+            
+            // Handle last element
+            if (col < group_end) {
                 float val = ConvertFunc(row_data[col]);
                 int8_t quantized = static_cast<int8_t>(std::round(val * inv_scale));
                 quantized = std::max(level_low, std::min(level_high, quantized));
                 
                 uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
-                size_t byte_idx = col / 2;
-                if (col % 2 == 0) {
-                    row_compressed[byte_idx] = packed;
-                } else {
-                    row_compressed[byte_idx] |= (packed << 4);
-                }
+                row_compressed[col / 2] = packed;
             }
         }
-    }
+    });
 }
 
-// Conversion function wrappers for template
-inline float convert_f32(float val) { return val; }
-inline float convert_f16(uint16_t val) { return fp16_to_float(val); }
-inline float convert_bf16(uint16_t val) { return bf16_to_float(val); }
+// Conversion function wrappers for template - moved up
+
 
 /**
  * @brief Templated quantization for INT4 asymmetric - optimized inner loop
  */
-template<typename DataType, float (*ConvertFunc)(DataType)>
-void quantize_int4_asym_typed(
+template<typename DataType, InputType InType, float (*ConvertFunc)(DataType)>
+inline void quantize_int4_asym_typed(
     const DataType* src_data,
     uint8_t* compressed_data,
     uint16_t* scale_data,
@@ -213,7 +358,7 @@ void quantize_int4_asym_typed(
     constexpr int32_t level_high = 15;
     constexpr float eps = 1.1920929e-7f;
     
-    for (size_t row = 0; row < out_features; row++) {
+    ov::parallel_for(out_features, [&](size_t row) {
         const DataType* row_data = src_data + row * in_features;
         uint8_t* row_compressed = compressed_data + row * packed_in_features;
         uint16_t* row_scale = scale_data + row * num_groups;
@@ -226,11 +371,7 @@ void quantize_int4_asym_typed(
             float w_min = std::numeric_limits<float>::max();
             float w_max = std::numeric_limits<float>::lowest();
             
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = ConvertFunc(row_data[col]);
-                w_min = std::min(w_min, val);
-                w_max = std::max(w_max, val);
-            }
+            find_min_max<DataType, InType>(row_data + group_start, group_end - group_start, w_min, w_max);
             
             float scale_val = (w_max - w_min) / levels;
             if (scale_val < eps) scale_val = eps;
@@ -242,21 +383,84 @@ void quantize_int4_asym_typed(
             row_scale[g] = float_to_fp16(scale_val);
             row_zp[g] = static_cast<uint8_t>(zp);
             
-            for (size_t col = group_start; col < group_end; col++) {
+            size_t col = group_start;
+
+#ifdef OV_GENAI_RTN_AVX2
+            if (col + 7 < group_end) {
+                __m256 v_inv_scale = _mm256_set1_ps(inv_scale);
+                __m256i v_zp = _mm256_set1_epi32(zp);
+                __m256i v_low = _mm256_set1_epi32(level_low);
+                __m256i v_high = _mm256_set1_epi32(level_high);
+
+                for (; col + 7 < group_end; col += 8) {
+                    __m256 vals;
+                    if constexpr (InType == InputType::F32) {
+                        vals = _mm256_loadu_ps(reinterpret_cast<const float*>(row_data + col));
+                    } else if constexpr (InType == InputType::F16) {
+                        __m128i v_fp16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        vals = _mm256_cvtph_ps(v_fp16);
+                    } else if constexpr (InType == InputType::BF16) {
+                        __m128i v_bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        __m256i v_32 = _mm256_cvtepu16_epi32(v_bf16);
+                        v_32 = _mm256_slli_epi32(v_32, 16);
+                        vals = _mm256_castsi256_ps(v_32);
+                    }
+
+                    // Quantize
+                    vals = _mm256_mul_ps(vals, v_inv_scale);
+                    vals = _mm256_round_ps(vals, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    __m256i v_q = _mm256_cvtps_epi32(vals);
+                    v_q = _mm256_add_epi32(v_q, v_zp);
+                    
+                    // Clamp
+                    v_q = _mm256_max_epi32(v_q, v_low);
+                    v_q = _mm256_min_epi32(v_q, v_high);
+
+                    // Store temp to pack scalar-wise
+                    int32_t tmp[8];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tmp), v_q);
+                    
+                    uint8_t* d = row_compressed + col / 2;
+                    d[0] = (tmp[0] & 0x0F) | ((tmp[1] & 0x0F) << 4);
+                    d[1] = (tmp[2] & 0x0F) | ((tmp[3] & 0x0F) << 4);
+                    d[2] = (tmp[4] & 0x0F) | ((tmp[5] & 0x0F) << 4);
+                    d[3] = (tmp[6] & 0x0F) | ((tmp[7] & 0x0F) << 4);
+                }
+            }
+#endif
+
+            if (col % 2 != 0 && col < group_end) {
                 float val = ConvertFunc(row_data[col]);
                 int32_t quantized = static_cast<int32_t>(std::round(val * inv_scale)) + zp;
                 quantized = std::max(level_low, std::min(level_high, quantized));
-                
                 uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
-                size_t byte_idx = col / 2;
-                if (col % 2 == 0) {
-                    row_compressed[byte_idx] = packed;
-                } else {
-                    row_compressed[byte_idx] |= (packed << 4);
-                }
+                row_compressed[col / 2] |= (packed << 4);
+                col++;
+            }
+            
+            for (; col + 1 < group_end; col += 2) {
+                float val0 = ConvertFunc(row_data[col]);
+                float val1 = ConvertFunc(row_data[col+1]);
+                
+                int32_t q0 = static_cast<int32_t>(std::round(val0 * inv_scale)) + zp;
+                q0 = std::max(level_low, std::min(level_high, q0));
+                
+                int32_t q1 = static_cast<int32_t>(std::round(val1 * inv_scale)) + zp;
+                q1 = std::max(level_low, std::min(level_high, q1));
+                
+                uint8_t packed = (static_cast<uint8_t>(q0) & 0x0F) | ((static_cast<uint8_t>(q1) & 0x0F) << 4);
+                row_compressed[col / 2] = packed;
+            }
+            
+            if (col < group_end) {
+                float val = ConvertFunc(row_data[col]);
+                int32_t quantized = static_cast<int32_t>(std::round(val * inv_scale)) + zp;
+                quantized = std::max(level_low, std::min(level_high, quantized));
+                uint8_t packed = static_cast<uint8_t>(quantized) & 0x0F;
+                row_compressed[col / 2] = packed;
             }
         }
-    }
+    });
 }
 
 /**
@@ -314,17 +518,17 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
     // Dispatch based on dtype - type check happens ONCE, not per element
     auto dtype = weight.get_element_type();
     if (dtype == ov::element::f32) {
-        quantize_int4_sym_typed<float, convert_f32>(
+        quantize_int4_sym_typed<float, InputType::F32, convert_f32>(
             static_cast<const float*>(weight.data()),
             compressed_data, scale_data,
             out_features, in_features, packed_in_features, num_groups, group_size);
     } else if (dtype == ov::element::f16) {
-        quantize_int4_sym_typed<uint16_t, convert_f16>(
+        quantize_int4_sym_typed<uint16_t, InputType::F16, convert_f16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data,
             out_features, in_features, packed_in_features, num_groups, group_size);
     } else if (dtype == ov::element::bf16) {
-        quantize_int4_sym_typed<uint16_t, convert_bf16>(
+        quantize_int4_sym_typed<uint16_t, InputType::BF16, convert_bf16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data,
             out_features, in_features, packed_in_features, num_groups, group_size);
@@ -396,17 +600,17 @@ inline QuantizedWeight quantize_int4_asym(const ov::Tensor& weight, int group_si
     
     auto dtype = weight.get_element_type();
     if (dtype == ov::element::f32) {
-        quantize_int4_asym_typed<float, convert_f32>(
+        quantize_int4_asym_typed<float, InputType::F32, convert_f32>(
             static_cast<const float*>(weight.data()),
             compressed_data, scale_data, zero_point_data,
             out_features, in_features, packed_in_features, num_groups, group_size);
     } else if (dtype == ov::element::f16) {
-        quantize_int4_asym_typed<uint16_t, convert_f16>(
+        quantize_int4_asym_typed<uint16_t, InputType::F16, convert_f16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data, zero_point_data,
             out_features, in_features, packed_in_features, num_groups, group_size);
     } else if (dtype == ov::element::bf16) {
-        quantize_int4_asym_typed<uint16_t, convert_bf16>(
+        quantize_int4_asym_typed<uint16_t, InputType::BF16, convert_bf16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data, zero_point_data,
             out_features, in_features, packed_in_features, num_groups, group_size);
@@ -425,8 +629,8 @@ inline QuantizedWeight quantize_int4_asym(const ov::Tensor& weight, int group_si
 /**
  * @brief Templated quantization for INT8 symmetric - optimized inner loop
  */
-template<typename DataType, float (*ConvertFunc)(DataType)>
-void quantize_int8_sym_typed(
+template<typename DataType, InputType InType, float (*ConvertFunc)(DataType)>
+inline void quantize_int8_sym_typed(
     const DataType* src_data,
     int8_t* compressed_data,
     uint16_t* scale_data,
@@ -440,7 +644,7 @@ void quantize_int8_sym_typed(
     constexpr int32_t level_high = 127;
     constexpr float eps = 1.1920929e-7f;
     
-    for (size_t row = 0; row < out_features; row++) {
+    ov::parallel_for(out_features, [&](size_t row) {
         const DataType* row_data = src_data + row * in_features;
         int8_t* row_compressed = compressed_data + row * in_features;
         uint16_t* row_scale = scale_data + row * num_groups;
@@ -453,11 +657,7 @@ void quantize_int8_sym_typed(
             float w_min = std::numeric_limits<float>::max();
             float w_max = std::numeric_limits<float>::lowest();
             
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = ConvertFunc(row_data[col]);
-                w_min = std::min(w_min, val);
-                w_max = std::max(w_max, val);
-            }
+            find_min_max<DataType, InType>(row_data + group_start, group_end - group_start, w_min, w_max);
             
             // Compute scale
             float max_abs = std::max(std::abs(w_min), std::abs(w_max));
@@ -468,22 +668,64 @@ void quantize_int8_sym_typed(
             // Store scale
             row_scale[g] = float_to_fp16(scale_val);
             
+#ifdef OV_GENAI_RTN_AVX2
+            size_t col = group_start;
+            if (col + 7 < group_end) {
+                __m256 v_inv_scale = _mm256_set1_ps(inv_scale);
+                __m256i v_low = _mm256_set1_epi32(level_low);
+                __m256i v_high = _mm256_set1_epi32(level_high);
+
+                for (; col + 7 < group_end; col += 8) {
+                    __m256 vals;
+                    if constexpr (InType == InputType::F32) {
+                        vals = _mm256_loadu_ps(reinterpret_cast<const float*>(row_data + col));
+                    } else if constexpr (InType == InputType::F16) {
+                        __m128i v_fp16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        vals = _mm256_cvtph_ps(v_fp16);
+                    } else if constexpr (InType == InputType::BF16) {
+                        __m128i v_bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        __m256i v_32 = _mm256_cvtepu16_epi32(v_bf16);
+                        v_32 = _mm256_slli_epi32(v_32, 16);
+                        vals = _mm256_castsi256_ps(v_32);
+                    }
+
+                    // Quantize
+                    vals = _mm256_mul_ps(vals, v_inv_scale);
+                    vals = _mm256_round_ps(vals, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    __m256i v_q = _mm256_cvtps_epi32(vals);
+                    
+                    // Clamp
+                    v_q = _mm256_max_epi32(v_q, v_low);
+                    v_q = _mm256_min_epi32(v_q, v_high);
+
+                    // Store elements
+                    int8_t* d = row_compressed + col;
+                    int32_t tmp[8];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tmp), v_q);
+                    
+                    for(int k=0; k<8; ++k) d[k] = static_cast<int8_t>(tmp[k]);
+                }
+            }
+            // Fallback loop continues from 'col'
+            for (; col < group_end; col++) {
+#else
             // Quantize elements
             for (size_t col = group_start; col < group_end; col++) {
+#endif
                 float val = ConvertFunc(row_data[col]);
                 int32_t quantized = static_cast<int32_t>(std::round(val * inv_scale));
                 quantized = std::max(level_low, std::min(level_high, quantized));
                 row_compressed[col] = static_cast<int8_t>(quantized);
             }
         }
-    }
+    });
 }
 
 /**
  * @brief Templated quantization for INT8 asymmetric - optimized inner loop
  */
-template<typename DataType, float (*ConvertFunc)(DataType)>
-void quantize_int8_asym_typed(
+template<typename DataType, InputType InType, float (*ConvertFunc)(DataType)>
+inline void quantize_int8_asym_typed(
     const DataType* src_data,
     uint8_t* compressed_data,
     uint16_t* scale_data,
@@ -498,7 +740,7 @@ void quantize_int8_asym_typed(
     constexpr int32_t level_high = 255;
     constexpr float eps = 1.1920929e-7f;
     
-    for (size_t row = 0; row < out_features; row++) {
+    ov::parallel_for(out_features, [&](size_t row) {
         const DataType* row_data = src_data + row * in_features;
         uint8_t* row_compressed = compressed_data + row * in_features;
         uint16_t* row_scale = scale_data + row * num_groups;
@@ -511,11 +753,7 @@ void quantize_int8_asym_typed(
             float w_min = std::numeric_limits<float>::max();
             float w_max = std::numeric_limits<float>::lowest();
             
-            for (size_t col = group_start; col < group_end; col++) {
-                float val = ConvertFunc(row_data[col]);
-                w_min = std::min(w_min, val);
-                w_max = std::max(w_max, val);
-            }
+            find_min_max<DataType, InType>(row_data + group_start, group_end - group_start, w_min, w_max);
             
             float scale_val = (w_max - w_min) / levels;
             if (scale_val < eps) scale_val = eps;
@@ -527,14 +765,57 @@ void quantize_int8_asym_typed(
             row_scale[g] = float_to_fp16(scale_val);
             row_zp[g] = static_cast<uint8_t>(zp);
             
-            for (size_t col = group_start; col < group_end; col++) {
+            size_t col = group_start;
+
+#ifdef OV_GENAI_RTN_AVX2
+            if (col + 7 < group_end) {
+                __m256 v_inv_scale = _mm256_set1_ps(inv_scale);
+                __m256i v_zp = _mm256_set1_epi32(zp);
+                __m256i v_low = _mm256_set1_epi32(level_low);
+                __m256i v_high = _mm256_set1_epi32(level_high);
+
+                for (; col + 7 < group_end; col += 8) {
+                    __m256 vals;
+                    if constexpr (InType == InputType::F32) {
+                        vals = _mm256_loadu_ps(reinterpret_cast<const float*>(row_data + col));
+                    } else if constexpr (InType == InputType::F16) {
+                        __m128i v_fp16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        vals = _mm256_cvtph_ps(v_fp16);
+                    } else if constexpr (InType == InputType::BF16) {
+                        __m128i v_bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row_data + col));
+                        __m256i v_32 = _mm256_cvtepu16_epi32(v_bf16);
+                        v_32 = _mm256_slli_epi32(v_32, 16);
+                        vals = _mm256_castsi256_ps(v_32);
+                    }
+
+                    // Quantize
+                    vals = _mm256_mul_ps(vals, v_inv_scale);
+                    vals = _mm256_round_ps(vals, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                    __m256i v_q = _mm256_cvtps_epi32(vals);
+                    v_q = _mm256_add_epi32(v_q, v_zp);
+                    
+                    // Clamp
+                    v_q = _mm256_max_epi32(v_q, v_low);
+                    v_q = _mm256_min_epi32(v_q, v_high);
+
+                    // Store elements
+                    uint8_t* d = row_compressed + col;
+                    int32_t tmp[8];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tmp), v_q);
+                    
+                    for(int k=0; k<8; ++k) d[k] = static_cast<uint8_t>(tmp[k]);
+                }
+            }
+#endif
+            
+            for (; col < group_end; col++) {
                 float val = ConvertFunc(row_data[col]);
                 int32_t quantized = static_cast<int32_t>(std::round(val * inv_scale)) + zp;
                 quantized = std::max(level_low, std::min(level_high, quantized));
                 row_compressed[col] = static_cast<uint8_t>(quantized);
             }
         }
-    }
+    });
 }
 
 /**
@@ -588,17 +869,17 @@ inline QuantizedWeight quantize_int8_sym(const ov::Tensor& weight, int group_siz
     // Dispatch based on dtype - type check happens ONCE, not per element
     auto dtype = weight.get_element_type();
     if (dtype == ov::element::f32) {
-        quantize_int8_sym_typed<float, convert_f32>(
+        quantize_int8_sym_typed<float, InputType::F32, convert_f32>(
             static_cast<const float*>(weight.data()),
             compressed_data, scale_data,
             out_features, in_features, num_groups, group_size);
     } else if (dtype == ov::element::f16) {
-        quantize_int8_sym_typed<uint16_t, convert_f16>(
+        quantize_int8_sym_typed<uint16_t, InputType::F16, convert_f16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data,
             out_features, in_features, num_groups, group_size);
     } else if (dtype == ov::element::bf16) {
-        quantize_int8_sym_typed<uint16_t, convert_bf16>(
+        quantize_int8_sym_typed<uint16_t, InputType::BF16, convert_bf16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data,
             out_features, in_features, num_groups, group_size);
@@ -667,17 +948,17 @@ inline QuantizedWeight quantize_int8_asym(const ov::Tensor& weight, int group_si
     // Dispatch based on dtype - type check happens ONCE, not per element
     auto dtype = weight.get_element_type();
     if (dtype == ov::element::f32) {
-        quantize_int8_asym_typed<float, convert_f32>(
+        quantize_int8_asym_typed<float, InputType::F32, convert_f32>(
             static_cast<const float*>(weight.data()),
             compressed_data, scale_data, zero_point_data,
             out_features, in_features, num_groups, group_size);
     } else if (dtype == ov::element::f16) {
-        quantize_int8_asym_typed<uint16_t, convert_f16>(
+        quantize_int8_asym_typed<uint16_t, InputType::F16, convert_f16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data, zero_point_data,
             out_features, in_features, num_groups, group_size);
     } else if (dtype == ov::element::bf16) {
-        quantize_int8_asym_typed<uint16_t, convert_bf16>(
+        quantize_int8_asym_typed<uint16_t, InputType::BF16, convert_bf16>(
             static_cast<const uint16_t*>(weight.data()),
             compressed_data, scale_data, zero_point_data,
             out_features, in_features, num_groups, group_size);
