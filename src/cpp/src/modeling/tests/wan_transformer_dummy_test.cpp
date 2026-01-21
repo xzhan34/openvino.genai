@@ -10,7 +10,7 @@
 #include <openvino/openvino.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/wan_transformer3d.hpp"
+#include "modeling/models/wan_dit.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/models/wan_transformer3d.hpp"
+#include "modeling/models/wan_dit.hpp"
 
 #include <cmath>
 #include <vector>
@@ -684,7 +684,7 @@ Tensor WanTransformer3DModel::forward(const Tensor& hidden_states,
     return unpatched.reshape(final_shape);
 }
 
-std::shared_ptr<ov::Model> create_wan_transformer3d_model(
+std::shared_ptr<ov::Model> create_wan_dit_model(
     const WanTransformer3DConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer) {

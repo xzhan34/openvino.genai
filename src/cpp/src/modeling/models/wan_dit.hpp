@@ -279,7 +279,7 @@ private:
     WeightParameter* scale_shift_table_ = nullptr;
 };
 
-std::shared_ptr<ov::Model> create_wan_transformer3d_model(
+std::shared_ptr<ov::Model> create_wan_dit_model(
     const WanTransformer3DConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);

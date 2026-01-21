@@ -22,7 +22,7 @@
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
 #include "image_generation/schedulers/flow_match_euler_discrete.hpp"
-#include "modeling/models/wan_transformer3d.hpp"
+#include "modeling/models/wan_dit.hpp"
 #include "modeling/models/wan_vae.hpp"
 #include "modeling/models/wan_utils.hpp"
 #include "modeling/models/wan_umt5.hpp"
@@ -245,7 +245,7 @@ int main(int argc, char* argv[]) try {
     auto transformer_data = ov::genai::safetensors::load_safetensors(transformer_dir);
     ov::genai::safetensors::SafetensorsWeightSource transformer_source(std::move(transformer_data));
     ov::genai::safetensors::SafetensorsWeightFinalizer transformer_finalizer;
-    auto transformer_model = ov::genai::modeling::models::create_wan_transformer3d_model(
+    auto transformer_model = ov::genai::modeling::models::create_wan_dit_model(
         transformer_cfg, transformer_source, transformer_finalizer);
 
     auto vae_data = ov::genai::safetensors::load_safetensors(vae_dir);
