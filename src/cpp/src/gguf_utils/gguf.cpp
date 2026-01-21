@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <openvino/core/parallel.hpp>
+#include <cfloat>
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))

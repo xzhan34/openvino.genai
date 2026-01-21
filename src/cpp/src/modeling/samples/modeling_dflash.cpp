@@ -60,6 +60,15 @@ struct PerfStats {
     size_t generated_tokens = 0;
     double ttft_ms = 0.0;
     double total_generate_ms = 0.0;
+    std::vector<size_t> accepted_per_step;
+};
+
+struct TargetBaselineStats {
+    StageStats prefill_wall;
+    StageStats decode_wall;
+    size_t generated_tokens = 0;
+    double ttft_ms = 0.0;
+    double total_generate_ms = 0.0;
 };
 
 double duration_ms(Clock::time_point start, Clock::time_point end) {
@@ -263,6 +272,15 @@ ov::Tensor make_position_ids(size_t seq_len) {
     return ids;
 }
 
+ov::Tensor make_position_ids_range(size_t start, size_t count) {
+    ov::Tensor ids(ov::element::i64, {1, count});
+    auto* data = ids.data<int64_t>();
+    for (size_t i = 0; i < count; ++i) {
+        data[i] = static_cast<int64_t>(start + i);
+    }
+    return ids;
+}
+
 ov::Tensor make_position_ids_with_overlap(size_t context_len, size_t draft_len) {
     const size_t total = context_len + draft_len;
     ov::Tensor ids(ov::element::i64, {1, total});
@@ -373,6 +391,69 @@ int64_t resolve_mask_token_id(ov::genai::Tokenizer tokenizer) {
     throw std::runtime_error("Tokenizer has no suitable mask/pad/eos token to use as mask placeholder");
 }
 
+ov::Tensor make_beam_idx(size_t batch) {
+    ov::Tensor beam_idx(ov::element::i32, {batch});
+    auto* data = beam_idx.data<int32_t>();
+    for (size_t i = 0; i < batch; ++i) {
+        data[i] = static_cast<int32_t>(i);
+    }
+    return beam_idx;
+}
+
+struct TargetBaselineResult {
+    TargetBaselineStats stats;
+    std::vector<int64_t> output_ids;
+};
+
+TargetBaselineResult run_target_baseline(ov::InferRequest& target_request,
+                                         const ov::Tensor& beam_idx,
+                                         const std::vector<int64_t>& prompt_ids,
+                                         int max_new_tokens,
+                                         int64_t eos_token_id) {
+    TargetBaselineResult result;
+    result.output_ids = prompt_ids;
+    const size_t prompt_len = prompt_ids.size();
+    const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
+
+    auto prefill_start = Clock::now();
+    target_request.set_tensor("input_ids", make_ids_tensor(result.output_ids));
+    target_request.set_tensor("attention_mask", make_attention_mask(result.output_ids.size()));
+    target_request.set_tensor("position_ids", make_position_ids_range(0, result.output_ids.size()));
+    target_request.set_tensor("beam_idx", beam_idx);
+    target_request.infer();
+    auto logits = target_request.get_tensor("logits");
+    auto prefill_end = Clock::now();
+    result.stats.prefill_wall.add(duration_ms(prefill_start, prefill_end));
+
+    int64_t next_token = argmax_last_token(logits);
+    result.stats.ttft_ms = duration_ms(prefill_start, prefill_end);
+    result.output_ids.push_back(next_token);
+    const auto generation_start = Clock::now();
+    while (result.output_ids.size() < max_length) {
+        if (next_token == eos_token_id) {
+            break;
+        }
+        auto decode_start = Clock::now();
+        const size_t pos = result.output_ids.size() - 1;
+        target_request.set_tensor("input_ids", make_ids_tensor({next_token}));
+        target_request.set_tensor("attention_mask", make_attention_mask(1));
+        target_request.set_tensor("position_ids", make_position_ids_range(pos, 1));
+        target_request.set_tensor("beam_idx", beam_idx);
+        target_request.infer();
+        auto decode_end = Clock::now();
+        result.stats.decode_wall.add(duration_ms(decode_start, decode_end));
+
+        logits = target_request.get_tensor("logits");
+        next_token = argmax_last_token(logits);
+        result.output_ids.push_back(next_token);
+    }
+
+    const auto generation_end = Clock::now();
+    result.stats.total_generate_ms = duration_ms(generation_start, generation_end);
+    result.stats.generated_tokens = result.output_ids.size() - prompt_len;
+    return result;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) try {
@@ -437,6 +518,12 @@ int main(int argc, char* argv[]) try {
 
     const auto target_layer_ids = ov::genai::modeling::models::build_target_layer_ids(
         dflash_cfg.num_target_layers, dflash_cfg.num_hidden_layers);
+    std::cout << "dflash_cfg.block_size is " << dflash_cfg.block_size << std::endl;
+    std::cout << "target_layer_ids is " << std::endl;
+    for(auto id : target_layer_ids) {
+        std::cout << id << " ";
+    }
+    std::cout << std::endl;
 
     auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
     ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
@@ -447,6 +534,7 @@ int main(int argc, char* argv[]) try {
     ov::genai::safetensors::SafetensorsWeightFinalizer draft_finalizer;
 
     PerfStats perf;
+    double dflash_throughput = 0.0;
 
     auto target_model = ov::genai::modeling::models::create_qwen3_dflash_target_model_no_cache(
         qwen_cfg, target_layer_ids, target_source, target_finalizer);
@@ -458,7 +546,7 @@ int main(int argc, char* argv[]) try {
         qwen_cfg, target_source, target_finalizer);
     auto lm_head_model = ov::genai::modeling::models::create_qwen3_lm_head_model(
         qwen_cfg, target_source, target_finalizer, draft_compute_type);
-
+    
     ov::Core core;
     // Force all sub-models to run in FP32 to rule out BF16/F16 precision issues.
     ov::AnyMap compile_cfg = {
@@ -474,17 +562,18 @@ int main(int argc, char* argv[]) try {
     auto lm_head_request = compiled_lm_head.create_infer_request();
     auto draft_request = compiled_draft.create_infer_request();
 
+    const auto generation_start = Clock::now();
+
     ov::genai::Tokenizer tokenizer(target_dir);
     const int64_t mask_token_id = resolve_mask_token_id(tokenizer);
     const int64_t eos_token_id = tokenizer.get_eos_token_id();
     std::cout << "[DEBUG] mask_token_id=" << mask_token_id << " eos_token_id=" << eos_token_id << std::endl;
 
     auto encoded = tokenizer.encode(prompt, {ov::genai::add_special_tokens(false)});
-    std::vector<int64_t> output_ids = tensor_to_ids(encoded.input_ids);
+    const std::vector<int64_t> prompt_ids = tensor_to_ids(encoded.input_ids);
+    std::vector<int64_t> output_ids = prompt_ids;
     const size_t prompt_len = output_ids.size();
     const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
-
-    const auto generation_start = Clock::now();
 
     // Prefill: run target on prompt to get first token.
     auto prefill_start = Clock::now();
@@ -619,7 +708,8 @@ int main(int argc, char* argv[]) try {
         }
         const size_t accepted_pushed = output_ids.size() - before_accept;
         ++perf.draft_steps;
-        perf.accepted_tokens += accepted_pushed;
+        perf.accepted_tokens += accepted_pushed + 1;
+        perf.accepted_per_step.push_back(accepted_pushed + 1);
         if (output_ids.size() >= max_length) {
             break;
         }
@@ -633,25 +723,25 @@ int main(int argc, char* argv[]) try {
 
     const size_t tokens_after_first = perf.generated_tokens > 0 ? perf.generated_tokens - 1 : 0;
     const double tpot_ms = tokens_after_first > 0
-                               ? (perf.total_generate_ms - perf.ttft_ms) / static_cast<double>(tokens_after_first)
-                               : 0.0;
-    const double throughput = perf.total_generate_ms > 0
-                                  ? (static_cast<double>(perf.generated_tokens) * 1000.0) / perf.total_generate_ms
-                                  : 0.0;
+                                ? (perf.total_generate_ms - perf.ttft_ms) / static_cast<double>(tokens_after_first)
+                                : 0.0;
+    dflash_throughput = perf.total_generate_ms > 0
+                            ? (static_cast<double>(perf.generated_tokens) * 1000.0) / perf.total_generate_ms
+                            : 0.0;
     const double avg_accept = perf.draft_steps > 0
-                                  ? static_cast<double>(perf.accepted_tokens) / static_cast<double>(perf.draft_steps)
-                                  : 0.0;
+                                    ? static_cast<double>(perf.accepted_tokens) / static_cast<double>(perf.draft_steps)
+                                    : 0.0;
     const size_t target_generated = perf.generated_tokens > perf.accepted_tokens
                                         ? perf.generated_tokens - perf.accepted_tokens
                                         : 0;
 
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "[Tokens] prompt=" << prompt_len << ", generated=" << perf.generated_tokens
-              << ", draft_accepted=" << perf.accepted_tokens << ", target_only=" << target_generated
-              << ", avg_accept_per_block=" << avg_accept << std::endl;
+                << ", draft_accepted=" << perf.accepted_tokens << ", target_only=" << target_generated
+                << ", avg_accept_per_block=" << avg_accept << std::endl;
     std::cout << "[Latency] TTFT=" << perf.ttft_ms << " ms, TPOT=" << tpot_ms
-              << " ms/token, total_generate=" << perf.total_generate_ms
-              << " ms, throughput=" << throughput << " tokens/s" << std::endl;
+                << " ms/token, total_generate=" << perf.total_generate_ms
+                << " ms, throughput=" << dflash_throughput << " tokens/s" << std::endl;
     std::cout << "[Stage timings] wall-clock (ms):" << std::endl;
     print_stage_stats("prefill target", perf.prefill_wall);
     print_stage_stats("target ctx", perf.target_ctx_wall);
@@ -659,10 +749,63 @@ int main(int argc, char* argv[]) try {
     print_stage_stats("draft", perf.draft_wall);
     print_stage_stats("lm_head", perf.lm_head_wall);
     print_stage_stats("target verify", perf.verify_wall);
+    if (!perf.accepted_per_step.empty()) {
+        std::cout << "[Draft acceptance per step] [";
+        for (size_t i = 0; i < perf.accepted_per_step.size(); ++i) {
+            if (i) {
+                std::cout << ",";
+            }
+            std::cout << perf.accepted_per_step[i];
+        }
+        std::cout << "]" << std::endl;
+    }
 
     std::vector<int64_t> generated(output_ids.begin() + static_cast<std::ptrdiff_t>(prompt_len), output_ids.end());
     auto text = tokenizer.decode(generated, {ov::genai::skip_special_tokens(true)});
     std::cout << text << std::endl;
+
+    draft_request = {};
+    lm_head_request = {};
+    embed_request = {};
+    target_request = {};
+
+    compiled_draft = {};
+    compiled_lm_head = {};
+    compiled_embed = {};
+    compiled_target = {};
+
+    std::cout << std::endl << "=====Run Baseline model for comparison . =====" << std::endl;
+
+    auto baseline_model = ov::genai::modeling::models::create_qwen3_dense_model(
+        qwen_cfg, target_source, target_finalizer);
+    auto compiled_baseline = core.compile_model(baseline_model, device, compile_cfg);
+    auto baseline_request = compiled_baseline.create_infer_request();
+    const auto beam_idx = make_beam_idx(1);
+    baseline_request.reset_state();
+    auto baseline = run_target_baseline(baseline_request, beam_idx, prompt_ids, max_new_tokens, eos_token_id);
+    const size_t baseline_tokens_after_first = baseline.stats.generated_tokens > 0 ? baseline.stats.generated_tokens - 1 : 0;
+    const double baseline_tpot_ms = baseline_tokens_after_first > 0
+                                        ? (baseline.stats.total_generate_ms - baseline.stats.ttft_ms)
+                                              / static_cast<double>(baseline_tokens_after_first)
+                                        : 0.0;
+    const double baseline_throughput = baseline.stats.total_generate_ms > 0
+                                           ? (static_cast<double>(baseline.stats.generated_tokens) * 1000.0)
+                                                 / baseline.stats.total_generate_ms
+                                           : 0.0;
+
+    std::cout << "[Target-only] generated=" << baseline.stats.generated_tokens
+              << ", TTFT=" << baseline.stats.ttft_ms << " ms, TPOT=" << baseline_tpot_ms
+              << " ms/token, total_generate=" << baseline.stats.total_generate_ms
+              << " ms, throughput=" << baseline_throughput << " tokens/s" << std::endl;
+    std::cout << "[Target-only stage timings] wall-clock (ms):" << std::endl;
+    print_stage_stats("prefill target", baseline.stats.prefill_wall);
+    print_stage_stats("decode target", baseline.stats.decode_wall);
+    auto text_original = tokenizer.decode(baseline.output_ids, {ov::genai::skip_special_tokens(true)});
+    std::cout << text_original << std::endl;
+
+    if (baseline_throughput > 0.0 && dflash_throughput > 0.0) {
+        std::cout << "[Compare] dflash / baseline throughput ratio=" << (dflash_throughput / baseline_throughput) << std::endl;
+    }
     return 0;
 } catch (const std::exception& ex) {
     std::cerr << "DFlash sample failed: " << ex.what() << std::endl;

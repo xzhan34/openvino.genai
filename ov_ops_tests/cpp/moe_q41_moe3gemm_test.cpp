@@ -13,6 +13,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <cfloat>
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
