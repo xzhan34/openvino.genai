@@ -18,6 +18,12 @@ namespace weights {
  * This class provides common selection logic that can be used by any
  * weight finalizer implementation (Safetensors, GGUF, etc.)
  * 
+ * Implements NNCF-compatible quantization strategy:
+ * - Primary precision (INT4) for attention and MLP layers
+ * - Backup precision (INT8_ASYM) for lm_head and embeddings
+ * - Set backup_mode=primary_mode to use same mode for all layers
+ * - Set backup_mode=NONE to skip quantizing sensitive layers
+ * 
  * Usage:
  * ```cpp
  * class MyWeightFinalizer : public WeightFinalizer {
@@ -27,8 +33,9 @@ namespace weights {
  *     
  *     Tensor finalize(const std::string& name, WeightSource& source, OpContext& ctx) override {
  *         auto tensor = source.get_tensor(name);
- *         if (selector_.should_quantize(name, tensor.get_shape())) {
- *             // Apply quantization
+ *         auto quant_mode = selector_.get_quantization_mode(name, tensor.get_shape());
+ *         if (quant_mode != QuantizationConfig::Mode::NONE) {
+ *             // Apply quantization with quant_mode
  *         }
  *         // Return result
  *     }
@@ -53,6 +60,30 @@ public:
     bool should_quantize(const std::string& name, 
                         const ov::Shape& shape,
                         ov::element::Type dtype = ov::element::undefined) const;
+    
+    /**
+     * @brief Get the quantization mode for a specific weight (NNCF-style)
+     * 
+     * Returns:
+     * - NONE: if weight should not be quantized
+     * - Primary mode (e.g., INT4_SYM): for regular transformer layers
+     * - Backup mode (e.g., INT8_ASYM): for lm_head and embeddings (when backup_mode != primary_mode)
+     * 
+     * @param name Weight name
+     * @param shape Weight shape
+     * @param dtype Weight data type (optional)
+     * @return Quantization mode for this weight
+     */
+    QuantizationConfig::Mode get_quantization_mode(const std::string& name,
+                                                   const ov::Shape& shape,
+                                                   ov::element::Type dtype = ov::element::undefined) const;
+    
+    /**
+     * @brief Get group size for a weight (may vary by layer type in future)
+     * @param name Weight name
+     * @return Group size to use
+     */
+    int get_group_size(const std::string& name) const;
     
     /**
      * @brief Get the quantization configuration

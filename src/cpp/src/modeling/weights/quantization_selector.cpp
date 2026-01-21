@@ -209,6 +209,64 @@ bool QuantizationSelector::should_quantize(const std::string& name,
     return should_quantize;
 }
 
+QuantizationConfig::Mode QuantizationSelector::get_quantization_mode(
+    const std::string& name,
+    const ov::Shape& shape,
+    ov::element::Type dtype) const {
+    
+    // First check if we should quantize at all
+    if (!should_quantize(name, shape, dtype)) {
+        return QuantizationConfig::Mode::NONE;
+    }
+    
+    // NNCF-style logic: check if this is a sensitive layer that needs backup precision
+    bool is_embedding = name.find("embed") != std::string::npos;
+    bool is_lm_head = name.find("lm_head") != std::string::npos;
+    
+    // NNCF-compatible logic:
+    // - If backup_mode != mode: lm_head and embeddings use backup_mode
+    // - If backup_mode == mode: all layers use same mode (like NNCF --all-layers)
+    // - If backup_mode == NONE: sensitive layers return NONE (handled by should_quantize)
+    bool is_sensitive = is_lm_head || is_embedding;
+    bool use_backup = is_sensitive && (config_.backup_mode != config_.mode);
+    
+    if (use_backup) {
+        // Use backup mode (typically INT8_ASYM for better accuracy)
+        if (config_.selection.verbose) {
+            std::cout << "[QuantizationSelector] " << name 
+                      << " -> backup mode - sensitive layer" << std::endl;
+        }
+        return config_.backup_mode;
+    }
+    
+    // Use primary mode (typically INT4 for efficiency)
+    if (config_.selection.verbose) {
+        std::cout << "[QuantizationSelector] " << name 
+                  << " -> primary mode - regular layer" << std::endl;
+    }
+    return config_.mode;
+}
+
+int QuantizationSelector::get_group_size(const std::string& name) const {
+    // Determine group_size based on the actual quantization mode for this layer
+    auto mode = get_quantization_mode(name, {}, ov::element::undefined);
+    
+    // Check if this layer uses backup_mode (sensitive layers like lm_head, embeddings)
+    bool is_embedding = name.find("embed") != std::string::npos;
+    bool is_lm_head = name.find("lm_head") != std::string::npos;
+    bool is_sensitive = is_lm_head || is_embedding;
+    bool uses_backup = is_sensitive && (config_.backup_mode != config_.mode);
+    
+    if (uses_backup) {
+        // Backup mode (typically INT8) uses per-channel quantization by default
+        // This matches NNCF behavior where sensitive layers use INT8 per-channel
+        return -1;  // Per-channel for backup mode
+    }
+    
+    // Primary mode uses user-configured group_size
+    return config_.group_size;
+}
+
 }  // namespace weights
 }  // namespace modeling
 }  // namespace genai

@@ -177,6 +177,37 @@ QuantizationConfig parse_quantization_config_from_env() {
         selection.max_weight_size = std::atoll(max_size_env);
     }
     
+    // NNCF-style options
+    // backup_mode: quantization mode for sensitive layers (lm_head, embeddings)
+    // Default is INT8_ASYM (matching NNCF default)
+    // Set to primary mode to quantize all layers with same mode
+    // Set to NONE to skip quantizing sensitive layers
+    const char* backup_mode_env = std::getenv("OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE");
+    if (backup_mode_env) {
+        std::string mode_str(backup_mode_env);
+        std::transform(mode_str.begin(), mode_str.end(), mode_str.begin(), ::toupper);
+        
+        if (mode_str == "INT4_SYM") {
+            quant_config.backup_mode = QuantizationConfig::Mode::INT4_SYM;
+        } else if (mode_str == "INT4_ASYM") {
+            quant_config.backup_mode = QuantizationConfig::Mode::INT4_ASYM;
+        } else if (mode_str == "INT8_SYM") {
+            quant_config.backup_mode = QuantizationConfig::Mode::INT8_SYM;
+        } else if (mode_str == "INT8_ASYM") {
+            quant_config.backup_mode = QuantizationConfig::Mode::INT8_ASYM;
+        } else if (mode_str == "NONE") {
+            quant_config.backup_mode = QuantizationConfig::Mode::NONE;
+        }
+    }
+    
+    // Verbose mode for debugging
+    const char* verbose_env = std::getenv("OV_GENAI_INFLIGHT_QUANT_VERBOSE");
+    if (verbose_env) {
+        std::string val(verbose_env);
+        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+        selection.verbose = (val == "1" || val == "true");
+    }
+    
     return quant_config;
 }
 

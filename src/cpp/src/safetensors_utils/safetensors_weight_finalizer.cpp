@@ -27,17 +27,34 @@ SafetensorsWeightFinalizer::SafetensorsWeightFinalizer() = default;
 SafetensorsWeightFinalizer::SafetensorsWeightFinalizer(const QuantizationConfig& config)
     : selector_(config) {
     if (config.enabled()) {
-        std::cout << "[SafetensorsWeightFinalizer] In-flight quantization enabled:" << std::endl;
-        std::cout << "  Mode: ";
-        switch (config.mode) {
-            case QuantizationConfig::Mode::INT4_SYM: std::cout << "INT4 Symmetric"; break;
-            case QuantizationConfig::Mode::INT4_ASYM: std::cout << "INT4 Asymmetric"; break;
-            case QuantizationConfig::Mode::INT8_SYM: std::cout << "INT8 Symmetric"; break;
-            case QuantizationConfig::Mode::INT8_ASYM: std::cout << "INT8 Asymmetric"; break;
-            default: break;
+        std::cout << "[SafetensorsWeightFinalizer] In-flight quantization enabled (NNCF-compatible):" << std::endl;
+        
+        // Helper lambda to print mode name
+        auto mode_name = [](QuantizationConfig::Mode m) -> std::string {
+            switch (m) {
+                case QuantizationConfig::Mode::INT4_SYM: return "INT4_SYM";
+                case QuantizationConfig::Mode::INT4_ASYM: return "INT4_ASYM";
+                case QuantizationConfig::Mode::INT8_SYM: return "INT8_SYM";
+                case QuantizationConfig::Mode::INT8_ASYM: return "INT8_ASYM";
+                case QuantizationConfig::Mode::NONE: return "NONE";
+                default: return "UNKNOWN";
+            }
+        };
+        
+        std::cout << "  Primary mode: " << mode_name(config.mode) 
+                  << " (group_size=" << config.group_size << ")" << std::endl;
+        std::cout << "  Backup mode: " << mode_name(config.backup_mode) 
+                  << " (per-channel)" << std::endl;
+        
+        if (config.backup_mode == config.mode) {
+            std::cout << "  -> All layers use same mode (" 
+                      << mode_name(config.mode) << ", group_size=" << config.group_size << ")" << std::endl;
+        } else if (config.backup_mode != QuantizationConfig::Mode::NONE) {
+            std::cout << "  -> lm_head, embeddings will use backup mode (" 
+                      << mode_name(config.backup_mode) << ", per-channel)" << std::endl;
+        } else {
+            std::cout << "  -> lm_head, embeddings will NOT be quantized (backup_mode=NONE)" << std::endl;
         }
-        std::cout << std::endl;
-        std::cout << "  Group size: " << config.group_size << std::endl;
         
         const auto& sel = config.selection;
         if (!sel.include_patterns.empty()) {
@@ -51,6 +68,9 @@ SafetensorsWeightFinalizer::SafetensorsWeightFinalizer(const QuantizationConfig&
         if (sel.layer_range.has_value()) {
             std::cout << "  Layer range: [" << sel.layer_range->first 
                       << ", " << sel.layer_range->second << "]" << std::endl;
+        }
+        if (sel.verbose) {
+            std::cout << "  Verbose mode enabled" << std::endl;
         }
     }
 }
@@ -126,7 +146,10 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
     using namespace ov::genai::rtn;
     using Mode = QuantizationConfig::Mode;
     
-    const auto& config = selector_.config();
+    // NNCF-style: Get the quantization mode for this specific weight
+    // This may return different modes for different layers (e.g., INT8 for lm_head, INT4 for others)
+    Mode quant_mode = selector_.get_quantization_mode(name, tensor.get_shape(), tensor.get_element_type());
+    int group_size = selector_.get_group_size(name);
     
     // RTN quantization functions expect 2D tensors
     OPENVINO_ASSERT(tensor.get_shape().size() == 2 || tensor.get_shape().size() == 3, 
@@ -135,21 +158,21 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
     // Quantize using RTN algorithms
     rtn::QuantizedWeight quant_result;
     
-    switch (config.mode) {
+    switch (quant_mode) {
         case Mode::INT4_SYM:
-            quant_result = rtn::quantize_int4_sym(tensor, config.group_size);
+            quant_result = rtn::quantize_int4_sym(tensor, group_size);
             break;
             
         case Mode::INT4_ASYM:
-            quant_result = rtn::quantize_int4_asym(tensor, config.group_size);
+            quant_result = rtn::quantize_int4_asym(tensor, group_size);
             break;
             
         case Mode::INT8_SYM:
-            quant_result = rtn::quantize_int8_sym(tensor, config.group_size);
+            quant_result = rtn::quantize_int8_sym(tensor, group_size);
             break;
             
         case Mode::INT8_ASYM:
-            quant_result = rtn::quantize_int8_asym(tensor, config.group_size);
+            quant_result = rtn::quantize_int8_asym(tensor, group_size);
             break;
             
         default:

@@ -82,6 +82,12 @@ struct WeightSelectionConfig {
  * 
  * This configuration is format-agnostic and can be used by any weight finalizer
  * that supports quantization (Safetensors, GGUF, etc.)
+ * 
+ * NNCF-compatible behavior:
+ * - Primary mode (INT4) for most transformer layers (attention, MLP)
+ * - Backup mode (INT8_ASYM by default) for sensitive layers (lm_head, embeddings)
+ * - Set backup_mode=primary_mode to use same mode for all layers
+ * - Set backup_mode=NONE to skip quantizing sensitive layers
  */
 struct QuantizationConfig {
     enum class Mode {
@@ -92,42 +98,79 @@ struct QuantizationConfig {
         INT8_ASYM      // INT8 asymmetric
     };
     
+    // Primary quantization mode (for most layers)
     Mode mode = Mode::NONE;
     int group_size = 128;              // Group size for group-wise quantization
     
+    // Backup mode for sensitive layers (NNCF-style)
+    // - backup_mode != NONE: lm_head and embeddings use backup_mode
+    // - backup_mode == mode: all layers use same mode (like NNCF --all-layers)
+    // - backup_mode == NONE: sensitive layers NOT quantized (keep FP16)
+    Mode backup_mode = Mode::INT8_ASYM;
+    
     // Legacy options (kept for backward compatibility)
-    bool quantize_embeddings = false;  // Whether to quantize embeddings
-    bool quantize_lm_head = false;     // Whether to quantize LM head
+    bool quantize_embeddings = false;  // Whether to quantize embeddings (deprecated, use backup_mode)
+    bool quantize_lm_head = false;     // Whether to quantize LM head (deprecated, use backup_mode)
     
     // Custom weight selection (new!)
     WeightSelectionConfig selection;
     
     bool enabled() const { return mode != Mode::NONE; }
+    
+    bool is_primary_4bit() const {
+        return mode == Mode::INT4_SYM || mode == Mode::INT4_ASYM;
+    }
+    
     int bits() const {
-        return (mode == Mode::INT4_SYM || mode == Mode::INT4_ASYM) ? 4 : 8;
+        return is_primary_4bit() ? 4 : 8;
+    }
+    
+    int backup_bits() const {
+        return (backup_mode == Mode::INT4_SYM || backup_mode == Mode::INT4_ASYM) ? 4 : 8;
     }
     
     /**
      * @brief Convenience: Set selection from legacy options
+     * 
+     * NNCF-style behavior:
+     * - When backup_mode != NONE: always quantize embeddings and lm_head (with backup mode)
+     * - When backup_mode == mode: all layers use same mode (like NNCF --all-layers)
+     * - When backup_mode == NONE: sensitive layers not quantized
      */
     void apply_legacy_options() {
-        selection.quantize_embeddings = quantize_embeddings;
-        selection.quantize_lm_head = quantize_lm_head;
+        // NNCF-style: Always quantize embeddings/lm_head when backup_mode is available
+        // They will use backup_mode (INT8_ASYM by default) instead of primary mode
+        bool use_backup_quantization = (backup_mode != Mode::NONE);
+        
+        selection.quantize_embeddings = quantize_embeddings || use_backup_quantization;
+        selection.quantize_lm_head = quantize_lm_head || use_backup_quantization;
     }
 };
 
 /**
  * @brief Parse quantization configuration from environment variables
  * 
+ * NNCF-compatible quantization with mixed precision support.
+ * 
  * Environment variables:
- *   OV_GENAI_INFLIGHT_QUANT_MODE: Quantization mode (INT4_SYM, INT4_ASYM, INT8_SYM, INT8_ASYM)
- *   OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE: Group size for quantization (default: 128)
+ *   OV_GENAI_INFLIGHT_QUANT_MODE: Primary quantization mode (INT4_SYM, INT4_ASYM, INT8_SYM, INT8_ASYM)
+ *   OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE: Group size for INT4 quantization (default: 128)
+ *   OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE: Backup mode for sensitive layers (default: INT8_ASYM)
+ *                                         Set to primary mode for all-layers quantization
+ *                                         Set to NONE to skip quantizing sensitive layers
+ *   OV_GENAI_INFLIGHT_QUANT_VERBOSE: If "1" or "true", print detailed quantization decisions
  *   OV_GENAI_INFLIGHT_QUANT_INCLUDE: Comma-separated include patterns
  *   OV_GENAI_INFLIGHT_QUANT_EXCLUDE: Comma-separated exclude patterns
  *   OV_GENAI_INFLIGHT_QUANT_LAYER_RANGE: Layer range (e.g., "10-20")
  *   OV_GENAI_INFLIGHT_QUANT_WEIGHT_NAMES: Comma-separated explicit weight names
- *   OV_GENAI_INFLIGHT_QUANT_MIN_SIZE: Minimum weight size in bytes
- *   OV_GENAI_INFLIGHT_QUANT_MAX_SIZE: Maximum weight size in bytes
+ *   OV_GENAI_INFLIGHT_QUANT_MIN_SIZE: Minimum weight size in elements
+ *   OV_GENAI_INFLIGHT_QUANT_MAX_SIZE: Maximum weight size in elements
+ * 
+ * NNCF-compatible default behavior (when mode=INT4_SYM, backup_mode=INT8_ASYM):
+ *   - Attention/MLP layers: INT4_SYM with group_size=128
+ *   - lm_head: INT8_ASYM per-channel
+ *   - embeddings: INT8_ASYM per-channel
+ *   - norm layers: not quantized
  * 
  * @return QuantizationConfig parsed from environment variables
  */
