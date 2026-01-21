@@ -191,73 +191,100 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
         OPENVINO_THROW("Invalid Qwen3 MoE configuration");
     }
 
-    gate_inp_param_ = &register_parameter("gate_inp.weight");
-    gate_exps_param_ = &register_parameter("gate_exps.weight");
-    up_exps_param_ = &register_parameter("up_exps.weight");
-    down_exps_param_ = &register_parameter("down_exps.weight");
-
     if (cfg.architecture == "qwen3_moe") {
-        gate_exps_param_->set_weight_loader([this](WeightParameter& param,
+        gate_exps_param_.resize(num_experts_);
+        up_exps_param_.resize(num_experts_);
+        down_exps_param_.resize(num_experts_);
+        gate_exps_scales_.resize(num_experts_);
+        gate_exps_zps_.resize(num_experts_);
+        up_exps_scales_.resize(num_experts_);
+        up_exps_zps_.resize(num_experts_);
+        down_exps_scales_.resize(num_experts_);
+        down_exps_zps_.resize(num_experts_);
+
+        gate_inp_param_ = &register_parameter("gate.weight");
+        for (int32_t i = 0; i < num_experts_; ++i) {
+            std::string prefix = "experts." + std::to_string(i) + ".";
+            gate_exps_param_[i] = &register_parameter(prefix + "gate_proj.weight");
+            up_exps_param_[i] = &register_parameter(prefix + "up_proj.weight");
+            down_exps_param_[i] = &register_parameter(prefix + "down_proj.weight");
+
+            gate_exps_param_[i]->set_weight_loader([this, i](WeightParameter& param,
                                                    weights::WeightSource& source,
                                                    weights::WeightFinalizer& finalizer,
                                                    const std::string& weight_name,
                                                    const std::optional<int>& shard_id) {
-            (void)finalizer;
-            (void)shard_id;
-            if (!param.context()) {
-                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
-            }
-            auto weight = finalizer.finalize(weight_name, source, *param.context());
-            param.bind(weight);
-            if (weight.get_auxiliary("scales") == std::nullopt ||
-                weight.get_auxiliary("zps") == std::nullopt) {
-                OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
-            }
-            gate_exps_scales_ = weight.auxiliary.at("scales");
-            gate_exps_zps_ = weight.auxiliary.at("zps");
-        });
+                (void)finalizer;
+                (void)shard_id;
+                if (!param.context()) {
+                    OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+                }
+                auto weight = finalizer.finalize(weight_name, source, *param.context());
+                param.bind(weight);
+                if (weight.get_auxiliary("scales") == std::nullopt ||
+                    weight.get_auxiliary("zps") == std::nullopt) {
+                    OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+                }
+                gate_exps_scales_[i] = weight.auxiliary.at("scales");
+                gate_exps_zps_[i] = weight.auxiliary.at("zps");
+            });
 
-        up_exps_param_->set_weight_loader([this](WeightParameter& param,
+            up_exps_param_[i]->set_weight_loader([this, i](WeightParameter& param,
                                                  weights::WeightSource& source,
                                                  weights::WeightFinalizer& finalizer,
                                                  const std::string& weight_name,
                                                  const std::optional<int>& shard_id) {
-            (void)finalizer;
-            (void)shard_id;
-            if (!param.context()) {
-                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
-            }
-            auto weight = finalizer.finalize(weight_name, source, *param.context());
-            param.bind(weight);
-            if (weight.get_auxiliary("scales") == std::nullopt ||
-                weight.get_auxiliary("zps") == std::nullopt) {
-                OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
-            }
-            up_exps_scales_ = weight.auxiliary.at("scales");
-            up_exps_zps_ = weight.auxiliary.at("zps");
-        });
+                (void)finalizer;
+                (void)shard_id;
+                if (!param.context()) {
+                    OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+                }
+                auto weight = finalizer.finalize(weight_name, source, *param.context());
+                param.bind(weight);
+                if (weight.get_auxiliary("scales") == std::nullopt ||
+                    weight.get_auxiliary("zps") == std::nullopt) {
+                    OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+                }
+                up_exps_scales_[i] = weight.auxiliary.at("scales");
+                up_exps_zps_[i] = weight.auxiliary.at("zps");
+            });
 
-        down_exps_param_->set_weight_loader([this](WeightParameter& param,
+            down_exps_param_[i]->set_weight_loader([this, i](WeightParameter& param,
                                                    weights::WeightSource& source,
                                                    weights::WeightFinalizer& finalizer,
                                                    const std::string& weight_name,
                                                    const std::optional<int>& shard_id) {
-            (void)finalizer;
-            (void)shard_id;
-            if (!param.context()) {
-                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
-            }
-            auto weight = finalizer.finalize(weight_name, source, *param.context());
-            param.bind(weight);
-            if (weight.get_auxiliary("scales") == std::nullopt ||
-                weight.get_auxiliary("zps") == std::nullopt) {
-                OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
-            }
-            down_exps_scales_ = weight.auxiliary.at("scales");
-            down_exps_zps_ = weight.auxiliary.at("zps");
-        });
+                (void)finalizer;
+                (void)shard_id;
+                if (!param.context()) {
+                    OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+                }
+                auto weight = finalizer.finalize(weight_name, source, *param.context());
+                param.bind(weight);
+                if (weight.get_auxiliary("scales") == std::nullopt ||
+                    weight.get_auxiliary("zps") == std::nullopt) {
+                    OPENVINO_THROW("Missing MoE quantization params for scales and zps! ");
+                }
+                down_exps_scales_[i] = weight.auxiliary.at("scales");
+                down_exps_zps_[i] = weight.auxiliary.at("zps");
+            });
+        }
     } else {
-        gate_exps_param_->set_weight_loader([this](WeightParameter& param,
+        gate_exps_param_.resize(1);
+        up_exps_param_.resize(1);
+        down_exps_param_.resize(1);
+        gate_exps_scales_.resize(1);
+        gate_exps_zps_.resize(1);
+        up_exps_scales_.resize(1);
+        up_exps_zps_.resize(1);
+        down_exps_scales_.resize(1);
+        down_exps_zps_.resize(1);
+
+        gate_inp_param_ = &register_parameter("gate_inp.weight");
+        gate_exps_param_[0] = &register_parameter("gate_exps.weight");
+        up_exps_param_[0] = &register_parameter("up_exps.weight");
+        down_exps_param_[0] = &register_parameter("down_exps.weight");
+        gate_exps_param_[0]->set_weight_loader([this](WeightParameter& param,
                                                    weights::WeightSource& source,
                                                    weights::WeightFinalizer& finalizer,
                                                    const std::string& weight_name,
@@ -271,11 +298,11 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
             if (!source.has(scales_key) || !source.has(zps_key)) {
                 OPENVINO_THROW("Missing MoE quantization params for ", base_key);
             }
-            gate_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
-            gate_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
+            gate_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
+            gate_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
         });
 
-        up_exps_param_->set_weight_loader([this](WeightParameter& param,
+        up_exps_param_[0]->set_weight_loader([this](WeightParameter& param,
                                                  weights::WeightSource& source,
                                                  weights::WeightFinalizer& finalizer,
                                                  const std::string& weight_name,
@@ -289,11 +316,11 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
             if (!source.has(scales_key) || !source.has(zps_key)) {
                 OPENVINO_THROW("Missing MoE quantization params for ", base_key);
             }
-            up_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
-            up_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
+            up_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
+            up_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
         });
 
-        down_exps_param_->set_weight_loader([this](WeightParameter& param,
+        down_exps_param_[0]->set_weight_loader([this](WeightParameter& param,
                                                    weights::WeightSource& source,
                                                    weights::WeightFinalizer& finalizer,
                                                    const std::string& weight_name,
@@ -307,8 +334,8 @@ Qwen3MoE::Qwen3MoE(BuilderContext& ctx, const std::string& name, const Qwen3MoeC
             if (!source.has(scales_key) || !source.has(zps_key)) {
                 OPENVINO_THROW("Missing MoE quantization params for ", base_key);
             }
-            down_exps_scales_ = ops::constant(source.get_tensor(scales_key), param.context());
-            down_exps_zps_ = ops::constant(source.get_tensor(zps_key), param.context());
+            down_exps_scales_[0] = ops::constant(source.get_tensor(scales_key), param.context());
+            down_exps_zps_[0] = ops::constant(source.get_tensor(zps_key), param.context());
         });
     }
 }
@@ -320,49 +347,67 @@ const Tensor& Qwen3MoE::gate_inp_weight() const {
     return gate_inp_param_->value();
 }
 
-const Tensor& Qwen3MoE::gate_exps_weight() const {
-    if (!gate_exps_param_) {
+Tensor Qwen3MoE::gate_exps_weight() const {
+    if (gate_exps_param_.empty() || !gate_exps_param_[0]) {
         OPENVINO_THROW("Qwen3MoE gate expert parameter not registered");
     }
-    return gate_exps_param_->value();
+    std::vector<Tensor> valid;
+    valid.reserve(gate_exps_param_.size());
+    for(auto* p : gate_exps_param_) valid.push_back(p->value());
+    if (valid.size() == 1) return valid[0];
+    return ops::concat(valid, 0);
 }
 
-const Tensor& Qwen3MoE::up_exps_weight() const {
-    if (!up_exps_param_) {
+Tensor Qwen3MoE::up_exps_weight() const {
+    if (up_exps_param_.empty() || !up_exps_param_[0]) {
         OPENVINO_THROW("Qwen3MoE up expert parameter not registered");
     }
-    return up_exps_param_->value();
+    std::vector<Tensor> valid;
+    valid.reserve(up_exps_param_.size());
+    for(auto* p : up_exps_param_) valid.push_back(p->value());
+    if (valid.size() == 1) return valid[0];
+    return ops::concat(valid, 0);
 }
 
-const Tensor& Qwen3MoE::down_exps_weight() const {
-    if (!down_exps_param_) {
+Tensor Qwen3MoE::down_exps_weight() const {
+    if (down_exps_param_.empty() || !down_exps_param_[0]) {
         OPENVINO_THROW("Qwen3MoE down expert parameter not registered");
     }
-    return down_exps_param_->value();
+    std::vector<Tensor> valid;
+    valid.reserve(down_exps_param_.size());
+    for(auto* p : down_exps_param_) valid.push_back(p->value());
+    if (valid.size() == 1) return valid[0];
+    return ops::concat(valid, 0);
 }
 
-const Tensor& Qwen3MoE::gate_exps_scales() const {
-    return gate_exps_scales_;
+Tensor Qwen3MoE::gate_exps_scales() const {
+    if (gate_exps_scales_.size() == 1) return gate_exps_scales_[0];
+    return ops::concat(gate_exps_scales_, 0);
 }
 
-const Tensor& Qwen3MoE::gate_exps_zps() const {
-    return gate_exps_zps_;
+Tensor Qwen3MoE::gate_exps_zps() const {
+    if (gate_exps_zps_.size() == 1) return gate_exps_zps_[0];
+    return ops::concat(gate_exps_zps_, 0);
 }
 
-const Tensor& Qwen3MoE::up_exps_scales() const {
-    return up_exps_scales_;
+Tensor Qwen3MoE::up_exps_scales() const {
+    if (up_exps_scales_.size() == 1) return up_exps_scales_[0];
+    return ops::concat(up_exps_scales_, 0);
 }
 
-const Tensor& Qwen3MoE::up_exps_zps() const {
-    return up_exps_zps_;
+Tensor Qwen3MoE::up_exps_zps() const {
+    if (up_exps_zps_.size() == 1) return up_exps_zps_[0];
+    return ops::concat(up_exps_zps_, 0);
 }
 
-const Tensor& Qwen3MoE::down_exps_scales() const {
-    return down_exps_scales_;
+Tensor Qwen3MoE::down_exps_scales() const {
+    if (down_exps_scales_.size() == 1) return down_exps_scales_[0];
+    return ops::concat(down_exps_scales_, 0);
 }
 
-const Tensor& Qwen3MoE::down_exps_zps() const {
-    return down_exps_zps_;
+Tensor Qwen3MoE::down_exps_zps() const {
+    if (down_exps_zps_.size() == 1) return down_exps_zps_[0];
+    return ops::concat(down_exps_zps_, 0);
 }
 
 Tensor Qwen3MoE::forward(const Tensor& x) const {
@@ -392,7 +437,7 @@ Qwen3MoeDecoderLayer::Qwen3MoeDecoderLayer(BuilderContext& ctx,
                                            Module* parent)
     : Module(name, ctx, parent),
       self_attn_(ctx, "self_attn", cfg, this),
-      moe_(ctx, "moe", cfg, this),
+      moe_(ctx, cfg.architecture == "qwen3_moe" ? "mlp" : "moe", cfg, this),
       input_layernorm_(ctx, "input_layernorm", cfg.rms_norm_eps, this),
       post_attention_layernorm_(ctx, "post_attention_layernorm", cfg.rms_norm_eps, this) {}
 

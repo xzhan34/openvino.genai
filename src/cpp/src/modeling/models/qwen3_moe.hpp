@@ -106,28 +106,28 @@ public:
 
 private:
     const Tensor& gate_inp_weight() const;
-    const Tensor& gate_exps_weight() const;
-    const Tensor& up_exps_weight() const;
-    const Tensor& down_exps_weight() const;
+    Tensor gate_exps_weight() const;
+    Tensor up_exps_weight() const;
+    Tensor down_exps_weight() const;
 
-    const Tensor& gate_exps_scales() const;
-    const Tensor& gate_exps_zps() const;
-    const Tensor& up_exps_scales() const;
-    const Tensor& up_exps_zps() const;
-    const Tensor& down_exps_scales() const;
-    const Tensor& down_exps_zps() const;
+    Tensor gate_exps_scales() const;
+    Tensor gate_exps_zps() const;
+    Tensor up_exps_scales() const;
+    Tensor up_exps_zps() const;
+    Tensor down_exps_scales() const;
+    Tensor down_exps_zps() const;
 
     WeightParameter* gate_inp_param_ = nullptr;
-    WeightParameter* gate_exps_param_ = nullptr;
-    WeightParameter* up_exps_param_ = nullptr;
-    WeightParameter* down_exps_param_ = nullptr;
+    std::vector<WeightParameter*> gate_exps_param_;
+    std::vector<WeightParameter*> up_exps_param_;
+    std::vector<WeightParameter*> down_exps_param_;
 
-    Tensor gate_exps_scales_;
-    Tensor gate_exps_zps_;
-    Tensor up_exps_scales_;
-    Tensor up_exps_zps_;
-    Tensor down_exps_scales_;
-    Tensor down_exps_zps_;
+    std::vector<Tensor> gate_exps_scales_;
+    std::vector<Tensor> gate_exps_zps_;
+    std::vector<Tensor> up_exps_scales_;
+    std::vector<Tensor> up_exps_zps_;
+    std::vector<Tensor> down_exps_scales_;
+    std::vector<Tensor> down_exps_zps_;
 
     int32_t hidden_size_ = 0;
     int32_t inter_size_ = 0;

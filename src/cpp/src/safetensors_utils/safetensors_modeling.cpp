@@ -907,14 +907,6 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     }
     st_data.tensor_mmap_info = std::move(converted_mmap);
 
-    if (config.model_type == "qwen3_moe") {
-        bool is_zero_copy_enabled = st_data.tensors.empty() && !st_data.tensor_infos.empty();
-        if (is_zero_copy_enabled) {
-            fuse_moe_tensors_zero_copy(st_data);
-        } else {
-            fuse_moe_tensors_in_memory(st_data);
-        }
-    }
 
     auto load_finish_time = std::chrono::high_resolution_clock::now();
     auto load_duration = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -69,9 +69,9 @@ private:
         const ov::Shape& original_shape);
     
     /**
-     * @brief Check if weight name corresponds to a fused MoE weight
+     * @brief Check if weight name corresponds to a MoE weight
      */
-    bool is_moe_fused_weight(const std::string& name) const;
+    bool is_moe_weight(const std::string& name) const;
     
     /**
      * @brief Create MoE-specific subgraph with accessible scales and zero-points

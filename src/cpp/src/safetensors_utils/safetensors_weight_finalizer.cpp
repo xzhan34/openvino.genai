@@ -106,8 +106,8 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
         // Quantize the weight during finalization
         // Tensor reference is already fetched above, no need to fetch again
         auto quant_result = quantize_weight(name, tensor, source, ctx);
-        if (is_moe_fused_weight(name)) {
-            // For MoE fused weights, return FinalizedWeight with scales and zps in auxiliary
+        if (is_moe_weight(name)) {
+            // For MoE weights, return FinalizedWeight with scales and zps in auxiliary
             return create_moe_subgraph(name, quant_result, shape, ctx);
         } else {
             output = create_dequant_subgraph(name, quant_result, shape);
@@ -275,15 +275,15 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     return std::make_shared<ov::op::v0::Convert>(reshaped, ov::element::f32);
 }
 
-bool SafetensorsWeightFinalizer::is_moe_fused_weight(const std::string& name) const {
-    // Check for MoE fused weight patterns:
-    // - model.layers[X].moe.gate_exps.weight
-    // - model.layers[X].moe.up_exps.weight
-    // - model.layers[X].moe.down_exps.weight
-    // Also matches .scales and .zps variants
-    return name.find(".moe.gate_exps.") != std::string::npos ||
-           name.find(".moe.up_exps.") != std::string::npos ||
-           name.find(".moe.down_exps.") != std::string::npos;
+bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
+    // Check for MoE weight patterns:
+    // - model.layers[X].mlp.experts.X.gate_proj.weight
+    // - model.layers[X].mlp.experts.X.up_proj.weight
+    // - model.layers[X].mlp.experts.X.down_proj.weight
+    return name.find("experts") != std::string::npos && 
+           (name.find("gate_proj") != std::string::npos ||
+            name.find("up_proj") != std::string::npos ||
+            name.find("down_proj") != std::string::npos);
 }
 
 ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create_moe_subgraph(
@@ -292,9 +292,8 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     const ov::Shape& original_shape,
     ov::genai::modeling::OpContext& ctx) {
     
-    // MoE weights are already fused: [num_experts, out_features, in_features]
- 
-    OPENVINO_ASSERT(original_shape.size() == 3, "MoE original shape must be 3D");
+    // MoE weights: [out_features, in_features]
+    OPENVINO_ASSERT(original_shape.size() == 2, "MoE original shape must be 2D");
     
     // Determine element type based on compressed type
     ov::element::Type compressed_type = quant_result.compressed.get_element_type();
@@ -313,14 +312,13 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     
     ov::Shape scale_shape = quant_result.scale.get_shape();
     ov::Shape ZERO_SHAPE = quant_result.zero_point.get_shape();
-    size_t num_groups = scale_shape[2];
-    size_t group_size = original_shape[2] / num_groups;
+    size_t num_groups = scale_shape[1];
+    size_t group_size = original_shape[1] / num_groups;
 
    // Create INT4 weight tensor with proper shape
-    // 3D: [num_experts, rows, group_num, group_size]
-    ov::Shape packed_shape{original_shape[0],                  // num_experts
-                           original_shape[1],               // rows
-                           scale_shape[2],     // group_num
+    // [out_features, group_num, group_size]
+    ov::Shape packed_shape{original_shape[0],
+                           scale_shape[1],     // group_num
                            group_size};
     ;
 
@@ -355,9 +353,9 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
 
     zp_const = std::make_shared<ov::op::v0::Constant>(zero_point_tensor);
     zp_const->set_friendly_name(name + "_zp");
-    // Transpose from [E, I, H] to [E, H, I]
+    // Transpose from [I, H] to [H, I]
     auto transpose_order = std::make_shared<ov::op::v0::Constant>(
-        ov::element::i64, ov::Shape{3}, std::vector<int64_t>{0, 2, 1});
+        ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
     
     auto scales_transposed = std::make_shared<ov::op::v1::Transpose>(scale_const, transpose_order);
     scales_transposed->set_friendly_name(name + "_scales_transposed");
