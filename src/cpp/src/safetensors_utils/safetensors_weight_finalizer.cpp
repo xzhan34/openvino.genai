@@ -92,33 +92,33 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
             empty_auxiliary);
     }
 
-    std::shared_ptr<ov::op::v0::Constant> constant;
-    ov::element::Type element_type;
-    
-    // Use get_tensor() which now returns a tensor that holds mmap lifetime
-    // via Tensor(view_tensor, mmap_holder) constructor
+    // Get tensor info for quantization check
+    // Fetch tensor only once to avoid unnecessary caching
     const ov::Tensor& tensor = source.get_tensor(name);
-    constant = std::make_shared<ov::op::v0::Constant>(tensor);
-    element_type = tensor.get_element_type();
-    
-    constant->set_friendly_name(name);
-    constant->output(0).set_names({name});
+    ov::element::Type element_type = tensor.get_element_type();
+    const ov::Shape& shape = tensor.get_shape();
 
     // Check if in-flight quantization should be applied
     ov::Output<ov::Node> output;
     std::unordered_map<std::string, ov::genai::modeling::Tensor> auxiliary;
     
-    if (selector_.enabled() && selector_.should_quantize(name, constant->get_shape(), element_type)) {
+    if (selector_.enabled() && selector_.should_quantize(name, shape, element_type)) {
         // Quantize the weight during finalization
-        const ov::Tensor& tensor = source.get_tensor(name);
+        // Tensor reference is already fetched above, no need to fetch again
         auto quant_result = quantize_weight(name, tensor, source, ctx);
         if (is_moe_fused_weight(name)) {
             // For MoE fused weights, return FinalizedWeight with scales and zps in auxiliary
-            return create_moe_subgraph(name, quant_result, tensor.get_shape(), ctx);
+            return create_moe_subgraph(name, quant_result, shape, ctx);
         } else {
-            output = create_dequant_subgraph(name, quant_result, tensor.get_shape());
+            output = create_dequant_subgraph(name, quant_result, shape);
         }
     } else {
+        // Only create Constant when NOT quantizing
+        // This avoids keeping the original tensor in memory when we compress it
+        std::shared_ptr<ov::op::v0::Constant> constant = std::make_shared<ov::op::v0::Constant>(tensor);
+        constant->set_friendly_name(name);
+        constant->output(0).set_names({name});
+
         // Convert to F32 if needed (matching GGUF behavior)
         // This ensures consistency with how GGUF weights are processed
         if (element_type == ov::element::bf16 || 
