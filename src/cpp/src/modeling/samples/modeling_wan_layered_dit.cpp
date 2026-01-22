@@ -290,19 +290,7 @@ int main(int argc, char* argv[]) try {
             : core.compile_model(model, device, compile_props);
     };
 
-    auto compiled_mono = compile_model(mono_model, "monolithic model");
-    auto compiled_preprocess = compile_model(layered_models.preprocess, "preprocess");
-
-    std::vector<ov::CompiledModel> compiled_block_groups;
-    compiled_block_groups.reserve(layered_models.block_groups.size());
-    for (size_t i = 0; i < layered_models.block_groups.size(); ++i) {
-        compiled_block_groups.push_back(
-            compile_model(layered_models.block_groups[i], "block_group_" + std::to_string(i)));
-    }
-
-    auto compiled_postprocess = compile_model(layered_models.postprocess, "postprocess");
-
-    std::cout << "  All models compiled successfully\n";
+    std::cout << "  Compiler ready; models will be compiled on demand\n";
     std::cout << "\n";
 
     // ========================================================================
@@ -350,22 +338,31 @@ int main(int argc, char* argv[]) try {
     // ========================================================================
     std::cout << "[7] Running monolithic model inference...\n";
 
-    auto mono_request = compiled_mono.create_infer_request();
-    mono_request.set_tensor("hidden_states", hidden_states_tensor);
-    mono_request.set_tensor("timestep", timestep_tensor);
-    mono_request.set_tensor("encoder_hidden_states", text_embed_tensor);
+    std::vector<float> mono_output_vec;
+    ov::Shape mono_output_shape;
+    std::chrono::milliseconds mono_duration(0);
+    {
+        auto compiled_mono = compile_model(mono_model, "monolithic model");
+        auto mono_request = compiled_mono.create_infer_request();
+        mono_request.set_tensor("hidden_states", hidden_states_tensor);
+        mono_request.set_tensor("timestep", timestep_tensor);
+        mono_request.set_tensor("encoder_hidden_states", text_embed_tensor);
 
-    auto mono_start = std::chrono::high_resolution_clock::now();
-    mono_request.infer();
-    auto mono_end = std::chrono::high_resolution_clock::now();
+        auto mono_start = std::chrono::high_resolution_clock::now();
+        mono_request.infer();
+        auto mono_end = std::chrono::high_resolution_clock::now();
 
-    auto mono_output = mono_request.get_output_tensor(0);
-    auto mono_output_vec = tensor_to_float_vector(mono_output);
+        auto mono_output = mono_request.get_output_tensor(0);
+        mono_output_vec = tensor_to_float_vector(mono_output);
+        mono_output_shape = mono_output.get_shape();
 
-    auto mono_duration = std::chrono::duration_cast<std::chrono::milliseconds>(mono_end - mono_start);
-    std::cout << "  Monolithic model inference completed in " << mono_duration.count() << " ms\n";
-    std::cout << "  Output shape: " << mono_output.get_shape() << "\n";
-    std::cout << "\n";
+        mono_duration = std::chrono::duration_cast<std::chrono::milliseconds>(mono_end - mono_start);
+        std::cout << "  Monolithic model inference completed in " << mono_duration.count() << " ms\n";
+        std::cout << "  Output shape: " << mono_output_shape << "\n";
+        std::cout << "\n";
+    }
+
+    mono_model.reset();
 
     // ========================================================================
     // Run Layered Models
@@ -376,22 +373,35 @@ int main(int argc, char* argv[]) try {
 
     // Step 1: Preprocess
     std::cout << "  Running preprocess...\n";
-    auto preprocess_request = compiled_preprocess.create_infer_request();
-    preprocess_request.set_tensor("hidden_states", hidden_states_tensor);
-    preprocess_request.set_tensor("timestep", timestep_tensor);
-    preprocess_request.set_tensor("encoder_hidden_states", text_embed_tensor);
-    preprocess_request.infer();
+    ov::Tensor tokens;
+    ov::Tensor rotary_cos;
+    ov::Tensor rotary_sin;
+    ov::Tensor temb;
+    ov::Tensor timestep_proj;
+    ov::Tensor text_embeds;
+    ov::Tensor ppf_tensor;
+    ov::Tensor pph_tensor;
+    ov::Tensor ppw_tensor;
+    {
+        auto compiled_preprocess = compile_model(layered_models.preprocess, "preprocess");
+        auto preprocess_request = compiled_preprocess.create_infer_request();
+        preprocess_request.set_tensor("hidden_states", hidden_states_tensor);
+        preprocess_request.set_tensor("timestep", timestep_tensor);
+        preprocess_request.set_tensor("encoder_hidden_states", text_embed_tensor);
+        preprocess_request.infer();
 
-    // Get preprocess outputs
-    ov::Tensor tokens = preprocess_request.get_tensor("tokens");
-    ov::Tensor rotary_cos = preprocess_request.get_tensor("rotary_cos");
-    ov::Tensor rotary_sin = preprocess_request.get_tensor("rotary_sin");
-    ov::Tensor temb = preprocess_request.get_tensor("temb");
-    ov::Tensor timestep_proj = preprocess_request.get_tensor("timestep_proj");
-    ov::Tensor text_embeds = preprocess_request.get_tensor("text_embeds");
-    ov::Tensor ppf_tensor = preprocess_request.get_tensor("ppf");
-    ov::Tensor pph_tensor = preprocess_request.get_tensor("pph");
-    ov::Tensor ppw_tensor = preprocess_request.get_tensor("ppw");
+        // Get preprocess outputs
+        tokens = preprocess_request.get_tensor("tokens");
+        rotary_cos = preprocess_request.get_tensor("rotary_cos");
+        rotary_sin = preprocess_request.get_tensor("rotary_sin");
+        temb = preprocess_request.get_tensor("temb");
+        timestep_proj = preprocess_request.get_tensor("timestep_proj");
+        text_embeds = preprocess_request.get_tensor("text_embeds");
+        ppf_tensor = preprocess_request.get_tensor("ppf");
+        pph_tensor = preprocess_request.get_tensor("pph");
+        ppw_tensor = preprocess_request.get_tensor("ppw");
+    }
+    layered_models.preprocess.reset();
 
     std::cout << "    tokens shape: " << tokens.get_shape() << "\n";
     std::cout << "    rotary_cos shape: " << rotary_cos.get_shape() << "\n";
@@ -399,10 +409,12 @@ int main(int argc, char* argv[]) try {
 
     // Step 2: Block Groups
     ov::Tensor current_hidden_states = tokens;
-    for (size_t i = 0; i < compiled_block_groups.size(); ++i) {
+    for (size_t i = 0; i < layered_models.block_groups.size(); ++i) {
         std::cout << "  Running block_group_" << i << "...\n";
 
-        auto block_request = compiled_block_groups[i].create_infer_request();
+        auto compiled_block_group =
+            compile_model(layered_models.block_groups[i], "block_group_" + std::to_string(i));
+        auto block_request = compiled_block_group.create_infer_request();
         block_request.set_tensor("hidden_states", current_hidden_states);
         block_request.set_tensor("text_embeds", text_embeds);
         block_request.set_tensor("timestep_proj", timestep_proj);
@@ -411,20 +423,27 @@ int main(int argc, char* argv[]) try {
         block_request.infer();
 
         current_hidden_states = block_request.get_tensor("hidden_states");
+        layered_models.block_groups[i].reset();
     }
 
     // Step 3: Postprocess
     std::cout << "  Running postprocess...\n";
-    auto postprocess_request = compiled_postprocess.create_infer_request();
-    postprocess_request.set_tensor("hidden_states", current_hidden_states);
-    postprocess_request.set_tensor("temb", temb);
-    postprocess_request.set_tensor("ppf", ppf_tensor);
-    postprocess_request.set_tensor("pph", pph_tensor);
-    postprocess_request.set_tensor("ppw", ppw_tensor);
-    postprocess_request.infer();
+    ov::Tensor layered_output;
+    std::vector<float> layered_output_vec;
+    {
+        auto compiled_postprocess = compile_model(layered_models.postprocess, "postprocess");
+        auto postprocess_request = compiled_postprocess.create_infer_request();
+        postprocess_request.set_tensor("hidden_states", current_hidden_states);
+        postprocess_request.set_tensor("temb", temb);
+        postprocess_request.set_tensor("ppf", ppf_tensor);
+        postprocess_request.set_tensor("pph", pph_tensor);
+        postprocess_request.set_tensor("ppw", ppw_tensor);
+        postprocess_request.infer();
 
-    auto layered_output = postprocess_request.get_tensor("sample");
-    auto layered_output_vec = tensor_to_float_vector(layered_output);
+        layered_output = postprocess_request.get_tensor("sample");
+        layered_output_vec = tensor_to_float_vector(layered_output);
+    }
+    layered_models.postprocess.reset();
 
     auto layered_end = std::chrono::high_resolution_clock::now();
     auto layered_duration = std::chrono::duration_cast<std::chrono::milliseconds>(layered_end - layered_start);
@@ -438,9 +457,9 @@ int main(int argc, char* argv[]) try {
     // ========================================================================
     std::cout << "[9] Comparing outputs...\n";
 
-    if (mono_output.get_shape() != layered_output.get_shape()) {
+    if (mono_output_shape != layered_output.get_shape()) {
         std::cerr << "ERROR: Output shapes do not match!\n";
-        std::cerr << "  Monolithic: " << mono_output.get_shape() << "\n";
+        std::cerr << "  Monolithic: " << mono_output_shape << "\n";
         std::cerr << "  Layered: " << layered_output.get_shape() << "\n";
         return 1;
     }
