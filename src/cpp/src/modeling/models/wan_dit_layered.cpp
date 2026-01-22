@@ -395,9 +395,10 @@ std::shared_ptr<ov::Model> create_wan_dit_postprocess_model(
     auto temb = ctx.parameter("temb",
                               ov::element::f32,
                               ov::PartialShape{-1, inner_dim});
-    auto ppf_param = ctx.parameter("ppf", ov::element::i64, ov::PartialShape{});
-    auto pph_param = ctx.parameter("pph", ov::element::i64, ov::PartialShape{});
-    auto ppw_param = ctx.parameter("ppw", ov::element::i64, ov::PartialShape{});
+    // Shape {1} to match preprocess output (div_dim uses Gather which produces {1})
+    auto ppf_param = ctx.parameter("ppf", ov::element::i64, ov::PartialShape{1});
+    auto pph_param = ctx.parameter("pph", ov::element::i64, ov::PartialShape{1});
+    auto ppw_param = ctx.parameter("ppw", ov::element::i64, ov::PartialShape{1});
 
     // Get batch from hidden_states
     auto batch = shape::dim(hidden_states, 0);
