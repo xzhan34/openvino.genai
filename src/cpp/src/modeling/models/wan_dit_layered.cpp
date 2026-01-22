@@ -17,6 +17,19 @@
 
 namespace {
 
+// Helper function to load model weights with allow_unmatched=true
+// This is needed because each layered sub-model only contains a subset of the full model's parameters
+void load_model_partial(ov::genai::modeling::Module& model,
+                        ov::genai::modeling::weights::WeightSource& source,
+                        ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_missing = true;
+    options.allow_unmatched = true;  // Allow weights that don't match any parameter
+    options.report_missing = false;
+    options.report_unmatched = false;
+    (void)ov::genai::modeling::weights::load_model(model, source, finalizer, options);
+}
+
 auto set_name = [](const std::shared_ptr<ov::Node>& node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
@@ -223,12 +236,19 @@ Tensor WanDitPostprocess::forward(const Tensor& hidden_states,
     auto p_h_vec = ops::const_vec(ctx, std::vector<int64_t>{cfg_.patch_size[1]});
     auto p_w_vec = ops::const_vec(ctx, std::vector<int64_t>{cfg_.patch_size[2]});
 
-    auto reshape_shape = shape::make({batch, ppf, pph, ppw, p_t_vec, p_h_vec, p_w_vec, out_ch});
+    // Reshape scalar inputs (shape {}) to 1D (shape {1}) for compatibility with shape::make
+    // shape::make uses Concat which requires all inputs to have the same rank
+    auto target_shape_1d = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+    auto ppf_1d = std::make_shared<ov::op::v1::Reshape>(ppf, target_shape_1d, false);
+    auto pph_1d = std::make_shared<ov::op::v1::Reshape>(pph, target_shape_1d, false);
+    auto ppw_1d = std::make_shared<ov::op::v1::Reshape>(ppw, target_shape_1d, false);
+
+    auto reshape_shape = shape::make({batch, ppf_1d, pph_1d, ppw_1d, p_t_vec, p_h_vec, p_w_vec, out_ch});
     auto unpatched = out.reshape(reshape_shape).permute({0, 7, 1, 4, 2, 5, 3, 6});
 
-    auto out_frames = std::make_shared<ov::op::v1::Multiply>(ppf, p_t);
-    auto out_height = std::make_shared<ov::op::v1::Multiply>(pph, p_h);
-    auto out_width = std::make_shared<ov::op::v1::Multiply>(ppw, p_w);
+    auto out_frames = std::make_shared<ov::op::v1::Multiply>(ppf_1d, p_t);
+    auto out_height = std::make_shared<ov::op::v1::Multiply>(pph_1d, p_h);
+    auto out_width = std::make_shared<ov::op::v1::Multiply>(ppw_1d, p_w);
     auto final_shape = shape::make({batch, out_ch, out_frames, out_height, out_width});
     return unpatched.reshape(final_shape);
 }
@@ -245,7 +265,7 @@ std::shared_ptr<ov::Model> create_wan_dit_preprocess_model(
     WanDitPreprocess model(ctx, cfg);
 
     WanWeightMapping::apply_transformer_packed_mapping(model);
-    ov::genai::modeling::weights::load_model(model, source, finalizer);
+    load_model_partial(model, source, finalizer);
 
     // Define inputs
     auto latents = ctx.parameter("hidden_states",
@@ -325,7 +345,7 @@ std::shared_ptr<ov::Model> create_wan_dit_block_group_model(
     WanDitBlockGroup model(ctx, cfg, start_layer, num_layers);
 
     WanWeightMapping::apply_transformer_packed_mapping(model);
-    ov::genai::modeling::weights::load_model(model, source, finalizer);
+    load_model_partial(model, source, finalizer);
 
     const int32_t inner_dim = cfg.inner_dim();
 
@@ -364,7 +384,7 @@ std::shared_ptr<ov::Model> create_wan_dit_postprocess_model(
     WanDitPostprocess model(ctx, cfg);
 
     WanWeightMapping::apply_transformer_packed_mapping(model);
-    ov::genai::modeling::weights::load_model(model, source, finalizer);
+    load_model_partial(model, source, finalizer);
 
     const int32_t inner_dim = cfg.inner_dim();
 
