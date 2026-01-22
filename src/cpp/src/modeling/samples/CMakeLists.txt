@@ -103,3 +103,31 @@ add_custom_command(TARGET modeling_wan_t2v POST_BUILD
 set_target_properties(modeling_wan_t2v PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+add_executable(modeling_wan_layered_dit
+    modeling_wan_layered_dit.cpp
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(modeling_wan_layered_dit PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(modeling_wan_layered_dit PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(modeling_wan_layered_dit PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(modeling_wan_layered_dit openvino_genai)
+
+add_custom_command(TARGET modeling_wan_layered_dit POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:modeling_wan_layered_dit>"
+    VERBATIM)
+
+set_target_properties(modeling_wan_layered_dit PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)
