@@ -47,7 +47,7 @@ struct WeightSelectionConfig {
     bool quantize_embeddings = false;   // embed_tokens
     bool quantize_lm_head = false;      // lm_head
     bool quantize_norm = false;         // Normalization layers (usually not beneficial)
-    bool quantize_routers = false;      // MoE router/gate weights (usually not beneficial)
+    bool quantize_routers = true;      // MoE router/gate weights (usually not beneficial)
     
     // Explicit weight lists (highest priority)
     std::vector<std::string> include_weights;  // Exact weight names to quantize
@@ -142,8 +142,8 @@ struct QuantizationConfig {
         // They will use backup_mode (INT8_ASYM by default) instead of primary mode
         bool use_backup_quantization = (backup_mode != Mode::NONE);
         
-        selection.quantize_embeddings = quantize_embeddings || use_backup_quantization;
-        selection.quantize_lm_head = quantize_lm_head || use_backup_quantization;
+        selection.quantize_embeddings = use_backup_quantization;
+        selection.quantize_lm_head = use_backup_quantization;
     }
 };
 

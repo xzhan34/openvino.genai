@@ -86,11 +86,21 @@ struct Q41Quantized {
     size_t group_size = 0;
     size_t k = 0;
 };
+
+// Helper to construct dequantization reference subgraph
+ov::genai::modeling::Tensor make_dequant_subgraph(const Q41Quantized& q_weights,
+                                                  ov::genai::modeling::OpContext* op_ctx);
+
 Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
                           size_t num_experts,
                           size_t n,
                           size_t k,
                           size_t group_size);
+Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
+                          size_t n,
+                          size_t k,
+                          size_t group_size);
+
 std::vector<float> dequantize_q41(const Q41Quantized& q,
                                   size_t num_experts,
                                   size_t n,

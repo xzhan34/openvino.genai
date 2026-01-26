@@ -96,6 +96,11 @@ public:
     bool enabled() const { return config_.enabled(); }
     
 private:
+    /**
+     * @brief Check if layer is considered "sensitive" (needs backup precision)
+     */
+    bool is_sensitive_layer(const std::string& name) const;
+
     QuantizationConfig config_;
 };
 

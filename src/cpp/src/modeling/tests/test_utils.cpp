@@ -14,6 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include <openvino/op/constant.hpp>
+#include <openvino/op/convert.hpp>
+#include <openvino/op/multiply.hpp>
+#include <openvino/op/subtract.hpp>
+#include <openvino/op/reshape.hpp>
+#include <openvino/op/transpose.hpp>
+
 namespace ov {
 namespace genai {
 namespace modeling {
@@ -280,7 +287,107 @@ uint8_t get_u4(const uint8_t* packed, size_t idx) {
     return (idx & 1) == 0 ? (byte_val & 0x0F) : (byte_val >> 4);
 }
 
-}  // namespace
+template <typename T>
+std::vector<T> concat_vectors(const std::vector<std::vector<T>>& vectors) {
+    size_t total_size = 0;
+    for (const auto& v : vectors) {
+        total_size += v.size();
+    }
+    std::vector<T> result;
+    result.reserve(total_size);
+    for (const auto& v : vectors) {
+        result.insert(result.end(), v.begin(), v.end());
+    }
+    return result;
+}
+
+} // namespace
+
+// Correct implementation for graph construction helper
+ov::genai::modeling::Tensor make_dequant_subgraph(const Q41Quantized& q_weights,
+                                           ov::genai::modeling::OpContext* op_ctx) {
+    // Extract metadata
+    const auto& w_shape = q_weights.weights_u4.get_shape();
+    const auto& s_shape = q_weights.scales_f16.get_shape();
+
+    int64_t N = (w_shape.size() == 3) ? w_shape[1] : w_shape[0];
+    int64_t K = (w_shape.size() == 3) ? w_shape[2] : w_shape[1];
+    int64_t G = q_weights.group_num;
+    int64_t GS = q_weights.group_size;
+
+    // 1. Construct Weights Constant with PRE-FOLDED shape [N, G, GS]
+    // This allows Reshape to be avoided before Convert, satisfying FC_COMPRESSED_WEIGHT_PATTERN
+    ov::Shape weights_const_shape = {static_cast<size_t>(N), static_cast<size_t>(G), static_cast<size_t>(GS)};
+    
+    auto weights_const = std::make_shared<ov::op::v0::Constant>(
+        ov::element::u4,
+        weights_const_shape,
+        q_weights.weights_u4.data()
+    );
+
+    // 2. Convert Weights to F16 directly
+    auto weights_f16 = std::make_shared<ov::op::v0::Convert>(weights_const, ov::element::f16);
+
+    // 3. Prepare Scales and ZPs
+    // Pattern requires Multiply/Subtract inputs to be Constants (not Transpose/Reshape nodes) for perfect match.
+    // We check if data layout allows direct Constant creation with broadcastable shape [N, G, 1].
+    
+    // Check if scales are [..., N] (Legacy/3D: [E, G, N]) or [..., G] (New 2D: [N, G])
+    bool need_transpose = (s_shape.back() == static_cast<size_t>(N));
+
+    std::shared_ptr<ov::Node> scales_node;
+    std::shared_ptr<ov::Node> zps_node;
+    
+    ov::Shape broadcast_shape = {static_cast<size_t>(N), static_cast<size_t>(G), 1};
+
+    if (!need_transpose) {
+        // Good layout [N, G], just wrap in Constant with [N, G, 1]
+        scales_node = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f16, broadcast_shape, q_weights.scales_f16.data()
+        );
+        auto zps_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::u4, broadcast_shape, q_weights.zps_u4.data()
+        );
+        zps_node = std::make_shared<ov::op::v0::Convert>(zps_const, ov::element::f16);
+    } else {
+        // Legacy layout [G, N]. Must use Transpose node (might miss strict pattern match)
+        // or assumes the test only uses new layout for pattern validation.
+        auto sz_shape = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{G, N});
+        
+        auto sc_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f16, ov::Shape{static_cast<size_t>(G), static_cast<size_t>(N)}, q_weights.scales_f16.data()
+        );
+        auto zp_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::u4, ov::Shape{static_cast<size_t>(G), static_cast<size_t>(N)}, q_weights.zps_u4.data()
+        );
+        auto zp_conv = std::make_shared<ov::op::v0::Convert>(zp_const, ov::element::f16);
+        
+        // Transpose [G, N] -> [N, G]
+        auto perm = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
+        auto sc_t = std::make_shared<ov::op::v1::Transpose>(sc_const, perm);
+        auto zp_t = std::make_shared<ov::op::v1::Transpose>(zp_conv, perm);
+        
+        // Reshape to [N, G, 1]
+        auto bc_shape_const = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, std::vector<int64_t>{N, G, 1});
+        scales_node = std::make_shared<ov::op::v1::Reshape>(sc_t, bc_shape_const, false);
+        zps_node = std::make_shared<ov::op::v1::Reshape>(zp_t, bc_shape_const, false);
+    }
+
+    // 4. Compute (Weights - ZP) * Scale
+    auto sub = std::make_shared<ov::op::v1::Subtract>(weights_f16, zps_node);
+    auto mul = std::make_shared<ov::op::v1::Multiply>(sub, scales_node);
+    
+    // 5. Flatten back to [N, K] (Matches reshape_squeeze predicate)
+    auto final_measured = std::make_shared<ov::op::v1::Reshape>(
+        mul,
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{N, K}),
+        false
+    );
+
+    auto final_measured_f32 = std::make_shared<ov::op::v0::Convert>(final_measured, ov::element::f32);
+
+    return ov::genai::modeling::Tensor(final_measured_f32->output(0), op_ctx);
+}
 
 Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
                           size_t num_experts,
@@ -355,6 +462,80 @@ Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
     return q;
 }
 
+Q41Quantized quantize_q41(const std::vector<float>& weights_f32,
+                          size_t n,
+                          size_t k,
+                          size_t group_size) {
+    Q41Quantized q;
+    q.group_size = group_size;
+    q.k = k;
+    q.group_num = k / group_size;
+
+    ov::Shape weights_shape{n, k};
+    ov::Tensor weights(ov::element::u4, weights_shape);
+    auto weights_ptr = static_cast<uint8_t*>(weights.data());
+    std::memset(weights_ptr, 0, weights.get_byte_size());
+
+    // Layout: [N, Group_Num]
+    ov::Shape scale_zp_shape{n, q.group_num};
+    ov::Tensor scales(ov::element::f16, scale_zp_shape);
+    ov::Tensor zps(ov::element::u4, scale_zp_shape);
+
+    auto scales_ptr = scales.data<ov::float16>();
+    auto zps_ptr = static_cast<uint8_t*>(zps.data());
+    std::memset(zps_ptr, 0, zps.get_byte_size());
+
+    for (size_t row = 0; row < n; ++row) {
+        for (size_t g = 0; g < q.group_num; ++g) {
+            const size_t start_idx = row * k + g * group_size;
+            float min_v = std::numeric_limits<float>::max();
+            float max_v = std::numeric_limits<float>::lowest();
+            
+            for (size_t i = 0; i < group_size; ++i) {
+                const float v = weights_f32[start_idx + i];
+                min_v = std::min(min_v, v);
+                max_v = std::max(max_v, v);
+            }
+
+            const float d = (max_v - min_v) / 15.0f;
+            const float inv = d ? 1.0f / d : 0.0f;
+            int zp = 0;
+            if (d != 0.0f) {
+                zp = static_cast<int>(std::round(-min_v / d));
+            }
+            zp = std::max(0, std::min(15, zp));
+
+            // Matching logic: scale_idx = row * q.group_num + g;
+            const size_t scale_idx = row * q.group_num + g;
+
+            scales_ptr[scale_idx] = ov::float16(d);
+            set_u4(zps_ptr, scale_idx, static_cast<uint8_t>(zp));
+
+            for (size_t i = 0; i < group_size; ++i) {
+                float q_f = (weights_f32[start_idx + i] - min_v) * inv;
+                int q_i = static_cast<int>(std::round(q_f));
+                q_i = std::max(0, std::min(15, q_i));
+                set_u4(weights_ptr, start_idx + i, static_cast<uint8_t>(q_i));
+            }
+        }
+    }
+
+    q.weights_u4 = weights;
+    q.scales_f16 = scales;
+    q.zps_u4 = zps;
+
+    q.weights_packed.resize(weights.get_byte_size());
+    std::memcpy(q.weights_packed.data(), weights.data(), q.weights_packed.size());
+
+    q.zps_packed.resize(zps.get_byte_size());
+    std::memcpy(q.zps_packed.data(), zps.data(), q.zps_packed.size());
+
+    q.scales.resize(scales.get_size());
+    std::memcpy(q.scales.data(), scales.data<ov::float16>(), q.scales.size() * sizeof(ov::float16));
+
+    return q;
+}
+
 std::vector<float> dequantize_q41(const Q41Quantized& q,
                                   size_t num_experts,
                                   size_t n,
@@ -363,10 +544,19 @@ std::vector<float> dequantize_q41(const Q41Quantized& q,
     const uint8_t* weights_packed = q.weights_packed.data();
     const uint8_t* zps_packed = q.zps_packed.data();
 
+    bool is_2d_layout = q.scales_f16.get_shape().size() == 2 && 
+                        q.scales_f16.get_shape()[0] == n;
+
     for (size_t e = 0; e < num_experts; ++e) {
         for (size_t row = 0; row < n; ++row) {
             for (size_t g = 0; g < q.group_num; ++g) {
-                const size_t scale_idx = (e * q.group_num + g) * n + row;
+                size_t scale_idx;
+                if (is_2d_layout) {
+                     scale_idx = row * q.group_num + g;
+                } else {
+                     scale_idx = (e * q.group_num + g) * n + row;
+                }
+                
                 const float scale = static_cast<float>(q.scales[scale_idx]);
                 const int zp = static_cast<int>(get_u4(zps_packed, scale_idx));
                 for (size_t kk = 0; kk < q.group_size; ++kk) {

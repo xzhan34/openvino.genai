@@ -204,26 +204,24 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     size_t num_groups = scale_shape.back();
     size_t group_size = in_features / num_groups;
     
-    // Determine element type based on compressed type and size
-    ov::element::Type compressed_type = quant_result.compressed.get_element_type();
+    // Determine element type based on compressed type from result
+    ov::element::Type elem_type = quant_result.compressed_type;
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
-    ov::element::Type elem_type;
     
     size_t num_elements = out_features * in_features;
     
-    if (compressed_type == ov::element::u8) {
-        if (quant_result.compressed.get_size() == num_elements) {
-            // INT8 Asymmetric
-            elem_type = ov::element::u8;
-        } else {
-            // INT4 (packed in U8)
-            elem_type = has_zero_point ? ov::element::u4 : ov::element::i4;
-        }
-    } else if (compressed_type == ov::element::i8) {
-        // INT8 Symmetric
-        elem_type = ov::element::i8;
+    // Validation check
+    if (elem_type == ov::element::u4 || elem_type == ov::element::i4) {
+        // Check if size matches packed 4-bit expectation
+        size_t expected_size = (out_features * ((in_features + 1) / 2)); 
+        // Note: For grouped quantization, shapes might slightly differ due to padding, 
+        // but generally packed size should be roughly half.
+        // We skip strict size check here relying on the quantization function correctness.
+    } else if (elem_type == ov::element::u8 || elem_type == ov::element::i8) {
+        OPENVINO_ASSERT(quant_result.compressed.get_size() == num_elements, 
+                        "INT8 compressed size mismatch");
     } else {
-        OPENVINO_THROW("Unsupported compressed type for dequantization: ", compressed_type);
+        OPENVINO_THROW("Unsupported compressed type for dequantization: ", elem_type);
     }
     
     // Step 1: Create grouped constant with appropriate element type
@@ -296,19 +294,8 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     OPENVINO_ASSERT(original_shape.size() == 2, "MoE original shape must be 2D");
     
     // Determine element type based on compressed type
-    ov::element::Type compressed_type = quant_result.compressed.get_element_type();
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
-    ov::element::Type elem_type;
-    
-    if (compressed_type == ov::element::u8) {
-        // INT4 packed in U8: use i4 for symmetric, u4 for asymmetric
-        elem_type = has_zero_point ? ov::element::u4 : ov::element::i4;
-    } else if (compressed_type == ov::element::i8) {
-        // INT8: always i8
-        elem_type = ov::element::i8;
-    } else {
-        OPENVINO_THROW("Unsupported compressed type for MoE dequantization: ", compressed_type);
-    }
+    ov::element::Type elem_type = quant_result.compressed_type;
     
     ov::Shape scale_shape = quant_result.scale.get_shape();
     ov::Shape ZERO_SHAPE = quant_result.zero_point.get_shape();

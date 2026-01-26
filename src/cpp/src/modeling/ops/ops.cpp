@@ -112,9 +112,8 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  size_t group_size,
                                  const ov::element::Type& out_type) {
     auto* ctx = input.context();
+    auto router = matmul(input, gate_inp_weight, false, true);
     auto hidden_f16 = input.to(ov::element::f16);
-    auto gate_inp_f16 = gate_inp_weight.to(ov::element::f16);
-    auto router = matmul(hidden_f16, gate_inp_f16, false, true);
 
     ov::op::internal::MOE3GemmFusedCompressed::Config config;
     config.hidden_size = hidden_size;

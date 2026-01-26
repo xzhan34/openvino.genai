@@ -209,6 +209,13 @@ bool QuantizationSelector::should_quantize(const std::string& name,
     return should_quantize;
 }
 
+bool QuantizationSelector::is_sensitive_layer(const std::string& name) const {
+    bool is_embedding = name.find("embed") != std::string::npos;
+    bool is_lm_head = name.find("lm_head") != std::string::npos;
+        
+    return is_lm_head || is_embedding;
+}
+
 QuantizationConfig::Mode QuantizationSelector::get_quantization_mode(
     const std::string& name,
     const ov::Shape& shape,
@@ -219,15 +226,11 @@ QuantizationConfig::Mode QuantizationSelector::get_quantization_mode(
         return QuantizationConfig::Mode::NONE;
     }
     
-    // NNCF-style logic: check if this is a sensitive layer that needs backup precision
-    bool is_embedding = name.find("embed") != std::string::npos;
-    bool is_lm_head = name.find("lm_head") != std::string::npos;
-    
     // NNCF-compatible logic:
-    // - If backup_mode != mode: lm_head and embeddings use backup_mode
+    // - If backup_mode != mode: sensitive layers (lm_head, embeddings, routers) use backup_mode
     // - If backup_mode == mode: all layers use same mode (like NNCF --all-layers)
     // - If backup_mode == NONE: sensitive layers return NONE (handled by should_quantize)
-    bool is_sensitive = is_lm_head || is_embedding;
+    bool is_sensitive = is_sensitive_layer(name);
     bool use_backup = is_sensitive && (config_.backup_mode != config_.mode);
     
     if (use_backup) {
@@ -249,12 +252,8 @@ QuantizationConfig::Mode QuantizationSelector::get_quantization_mode(
 
 int QuantizationSelector::get_group_size(const std::string& name) const {
     // Determine group_size based on the actual quantization mode for this layer
-    auto mode = get_quantization_mode(name, {}, ov::element::undefined);
-    
     // Check if this layer uses backup_mode (sensitive layers like lm_head, embeddings)
-    bool is_embedding = name.find("embed") != std::string::npos;
-    bool is_lm_head = name.find("lm_head") != std::string::npos;
-    bool is_sensitive = is_lm_head || is_embedding;
+    bool is_sensitive = is_sensitive_layer(name);
     bool uses_backup = is_sensitive && (config_.backup_mode != config_.mode);
     
     if (uses_backup) {

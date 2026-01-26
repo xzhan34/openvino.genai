@@ -40,6 +40,7 @@ struct QuantizedWeight {
     ov::Tensor compressed;      ///< Quantized weights (INT4 or INT8)
     ov::Tensor scale;           ///< Scale tensor for dequantization
     ov::Tensor zero_point;      ///< Zero point (for asymmetric quantization)
+    ov::element::Type compressed_type; ///< Data type of compressed weights
     bool has_zero_point;        ///< True if asymmetric quantization was used
 };
 
@@ -540,6 +541,7 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
     result.compressed = compressed;
     result.scale = scale;
     result.has_zero_point = false;
+    result.compressed_type = ov::element::i4;
     return result;
 }
 
@@ -623,6 +625,7 @@ inline QuantizedWeight quantize_int4_asym(const ov::Tensor& weight, int group_si
     result.scale = scale;
     result.zero_point = zero_point;
     result.has_zero_point = true;
+    result.compressed_type = ov::element::u4;
     return result;
 }
 
@@ -890,6 +893,7 @@ inline QuantizedWeight quantize_int8_sym(const ov::Tensor& weight, int group_siz
     QuantizedWeight result;
     result.compressed = compressed;
     result.scale = scale;
+    result.compressed_type = ov::element::i8;
     result.has_zero_point = false;
     return result;
 }
@@ -970,6 +974,7 @@ inline QuantizedWeight quantize_int8_asym(const ov::Tensor& weight, int group_si
     result.compressed = compressed;
     result.scale = scale;
     result.zero_point = zero_point;
+    result.compressed_type = ov::element::u8;
     result.has_zero_point = true;
     return result;
 }
