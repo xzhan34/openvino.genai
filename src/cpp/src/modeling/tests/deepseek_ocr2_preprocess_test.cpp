@@ -38,7 +38,7 @@ TEST(DeepseekOCR2PreprocessTest, DynamicPreprocess) {
 
     const auto local_shape = out.local_images.get_shape();
     ASSERT_EQ(local_shape.size(), 4u);
-    EXPECT_EQ(local_shape[0], 2u);
+    EXPECT_EQ(local_shape[0], 4u);
     EXPECT_EQ(local_shape[1], 3u);
     EXPECT_EQ(local_shape[2], 768u);
     EXPECT_EQ(local_shape[3], 768u);
@@ -49,13 +49,13 @@ TEST(DeepseekOCR2PreprocessTest, DynamicPreprocess) {
     EXPECT_EQ(crop_shape[1], 2u);
 
     const auto* crop = out.images_spatial_crop.data<const int64_t>();
-    EXPECT_EQ(crop[0], 1);
+    EXPECT_EQ(crop[0], 2);
     EXPECT_EQ(crop[1], 2);
 
     ASSERT_EQ(out.image_tokens.size(), 1u);
     EXPECT_EQ(out.image_tokens[0].base_tokens, 256);
-    EXPECT_EQ(out.image_tokens[0].local_tokens, 288);
-    EXPECT_EQ(out.image_tokens[0].total_tokens(), 545);
+    EXPECT_EQ(out.image_tokens[0].local_tokens, 576);
+    EXPECT_EQ(out.image_tokens[0].total_tokens(), 833);
 
     const float first_val = out.global_images.data<const float>()[0];
     EXPECT_NEAR(first_val, 1.0f, 1e-3f);
