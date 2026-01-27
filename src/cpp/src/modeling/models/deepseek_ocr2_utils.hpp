@@ -210,9 +210,24 @@ DeepseekOCR2PromptPlan build_prompt_plan(ov::genai::Tokenizer& tokenizer,
 std::vector<std::string> split_prompt_by_image_token(const std::string& prompt,
                                                      const std::string& image_token);
 
+class DeepseekOCR2VisionPackager {
+public:
+    explicit DeepseekOCR2VisionPackager(const ov::Tensor& view_separator);
+
+    const ov::Tensor& view_separator() const;
+
+    std::vector<ov::Tensor> pack(const ov::Tensor& global_embeds,
+                                 const ov::Tensor* local_embeds,
+                                 const std::vector<DeepseekOCR2ImageTokens>& image_tokens) const;
+
+private:
+    ov::Tensor view_separator_;
+};
+
 struct DeepseekOCR2WeightNames {
     static constexpr const char* kSamPrefix = "model.sam_model.";
     static constexpr const char* kQwen2Prefix = "model.qwen2_model.model.model.";
+    static constexpr const char* kProjectorPrefix = "model.projector.";
     static constexpr const char* kQuery768 = "model.qwen2_model.query_768.weight";
     static constexpr const char* kQuery1024 = "model.qwen2_model.query_1024.weight";
     static constexpr const char* kProjectorWeight = "model.projector.layers.weight";

@@ -10,6 +10,8 @@
 #include <limits>
 
 #include <openvino/core/except.hpp>
+#include <openvino/core/type/bfloat16.hpp>
+#include <openvino/core/type/float16.hpp>
 
 #include "json_utils.hpp"
 
@@ -362,6 +364,19 @@ std::pair<int32_t, int32_t> find_closest_aspect_ratio(double aspect_ratio,
         }
     }
     return best_ratio;
+}
+
+float read_as_f32(const void* data, size_t idx, const ov::element::Type& type) {
+    if (type == ov::element::f32) {
+        return static_cast<const float*>(data)[idx];
+    }
+    if (type == ov::element::f16) {
+        return static_cast<const ov::float16*>(data)[idx];
+    }
+    if (type == ov::element::bf16) {
+        return static_cast<const ov::bfloat16*>(data)[idx];
+    }
+    OPENVINO_THROW("Unsupported view separator dtype");
 }
 
 }  // namespace
@@ -809,6 +824,142 @@ DeepseekOCR2PromptPlan build_prompt_plan(ov::genai::Tokenizer& tokenizer,
                                          bos,
                                          add_eos,
                                          eos);
+}
+
+DeepseekOCR2VisionPackager::DeepseekOCR2VisionPackager(const ov::Tensor& view_separator)
+    : view_separator_(view_separator) {
+}
+
+const ov::Tensor& DeepseekOCR2VisionPackager::view_separator() const {
+    return view_separator_;
+}
+
+std::vector<ov::Tensor> DeepseekOCR2VisionPackager::pack(
+    const ov::Tensor& global_embeds,
+    const ov::Tensor* local_embeds,
+    const std::vector<DeepseekOCR2ImageTokens>& image_tokens) const {
+    const auto global_shape = global_embeds.get_shape();
+    if (global_shape.size() != 3) {
+        OPENVINO_THROW("global_embeds must have shape [B, T, H]");
+    }
+    const size_t batch = global_shape[0];
+    const size_t base_tokens = global_shape[1];
+    const size_t hidden = global_shape[2];
+    if (image_tokens.size() != batch) {
+        OPENVINO_THROW("image_tokens size does not match global_embeds batch");
+    }
+
+    size_t total_local_tokens = 0;
+    for (const auto& tokens : image_tokens) {
+        if (tokens.base_tokens > 0 && static_cast<size_t>(tokens.base_tokens) != base_tokens) {
+            OPENVINO_THROW("base_tokens mismatch between image_tokens and global_embeds");
+        }
+        if (tokens.local_tokens < 0) {
+            OPENVINO_THROW("local_tokens must be non-negative");
+        }
+        total_local_tokens += static_cast<size_t>(tokens.local_tokens);
+    }
+
+    const ov::Tensor* local_ptr = local_embeds;
+    if (total_local_tokens == 0) {
+        local_ptr = nullptr;
+    }
+    if (!local_ptr && total_local_tokens > 0) {
+        OPENVINO_THROW("local_embeds is required when local_tokens are present");
+    }
+
+    size_t tokens_per_crop = 0;
+    if (local_ptr) {
+        const auto local_shape = local_ptr->get_shape();
+        if (local_shape.size() != 3) {
+            OPENVINO_THROW("local_embeds must have shape [N, T, H]");
+        }
+        if (local_shape[2] != hidden) {
+            OPENVINO_THROW("local_embeds hidden size mismatch");
+        }
+        tokens_per_crop = local_shape[1];
+        if (tokens_per_crop == 0) {
+            OPENVINO_THROW("local_embeds tokens_per_crop must be > 0");
+        }
+        const size_t local_total = local_shape[0] * local_shape[1];
+        if (local_total != total_local_tokens) {
+            OPENVINO_THROW("local_embeds length does not match image_tokens.local_tokens");
+        }
+    }
+
+    const auto out_type = global_embeds.get_element_type();
+    const size_t row_bytes = hidden * out_type.size();
+
+    if (view_separator_.get_size() != hidden) {
+        OPENVINO_THROW("view_separator must have size equal to hidden");
+    }
+
+    const void* view_ptr = view_separator_.data();
+    std::vector<float> view_f32;
+    std::vector<ov::float16> view_f16;
+    std::vector<ov::bfloat16> view_bf16;
+    if (view_separator_.get_element_type() != out_type) {
+        if (out_type == ov::element::f32) {
+            view_f32.resize(hidden);
+            for (size_t i = 0; i < hidden; ++i) {
+                view_f32[i] = read_as_f32(view_separator_.data(), i, view_separator_.get_element_type());
+            }
+            view_ptr = view_f32.data();
+        } else if (out_type == ov::element::f16) {
+            view_f16.resize(hidden);
+            for (size_t i = 0; i < hidden; ++i) {
+                float value = read_as_f32(view_separator_.data(), i, view_separator_.get_element_type());
+                view_f16[i] = ov::float16(value);
+            }
+            view_ptr = view_f16.data();
+        } else if (out_type == ov::element::bf16) {
+            view_bf16.resize(hidden);
+            for (size_t i = 0; i < hidden; ++i) {
+                float value = read_as_f32(view_separator_.data(), i, view_separator_.get_element_type());
+                view_bf16[i] = ov::bfloat16(value);
+            }
+            view_ptr = view_bf16.data();
+        } else {
+            OPENVINO_THROW("Unsupported output dtype for view_separator cast");
+        }
+    }
+
+    const char* global_data = static_cast<const char*>(global_embeds.data());
+    const char* local_data = local_ptr ? static_cast<const char*>(local_ptr->data()) : nullptr;
+
+    std::vector<ov::Tensor> outputs;
+    outputs.reserve(batch);
+
+    size_t local_row_offset = 0;
+    for (size_t b = 0; b < batch; ++b) {
+        const size_t local_tokens = static_cast<size_t>(image_tokens[b].local_tokens);
+        if (local_ptr && local_tokens > 0 && tokens_per_crop > 0 && (local_tokens % tokens_per_crop != 0)) {
+            OPENVINO_THROW("local_tokens must be divisible by tokens_per_crop");
+        }
+        const size_t total_rows = local_tokens + base_tokens + 1;
+
+        ov::Tensor packed(out_type, {total_rows, hidden});
+        char* dst = static_cast<char*>(packed.data());
+        size_t offset_bytes = 0;
+
+        if (local_data && local_tokens > 0) {
+            const size_t local_bytes = local_tokens * row_bytes;
+            std::memcpy(dst + offset_bytes, local_data + local_row_offset * row_bytes, local_bytes);
+            offset_bytes += local_bytes;
+            local_row_offset += local_tokens;
+        }
+
+        const size_t global_bytes = base_tokens * row_bytes;
+        const size_t global_offset = b * base_tokens * row_bytes;
+        std::memcpy(dst + offset_bytes, global_data + global_offset, global_bytes);
+        offset_bytes += global_bytes;
+
+        std::memcpy(dst + offset_bytes, view_ptr, row_bytes);
+
+        outputs.push_back(std::move(packed));
+    }
+
+    return outputs;
 }
 
 }  // namespace models
