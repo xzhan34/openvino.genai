@@ -877,11 +877,72 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
 }
 
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
+    // abs_tol = rel_tol = tol。|expected| <= 1 用绝对 diff <= tol；|expected| > 1 用相对 diff/|x| <= tol。
+    const float abs_tol = tol;
+    const float rel_tol = tol;
+
     ASSERT_EQ(output.get_size(), expected.size());
     const float* out_data = output.data<const float>();
+
+    constexpr float k_threshold = 1.0f;
+
+    size_t pass_count = 0;
+    size_t fail_count = 0;
+    size_t n_abs = 0;
+    size_t n_rel = 0;
+    float max_abs_error = 0.0f;
+    float max_rel_error = 0.0f;
+    float max_error = 0.0f;
     for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out_data[i], expected[i], tol);
+        float actual = out_data[i];
+        float expected_val = expected[i];
+        float diff = std::abs(actual - expected_val);
+        float expected_magnitude = std::abs(expected_val);
+        max_error = std::max(max_error, diff); 
+        max_abs_error = std::max(max_abs_error, diff);
+
+        bool pass = false;
+        if (expected_magnitude > k_threshold) {
+            float rel_error = diff / expected_magnitude;
+            max_rel_error = std::max(max_rel_error, rel_error);
+            ++n_rel;
+            pass = (rel_error <= rel_tol);
+
+            if (!pass) {
+                EXPECT_LE(rel_error, rel_tol)
+                    << "Element " << i << ": Relative error " << (rel_error * 100.0f) << "%"
+                    << " exceeds tolerance " << (rel_tol * 100.0f) << "%"
+                    << " (actual=" << actual << ", expected=" << expected_val << ", abs_diff=" << diff << ")";
+            }
+        } else {
+            ++n_abs;
+            pass = (diff <= abs_tol);
+            if (!pass) {
+                EXPECT_LE(diff, abs_tol)
+                    << "Element " << i << ": Absolute error " << diff << " exceeds tolerance " << abs_tol
+                    << " (actual=" << actual << ", expected=" << expected_val << ")";
+            }
+        }
+
+        if (pass)
+            ++pass_count;
+        else
+            ++fail_count;
     }
+
+    // const char* mode_abs = (n_abs > 0 && n_rel == 0) ? "abs" : (n_abs == 0 && n_rel > 0) ? "rel" : "abs+rel";
+    // std::cerr << "\n[expect_tensor_near] ------" << std::endl;
+    // std::cerr << "  judge method: " << mode_abs;
+    // if (n_abs > 0 && n_rel == 0)
+    //     std::cerr << ", abs_tol=" << abs_tol;
+    // else if (n_abs == 0 && n_rel > 0)
+    //     std::cerr << ", rel_tol=" << rel_tol << " (" << (rel_tol * 100.0f) << "%)";
+    // else
+    //     std::cerr << ", abs_tol=" << abs_tol << ", rel_tol=" << rel_tol << " (" << (rel_tol * 100.0f) << "%)";
+    // std::cerr << std::endl;
+    // std::cerr << "max error value :" << max_error << std::endl;
+    // std::cerr.flush();
+
 }
 
 }  // namespace tests

@@ -138,7 +138,7 @@ TEST(LLMOps, ApplyRopeInterleaveMatchesReference) {
 
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-5f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(LLMOps, PadSliceHeadDimRoundTrip) {
@@ -168,6 +168,6 @@ TEST(LLMOps, PadSliceHeadDimRoundTrip) {
 
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_padded, 1e-6f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), x_data, 1e-6f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_padded, test_utils::k_tol_exact);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), x_data, test_utils::k_tol_exact);
 }

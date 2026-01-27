@@ -210,5 +210,5 @@ TEST(SmolLM3Dummy, BuildsAndRuns) {
     hidden0 = test_utils::rms_ref(sum, norm_weight, batch * seq_len, hidden, cfg.rms_norm_eps);
     auto expected = test_utils::linear_ref_3d(hidden0, embed_weight, batch, seq_len, hidden, vocab);
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

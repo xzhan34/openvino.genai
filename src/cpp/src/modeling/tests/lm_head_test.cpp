@@ -54,7 +54,7 @@ TEST(LMHeadLayer, Decode) {
     request.set_input_tensor(input_tensor);
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(LMHeadLayer, PrefillLastToken) {
@@ -114,7 +114,7 @@ TEST(LMHeadLayer, PrefillLastToken) {
 
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 

@@ -323,7 +323,7 @@ DeepseekQwen2VisionModel::DeepseekQwen2VisionModel(BuilderContext& ctx,
 
     layers_.reserve(static_cast<size_t>(cfg.num_hidden_layers));
     for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
-        std::string name = std::string("layers.") + std::to_string(i);
+        std::string name = std::string("layers[") + std::to_string(i) + "]";
         layers_.emplace_back(ctx, name, cfg, this);
         register_module(name, &layers_.back());
     }

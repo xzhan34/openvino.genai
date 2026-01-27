@@ -167,6 +167,25 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
                                  float rope_theta,
                                  float rms_norm_eps,
                                  bool use_rope = true);
+
+/// expect_tensor_near: \p tol 即 abs_tol = rel_tol（k_tol_*）。
+/// - |expected| <= 1: 绝对误差 diff <= tol；
+/// - |expected| > 1: 相对误差 diff/|x| <= tol。
+///
+/// Recommended tol by operator:
+///   tol    | 使用场景
+///   -------|---------------------------
+///   1e-6   | reshape, permute, tile, pad
+///   1e-5   | rope, 精确线性代数
+///   1e-3   | matmul, linear, MLP, attention
+///   2.5e-3 | sin, cos, exp, log, softmax
+///   5e-1   | MoE, Q41 融合 gemm
+constexpr float k_tol_exact = 1e-6f;
+constexpr float k_tol_linear = 1e-5f;
+constexpr float k_tol_default = 1e-3f;
+constexpr float k_tol_transcendental = 2.5e-3f;
+constexpr float k_tol_moe = 5e-1f;
+
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol);
 
 class DummyWeightSource : public weights::WeightSource {

@@ -28,7 +28,7 @@ std::shared_ptr<ov::Model> build_model_from_output(const ov::Output<ov::Node>& o
 void run_model_test(const std::shared_ptr<ov::Model>& model,
                     const ov::Tensor& input_tensor,
                     const std::vector<float>& expected,
-                    float tol = 1e-4f) {
+                    float tol = test_utils::k_tol_default) {
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
@@ -173,7 +173,7 @@ TEST(OpsNN, LayerNorm) {
     ov::Tensor input_tensor(ov::element::f32, shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     auto expected = layer_norm_ref(input_data, weight_data, bias_data, 2, 3, 1e-5f);
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_default);
 }
 
 TEST(OpsNN, GeluTanh) {
@@ -193,7 +193,7 @@ TEST(OpsNN, GeluTanh) {
     }
     ov::Tensor input_tensor(ov::element::f32, shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_transcendental);
 }
 
 TEST(OpsNN, Conv2d) {
@@ -215,7 +215,7 @@ TEST(OpsNN, Conv2d) {
     ov::Tensor input_tensor(ov::element::f32, in_shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     auto expected = conv2d_ref(input_data, weight_data, 3, 3, 2, 2);
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_default);
 }
 
 TEST(OpsNN, GroupNorm) {
@@ -241,7 +241,7 @@ TEST(OpsNN, GroupNorm) {
     ov::Tensor input_tensor(ov::element::f32, in_shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     auto expected = group_norm_ref(input_data, weight_data, bias_data, 1, 4, 1, 2, 2, 1e-5f);
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_default);
 }
 
 TEST(OpsNN, PadConstant) {
@@ -263,7 +263,7 @@ TEST(OpsNN, PadConstant) {
     };
     ov::Tensor input_tensor(ov::element::f32, in_shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_exact);
 }
 
 TEST(OpsNN, UpsampleNearest) {
@@ -285,5 +285,5 @@ TEST(OpsNN, UpsampleNearest) {
     };
     ov::Tensor input_tensor(ov::element::f32, in_shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_exact);
 }

@@ -79,7 +79,7 @@ TEST(TensorOps, TypeConversions) {
     request.set_input_tensor(input_tensor);
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), input_data, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), input_data, test_utils::k_tol_default);
 }
 
 TEST(TensorOps, PowMeanRsqrtAndMean) {
@@ -106,8 +106,8 @@ TEST(TensorOps, PowMeanRsqrtAndMean) {
     auto expected_z = pow_mean_rsqrt_expected(input_data, 2, 3);
     auto expected_mean = mean_expected(input_data, 2, 3);
 
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_z, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_mean, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_z, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_mean, test_utils::k_tol_default);
 }
 
 TEST(TensorOps, ArithmeticOperators) {
@@ -173,19 +173,19 @@ TEST(TensorOps, ArithmeticOperators) {
     std::vector<float> expected_div_scalar = {0.5f, 1.5f, 3.5f};
     std::vector<float> expected_div_scalar_rev = {2.0f, 0.6666667f, 0.2857143f};
 
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_sum, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_sum_scalar, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_sum_rev, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(3), expected_diff, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(4), expected_diff_scalar, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(5), expected_diff_rev, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(6), expected_neg, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(7), expected_prod, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(8), expected_prod_scalar, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(9), expected_prod_scalar_rev, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(10), expected_div, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(11), expected_div_scalar, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(12), expected_div_scalar_rev, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_sum, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_sum_scalar, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_sum_rev, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(3), expected_diff, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(4), expected_diff_scalar, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(5), expected_diff_rev, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(6), expected_neg, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(7), expected_prod, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(8), expected_prod_scalar, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(9), expected_prod_scalar_rev, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(10), expected_div, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(11), expected_div_scalar, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(12), expected_div_scalar_rev, test_utils::k_tol_default);
 }
 
 TEST(TensorOps, TrigExpLogSoftmax) {
@@ -236,11 +236,16 @@ TEST(TensorOps, TrigExpLogSoftmax) {
         expected_softmax[i] = std::exp(x_data[i] - max_val) / denom;
     }
 
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_sin, 1e-4f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_cos, 1e-4f);
-    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_exp, 1e-4f);
-    test_utils::expect_tensor_near(request.get_output_tensor(3), expected_log, 1e-4f);
-    test_utils::expect_tensor_near(request.get_output_tensor(4), expected_softmax, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_sin,
+                                  test_utils::k_tol_transcendental);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_cos,
+                                  test_utils::k_tol_transcendental);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_exp,
+                                  test_utils::k_tol_transcendental);
+    test_utils::expect_tensor_near(request.get_output_tensor(3), expected_log,
+                                  test_utils::k_tol_transcendental);
+    test_utils::expect_tensor_near(request.get_output_tensor(4), expected_softmax,
+                                  test_utils::k_tol_transcendental);
 }
 
 TEST(TensorShapeOps, ReshapePermuteMerge) {
@@ -277,8 +282,8 @@ TEST(TensorShapeOps, ReshapePermuteMerge) {
     EXPECT_EQ(merged_output.get_shape(), (ov::Shape{batch, seq_len, hidden}));
 
     auto expected_heads = test_utils::to_heads_ref(input_data, batch, seq_len, num_heads, head_dim);
-    test_utils::expect_tensor_near(heads_output, expected_heads, 1e-3f);
-    test_utils::expect_tensor_near(merged_output, input_data, 1e-3f);
+    test_utils::expect_tensor_near(heads_output, expected_heads, test_utils::k_tol_exact);
+    test_utils::expect_tensor_near(merged_output, input_data, test_utils::k_tol_exact);
 }
 
 TEST(ShapeOps, ShapeHelpersBroadcast) {
@@ -308,7 +313,8 @@ TEST(ShapeOps, ShapeHelpersBroadcast) {
 
     expect_tensor_eq_i64(request.get_output_tensor(0), {1});
     expect_tensor_eq_i64(request.get_output_tensor(1), {3});
-    test_utils::expect_tensor_near(request.get_output_tensor(2), {1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f}, 1e-6f);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), {1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f},
+                                  test_utils::k_tol_exact);
 }
 
 TEST(TensorShapeOps, UnsqueezeSqueezeChain) {
@@ -334,5 +340,5 @@ TEST(TensorShapeOps, UnsqueezeSqueezeChain) {
 
     auto output = request.get_output_tensor();
     EXPECT_EQ(output.get_shape(), (ov::Shape{rows, cols}));
-    test_utils::expect_tensor_near(output, input_data, 1e-6f);
+    test_utils::expect_tensor_near(output, input_data, test_utils::k_tol_exact);
 }

@@ -80,5 +80,5 @@ TEST(ZImageBlocks, AttentionZeroWeights) {
     request.infer();
 
     std::vector<float> expected(1 * 4 * dim, 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

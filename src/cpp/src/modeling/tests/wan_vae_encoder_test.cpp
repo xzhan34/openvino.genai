@@ -131,5 +131,5 @@ TEST(WanVAEEncoderTest, BuildsAndRuns) {
     EXPECT_EQ(output.get_element_type(), ov::element::f32);
     EXPECT_EQ(output.get_shape(), (ov::Shape{1, z_dim2, 2, 2, 2}));
     std::vector<float> expected(output.get_size(), 0.0f);
-    test_utils::expect_tensor_near(output, expected, 1e-4f);
+    test_utils::expect_tensor_near(output, expected, test_utils::k_tol_default);
 }

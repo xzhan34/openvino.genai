@@ -57,7 +57,7 @@ TEST(VocabEmbeddingLayer, Basic) {
 
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 

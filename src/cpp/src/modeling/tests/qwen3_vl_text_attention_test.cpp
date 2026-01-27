@@ -5,10 +5,13 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <fstream>
+#include <iostream>
 
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
+#include <openvino/pass/serialize.hpp>
 
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_vl_text.hpp"
@@ -22,10 +25,10 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
 
     const size_t batch = 1;
     const size_t seq_len = 2;
-    const size_t hidden = 4;
     const size_t num_heads = 2;
     const size_t num_kv_heads = 1;
-    const size_t head_dim = 2;
+    const size_t head_dim = 16;
+    const size_t hidden = num_heads * head_dim;  // hidden = 2 * 16 = 32
     const float rope_theta = 10000.0f;
     const size_t kv_hidden = num_kv_heads * head_dim;
 
@@ -84,14 +87,17 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
     auto output = attn.forward(hidden_states, beam_idx, rotary_cos, rotary_sin);
     auto ov_model = ctx.build_model({output.output()});
 
+
     ov::Core core;
     auto compiled = core.compile_model(ov_model, "GPU");
+    
     auto request = compiled.create_infer_request();
 
-    const std::vector<float> hidden_data = {
-        0.1f, 0.2f, 0.3f, 0.4f,
-        0.5f, 0.6f, 0.7f, 0.8f,
-    };
+    // Generate hidden_data for batch=1, seq_len=2, hidden=32
+    std::vector<float> hidden_data(batch * seq_len * hidden);
+    for (size_t i = 0; i < hidden_data.size(); ++i) {
+        hidden_data[i] = 0.1f + i * 0.01f;
+    }
     ov::Tensor hidden_tensor(ov::element::f32, {batch, seq_len, hidden});
     std::memcpy(hidden_tensor.data(), hidden_data.data(), hidden_data.size() * sizeof(float));
     request.set_input_tensor(0, hidden_tensor);
@@ -134,5 +140,5 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
                                               rope_theta,
                                               cfg.rms_norm_eps);
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

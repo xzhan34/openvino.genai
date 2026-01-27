@@ -141,6 +141,6 @@ TEST(WanAttentionTest, SelfAndCrossPaths) {
     request.infer();
 
     std::vector<float> expected(static_cast<size_t>(1 * 3 * dim), 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected, 1e-4f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected, test_utils::k_tol_default);
 }

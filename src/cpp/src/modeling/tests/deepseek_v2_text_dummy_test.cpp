@@ -90,22 +90,22 @@ TEST(DeepseekV2TextDummy, BuildsAndRunsWithMoE) {
 
     ov::genai::modeling::tests::DummyWeightSource weights;
     weights.add("model.embed_tokens.weight", test_utils::make_tensor(embed_weight, embed_shape));
-    weights.add("model.layers.0.input_layernorm.weight", test_utils::make_tensor(input_norm_weight, norm_shape));
-    weights.add("model.layers.0.self_attn.q_proj.weight", test_utils::make_tensor(q_w, q_weight_shape));
-    weights.add("model.layers.0.self_attn.k_proj.weight", test_utils::make_tensor(k_w, kv_weight_shape));
-    weights.add("model.layers.0.self_attn.v_proj.weight", test_utils::make_tensor(v_w, kv_weight_shape));
-    weights.add("model.layers.0.self_attn.o_proj.weight", test_utils::make_tensor(o_w, o_weight_shape));
-    weights.add("model.layers.0.post_attention_layernorm.weight", test_utils::make_tensor(post_norm_weight, norm_shape));
-    weights.add("model.layers.0.mlp.gate.weight", test_utils::make_tensor(gate_w, gate_shape));
-    weights.add("model.layers.0.mlp.experts.0.gate_proj.weight", test_utils::make_tensor(gate_w0, expert_up_shape));
-    weights.add("model.layers.0.mlp.experts.0.up_proj.weight", test_utils::make_tensor(up_w0, expert_up_shape));
-    weights.add("model.layers.0.mlp.experts.0.down_proj.weight", test_utils::make_tensor(down_w0, expert_down_shape));
-    weights.add("model.layers.0.mlp.experts.1.gate_proj.weight", test_utils::make_tensor(gate_w1, expert_up_shape));
-    weights.add("model.layers.0.mlp.experts.1.up_proj.weight", test_utils::make_tensor(up_w1, expert_up_shape));
-    weights.add("model.layers.0.mlp.experts.1.down_proj.weight", test_utils::make_tensor(down_w1, expert_down_shape));
-    weights.add("model.layers.0.mlp.shared_experts.gate_proj.weight", test_utils::make_tensor(shared_gate_w, shared_up_shape));
-    weights.add("model.layers.0.mlp.shared_experts.up_proj.weight", test_utils::make_tensor(shared_up_w, shared_up_shape));
-    weights.add("model.layers.0.mlp.shared_experts.down_proj.weight", test_utils::make_tensor(shared_down_w, shared_down_shape));
+    weights.add("model.layers[0].input_layernorm.weight", test_utils::make_tensor(input_norm_weight, norm_shape));
+    weights.add("model.layers[0].self_attn.q_proj.weight", test_utils::make_tensor(q_w, q_weight_shape));
+    weights.add("model.layers[0].self_attn.k_proj.weight", test_utils::make_tensor(k_w, kv_weight_shape));
+    weights.add("model.layers[0].self_attn.v_proj.weight", test_utils::make_tensor(v_w, kv_weight_shape));
+    weights.add("model.layers[0].self_attn.o_proj.weight", test_utils::make_tensor(o_w, o_weight_shape));
+    weights.add("model.layers[0].post_attention_layernorm.weight", test_utils::make_tensor(post_norm_weight, norm_shape));
+    weights.add("model.layers[0].mlp.gate.weight", test_utils::make_tensor(gate_w, gate_shape));
+    weights.add("model.layers[0].mlp.experts.0.gate_proj.weight", test_utils::make_tensor(gate_w0, expert_up_shape));
+    weights.add("model.layers[0].mlp.experts.0.up_proj.weight", test_utils::make_tensor(up_w0, expert_up_shape));
+    weights.add("model.layers[0].mlp.experts.0.down_proj.weight", test_utils::make_tensor(down_w0, expert_down_shape));
+    weights.add("model.layers[0].mlp.experts.1.gate_proj.weight", test_utils::make_tensor(gate_w1, expert_up_shape));
+    weights.add("model.layers[0].mlp.experts.1.up_proj.weight", test_utils::make_tensor(up_w1, expert_up_shape));
+    weights.add("model.layers[0].mlp.experts.1.down_proj.weight", test_utils::make_tensor(down_w1, expert_down_shape));
+    weights.add("model.layers[0].mlp.shared_experts.gate_proj.weight", test_utils::make_tensor(shared_gate_w, shared_up_shape));
+    weights.add("model.layers[0].mlp.shared_experts.up_proj.weight", test_utils::make_tensor(shared_up_w, shared_up_shape));
+    weights.add("model.layers[0].mlp.shared_experts.down_proj.weight", test_utils::make_tensor(shared_down_w, shared_down_shape));
     weights.add("model.norm.weight", test_utils::make_tensor(norm_weight, norm_shape));
     weights.add("lm_head.weight", test_utils::make_tensor(lm_head_weight, lm_head_shape));
 
@@ -227,4 +227,3 @@ TEST(DeepseekV2TextDummy, BuildsAndRunsWithMoE) {
 
     test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
 }
-

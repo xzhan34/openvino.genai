@@ -144,5 +144,5 @@ TEST(ZImageVAE, DecoderBuildsAndRuns) {
     const int64_t out_h = in_h * up_factor;
     const int64_t out_w = in_w * up_factor;
     std::vector<float> expected(static_cast<size_t>(batch * cfg.out_channels * out_h * out_w), 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

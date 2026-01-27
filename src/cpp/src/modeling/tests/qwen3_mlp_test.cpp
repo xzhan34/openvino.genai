@@ -65,5 +65,5 @@ TEST(Qwen3MLP, MatchesReference) {
     request.infer();
 
     auto expected = test_utils::mlp_ref(input_data, gate_w, up_w, down_w, batch, seq_len, hidden, intermediate);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

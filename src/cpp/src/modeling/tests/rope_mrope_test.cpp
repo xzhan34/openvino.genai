@@ -51,5 +51,5 @@ TEST(RopeOps, MropeInterleaved) {
     request.infer();
 
     ov::Tensor output = request.get_output_tensor();
-    test_utils::expect_tensor_near(output, expected, 1e-5f);
+    test_utils::expect_tensor_near(output, expected, test_utils::k_tol_linear);
 }

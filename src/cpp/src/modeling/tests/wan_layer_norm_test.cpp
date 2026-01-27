@@ -27,7 +27,7 @@ std::shared_ptr<ov::Model> build_model_from_output(const ov::Output<ov::Node>& o
 void run_model_test(const std::shared_ptr<ov::Model>& model,
                     const ov::Tensor& input_tensor,
                     const std::vector<float>& expected,
-                    float tol = 1e-4f) {
+                    float tol = test_utils::k_tol_default) {
     ov::Core core;
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
@@ -90,5 +90,5 @@ TEST(WanLayerNormTest, FP32LayerNormAffine) {
     ov::Tensor input_tensor(ov::element::f32, shape);
     std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
     auto expected = layer_norm_ref(input_data, weight_data, bias_data, 2, 3, eps);
-    run_model_test(model, input_tensor, expected, 1e-4f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_default);
 }

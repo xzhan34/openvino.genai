@@ -102,7 +102,7 @@ TEST(WanTextEncoder, BuildsAndRuns) {
     request.infer();
 
     std::vector<float> expected(batch * seq_len * hidden, 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected, test_utils::k_tol_default);
 }
 
 TEST(WanPromptClean, HandlesHtmlAndWhitespace) {

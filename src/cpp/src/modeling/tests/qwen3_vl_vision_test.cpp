@@ -49,7 +49,7 @@ TEST(Qwen3VLVisionPatchEmbedTest, Conv3dPatchEmbed) {
     request.infer();
 
     std::vector<float> expected{36.0f};
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Qwen3VLVisionAttentionTest, ZeroWeightsProduceZeroOutput) {
@@ -99,5 +99,5 @@ TEST(Qwen3VLVisionAttentionTest, ZeroWeightsProduceZeroOutput) {
     request.infer();
 
     std::vector<float> expected(8, 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

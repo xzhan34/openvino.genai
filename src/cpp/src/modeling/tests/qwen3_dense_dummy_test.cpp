@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2023-2025 Intel Corporation
+// Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
@@ -178,7 +178,7 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     hidden0 = test_utils::rms_ref(sum, norm_weight, batch * seq_len, hidden, cfg.rms_norm_eps);
     auto expected = test_utils::linear_ref_3d(hidden0, lm_head_weight, batch, seq_len, hidden, vocab);
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Qwen3DenseDummy, TiedWeights) {
@@ -331,5 +331,5 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     hidden0 = test_utils::rms_ref(sum, norm_weight, batch * seq_len, hidden, cfg.rms_norm_eps);
     auto expected = test_utils::linear_ref_3d(hidden0, embed_weight, batch, seq_len, hidden, vocab);
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

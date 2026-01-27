@@ -493,7 +493,7 @@ DeepseekV2Model::DeepseekV2Model(BuilderContext& ctx, const DeepseekV2TextConfig
     layers_.reserve(static_cast<size_t>(cfg.num_hidden_layers));
     for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
         const bool is_moe = cfg.is_moe_layer(i);
-        layers_.emplace_back(ctx, "layers." + std::to_string(i), cfg, is_moe, this);
+        layers_.emplace_back(ctx, "layers[" + std::to_string(i) + "]", cfg, is_moe, this);
     }
 }
 

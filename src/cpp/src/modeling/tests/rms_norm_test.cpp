@@ -44,7 +44,7 @@ void run_rms_model_test(const std::shared_ptr<ov::Model>& model,
                         const std::vector<float>& expected,
                         const ov::Shape& input_shape,
                         const std::string& model_file,
-                        float tol = 1e-3f) {
+                        float tol = test_utils::k_tol_default) {
     ov::serialize(model, model_file);
 
     ov::Core core;

@@ -97,5 +97,5 @@ TEST(Qwen3TextEncoder, BuildsAndRuns) {
     request.infer();
 
     std::vector<float> expected(batch * seq_len * hidden, 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

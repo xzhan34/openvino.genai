@@ -90,7 +90,8 @@ TEST(Qwen3VLE2E, PrefillAndDecode) {
     if (!model_dir_env) {
         GTEST_SKIP() << "QWEN3_VL_MODEL_DIR is not set";
     }
-    const std::string device = get_env("QWEN3_VL_DEVICE") ? get_env("QWEN3_VL_DEVICE") : "CPU";
+    const std::string device = "GPU";
+    
 
     const std::filesystem::path model_dir = model_dir_env;
     auto cfg = ov::genai::modeling::models::Qwen3VLConfig::from_json_file(model_dir);

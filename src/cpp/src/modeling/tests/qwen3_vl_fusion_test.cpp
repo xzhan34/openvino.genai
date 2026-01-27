@@ -47,7 +47,7 @@ TEST(Qwen3VLFusion, EmbeddingInjector) {
     request.infer();
 
     std::vector<float> expected{10, 10, 2, 2, 30, 30, 4, 4};
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Qwen3VLFusion, DeepstackInjector) {
@@ -82,7 +82,7 @@ TEST(Qwen3VLFusion, DeepstackInjector) {
     request.infer();
 
     std::vector<float> expected{11, 11, 2, 2, 33, 33, 4, 4};
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Qwen3VLFusion, InputPlannerTextOnly) {
@@ -171,6 +171,6 @@ TEST(Qwen3VLFusion, ScatterVisualEmbeds) {
     const float* out = padded.data<const float>();
     std::vector<float> expected{10, 10, 0, 0, 30, 30, 0, 0};
     for (size_t i = 0; i < expected.size(); ++i) {
-        EXPECT_NEAR(out[i], expected[i], 1e-4f);
+        EXPECT_NEAR(out[i], expected[i], test_utils::k_tol_exact);
     }
 }

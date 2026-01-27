@@ -39,7 +39,7 @@ TEST(Ops, Matmul) {
     request.infer();
 
     auto expected = test_utils::matmul_ref(a_data, b_data, 2, 3, 2);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Ops, MatmulTransposeA) {
@@ -71,7 +71,7 @@ TEST(Ops, MatmulTransposeA) {
     request.infer();
 
     auto expected = test_utils::matmul_ref_transpose_a(a_data, b_data, m, k, n);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Ops, Linear) {
@@ -104,7 +104,7 @@ TEST(Ops, Linear) {
     request.infer();
 
     auto expected = test_utils::linear_ref_3d(x_data, w_data, batch, seq_len, in_features, out_features);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Ops, ConstHelpers) {
@@ -133,8 +133,8 @@ TEST(Ops, ConstHelpers) {
     request.set_input_tensor(x_tensor);
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(0), {6.0f, 10.0f}, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), {5.0f}, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), {6.0f, 10.0f}, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), {5.0f}, test_utils::k_tol_default);
 }
 
 TEST(Ops, ReduceMean) {
@@ -157,7 +157,7 @@ TEST(Ops, ReduceMean) {
     request.infer();
 
     auto expected = test_utils::mean_ref(x_data, 2, 3);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Ops, GatherSliceConcat) {
@@ -192,9 +192,9 @@ TEST(Ops, GatherSliceConcat) {
     std::vector<float> expected_slice = {1.0f, 3.0f, 6.0f, 8.0f};
     std::vector<float> expected_concat = {0.0f, 2.0f, 1.0f, 3.0f, 5.0f, 7.0f, 6.0f, 8.0f};
 
-    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_gather, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_slice, 1e-3f);
-    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_concat, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_gather, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_slice, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(2), expected_concat, test_utils::k_tol_default);
 }
 
 TEST(Ops, Rms) {
@@ -224,18 +224,18 @@ TEST(Ops, Rms) {
     request.infer();
 
     auto expected = test_utils::rms_ref(x_data, w_data, 2, 3, eps);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(Ops, Moe3GemmFusedCompressed) {
     ov::genai::modeling::BuilderContext ctx;
 
     constexpr size_t batch = 1;
-    constexpr size_t seq_len = 2;
-    constexpr size_t hidden_size = 128;
-    constexpr size_t inter_size = 256;
+    constexpr size_t seq_len = 16;
+    constexpr size_t hidden_size = 1024;
+    constexpr size_t inter_size = 2048;
     constexpr size_t num_experts = 8;
-    constexpr size_t top_k = 2;
+    constexpr size_t top_k = 4;
     constexpr size_t group_size = 128;
 
     static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
@@ -313,7 +313,7 @@ TEST(Ops, Moe3GemmFusedCompressed) {
                                         inter_size,
                                         num_experts,
                                         top_k);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-1f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
 }
 
 TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
