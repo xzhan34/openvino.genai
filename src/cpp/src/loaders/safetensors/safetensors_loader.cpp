@@ -100,8 +100,14 @@ std::shared_ptr<WeightFinalizer> SafetensorsLoader::create_weight_finalizer(
     
     using namespace ov::genai::modeling::weights;
     
-    // Parse quantization configuration from environment variables
-    auto quant_config = parse_quantization_config_from_env();
+    // Check if quantization config is provided in model config (from properties)
+    QuantizationConfig quant_config;
+    if (config.quantization_config.has_value()) {
+        quant_config = *config.quantization_config;
+    } else {
+        // Fallback: Parse quantization configuration from environment variables
+        quant_config = parse_quantization_config_from_env();
+    }
     
     // Create finalizer with quantization config
     return std::make_shared<safetensors::SafetensorsWeightFinalizer>(quant_config);

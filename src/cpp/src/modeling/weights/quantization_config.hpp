@@ -7,6 +7,7 @@
 #include <vector>
 #include <optional>
 #include <limits>
+#include <iostream>
 
 namespace ov {
 namespace genai {
@@ -142,6 +143,11 @@ struct QuantizationConfig {
         // They will use backup_mode (INT8_ASYM by default) instead of primary mode
         bool use_backup_quantization = (backup_mode != Mode::NONE);
         
+        if (selection.verbose) {
+            std::cout << "[QuantizationConfig] Applying legacy options:" << std::endl;
+            std::cout << "  quantize_embeddings and lm_head: " << (use_backup_quantization ? "true" : "false") << std::endl;
+        }
+
         selection.quantize_embeddings = use_backup_quantization;
         selection.quantize_lm_head = use_backup_quantization;
     }

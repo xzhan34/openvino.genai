@@ -14,6 +14,8 @@ QuantizationSelector::QuantizationSelector(const QuantizationConfig& config)
     : config_(config) {
     // Apply legacy options to selection config
     config_.apply_legacy_options();
+    // exclude patterns default
+    config_.selection.exclude_patterns.push_back("*visual.patch_embed*");
 }
 
 bool QuantizationSelector::should_quantize(const std::string& name, 

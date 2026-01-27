@@ -42,6 +42,7 @@ class OPENVINO_GENAI_EXPORTS SafetensorsWeightFinalizer : public ov::genai::mode
 public:
     SafetensorsWeightFinalizer();
     explicit SafetensorsWeightFinalizer(const QuantizationConfig& config);
+    ~SafetensorsWeightFinalizer() override;
 
     ov::genai::modeling::weights::FinalizedWeight finalize(
         const std::string& name,
@@ -85,6 +86,10 @@ private:
 
     std::unordered_map<std::string, ov::Output<ov::Node>> cache_;
     ov::genai::modeling::weights::QuantizationSelector selector_;
+
+    // Statistics
+    size_t total_weights_ = 0;
+    size_t quantized_weights_ = 0;
 };
 
 }  // namespace safetensors

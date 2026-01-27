@@ -24,6 +24,7 @@
 #include "modeling/models/qwen3_vl_text.hpp"
 #include "modeling/models/qwen3_vl_utils.hpp"
 #include "modeling/models/qwen3_vl_vision.hpp"
+#include "quantization_utils.hpp"
 
 namespace {
 
@@ -134,7 +135,9 @@ double elapsed_ms(const std::chrono::steady_clock::time_point& start,
 int main(int argc, char* argv[]) try {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS]\n";
+                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] "
+                  << "[VISION_QUANT] [VISION_GS] [VISION_BACKUP] "
+                  << "[TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP]\n";
         return 1;
     }
 
@@ -143,6 +146,19 @@ int main(int argc, char* argv[]) try {
     const std::string user_prompt = (argc > 3) ? argv[3] : "Describe the image.";
     const std::string device = (argc > 4) ? argv[4] : "GPU";
     const int max_new_tokens = (argc > 5) ? std::stoi(argv[5]) : 64;
+
+    // Optional quantization args: "INT4", "INT8", "NONE"
+    std::string vision_quant_mode = (argc > 6) ? argv[6] : "";
+    int vision_group_size = (argc > 7) ? std::stoi(argv[7]) : 128;
+    std::string vision_backup_mode = (argc > 8) ? argv[8] : "";
+
+    std::string text_quant_mode = (argc > 9) ? argv[9] : "";
+    int text_group_size = (argc > 10) ? std::stoi(argv[10]) : 128;
+    std::string text_backup_mode = (argc > 11) ? argv[11] : "";
+
+    // Parse configs
+    auto vision_quant_config = create_quantization_config(vision_quant_mode, vision_group_size, vision_backup_mode);
+    auto text_quant_config = create_quantization_config(text_quant_mode, text_group_size, text_backup_mode);
 
     auto cfg = ov::genai::modeling::models::Qwen3VLConfig::from_json_file(model_dir);
     ov::genai::modeling::models::Qwen3VLVisionPreprocessConfig pre_cfg;
@@ -153,14 +169,18 @@ int main(int argc, char* argv[]) try {
 
     auto data = ov::genai::safetensors::load_safetensors(model_dir);
     ov::genai::safetensors::SafetensorsWeightSource source(std::move(data));
+    std::shared_ptr<ov::Model> vision_model;
+    {
+        ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer(vision_quant_config);
+        vision_model = ov::genai::modeling::models::create_qwen3_vl_vision_model(cfg, source, vision_finalizer);
+    }
 
-    ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer;
-    auto vision_model = ov::genai::modeling::models::create_qwen3_vl_vision_model(cfg, source, vision_finalizer);
-
-    // only do quantization for LLM backbone to keep precision
-    auto quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
-    ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(quant_config);
-    auto text_model = ov::genai::modeling::models::create_qwen3_vl_text_model(cfg, source, text_finalizer, false, true);
+    std::shared_ptr<ov::Model> text_model;
+    {
+        // Text model quantization
+        ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
+        text_model = ov::genai::modeling::models::create_qwen3_vl_text_model(cfg, source, text_finalizer);
+    }
 
     ov::Core core;
     auto compiled_vision = core.compile_model(vision_model, device);

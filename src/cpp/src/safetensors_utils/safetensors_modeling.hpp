@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "openvino/openvino.hpp"
+#include "modeling/weights/quantization_config.hpp"
 
 namespace ov {
 namespace genai {
@@ -35,13 +36,15 @@ namespace safetensors {
  * 
  * @param model_dir Path to the HuggingFace model directory
  * @param enable_save_ov_model If true, save the generated model to disk
+ * @param quant_config Optional quantization configuration for in-flight quantization
  * @return std::shared_ptr<ov::Model> The constructed OpenVINO model
  * @throws std::runtime_error if model creation fails
  */
 [[deprecated("Use loaders::LoaderRegistry and loaders::ModelBuilder instead")]]
 std::shared_ptr<ov::Model> create_from_safetensors(
     const std::filesystem::path& model_dir,
-    bool enable_save_ov_model = false);
+    bool enable_save_ov_model = false,
+    const ov::genai::modeling::weights::QuantizationConfig& quant_config = ov::genai::modeling::weights::QuantizationConfig());
 
 }  // namespace safetensors
 }  // namespace genai

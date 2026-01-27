@@ -408,8 +408,32 @@ bool use_unified_loader() {
     return env && (std::string(env) == "1" || std::string(env) == "true");
 }
 
+std::pair<ov::AnyMap, std::optional<ov::genai::modeling::weights::QuantizationConfig>> extract_quantization_config(const ov::AnyMap& properties) {
+    ov::AnyMap plugin_config = properties;
+    using QConfig = ov::genai::modeling::weights::QuantizationConfig;
+    std::optional<QConfig> quant_config = std::nullopt;
+    
+    // Check for "QUANTIZATION_CONFIG" key
+    auto it = plugin_config.find("QUANTIZATION_CONFIG");
+    if (it != plugin_config.end()) {
+         if (it->second.is<QConfig>()) {
+             quant_config = it->second.as<QConfig>();
+         }
+         plugin_config.erase(it);
+    }
+    
+    return {plugin_config, quant_config};
+};
+
 std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  const ov::AnyMap& properties) {
     auto [filtered_properties, enable_save_ov_model] = extract_gguf_properties(properties);
+    auto [props_without_qconfig, quant_config] = extract_quantization_config(filtered_properties);
+    // Use properties potentially without quantization config for further processing if needed, 
+    // but read_model typically passes filtered properties to Core.
+    // However, for Unified Loader we want to pass the config.
+    
+    // We update filtered_properties to remove QUANTIZATION_CONFIG so it doesn't cause issues if passed to Core
+    filtered_properties = props_without_qconfig; 
     
     // =========================================================================
     // New unified loader path (opt-in via OV_GENAI_USE_UNIFIED_LOADER=1)
@@ -432,6 +456,11 @@ std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  c
                     
                     // Load config
                     auto config = loader->load_config(model_dir.string());
+                    
+                    // Inject quantization config if provided via properties
+                    if (quant_config.has_value()) {
+                        config.quantization_config = quant_config;
+                    }
                     
                     // Create weight source and finalizer
                     auto source = loader->create_weight_source(model_dir.string());
@@ -476,7 +505,11 @@ std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  c
     if (std::filesystem::is_directory(model_dir) && is_safetensors_model_dir(model_dir)) {
         // If OpenVINO model already exists, use it; otherwise create from safetensors
         if (!std::filesystem::exists(model_dir / "openvino_model.xml")) {
-            return ov::genai::safetensors::create_from_safetensors(model_dir, enable_save_ov_model);
+             ov::genai::modeling::weights::QuantizationConfig q_conf;
+             if (quant_config.has_value()) {
+                 q_conf = *quant_config;
+             }
+            return ov::genai::safetensors::create_from_safetensors(model_dir, enable_save_ov_model, q_conf);
         }
     }
 #endif

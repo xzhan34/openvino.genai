@@ -27,6 +27,7 @@
 #include "openvino/genai/chat_history.hpp"
 #include "openvino/genai/json_container.hpp"
 #include "openvino/genai/tokenizer.hpp"
+#include "quantization_utils.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
@@ -943,7 +944,7 @@ int main(int argc, char* argv[]) try {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
                   << " <MODEL_DIR> <PROMPT> [OUTPUT_BMP] [DEVICE] [HEIGHT] [WIDTH] [STEPS] [SEED] [GUIDANCE]"
-                  << " [DUMP_DIR|none]\n";
+                  << " [DUMP_DIR|none] [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP] [DIT_QUANT] [DIT_GS] [DIT_BACKUP] [VAE_QUANT] [VAE_GS] [VAE_BACKUP]\n";
         return 1;
     }
 
@@ -957,6 +958,22 @@ int main(int argc, char* argv[]) try {
     const int32_t seed_arg = (argc > 8) ? std::stoi(argv[8]) : 0;
     const float guidance_scale = (argc > 9) ? std::stof(argv[9]) : 0.0f;
     const std::string dump_dir_arg = (argc > 10) ? argv[10] : "";
+    
+    // Text Encoder Quantization args
+    std::string text_quant_mode = (argc > 11) ? argv[11] : "";
+    int text_group_size = (argc > 12) ? std::stoi(argv[12]) : 128;
+    std::string text_backup_mode = (argc > 13) ? argv[13] : "";
+
+    // DiT Quantization args
+    std::string dit_quant_mode = (argc > 14) ? argv[14] : "";
+    int dit_group_size = (argc > 15) ? std::stoi(argv[15]) : 128;
+    std::string dit_backup_mode = (argc > 16) ? argv[16] : "";
+
+    // VAE Quantization args
+    std::string vae_quant_mode = (argc > 17) ? argv[17] : "";
+    int vae_group_size = (argc > 18) ? std::stoi(argv[18]) : 128;
+    std::string vae_backup_mode = (argc > 19) ? argv[19] : "";
+
     const float cfg_truncation = 1.0f;
 
     DumpContext dump;
@@ -1019,23 +1036,37 @@ int main(int argc, char* argv[]) try {
 
     ov::genai::Tokenizer tokenizer(tokenizer_dir);
 
-    // create text_encoder model
-    auto text_data = ov::genai::safetensors::load_safetensors(text_dir);
-    ov::genai::safetensors::SafetensorsWeightSource text_source(std::move(text_data));
-    ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer;
-    auto text_model = ov::genai::modeling::models::create_qwen3_text_encoder_model(text_cfg, text_source, text_finalizer);
+    // parse quantization config from args
+    auto text_quant_config = create_quantization_config(text_quant_mode, text_group_size, text_backup_mode);
+    auto dit_quant_config = create_quantization_config(dit_quant_mode, dit_group_size, dit_backup_mode);
+    auto vae_quant_config = create_quantization_config(vae_quant_mode, vae_group_size, vae_backup_mode);
 
-    // create DiT model
-    auto dit_data = ov::genai::safetensors::load_safetensors(dit_dir);
-    ov::genai::safetensors::SafetensorsWeightSource dit_source(std::move(dit_data));
-    ov::genai::safetensors::SafetensorsWeightFinalizer dit_finalizer;
-    auto dit_model = create_zimage_dit_model(dit_cfg, dit_source, dit_finalizer);
-
-    // create VAE decoder model
-    auto vae_data = ov::genai::safetensors::load_safetensors(vae_dir);
-    ov::genai::safetensors::SafetensorsWeightSource vae_source(std::move(vae_data));
-    ov::genai::safetensors::SafetensorsWeightFinalizer vae_finalizer;
-    auto vae_model = ov::genai::modeling::models::create_zimage_vae_decoder_model(vae_cfg, vae_source, vae_finalizer);
+    std::shared_ptr<ov::Model> text_model;
+    {
+        // create text_encoder model
+        auto text_data = ov::genai::safetensors::load_safetensors(text_dir);
+        ov::genai::safetensors::SafetensorsWeightSource text_source(std::move(text_data));
+        ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
+        text_model = ov::genai::modeling::models::create_qwen3_text_encoder_model(text_cfg, text_source, text_finalizer);
+    }
+    
+    std::shared_ptr<ov::Model> dit_model;
+    {
+        // create DiT model
+        auto dit_data = ov::genai::safetensors::load_safetensors(dit_dir);
+        ov::genai::safetensors::SafetensorsWeightSource dit_source(std::move(dit_data));
+        ov::genai::safetensors::SafetensorsWeightFinalizer dit_finalizer(dit_quant_config);
+        dit_model = create_zimage_dit_model(dit_cfg, dit_source, dit_finalizer);
+    }
+    
+    std::shared_ptr<ov::Model> vae_model;
+    {
+        // create VAE decoder model
+        auto vae_data = ov::genai::safetensors::load_safetensors(vae_dir);
+        ov::genai::safetensors::SafetensorsWeightSource vae_source(std::move(vae_data));
+        ov::genai::safetensors::SafetensorsWeightFinalizer vae_finalizer(vae_quant_config);
+        vae_model = ov::genai::modeling::models::create_zimage_vae_decoder_model(vae_cfg, vae_source, vae_finalizer);
+    }
 
     // compile the 3 models
     ov::Core core;

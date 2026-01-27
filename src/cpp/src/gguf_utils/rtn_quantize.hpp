@@ -483,15 +483,24 @@ inline void quantize_int4_asym_typed(
  */
 inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2 && shape.size() != 3) {
-        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
+    if (shape.size() != 1 && shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 1D, 2D or 3D for quantization");
     }
     
-    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
-    // For 3D, treat as [batch * out_features, in_features]
-    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
-    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
-    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
+    // Support 1D [in_features], 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    size_t out_features = 1;
+    size_t in_features = shape[0];
+    ov::Shape output_shape = {};
+
+    if (shape.size() == 2) {
+        out_features = shape[0];
+        in_features = shape[1];
+        output_shape = {shape[0]};
+    } else if (shape.size() == 3) {
+        out_features = shape[0] * shape[1];
+        in_features = shape[2];
+        output_shape = {shape[0], shape[1]};
+    }
     
     // Handle channel-wise quantization (group_size = -1)
     if (group_size <= 0) {
@@ -565,15 +574,24 @@ inline QuantizedWeight quantize_int4_sym(const ov::Tensor& weight, int group_siz
  */
 inline QuantizedWeight quantize_int4_asym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2 && shape.size() != 3) {
-        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
+    if (shape.size() != 1 && shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 1D, 2D or 3D for quantization");
     }
     
-    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
-    // For 3D, treat as [batch * out_features, in_features]
-    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
-    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
-    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
+    // Support 1D [in_features], 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    size_t out_features = 1;
+    size_t in_features = shape[0];
+    ov::Shape output_shape = {};
+
+    if (shape.size() == 2) {
+        out_features = shape[0];
+        in_features = shape[1];
+        output_shape = {shape[0]};
+    } else if (shape.size() == 3) {
+        out_features = shape[0] * shape[1];
+        in_features = shape[2];
+        output_shape = {shape[0], shape[1]};
+    }
     
     // Handle channel-wise quantization (group_size = -1)
     if (group_size <= 0) {
@@ -840,15 +858,24 @@ inline void quantize_int8_asym_typed(
  */
 inline QuantizedWeight quantize_int8_sym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2 && shape.size() != 3) {
-        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
+    if (shape.size() != 1 && shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 1D, 2D or 3D for quantization");
     }
     
-    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
-    // For 3D, treat as [batch * out_features, in_features]
-    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
-    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
-    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
+    // Support 1D [in_features], 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    size_t out_features = 1;
+    size_t in_features = shape[0];
+    ov::Shape output_shape = {};
+
+    if (shape.size() == 2) {
+        out_features = shape[0];
+        in_features = shape[1];
+        output_shape = {shape[0]};
+    } else if (shape.size() == 3) {
+        out_features = shape[0] * shape[1];
+        in_features = shape[2];
+        output_shape = {shape[0], shape[1]};
+    }
     
     // Handle channel-wise quantization (group_size = -1)
     if (group_size <= 0) {
@@ -918,15 +945,24 @@ inline QuantizedWeight quantize_int8_sym(const ov::Tensor& weight, int group_siz
  */
 inline QuantizedWeight quantize_int8_asym(const ov::Tensor& weight, int group_size = 128) {
     auto shape = weight.get_shape();
-    if (shape.size() != 2 && shape.size() != 3) {
-        throw std::runtime_error("Weight tensor must be 2D or 3D for quantization");
+    if (shape.size() != 1 && shape.size() != 2 && shape.size() != 3) {
+        throw std::runtime_error("Weight tensor must be 1D, 2D or 3D for quantization");
     }
     
-    // Support both 2D [out_features, in_features] and 3D [batch, out_features, in_features]
-    // For 3D, treat as [batch * out_features, in_features]
-    size_t out_features = (shape.size() == 3) ? (shape[0] * shape[1]) : shape[0];
-    size_t in_features = (shape.size() == 3) ? shape[2] : shape[1];
-    ov::Shape output_shape = (shape.size() == 3) ? ov::Shape{shape[0], shape[1]} : ov::Shape{shape[0]};
+    // Support 1D [in_features], 2D [out_features, in_features] and 3D [batch, out_features, in_features]
+    size_t out_features = 1;
+    size_t in_features = shape[0];
+    ov::Shape output_shape = {};
+
+    if (shape.size() == 2) {
+        out_features = shape[0];
+        in_features = shape[1];
+        output_shape = {shape[0]};
+    } else if (shape.size() == 3) {
+        out_features = shape[0] * shape[1];
+        in_features = shape[2];
+        output_shape = {shape[0], shape[1]};
+    }
 
     // Handle channel-wise quantization (group_size = -1)
     if (group_size <= 0) {

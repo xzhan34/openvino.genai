@@ -75,6 +75,18 @@ SafetensorsWeightFinalizer::SafetensorsWeightFinalizer(const QuantizationConfig&
     }
 }
 
+SafetensorsWeightFinalizer::~SafetensorsWeightFinalizer() {
+    if (total_weights_ > 0) {
+        std::cout << "[SafetensorsWeightFinalizer] Statistics:" << std::endl;
+        std::cout << "  Total weights processed: " << total_weights_ << std::endl;
+        std::cout << "  Quantized weights: " << quantized_weights_ << std::endl;
+        if (total_weights_ > 0) {
+             float ratio = 100.0f * static_cast<float>(quantized_weights_) / static_cast<float>(total_weights_);
+             std::cout << "  Quantization coverage: " << ratio << "%" << std::endl;
+        }
+    }
+}
+
 ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finalize(
     const std::string& name,
     ov::genai::modeling::weights::WeightSource& source,
@@ -98,11 +110,14 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
     ov::element::Type element_type = tensor.get_element_type();
     const ov::Shape& shape = tensor.get_shape();
 
+    total_weights_++;
+
     // Check if in-flight quantization should be applied
     ov::Output<ov::Node> output;
     std::unordered_map<std::string, ov::genai::modeling::Tensor> auxiliary;
     
     if (selector_.enabled() && selector_.should_quantize(name, shape, element_type)) {
+        quantized_weights_++;
         // Quantize the weight during finalization
         // Tensor reference is already fetched above, no need to fetch again
         auto quant_result = quantize_weight(name, tensor, source, ctx);
@@ -152,8 +167,8 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
     int group_size = selector_.get_group_size(name);
     
     // RTN quantization functions expect 2D tensors
-    OPENVINO_ASSERT(tensor.get_shape().size() == 2 || tensor.get_shape().size() == 3, 
-                    "Only 2D and 3D tensors can be quantized, got shape: ", tensor.get_shape());
+    OPENVINO_ASSERT(tensor.get_shape().size() == 2 || tensor.get_shape().size() == 3 || tensor.get_shape().size() == 1, 
+                    "Only 1D, 2D and 3D tensors can be quantized, got shape: ", tensor.get_shape());
     
     // Quantize using RTN algorithms
     rtn::QuantizedWeight quant_result;
@@ -187,12 +202,20 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     const rtn::QuantizedWeight& quant_result,
     const ov::Shape& original_shape) {
     
-    // Support 2D [out, in] and 3D [batch, out, in] weights
-    OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3, 
-                    "Original shape must be 2D or 3D for dequantization");
+    // Support 1D [in], 2D [out, in] and 3D [batch, out, in] weights
+    OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3 || original_shape.size() == 1, 
+                    "Original shape must be 1D, 2D or 3D for dequantization");
     
-    size_t out_features = (original_shape.size() == 3) ? (original_shape[0] * original_shape[1]) : original_shape[0];
-    size_t in_features = (original_shape.size() == 3) ? original_shape[2] : original_shape[1];
+    size_t out_features = 1;
+    size_t in_features = original_shape[0];
+
+    if (original_shape.size() == 2) {
+        out_features = original_shape[0];
+        in_features = original_shape[1];
+    } else if (original_shape.size() == 3) {
+        out_features = original_shape[0] * original_shape[1];
+        in_features = original_shape[2];
+    }
     
     // Create scale constant
     auto scale_const = std::make_shared<ov::op::v0::Constant>(quant_result.scale);

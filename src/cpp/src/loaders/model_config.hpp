@@ -20,6 +20,7 @@
 #include <filesystem>
 
 #include <openvino/openvino.hpp>
+#include "modeling/weights/quantization_config.hpp"
 
 // Forward declarations for format-specific types
 namespace ov {
@@ -120,6 +121,11 @@ struct ModelConfig {
     /// Activation function (e.g., "silu", "gelu")
     std::string hidden_act = "silu";
     
+    // ========== Quantization ==========
+    
+    /// In-flight quantization configuration
+    std::optional<ov::genai::modeling::weights::QuantizationConfig> quantization_config;
+
     // ========== SmolLM3-specific ==========
     
     /// Interval for layers without RoPE (SmolLM3: every 4th layer has no RoPE)

@@ -541,11 +541,10 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
  */
 std::shared_ptr<ov::Model> create_model_with_modeling_api(
     const HFConfig& hf_config,
-    SafetensorsData& st_data) {
+    SafetensorsData& st_data,
+    const ov::genai::modeling::weights::QuantizationConfig& quant_config) {
     // Create weight source
     SafetensorsWeightSource source(st_data);
-    // Helper to check if a key exists (tensor_infos is always populated)
-    auto quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
     SafetensorsWeightFinalizer finalizer(quant_config);
 
     // For checking bias/lm_head presence, use tensor_infos (always populated)
@@ -830,10 +829,22 @@ void convert_tokenizer_if_needed(const std::filesystem::path& model_dir) {
 
 std::shared_ptr<ov::Model> create_from_safetensors(
     const std::filesystem::path& model_dir,
-    bool enable_save_ov_model) {
+    bool enable_save_ov_model,
+    const ov::genai::modeling::weights::QuantizationConfig& quant_config) {
     
     // Check if in-flight compression is enabled via environment variable
     auto compression_config = get_compression_config_from_env();
+    
+    // Use passed config, but fallback to env if not provided/enabled
+    ov::genai::modeling::weights::QuantizationConfig final_quant_config = quant_config;
+    if (!final_quant_config.enabled()) {
+        final_quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
+    }
+    
+    if (final_quant_config.enabled()) {
+         std::cout << "[Safetensors] In-flight compression enabled" << std::endl;
+    }
+    
     if (!use_modeling_api() && compression_config.enabled) {
         std::cout << "[Safetensors] In-flight compression enabled via OV_GENAI_INFLIGHT_QUANT_MODE" << std::endl;
         return create_from_safetensors_compressed(model_dir, compression_config, enable_save_ov_model);
@@ -939,7 +950,7 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     // Check if new modeling API should be used
     if ((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "smollm3" || model_type == "youtu_llm") && use_modeling_api()) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
-        model = create_model_with_modeling_api(config, st_data);
+        model = create_model_with_modeling_api(config, st_data, final_quant_config);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
                model_type == "mistral" || model_type == "mixtral") {
         std::cout << "[Safetensors] Using legacy building_blocks" << std::endl;

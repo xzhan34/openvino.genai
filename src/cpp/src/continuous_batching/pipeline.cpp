@@ -89,7 +89,8 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
     auto is_prompt_lookup_enabled = extract_prompt_lookup_from_config(properties_without_draft_model);
 
     auto model = utils::read_model(models_path, properties_without_draft_model);
-    auto [properties_without_draft_model_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties_without_draft_model);
+    auto [properties_without_quantization, qconf_ignored] = utils::extract_quantization_config(properties_without_draft_model);
+    auto [properties_without_draft_model_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties_without_quantization);
     properties_without_draft_model_without_gguf[ov::cache_model_path.name()] = models_path;
 
     auto generation_config = utils::from_config_json_if_exists(models_path);
