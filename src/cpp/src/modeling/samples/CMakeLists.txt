@@ -44,6 +44,36 @@ set_target_properties(modeling_qwen3_vl PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
 
+add_executable(modeling_deepseek_ocr2
+    modeling_deepseek_ocr2.cpp
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat/load_image.cpp"
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(modeling_deepseek_ocr2 PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(modeling_deepseek_ocr2 PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(modeling_deepseek_ocr2 PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(modeling_deepseek_ocr2 openvino_genai)
+
+add_custom_command(TARGET modeling_deepseek_ocr2 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:modeling_deepseek_ocr2>"
+    VERBATIM)
+
+set_target_properties(modeling_deepseek_ocr2 PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)
+
 add_executable(modeling_zimage
     modeling_zimage.cpp
     "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/image_generation/imwrite.cpp"
