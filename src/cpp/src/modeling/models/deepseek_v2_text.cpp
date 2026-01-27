@@ -365,7 +365,7 @@ Tensor DeepseekV2MoE::forward(const Tensor& x) const {
     auto flat_f32 = flat.to(ov::element::f32);
     auto gate_w = gate_weight().to(ov::element::f32);
     auto logits = ops::linear(flat_f32, gate_w);
-    auto scores = logits.softmax(-1);
+    auto scores = logits.softmax(1);
 
     auto k_node = ops::const_scalar(ctx, static_cast<int64_t>(top_k_));
     auto topk = std::make_shared<ov::op::v11::TopK>(
@@ -407,12 +407,7 @@ Tensor DeepseekV2MoE::forward(const Tensor& x) const {
     auto gate_weights = ops::tensor::stack(gate_expert_weights(), 0);
     auto up_weights = ops::tensor::stack(up_expert_weights(), 0);
 
-    std::vector<Tensor> down_transposed;
-    down_transposed.reserve(num_experts_);
-    for (const auto& w : down_expert_weights()) {
-        down_transposed.push_back(w.transpose({1, 0}));
-    }
-    auto down_weights = ops::tensor::stack(down_transposed, 0);
+    auto down_weights = ops::tensor::stack(down_expert_weights(), 0);
 
     auto gate_bmm = ops::matmul(tiled, gate_weights, false, true);
     auto up_bmm = ops::matmul(tiled, up_weights, false, true);
