@@ -43,7 +43,7 @@ TEST(DeepseekQwen2MaskTest, BasicPattern) {
         0.0f, 0.0f, 0.0f, neg,
         0.0f, 0.0f, 0.0f, 0.0f
     };
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(DeepseekQwen2DecoderLayerTest, IdentityWithZeroWeights) {
@@ -116,5 +116,5 @@ TEST(DeepseekQwen2DecoderLayerTest, IdentityWithZeroWeights) {
     request.set_input_tensor(3, sin_tensor);
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), hidden_data, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), hidden_data, test_utils::k_tol_default);
 }

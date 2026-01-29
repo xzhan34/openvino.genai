@@ -225,5 +225,5 @@ TEST(DeepseekV2TextDummy, BuildsAndRunsWithMoE) {
     auto final_hidden = test_utils::rms_ref(sum2, norm_weight, batch * seq_len, hidden, cfg.rms_norm_eps);
     auto expected = test_utils::linear_ref_3d(final_hidden, lm_head_weight, batch, seq_len, hidden, vocab);
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-3f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
 }

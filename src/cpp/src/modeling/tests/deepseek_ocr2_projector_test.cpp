@@ -51,5 +51,5 @@ TEST(DeepseekOCR2ProjectorTest, LinearProjection) {
     request.infer();
 
     auto expected = test_utils::linear_ref_3d_bias(input_data, weight, bias, 1, 2, 4, 6);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }

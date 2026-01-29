@@ -47,7 +47,7 @@ TEST(DeepseekSamPatchEmbedTest, Conv2dPatchEmbed) {
     request.infer();
 
     std::vector<float> expected{10.0f};
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
 TEST(DeepseekSamBlockTest, WindowPartitionIdentity) {
@@ -99,5 +99,5 @@ TEST(DeepseekSamBlockTest, WindowPartitionIdentity) {
     request.set_input_tensor(0, input_tensor);
     request.infer();
 
-    test_utils::expect_tensor_near(request.get_output_tensor(), input_data, 1e-4f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), input_data, test_utils::k_tol_default);
 }

@@ -320,11 +320,11 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
     ov::genai::modeling::BuilderContext ctx;
 
     constexpr size_t batch = 1;
-    constexpr size_t seq_len = 2;
-    constexpr size_t hidden_size = 128;
-    constexpr size_t inter_size = 256;
+    constexpr size_t seq_len = 16;
+    constexpr size_t hidden_size = 1024;
+    constexpr size_t inter_size = 2048;
     constexpr size_t num_experts = 8;
-    constexpr size_t top_k = 2;
+    constexpr size_t top_k = 4;
     constexpr size_t group_size = 128;
 
     static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
@@ -335,7 +335,7 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
 
     auto hidden_states = test_utils::random_f32(tokens * hidden_size, -0.5f, 0.5f, 11);
     auto gate_inp = test_utils::random_f32(num_experts * hidden_size, -0.5f, 0.5f, 23);
-
+    
     auto gate_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 31);
     auto up_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 37);
     auto down_w_f32 = test_utils::random_f32(num_experts * hidden_size * inter_size, -0.5f, 0.5f, 41);
@@ -393,9 +393,11 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
     auto hidden_tensor = test_utils::make_tensor(hidden_states, {tokens, hidden_size});
     request.set_input_tensor(0, hidden_tensor);
     request.infer();
+    
+    auto gate_inp_deq = test_utils::dequantize_q41(q_gate_inp, num_experts, 1, hidden_size);
 
     auto expected = test_utils::moe_ref(hidden_states,
-                                        gate_inp,
+                                        gate_inp_deq,
                                         gate_w_deq,
                                         up_w_deq,
                                         down_w_deq,
@@ -405,5 +407,5 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
                                         inter_size,
                                         num_experts,
                                         top_k);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-1f);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
 }
