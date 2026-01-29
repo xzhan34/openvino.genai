@@ -440,17 +440,18 @@ Tensor WanAttention::forward(const Tensor& hidden_states,
     auto k_heads = k.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
     auto v_heads = v.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
 
+    auto* policy = &ctx().op_policy();
+
     if (rotary_cos || rotary_sin) {
         if (!rotary_cos || !rotary_sin) {
             OPENVINO_THROW("WanAttention requires both rotary_cos and rotary_sin");
         }
         auto cos = rotary_cos->to(q_heads.dtype());
         auto sin = rotary_sin->to(q_heads.dtype());
-        q_heads = ops::llm::apply_rope_interleave(q_heads, cos, sin, head_dim_);
-        k_heads = ops::llm::apply_rope_interleave(k_heads, cos, sin, head_dim_);
+        q_heads = ops::llm::apply_rope_interleave(q_heads, cos, sin, head_dim_, policy);
+        k_heads = ops::llm::apply_rope_interleave(k_heads, cos, sin, head_dim_, policy);
     }
 
-    auto* policy = &ctx().op_policy();
     auto context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, nullptr, false, policy);
 
     if (encoder_hidden_states_image && added_kv_proj_dim_) {
@@ -689,6 +690,7 @@ std::shared_ptr<ov::Model> create_wan_dit_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer) {
     BuilderContext ctx;
+    ctx.op_policy().use_internal_rope = false;
     WanTransformer3DModel model(ctx, cfg);
 
     WanWeightMapping::apply_transformer_packed_mapping(model);

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <openvino/opsets/opset13.hpp>
+#include <openvino/core/except.hpp>
 #include <ov_ops/rotary_positional_embeddings.hpp>
 
 #include "modeling/ops/ops.hpp"
@@ -47,7 +48,24 @@ Tensor apply_rope(const Tensor& x,
                   const Tensor& sin,
                   int32_t head_dim,
                   const OpPolicy* policy) {
-    (void)policy;
+    if (head_dim % 2 != 0) {
+        OPENVINO_THROW("apply_rope expects even head_dim");
+    }
+
+    const bool use_internal = policy ? policy->use_internal_rope : true;
+    if (!use_internal) {
+        const int32_t half_dim = head_dim / 2;
+        auto cos_cast = cos.to(x.dtype()).unsqueeze(1);  // [B, 1, S, half]
+        auto sin_cast = sin.to(x.dtype()).unsqueeze(1);  // [B, 1, S, half]
+
+        auto x1 = slice(x, 0, half_dim, 1, 3);
+        auto x2 = slice(x, half_dim, head_dim, 1, 3);
+
+        auto out1 = x1 * cos_cast - x2 * sin_cast;
+        auto out2 = x1 * sin_cast + x2 * cos_cast;
+        return concat({out1, out2}, 3);
+    }
+
     // Use internal RoPE op directly for optimal GPU performance.
     // This avoids relying on RoPEFusion transformation to match patterns.
     //

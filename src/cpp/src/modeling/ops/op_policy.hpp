@@ -10,7 +10,7 @@ namespace modeling {
 struct OpPolicy {
     bool use_internal_fc = true;
     bool use_internal_rms = false;
-    bool use_internal_rope = false;
+    bool use_internal_rope = true;
     bool use_internal_sdpa = false;
 };
 

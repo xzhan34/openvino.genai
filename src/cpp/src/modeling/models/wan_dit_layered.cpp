@@ -263,6 +263,7 @@ std::shared_ptr<ov::Model> create_wan_dit_preprocess_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer) {
     BuilderContext ctx;
+    ctx.op_policy().use_internal_rope = false;
     WanDitPreprocess model(ctx, cfg);
 
     WanWeightMapping::apply_transformer_packed_mapping(model);
@@ -342,6 +343,7 @@ std::shared_ptr<ov::Model> create_wan_dit_block_group_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer) {
     BuilderContext ctx;
+    ctx.op_policy().use_internal_rope = false;
 
     // Create block group with empty name to ensure weight paths are correct
     // (e.g., "blocks.0.attn1.to_q.weight" instead of "group.blocks.0.attn1.to_q.weight")
@@ -387,6 +389,7 @@ std::shared_ptr<ov::Model> create_wan_dit_postprocess_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer) {
     BuilderContext ctx;
+    ctx.op_policy().use_internal_rope = false;
     WanDitPostprocess model(ctx, cfg);
 
     WanWeightMapping::apply_transformer_packed_mapping(model);
