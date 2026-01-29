@@ -12,18 +12,22 @@
  * 4. Comparing results with the monolithic model for correctness verification
  *
  * Usage:
- *   modeling_wan_dit_layer <TRANSFORMER_DIR> [LAYERS_PER_GROUP] [DEVICE]
+ *   modeling_wan_dit_layer <TRANSFORMER_DIR> [LAYERS_PER_GROUP] [DEVICE] [DUMP_IR]
+ *   modeling_wan_dit_layer <TRANSFORMER_DIR> [LAYERS_PER_GROUP] [DEVICE] [--dump-ir]
  *
  * Arguments:
  *   TRANSFORMER_DIR   - Path to the transformer model directory
  *                       (e.g., D:/data/models/Huggingface/Wan2.1-T2V-1.3B-Diffusers/transformer)
  *   LAYERS_PER_GROUP  - Number of transformer layers per block group (default: 1)
  *   DEVICE            - OpenVINO device to use (default: CPU)
+ *   DUMP_IR           - Optional: 1/true/yes/on to dump IR, 0/false/no/off to disable (default: off)
+ *   --dump-ir         - Optional flag to dump IR (default: off)
  */
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -102,6 +106,41 @@ std::vector<float> generate_random_data(size_t count, float mean, float std, uin
         data[i] = dist(rng);
     }
     return data;
+}
+
+bool parse_bool_value(const std::string& value, bool* out) {
+    std::string lower;
+    lower.resize(value.size());
+    std::transform(value.begin(), value.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+        *out = true;
+        return true;
+    }
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+std::filesystem::path get_executable_dir(const char* argv0) {
+    std::filesystem::path exe_path(argv0 ? argv0 : "");
+    if (exe_path.empty()) {
+        return std::filesystem::current_path();
+    }
+    if (exe_path.is_relative()) {
+        exe_path = std::filesystem::absolute(exe_path);
+    }
+    return exe_path.parent_path();
+}
+
+void dump_ir_model(const std::shared_ptr<ov::Model>& model, const std::filesystem::path& xml_path) {
+    if (!model) {
+        throw std::runtime_error("Cannot dump null model to IR");
+    }
+    std::cout << "  Dumping IR: " << xml_path << "\n";
+    ov::serialize(model, xml_path.string());
 }
 
 struct ComparisonResult {
@@ -185,20 +224,59 @@ struct TestConfig {
 int main(int argc, char* argv[]) try {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <TRANSFORMER_DIR> [LAYERS_PER_GROUP] [DEVICE]\n";
+                  << " <TRANSFORMER_DIR> [LAYERS_PER_GROUP] [DEVICE] [DUMP_IR] [--dump-ir]\n";
         std::cerr << "\nArguments:\n";
         std::cerr << "  TRANSFORMER_DIR   - Path to the transformer model directory\n";
         std::cerr << "  LAYERS_PER_GROUP  - Number of transformer layers per block group (default: 1)\n";
         std::cerr << "  DEVICE            - OpenVINO device to use (default: CPU)\n";
+        std::cerr << "  DUMP_IR           - Optional: 1/true/yes/on to dump IR, 0/false/no/off to disable (default: off)\n";
+        std::cerr << "  --dump-ir         - Optional flag to dump IR (default: off)\n";
         std::cerr << "\nExample:\n";
         std::cerr << "  " << argv[0]
-                  << " D:/data/models/Huggingface/Wan2.1-T2V-1.3B-Diffusers/transformer 2 CPU\n";
+                  << " D:/data/models/Huggingface/Wan2.1-T2V-1.3B-Diffusers/transformer 2 CPU --dump-ir\n";
         return 1;
     }
 
-    const std::filesystem::path transformer_dir = argv[1];
-    const int32_t layers_per_group = (argc > 2) ? std::stoi(argv[2]) : 1;
-    const std::string device = (argc > 3) ? argv[3] : "CPU";
+    bool dump_ir = false;
+    std::vector<std::string> positional_args;
+    positional_args.reserve(static_cast<size_t>(argc));
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--dump-ir" || arg == "--dump") {
+            dump_ir = true;
+            continue;
+        }
+        const std::string prefix = "--dump-ir=";
+        if (arg.rfind(prefix, 0) == 0) {
+            const std::string value = arg.substr(prefix.size());
+            if (!parse_bool_value(value, &dump_ir)) {
+                throw std::runtime_error("Invalid value for --dump-ir: " + value);
+            }
+            continue;
+        }
+        if (!arg.empty() && arg[0] == '-') {
+            throw std::runtime_error("Unknown option: " + arg);
+        }
+        positional_args.push_back(std::move(arg));
+    }
+
+    if (positional_args.empty()) {
+        throw std::runtime_error("TRANSFORMER_DIR is required");
+    }
+
+    const std::filesystem::path transformer_dir = positional_args[0];
+    const int32_t layers_per_group = (positional_args.size() > 1) ? std::stoi(positional_args[1]) : 1;
+    const std::string device = (positional_args.size() > 2) ? positional_args[2] : "CPU";
+    if (positional_args.size() > 3) {
+        bool positional_dump = false;
+        if (!parse_bool_value(positional_args[3], &positional_dump)) {
+            throw std::runtime_error("Unexpected extra argument: " + positional_args[3]);
+        }
+        dump_ir = positional_dump;
+    }
+    if (positional_args.size() > 4) {
+        throw std::runtime_error("Too many arguments");
+    }
 
     std::cout << "========================================\n";
     std::cout << "WAN DIT Layered Model Test\n";
@@ -206,6 +284,7 @@ int main(int argc, char* argv[]) try {
     std::cout << "Transformer directory: " << transformer_dir << "\n";
     std::cout << "Layers per group: " << layers_per_group << "\n";
     std::cout << "Device: " << device << "\n";
+    std::cout << "Dump IR: " << (dump_ir ? "enabled" : "disabled") << "\n";
     std::cout << "\n";
 
     // Load configuration
@@ -271,6 +350,28 @@ int main(int argc, char* argv[]) try {
     std::cout << "  " << layered_models.num_block_groups() << " block group models created\n";
     std::cout << "  Postprocess model created\n";
     std::cout << "\n";
+
+    if (dump_ir) {
+        std::cout << "[4.1] Dumping IR models...\n";
+        const std::filesystem::path exe_dir = get_executable_dir(argv[0]);
+        const std::string layered_prefix = "wan_dit_layered_lpg" + std::to_string(layers_per_group);
+
+        dump_ir_model(mono_model, exe_dir / "wan_dit_full.xml");
+        dump_ir_model(layered_models.preprocess, exe_dir / (layered_prefix + "_preprocess.xml"));
+
+        const int32_t total_layers = transformer_cfg.num_layers;
+        const size_t num_groups = layered_models.block_groups.size();
+        for (size_t g = 0; g < num_groups; ++g) {
+            const int32_t start = static_cast<int32_t>(g) * layers_per_group;
+            const int32_t count = std::min(layers_per_group, total_layers - start);
+            const std::string name = layered_prefix + "_block_group_" + std::to_string(g) +
+                                     "_l" + std::to_string(start) + "_n" + std::to_string(count) + ".xml";
+            dump_ir_model(layered_models.block_groups[g], exe_dir / name);
+        }
+
+        dump_ir_model(layered_models.postprocess, exe_dir / (layered_prefix + "_postprocess.xml"));
+        std::cout << "  IR dump completed in " << exe_dir << "\n\n";
+    }
 
     // ========================================================================
     // Compile Models

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <openvino/core/except.hpp>
+#include <openvino/core/model.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/llm.hpp"
@@ -319,7 +320,7 @@ std::shared_ptr<ov::Model> create_wan_dit_preprocess_model(
     auto result_ppw = std::make_shared<ov::op::v0::Result>(ppw);
     set_name(result_ppw, "ppw");
 
-    return ctx.build_model({
+    auto ov_model = ctx.build_model({
         result_tokens->output(0),
         result_rotary_cos->output(0),
         result_rotary_sin->output(0),
@@ -330,6 +331,8 @@ std::shared_ptr<ov::Model> create_wan_dit_preprocess_model(
         result_pph->output(0),
         result_ppw->output(0)
     });
+    ov_model->set_friendly_name("wan_dit_layered_preprocess");
+    return ov_model;
 }
 
 std::shared_ptr<ov::Model> create_wan_dit_block_group_model(
@@ -373,7 +376,10 @@ std::shared_ptr<ov::Model> create_wan_dit_block_group_model(
     auto result = std::make_shared<ov::op::v0::Result>(output.output());
     set_name(result, "hidden_states");
 
-    return ctx.build_model({result->output(0)});
+    auto ov_model = ctx.build_model({result->output(0)});
+    ov_model->set_friendly_name("wan_dit_layered_block_group_" + std::to_string(start_layer) +
+                                "_n" + std::to_string(num_layers));
+    return ov_model;
 }
 
 std::shared_ptr<ov::Model> create_wan_dit_postprocess_model(
@@ -410,7 +416,9 @@ std::shared_ptr<ov::Model> create_wan_dit_postprocess_model(
     auto result = std::make_shared<ov::op::v0::Result>(output.output());
     set_name(result, "sample");
 
-    return ctx.build_model({result->output(0)});
+    auto ov_model = ctx.build_model({result->output(0)});
+    ov_model->set_friendly_name("wan_dit_layered_postprocess");
+    return ov_model;
 }
 
 WanDitLayeredModels create_wan_dit_layered_models(
