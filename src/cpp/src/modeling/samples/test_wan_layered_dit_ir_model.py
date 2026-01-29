@@ -98,6 +98,18 @@ def _compare_outputs(a: np.ndarray, b: np.ndarray, rel_threshold: float) -> dict
     }
 
 
+def _to_ov_tensor(value: object) -> ov.Tensor:
+    if isinstance(value, ov.Tensor):
+        return value
+    return ov.Tensor(value)
+
+
+def _to_numpy(value: object) -> np.ndarray:
+    if isinstance(value, ov.Tensor):
+        return np.asarray(value.data)
+    return np.asarray(value)
+
+
 def main() -> int:
     args = parse_args()
     ir_dir = args.ir_dir
@@ -156,15 +168,15 @@ def main() -> int:
     compiled_full = core.compile_model(full_model, args.device)
     full_request = compiled_full.create_infer_request()
     for name, value in inputs.items():
-        full_request.set_tensor(name, value)
+        full_request.set_tensor(name, _to_ov_tensor(value))
     full_request.infer()
-    full_output = np.array(full_request.get_output_tensor(0))
+    full_output = _to_numpy(full_request.get_output_tensor(0))
 
     preprocess = core.compile_model(str(preprocess_xml), args.device)
     preprocess_request = preprocess.create_infer_request()
     for name, value in inputs.items():
         if name in {inp.get_any_name() for inp in preprocess.inputs}:
-            preprocess_request.set_tensor(name, value)
+            preprocess_request.set_tensor(name, _to_ov_tensor(value))
     preprocess_request.infer()
 
     tokens = preprocess_request.get_tensor("tokens")
@@ -197,7 +209,7 @@ def main() -> int:
     post_request.set_tensor("pph", pph)
     post_request.set_tensor("ppw", ppw)
     post_request.infer()
-    layered_output = np.array(post_request.get_tensor("sample"))
+    layered_output = _to_numpy(post_request.get_tensor("sample"))
 
     stats = _compare_outputs(full_output, layered_output, args.rel_threshold)
     print("Output comparison:")
