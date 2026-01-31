@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <string>
 #include <iostream>
-#include "safetensors_utils/safetensors_weight_finalizer.hpp"
+#include "safetensors_weight_finalizer.hpp"
 
 inline ov::genai::modeling::weights::QuantizationConfig create_quantization_config(
     std::string quant_mode, 

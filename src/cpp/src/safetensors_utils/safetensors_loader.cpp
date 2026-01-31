@@ -15,6 +15,8 @@
 #include <set>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <iomanip>
 
 namespace ov {
 namespace genai {
@@ -307,7 +309,11 @@ SafetensorsData load_safetensors(const std::filesystem::path& model_dir) {
         std::cout << "[Safetensors " << mode_str << "] " 
                   << (zero_copy ? "Mapping" : "Loading") << " " << file_path.filename() << "..." << std::endl;
         
+        auto start_load = std::chrono::high_resolution_clock::now();
         SafetensorsData file_data = load_safetensors_file(file_path);
+        auto end_load = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end_load - start_load).count();
+        std::cout << "  -> Time: " << std::fixed << std::setprecision(2) << ms << " ms" << std::endl;
         
         // Merge mmap holders (keeps mmap alive)
         for (auto& holder : file_data.mmap_holders) {

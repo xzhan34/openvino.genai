@@ -877,33 +877,36 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     // e.g., key="model.embed_tokens" -> looks for consts["model.embed_tokens.weight"]
     
     // Debug: Print first few weight names
-    std::cout << "[Safetensors] First 10 weight names:" << std::endl;
-    int count = 0;
-    // Print from tensors (non-zero-copy) or tensor_infos (zero-copy)
-    if (!st_data.tensors.empty()) {
-        for (const auto& [name, tensor] : st_data.tensors) {
-            if (count++ < 10) {
-                std::cout << "  - " << name << " (shape: ";
-                for (size_t i = 0; i < tensor.get_shape().size(); ++i) {
-                    std::cout << tensor.get_shape()[i];
-                    if (i < tensor.get_shape().size() - 1) std::cout << "x";
+    bool debug_verbose = false;
+    if (debug_verbose) {
+        std::cout << "[Safetensors] First 10 weight names:" << std::endl;
+        int count = 0;
+        // Print from tensors (non-zero-copy) or tensor_infos (zero-copy)
+        if (!st_data.tensors.empty()) {
+            for (const auto& [name, tensor] : st_data.tensors) {
+                if (count++ < 10) {
+                    std::cout << "  - " << name << " (shape: ";
+                    for (size_t i = 0; i < tensor.get_shape().size(); ++i) {
+                        std::cout << tensor.get_shape()[i];
+                        if (i < tensor.get_shape().size() - 1) std::cout << "x";
+                    }
+                    std::cout << ")" << std::endl;
                 }
-                std::cout << ")" << std::endl;
             }
-        }
-        std::cout << "[Safetensors] Loaded " << st_data.tensors.size() << " weight tensors" << std::endl;
-    } else {
-        for (const auto& [name, info] : st_data.tensor_infos) {
-            if (count++ < 10) {
-                std::cout << "  - " << name << " (shape: ";
-                for (size_t i = 0; i < info.shape.size(); ++i) {
-                    std::cout << info.shape[i];
-                    if (i < info.shape.size() - 1) std::cout << "x";
+            std::cout << "[Safetensors] Loaded " << st_data.tensors.size() << " weight tensors" << std::endl;
+        } else {
+            for (const auto& [name, info] : st_data.tensor_infos) {
+                if (count++ < 10) {
+                    std::cout << "  - " << name << " (shape: ";
+                    for (size_t i = 0; i < info.shape.size(); ++i) {
+                        std::cout << info.shape[i];
+                        if (i < info.shape.size() - 1) std::cout << "x";
+                    }
+                    std::cout << ")" << std::endl;
                 }
-                std::cout << ")" << std::endl;
             }
+            std::cout << "[Safetensors] Mapped " << st_data.tensor_infos.size() << " weight tensors (zero-copy)" << std::endl;
         }
-        std::cout << "[Safetensors] Mapped " << st_data.tensor_infos.size() << " weight tensors (zero-copy)" << std::endl;
     }
 
     // Step 2.5: Convert weight names from HF format to internal format

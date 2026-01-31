@@ -90,6 +90,11 @@ private:
     // Statistics
     size_t total_weights_ = 0;
     size_t quantized_weights_ = 0;
+
+    // Timing stats
+    double total_fetch_time_ms_ = 0;
+    double total_quant_time_ms_ = 0;
+    double total_graph_time_ms_ = 0;
 };
 
 }  // namespace safetensors

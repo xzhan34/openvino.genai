@@ -24,7 +24,7 @@
 #include "modeling/models/qwen3_vl_text.hpp"
 #include "modeling/models/qwen3_vl_utils.hpp"
 #include "modeling/models/qwen3_vl_vision.hpp"
-#include "quantization_utils.hpp"
+#include "safetensors_utils/quantization_utils.hpp"
 
 namespace {
 

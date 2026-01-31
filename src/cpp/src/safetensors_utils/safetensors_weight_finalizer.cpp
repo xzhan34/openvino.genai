@@ -15,6 +15,8 @@
 #include <openvino/op/convert.hpp>
 
 #include <iostream>
+#include <chrono>
+#include <iomanip>
 
 namespace ov {
 namespace genai {
@@ -84,6 +86,11 @@ SafetensorsWeightFinalizer::~SafetensorsWeightFinalizer() {
              float ratio = 100.0f * static_cast<float>(quantized_weights_) / static_cast<float>(total_weights_);
              std::cout << "  Quantization coverage: " << ratio << "%" << std::endl;
         }
+        std::cout << "  Timing (ms):" << std::endl;
+        std::cout << "    Fetch: " << std::fixed << std::setprecision(2) << total_fetch_time_ms_ << std::endl;
+        std::cout << "    Quant: " << std::fixed << std::setprecision(2) << total_quant_time_ms_ << std::endl;
+        std::cout << "    Graph: " << std::fixed << std::setprecision(2) << total_graph_time_ms_ << std::endl;
+        std::cout << "    Total: " << std::fixed << std::setprecision(2) << (total_fetch_time_ms_ + total_quant_time_ms_ + total_graph_time_ms_) << std::endl;
     }
 }
 
@@ -106,7 +113,13 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
 
     // Get tensor info for quantization check
     // Fetch tensor only once to avoid unnecessary caching
+    auto start_fetch = std::chrono::high_resolution_clock::now();
     const ov::Tensor& tensor = source.get_tensor(name);
+    auto end_fetch = std::chrono::high_resolution_clock::now();
+
+    double fetch_ms = std::chrono::duration<double, std::milli>(end_fetch - start_fetch).count();
+    total_fetch_time_ms_ += fetch_ms;
+
     ov::element::Type element_type = tensor.get_element_type();
     const ov::Shape& shape = tensor.get_shape();
 
@@ -116,18 +129,41 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
     ov::Output<ov::Node> output;
     std::unordered_map<std::string, ov::genai::modeling::Tensor> auxiliary;
     
+    double quant_ms = 0;
+    double graph_ms = 0;
+    bool logged = false;
+
     if (selector_.enabled() && selector_.should_quantize(name, shape, element_type)) {
         quantized_weights_++;
         // Quantize the weight during finalization
         // Tensor reference is already fetched above, no need to fetch again
+        auto start_quant = std::chrono::high_resolution_clock::now();
         auto quant_result = quantize_weight(name, tensor, source, ctx);
+        auto end_quant = std::chrono::high_resolution_clock::now();
+        quant_ms = std::chrono::duration<double, std::milli>(end_quant - start_quant).count();
+        total_quant_time_ms_ += quant_ms;
+
+        auto start_graph = std::chrono::high_resolution_clock::now();
         if (is_moe_weight(name)) {
             // For MoE weights, return FinalizedWeight with scales and zps in auxiliary
-            return create_moe_subgraph(name, quant_result, shape, ctx);
+            auto res = create_moe_subgraph(name, quant_result, shape, ctx);
+            auto end_graph = std::chrono::high_resolution_clock::now();
+            graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+            total_graph_time_ms_ += graph_ms;
+            if (logged) {
+                std::cout << "[Weight: " << name << "] Fetch=" << std::fixed << std::setprecision(2) << fetch_ms 
+                      << "ms, Quant=" << quant_ms << "ms, Graph=" << graph_ms << "ms" << std::endl;
+            }
+            return res;
         } else {
             output = create_dequant_subgraph(name, quant_result, shape);
         }
+        auto end_graph = std::chrono::high_resolution_clock::now();
+        graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+        total_graph_time_ms_ += graph_ms;
+        logged = false;
     } else {
+        auto start_graph = std::chrono::high_resolution_clock::now();
         // Only create Constant when NOT quantizing
         // This avoids keeping the original tensor in memory when we compress it
         std::shared_ptr<ov::op::v0::Constant> constant = std::make_shared<ov::op::v0::Constant>(tensor);
@@ -143,6 +179,14 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
         } else {
             output = constant->output(0);
         }
+        auto end_graph = std::chrono::high_resolution_clock::now();
+        graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+        total_graph_time_ms_ += graph_ms;
+    }
+    
+    if (logged) {
+        std::cout << "[Weight: " << name << "] Fetch=" << std::fixed << std::setprecision(2) << fetch_ms 
+                  << "ms, Quant=" << quant_ms << "ms, Graph=" << graph_ms << "ms" << std::endl;
     }
     
     cache_.emplace(name, output);

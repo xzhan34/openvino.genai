@@ -27,7 +27,7 @@
 #include "openvino/genai/chat_history.hpp"
 #include "openvino/genai/json_container.hpp"
 #include "openvino/genai/tokenizer.hpp"
-#include "quantization_utils.hpp"
+#include "safetensors_utils/quantization_utils.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
@@ -1074,15 +1074,11 @@ int main(int argc, char* argv[]) try {
     if (device.find("GPU") != std::string::npos) {
         compile_props[ov::hint::inference_precision.name()] = ov::element::f32;
     }
-    auto compiled_text = compile_props.empty()
-                             ? core.compile_model(text_model, device)
-                             : core.compile_model(text_model, device, compile_props);
+    auto compiled_text = core.compile_model(text_model, device);
     auto compiled_dit = compile_props.empty()
                             ? core.compile_model(dit_model, device)
                             : core.compile_model(dit_model, device, compile_props);
-    auto compiled_vae = compile_props.empty()
-                            ? core.compile_model(vae_model, device)
-                            : core.compile_model(vae_model, device, compile_props);
+    auto compiled_vae = core.compile_model(vae_model, device);
 
     // build chat template, tokenize, text encoder model inference
     auto prompt_start = std::chrono::steady_clock::now();
