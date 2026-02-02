@@ -4,6 +4,7 @@
 #include "modeling/ops/kv_cache.hpp"
 
 #include <iostream>
+#include <regex>
 #include <openvino/op/util/variable.hpp>
 #include <openvino/opsets/opset13.hpp>
 
@@ -14,6 +15,50 @@ namespace ov {
 namespace genai {
 namespace modeling {
 namespace ops {
+
+namespace {
+
+/**
+ * @brief Extract layer index from cache_prefix for NPUW-compatible Variable naming.
+ * 
+ * The StatefulToStateless pass in OpenVINO expects Variable names in a specific format:
+ *   past_key_values.<layer_idx>.key + present.<layer_idx>.key
+ * 
+ * This function extracts the layer index from prefixes like:
+ *   "model.layers[15].self_attn" -> 15
+ *   "layers[0].attention" -> 0
+ * 
+ * @param cache_prefix The module path prefix (e.g., "model.layers[15].self_attn")
+ * @return The extracted layer index, or -1 if not found
+ */
+int extract_layer_index(const std::string& cache_prefix) {
+    // Match patterns like "layers[15]" or "layers.15"
+    static const std::regex layer_pattern(R"(layers[\[\.](\_d+)[\]\.]?)");
+    std::smatch match;
+    if (std::regex_search(cache_prefix, match, layer_pattern)) {
+        return std::stoi(match[1].str());
+    }
+    return -1;  // Not found - will use original naming
+}
+
+/**
+ * @brief Generate NPUW-compatible Variable names for KV cache.
+ * 
+ * NPUW's StatefulToStateless pass expects names like:
+ *   past_key_values.N.keypresent.N.key  (for keys)
+ *   past_key_values.N.valuepresent.N.value  (for values)
+ * 
+ * @param layer_idx The layer index (0-based)
+ * @param is_key True for key cache, false for value cache
+ * @return The Variable name compatible with StatefulToStateless
+ */
+std::string make_npuw_variable_name(int layer_idx, bool is_key) {
+    const std::string type = is_key ? "key" : "value";
+    return "past_key_values." + std::to_string(layer_idx) + "." + type +
+           "present." + std::to_string(layer_idx) + "." + type;
+}
+
+}  // namespace
 
 std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
                                           const Tensor& values,
@@ -33,8 +78,19 @@ std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
     auto k_init = shape::broadcast_to(zero, cache_shape);
     auto v_init = shape::broadcast_to(zero, cache_shape);
 
-    const std::string k_name = cache_prefix + ".key_cache";
-    const std::string v_name = cache_prefix + ".value_cache";
+    // Generate NPUW-compatible Variable names for KV cache
+    // StatefulToStateless pass expects: past_key_values.N.keypresent.N.key format
+    std::string k_name, v_name;
+    int layer_idx = extract_layer_index(cache_prefix);
+    if (layer_idx >= 0) {
+        // Use NPUW-compatible naming for layers with index
+        k_name = make_npuw_variable_name(layer_idx, true);
+        v_name = make_npuw_variable_name(layer_idx, false);
+    } else {
+        // Fallback to original naming for non-indexed caches
+        k_name = cache_prefix + ".key_cache";
+        v_name = cache_prefix + ".value_cache";
+    }
 
     ov::op::util::VariableInfo k_info{ov::PartialShape{-1, num_kv_heads, -1, head_dim},
                                       keys.dtype(),
