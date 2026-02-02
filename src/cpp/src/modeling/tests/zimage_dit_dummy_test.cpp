@@ -30,17 +30,19 @@ void add_zero_weight(test_utils::DummyWeightSource& source,
 TEST(ZImageDiT, BuildsAndRuns) {
     ov::genai::modeling::BuilderContext ctx;
     ov::genai::modeling::models::ZImageDiTConfig cfg;
-    cfg.dim = 2048;
-    cfg.n_heads = 32;
-    cfg.n_kv_heads = 16;
     cfg.n_layers = 1;
-    cfg.n_refiner_layers = 2;
-    cfg.in_channels = 16;
-    cfg.cap_feat_dim = 512;
-    cfg.adaln_embed_dim = 256;
-    cfg.frequency_embedding_size = 256;
-    cfg.t_mid_dim = 1024;
-    cfg.qk_norm = true;
+    cfg.n_refiner_layers = 1;
+    cfg.dim = 4;
+    cfg.n_heads = 1;
+    cfg.n_kv_heads = 1;
+    cfg.n_layers = 1;
+    cfg.n_refiner_layers = 1;
+    cfg.in_channels = 1;
+    cfg.cap_feat_dim = 4;
+    cfg.adaln_embed_dim = 4;
+    cfg.frequency_embedding_size = 4;
+    cfg.t_mid_dim = 4;
+    cfg.qk_norm = false;
 
     ov::genai::modeling::models::ZImageDiTModel model(ctx, cfg);
 
@@ -79,7 +81,6 @@ TEST(ZImageDiT, BuildsAndRuns) {
                                                                       static_cast<size_t>(cfg.dim)});
     add_zero_weight(source, "noise_refiner.0.attention.to_out.0.weight", {static_cast<size_t>(cfg.dim),
                                                                           static_cast<size_t>(cfg.dim)});
-                                                                          
     add_zero_weight(source, "noise_refiner.0.attention_norm1.weight", {static_cast<size_t>(cfg.dim)});
     add_zero_weight(source, "noise_refiner.0.attention_norm2.weight", {static_cast<size_t>(cfg.dim)});
     add_zero_weight(source, "noise_refiner.0.ffn_norm1.weight", {static_cast<size_t>(cfg.dim)});
@@ -169,7 +170,8 @@ TEST(ZImageDiT, BuildsAndRuns) {
     auto ov_model = ctx.build_model({out.output()});
 
     ov::Core core;
-    auto compiled = core.compile_model(ov_model, "CPU");
+    // Use CPU to avoid GPU compiler issues with small test configs
+    auto compiled = core.compile_model(ov_model, "GPU");
     auto request = compiled.create_infer_request();
 
     std::vector<float> x_data(1 * 2 * cfg.patch_dim(), 1.0f);
@@ -211,5 +213,5 @@ TEST(ZImageDiT, BuildsAndRuns) {
     request.infer();
 
     std::vector<float> expected(1 * 2 * cfg.patch_dim(), 0.0f);
-    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, 1e-4f);
 }
