@@ -33,7 +33,7 @@ namespace {
  */
 int extract_layer_index(const std::string& cache_prefix) {
     // Match patterns like "layers[15]" or "layers.15"
-    static const std::regex layer_pattern(R"(layers[\[\.](\_d+)[\]\.]?)");
+    static const std::regex layer_pattern(R"(layers[\[\.](\d+)[\]\.]?)");
     std::smatch match;
     if (std::regex_search(cache_prefix, match, layer_pattern)) {
         return std::stoi(match[1].str());
@@ -92,15 +92,13 @@ std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
         v_name = cache_prefix + ".value_cache";
     }
 
-    ov::op::util::VariableInfo k_info{ov::PartialShape{-1, num_kv_heads, -1, head_dim},
-                                      keys.dtype(),
-                                      k_name};
+    // Create Variable with dynamic shapes
+    ov::PartialShape var_shape{-1, num_kv_heads, -1, head_dim};
+    ov::op::util::VariableInfo k_info{var_shape, keys.dtype(), k_name};
     auto k_var = std::make_shared<ov::op::util::Variable>(k_info);
     auto k_read = std::make_shared<ov::op::v6::ReadValue>(k_init.output(), k_var);
 
-    ov::op::util::VariableInfo v_info{ov::PartialShape{-1, num_kv_heads, -1, head_dim},
-                                      values.dtype(),
-                                      v_name};
+    ov::op::util::VariableInfo v_info{var_shape, values.dtype(), v_name};
     auto v_var = std::make_shared<ov::op::util::Variable>(v_info);
     auto v_read = std::make_shared<ov::op::v6::ReadValue>(v_init.output(), v_var);
 
