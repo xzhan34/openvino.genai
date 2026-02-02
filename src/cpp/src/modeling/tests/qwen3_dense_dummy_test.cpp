@@ -113,10 +113,11 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     ov::genai::modeling::weights::load_model(model, weights, finalizer);
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, position_ids, beam_idx);
+    auto logits = model.forward(input_ids, position_ids, beam_idx, attention_mask);
     auto ov_model = ctx.build_model({logits.output()});
     ov::serialize(ov_model, "qwen3_dummy_original.xml");
 
@@ -132,13 +133,17 @@ TEST(Qwen3DenseDummy, BuildsAndRuns) {
     std::memcpy(input_ids_tensor.data(), input_ids_data.data(), input_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(0, input_ids_tensor);
 
+    ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
+    std::fill_n(attention_mask_tensor.data<int64_t>(), batch * seq_len, 1);
+    request.set_input_tensor(1, attention_mask_tensor);
+
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
-    request.set_input_tensor(1, position_ids_tensor);
+    request.set_input_tensor(2, position_ids_tensor);
 
     ov::Tensor beam_tensor(ov::element::i32, {batch});
     std::fill_n(beam_tensor.data<int32_t>(), batch, 0);
-    request.set_input_tensor(2, beam_tensor);
+    request.set_input_tensor(3, beam_tensor);
 
     request.infer();
 
@@ -265,10 +270,11 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     ov::genai::modeling::weights::load_model(model, weights, finalizer);
 
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    auto logits = model.forward(input_ids, position_ids, beam_idx);
+    auto logits = model.forward(input_ids, position_ids, beam_idx, attention_mask);
     auto ov_model = ctx.build_model({logits.output()});
 
     ov::serialize(ov_model, "qwen3_dummy_original.xml");
@@ -286,13 +292,17 @@ TEST(Qwen3DenseDummy, TiedWeights) {
     std::memcpy(input_ids_tensor.data(), input_ids_data.data(), input_ids_data.size() * sizeof(int64_t));
     request.set_input_tensor(0, input_ids_tensor);
 
+    ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
+    std::fill_n(attention_mask_tensor.data<int64_t>(), batch * seq_len, 1);
+    request.set_input_tensor(1, attention_mask_tensor);
+
     ov::Tensor position_ids_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(position_ids_tensor.data(), position_ids_data.data(), position_ids_data.size() * sizeof(int64_t));
-    request.set_input_tensor(1, position_ids_tensor);
+    request.set_input_tensor(2, position_ids_tensor);
 
     ov::Tensor beam_tensor(ov::element::i32, {batch});
     std::fill_n(beam_tensor.data<int32_t>(), batch, 0);
-    request.set_input_tensor(2, beam_tensor);
+    request.set_input_tensor(3, beam_tensor);
 
     request.infer();
 

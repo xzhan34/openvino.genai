@@ -60,7 +60,7 @@ public:
                    const Tensor& beam_idx,
                    const Tensor& rope_cos,
                    const Tensor& rope_sin,
-                   const Tensor& causal_mask) const;
+                   const Tensor& attention_mask) const;
     Tensor forward_no_cache(const Tensor& hidden_states,
                             const Tensor& rope_cos,
                             const Tensor& rope_sin,
@@ -121,7 +121,7 @@ public:
                                       const Tensor& beam_idx,
                                       const Tensor& rope_cos,
                                       const Tensor& rope_sin,
-                                      const Tensor& causal_mask,
+                                      const Tensor& attention_mask,
                                       const std::optional<Tensor>& residual) const;
     std::pair<Tensor, Tensor> forward_no_cache(const Tensor& hidden_states,
                                                const Tensor& rope_cos,
@@ -139,10 +139,10 @@ private:
 class Qwen3Model : public Module {
 public:
     Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
-
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
-                   const Tensor& beam_idx);
+                   const Tensor& beam_idx,
+                   const Tensor& attention_mask);
     std::pair<Tensor, Tensor> forward_with_penultimate(const Tensor& input_ids,
                                                        const Tensor& position_ids,
                                                        const Tensor& beam_idx);
@@ -174,10 +174,10 @@ private:
 class Qwen3ForCausalLM : public Module {
 public:
     Qwen3ForCausalLM(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module* parent = nullptr);
-
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
-                   const Tensor& beam_idx);
+                   const Tensor& beam_idx,
+                   const Tensor& attention_mask);
 
     Qwen3Model& model();
     LMHead& lm_head();

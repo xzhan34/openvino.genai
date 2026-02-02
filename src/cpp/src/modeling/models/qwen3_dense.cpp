@@ -115,23 +115,27 @@ const Tensor* Qwen3Attention::o_proj_bias() const {
 Tensor Qwen3Attention::forward(const Tensor& positions, const Tensor& hidden_states, const Tensor& beam_idx) const {
     auto* policy = &ctx().op_policy();
     auto cos_sin = ops::llm::rope_cos_sin(positions, head_dim_, rope_theta_, policy);
-    auto seq_len = Tensor(shape::dim(positions, 1), positions.context()).squeeze(0);
-    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
-    return forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, causal_mask);
+    auto* op_ctx = positions.context();
+    auto batch = shape::dim(positions, 0);
+    auto seq_len = shape::dim(positions, 1);
+    auto mask_shape = shape::make({batch, seq_len});
+    auto one = Tensor(ops::const_scalar(op_ctx, int64_t{1}), op_ctx);
+    auto attention_mask = shape::broadcast_to(one, mask_shape);
+    return forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, attention_mask);
 }
 
 Tensor Qwen3Attention::forward(const Tensor& hidden_states,
                                const Tensor& beam_idx,
                                const Tensor& rope_cos,
                                const Tensor& rope_sin,
-                               const Tensor& causal_mask) const {
+                               const Tensor& attention_mask) const {
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
     auto k = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
     auto v = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
 
     auto q_heads = q.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
-    auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}) .permute({0, 2, 1, 3});
-    auto v_heads = v.reshape({0, 0, num_kv_heads_, head_dim_}) .permute({0, 2, 1, 3});
+    auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto v_heads = v.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
 
     if (q_norm_.weight_param().is_bound()) {
         q_heads = q_norm_.forward(q_heads);
@@ -149,8 +153,8 @@ Tensor Qwen3Attention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    // Build causal mask that works with KV cache scenario
-    auto mask = ops::llm::build_kv_causal_mask(q_rot, k_expanded);
+    // Build causal mask with attention_mask integration for NPU/NPUW compatibility
+    auto mask = ops::llm::build_kv_causal_mask_with_attention(q_rot, k_expanded, attention_mask);
     auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, &mask, false, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
@@ -243,7 +247,7 @@ std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& hidden_states
                                                      const Tensor& beam_idx,
                                                      const Tensor& rope_cos,
                                                      const Tensor& rope_sin,
-                                                     const Tensor& causal_mask,
+                                                     const Tensor& attention_mask,
                                                      const std::optional<Tensor>& residual) const {
     Tensor normed;
     Tensor next_residual;
@@ -255,7 +259,7 @@ std::pair<Tensor, Tensor> Qwen3DecoderLayer::forward(const Tensor& hidden_states
         normed = input_layernorm_.forward(hidden_states);
         next_residual = hidden_states;
     }
-    auto attn_out = self_attn_.forward(normed, beam_idx, rope_cos, rope_sin, causal_mask);
+    auto attn_out = self_attn_.forward(normed, beam_idx, rope_cos, rope_sin, attention_mask);
     auto post_norm = post_attention_layernorm_.forward(attn_out, next_residual);
     auto mlp_out = mlp_.forward(post_norm.first);
     return {mlp_out, post_norm.second};
@@ -297,15 +301,13 @@ Qwen3Model::Qwen3Model(BuilderContext& ctx, const Qwen3DenseConfig& cfg, Module*
     }
 }
 
-Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids, const Tensor& beam_idx) {
+Tensor Qwen3Model::forward(const Tensor& input_ids, const Tensor& position_ids, const Tensor& beam_idx, const Tensor& attention_mask) {
     auto hidden_states = embed_tokens_.forward(input_ids);
     auto* policy = &ctx().op_policy();
     auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
-    auto seq_len = Tensor(shape::dim(position_ids, 1), position_ids.context()).squeeze(0);
-    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
     std::optional<Tensor> residual;
     for (auto& layer : layers_) {
-        auto layer_out = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, causal_mask, residual);
+        auto layer_out = layer.forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, attention_mask, residual);
         hidden_states = layer_out.first;
         residual = layer_out.second;
     }
@@ -322,12 +324,16 @@ std::pair<Tensor, Tensor> Qwen3Model::forward_with_penultimate(const Tensor& inp
     Tensor penultimate = hidden_states;
     auto* policy = &ctx().op_policy();
     auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
-    auto seq_len = Tensor(shape::dim(position_ids, 1), position_ids.context()).squeeze(0);
-    auto causal_mask = ops::llm::causal_mask_from_seq_len(seq_len);
+    auto* op_ctx = input_ids.context();
+    auto batch = shape::dim(input_ids, 0);
+    auto seq_len = shape::dim(input_ids, 1);
+    auto mask_shape = shape::make({batch, seq_len});
+    auto one = Tensor(ops::const_scalar(op_ctx, int64_t{1}), op_ctx);
+    auto attention_mask = shape::broadcast_to(one, mask_shape);
     std::optional<Tensor> residual;
     const int32_t capture_idx = static_cast<int32_t>(layers_.size()) - 2;
     for (size_t i = 0; i < layers_.size(); ++i) {
-        auto layer_out = layers_[i].forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, causal_mask, residual);
+        auto layer_out = layers_[i].forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second, attention_mask, residual);
         hidden_states = layer_out.first;
         residual = layer_out.second;
         if (static_cast<int32_t>(i) == capture_idx) {
@@ -487,8 +493,9 @@ Qwen3ForCausalLM::Qwen3ForCausalLM(BuilderContext& ctx, const Qwen3DenseConfig& 
 
 Tensor Qwen3ForCausalLM::forward(const Tensor& input_ids,
                                  const Tensor& position_ids,
-                                 const Tensor& beam_idx) {
-    auto hidden = model_.forward(input_ids, position_ids, beam_idx);
+                                 const Tensor& beam_idx,
+                                 const Tensor& attention_mask) {
+    auto hidden = model_.forward(input_ids, position_ids, beam_idx, attention_mask);
     return lm_head_.forward(hidden);
 }
 
@@ -514,8 +521,8 @@ std::shared_ptr<ov::Model> create_qwen3_dense_model(
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{-1});
 
-    (void)attention_mask;
-    auto logits = model.forward(input_ids, position_ids, beam_idx);
+    // Use attention_mask in the forward pass for NPU/NPUW compatibility
+    auto logits = model.forward(input_ids, position_ids, beam_idx, attention_mask);
 
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, "logits");
@@ -726,7 +733,7 @@ std::shared_ptr<ov::Model> build_qwen3_model(
         node->output(0).set_names({name});
     };
 
-    // Create input parameters
+    // Create input parameters with dynamic shapes
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
@@ -738,10 +745,8 @@ std::shared_ptr<ov::Model> build_qwen3_model(
     position_ids.output().get_node()->output(0).set_names({"position_ids"});
     beam_idx.output().get_node()->output(0).set_names({"beam_idx"});
 
-    (void)attention_mask;  // Attention mask is handled internally by SDPA
-
-    // Forward pass
-    auto logits = model.forward(input_ids, position_ids, beam_idx);
+    // Use attention_mask in the forward pass for NPU/NPUW compatibility
+    auto logits = model.forward(input_ids, position_ids, beam_idx, attention_mask);
 
     // Build model with named output
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
