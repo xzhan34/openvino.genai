@@ -318,7 +318,6 @@ TEST(Ops, Moe3GemmFusedCompressed) {
 }
 
 TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
-    //为了查看生成的图是否正确，暂不进行结果对比
     
     ov::genai::modeling::BuilderContext ctx;
 

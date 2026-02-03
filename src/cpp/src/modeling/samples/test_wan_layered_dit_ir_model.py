@@ -199,7 +199,7 @@ def main() -> int:
         block_request.set_tensor("rotary_cos", rotary_cos)
         block_request.set_tensor("rotary_sin", rotary_sin)
         block_request.infer()
-        current = block_request.get_tensor("hidden_states")
+        current = block_request.get_tensor("hidden_states_out")
 
     postprocess = core.compile_model(str(postprocess_xml), args.device)
     post_request = postprocess.create_infer_request()

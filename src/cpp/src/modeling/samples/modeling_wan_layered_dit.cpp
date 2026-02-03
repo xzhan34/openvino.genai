@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -80,6 +81,13 @@ std::vector<float> tensor_to_float_vector(const ov::Tensor& src) {
         }
         return out;
     }
+    if (type == ov::element::i64) {
+        const auto* data = src.data<const int64_t>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(data[i]);
+        }
+        return out;
+    }
     throw std::runtime_error("Unsupported tensor dtype for conversion");
 }
 
@@ -104,6 +112,14 @@ std::vector<float> generate_random_data(size_t count, float mean, float std, uin
     std::vector<float> data(count);
     for (size_t i = 0; i < count; ++i) {
         data[i] = dist(rng);
+    }
+    return data;
+}
+
+std::vector<float> generate_fixed_data(size_t count, float scale = 1.0f) {
+    std::vector<float> data(count);
+    for (size_t i = 0; i < count; ++i) {
+        data[i] = std::sin(static_cast<float>(i)) * scale;
     }
     return data;
 }
@@ -523,7 +539,7 @@ int main(int argc, char* argv[]) try {
         block_request.set_tensor("rotary_sin", rotary_sin);
         block_request.infer();
 
-        current_hidden_states = block_request.get_tensor("hidden_states");
+        current_hidden_states = block_request.get_tensor("hidden_states_out");
         layered_models.block_groups[i].reset();
     }
 

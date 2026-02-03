@@ -51,6 +51,12 @@ Tensor apply_rope(const Tensor& x,
     if (head_dim % 2 != 0) {
         OPENVINO_THROW("apply_rope expects even head_dim");
     }
+    (void)policy;
+    // Align rotary factors with activation dtype to avoid mixed-type multiplies.
+    auto dtype = x.dtype();
+    auto cos_unsq = cos.to(dtype).unsqueeze(1);
+    auto sin_unsq = sin.to(dtype).unsqueeze(1);
+    int64_t half_dim = head_dim / 2;
 
     const bool use_internal = policy ? policy->use_internal_rope : true;
     if (!use_internal) {
@@ -112,6 +118,19 @@ Tensor apply_rope_interleave(const Tensor& x,
                            .permute({0, 1, 2, 4, 3})
                            .reshape({0, 0, 0, head_dim});
     return apply_rope(interleaved, cos, sin, head_dim, policy);
+}
+
+Tensor rope_tail(const Tensor& cos_or_sin, const Tensor& q) {
+    auto* ctx = cos_or_sin.context();
+    auto total_len = shape::dim(cos_or_sin, 1);
+    auto q_len = shape::dim(q, 2);
+
+    auto total_len_scalar = Tensor(total_len, ctx).squeeze(0);
+    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
+    auto start = total_len_scalar - q_len_scalar;
+
+    auto indices = range(start, total_len_scalar, 1, ov::element::i64);
+    return gather(cos_or_sin, indices, 1);
 }
 
 Tensor pad_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim) {
@@ -240,108 +259,6 @@ Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k) {
     return shape::broadcast_to(mask_4d, target_shape);
 }
 
-Tensor build_kv_causal_mask_with_attention(const Tensor& q, const Tensor& k, const Tensor& attention_mask) {
-    // Build causal mask for KV cache scenario with attention_mask integration.
-    // This function produces a mask structure compatible with NPU/NPUW.
-    //
-    // attention_mask: [batch, kv_len] where 1=attend, 0=mask (padding)
-    // Q: [batch, heads, q_len, head_dim]
-    // K: [batch, heads, kv_len, head_dim]
-    // Output: [batch, 1, q_len, kv_len]
-    //
-    // The mask combines causal masking with attention_mask to handle both:
-    // 1. Causal constraint: only attend to current and past positions
-    // 2. Padding mask: don't attend to padded positions
-    
-    auto* ctx = q.context();
-
-    // Get dimensions
-    auto batch = shape::dim(q, 0);  // [1]
-    auto q_len = shape::dim(q, 2);  // [1]
-    auto kv_len = shape::dim(k, 2); // [1]
-
-    // Squeeze to scalars for Range op
-    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
-    auto kv_len_scalar = Tensor(kv_len, ctx).squeeze(0);
-
-    // Calculate cache_seq_len = kv_len - q_len (as scalar)
-    auto cache_len_scalar = Tensor(
-        std::make_shared<ov::opset13::Subtract>(kv_len_scalar.output(), q_len_scalar.output())->output(0), ctx);
-
-    // Convert to i32 for Range
-    auto cache_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(cache_len_scalar.output(), ov::element::i32)->output(0), ctx);
-    auto q_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(q_len_scalar.output(), ov::element::i32)->output(0), ctx);
-    auto kv_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(kv_len_scalar.output(), ov::element::i32)->output(0), ctx);
-
-    // Create col indices: [0, 1, 2, ..., kv_len-1] -> [1, kv_len]
-    auto col_range = range(kv_len_i32, 0, 1, ov::element::i32);
-    auto col_indices = col_range.unsqueeze(0);  // [1, kv_len]
-
-    // Create row indices: [cache_len, cache_len+1, ..., cache_len+q_len-1] -> [q_len, 1]
-    auto q_len_plus_cache = cache_len_i32 + q_len_i32;
-    auto row_range = range(cache_len_i32, q_len_plus_cache, 1, ov::element::i32);
-    auto row_indices = row_range.unsqueeze(1);  // [q_len, 1]
-
-    // Causal condition: col <= row (attend to current and past positions)
-    auto causal_cond = less_equal(col_indices, row_indices);  // [q_len, kv_len]
-
-    // Build mask values
-    auto zero_val = Tensor(const_scalar(ctx, 0.0f), ctx);
-    auto neg_inf = Tensor(const_scalar(ctx, -65504.0f), ctx);
-    
-    // Causal mask: 0 where can attend, -inf where masked
-    auto causal_mask_2d = where(causal_cond, zero_val, neg_inf);  // [q_len, kv_len]
-
-    // Process attention_mask: [batch, kv_len] -> [batch, 1, 1, kv_len]
-    // Convert attention_mask to float and create mask values
-    // attention_mask: 1=attend, 0=mask -> we need: 0 for attend, -inf for mask
-    auto attn_mask_f32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(attention_mask.output(), ov::element::f32)->output(0), ctx);
-    
-    // Create padding mask: where attention_mask==0, use -inf; where ==1, use 0
-    auto attn_zero = Tensor(const_scalar(ctx, 0.0f), ctx);
-    auto attn_mask_cond = Tensor(
-        std::make_shared<ov::op::v1::Equal>(attn_mask_f32.output(), attn_zero.output())->output(0), ctx);
-    auto padding_mask = where(attn_mask_cond, neg_inf, zero_val);  // [batch, kv_len]
-    
-    // Expand padding_mask to [batch, 1, 1, kv_len]
-    auto padding_mask_4d = padding_mask.unsqueeze({1, 2});  // [batch, 1, 1, kv_len]
-
-    // Expand causal_mask to [1, 1, q_len, kv_len] for broadcasting
-    auto causal_mask_4d = causal_mask_2d.unsqueeze({0, 1});  // [1, 1, q_len, kv_len]
-
-    // Combine masks: add causal_mask and padding_mask
-    // Result: positions that are either causally masked OR padding-masked get -inf
-    // This works because: 0 + 0 = 0, 0 + (-inf) = -inf, (-inf) + 0 = -inf, (-inf) + (-inf) = -inf
-    auto combined_mask = Tensor(
-        std::make_shared<ov::op::v1::Add>(causal_mask_4d.output(), padding_mask_4d.output())->output(0), ctx);
-    
-    // Clamp to -inf to handle the -inf + -inf = -inf*2 case
-    auto min_val = Tensor(const_scalar(ctx, -65504.0f), ctx);
-    auto clamped_mask = Tensor(
-        std::make_shared<ov::op::v1::Maximum>(combined_mask.output(), min_val.output())->output(0), ctx);
-
-    // NPU/NPUW compatibility: Add a passthrough Slice to make the mask identifiable.
-    // NPUW expects SDPA mask to come from a Slice node for proper processing.
-    auto zero_1d = const_vec(ctx, std::vector<int64_t>{0});
-    auto max_1d = const_vec(ctx, std::vector<int64_t>{std::numeric_limits<int64_t>::max()});
-    auto one_1d = const_vec(ctx, std::vector<int64_t>{1});
-    auto axis_1d = const_vec(ctx, std::vector<int64_t>{3});  // Last dimension
-    
-    auto slice_node = std::make_shared<ov::op::v8::Slice>(
-        clamped_mask.output(),
-        zero_1d,   // start: [0]
-        max_1d,    // stop: [max] (full slice)
-        one_1d,    // step: [1]
-        axis_1d    // axis: [3] (last dim)
-    );
-    
-    return Tensor(slice_node, ctx);
-}
-
 Tensor sdpa(const Tensor& q,
             const Tensor& k,
             const Tensor& v,
@@ -352,22 +269,18 @@ Tensor sdpa(const Tensor& q,
             const OpPolicy* policy) {
     (void)policy;
     (void)softmax_axis;  // Native SDPA handles this internally
+    (void)scale;  // Native SDPA handles scaling internally
 
     auto* ctx = q.context();
-    
-    // Create scale constant - this is critical for NPU compatibility
-    // The scale is typically 1/sqrt(head_dim)
-    auto scale_const = std::make_shared<ov::op::v0::Constant>(
-        ov::element::f32, ov::Shape{}, std::vector<float>{scale});
 
     // Use native ScaledDotProductAttention for optimal GPU performance
     if (mask) {
         auto sdpa_node = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
-            q.output(), k.output(), v.output(), mask->output(), scale_const, causal);
+            q.output(), k.output(), v.output(), mask->output(), causal);
         return Tensor(sdpa_node, ctx);
     } else {
         auto sdpa_node = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
-            q.output(), k.output(), v.output(), scale_const, causal);
+            q.output(), k.output(), v.output(), causal);
         return Tensor(sdpa_node, ctx);
     }
 }

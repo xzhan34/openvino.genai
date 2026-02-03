@@ -376,7 +376,7 @@ std::shared_ptr<ov::Model> create_wan_dit_block_group_model(
                                 rotary_cos, rotary_sin, nullptr);
 
     auto result = std::make_shared<ov::op::v0::Result>(output.output());
-    set_name(result, "hidden_states");
+    set_name(result, "hidden_states_out");
 
     auto ov_model = ctx.build_model({result->output(0)});
     ov_model->set_friendly_name("wan_dit_layered_block_group_" + std::to_string(start_layer) +
