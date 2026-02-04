@@ -52,6 +52,14 @@ Tensor where(const Tensor& cond, const Tensor& then_value, const Tensor& else_va
 Tensor concat(const std::vector<Tensor>& xs, int64_t axis);
 Tensor rms(const Tensor& x, const Tensor& weight, float eps);
 
+// Trigonometric operations (for SnakeBeta activation)
+Tensor sin(const Tensor& x);
+Tensor cos(const Tensor& x);
+
+// Reduction operations
+Tensor reduce_sum(const Tensor& x, int64_t axis, bool keepdim = true);
+Tensor reduce_sum(const Tensor& x, const std::vector<int64_t>& axes, bool keepdim = true);
+
 }  // namespace ops
 }  // namespace modeling
 }  // namespace genai

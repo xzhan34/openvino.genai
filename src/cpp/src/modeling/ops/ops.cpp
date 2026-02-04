@@ -243,6 +243,29 @@ Tensor rms(const Tensor& x, const Tensor& weight, float eps) {
     return norm.to(orig_dtype) * weight;
 }
 
+Tensor sin(const Tensor& x) {
+    auto* ctx = x.context();
+    auto node = std::make_shared<ov::op::v0::Sin>(x.output());
+    return Tensor(node, ctx);
+}
+
+Tensor cos(const Tensor& x) {
+    auto* ctx = x.context();
+    auto node = std::make_shared<ov::op::v0::Cos>(x.output());
+    return Tensor(node, ctx);
+}
+
+Tensor reduce_sum(const Tensor& x, int64_t axis, bool keepdim) {
+    return reduce_sum(x, std::vector<int64_t>{axis}, keepdim);
+}
+
+Tensor reduce_sum(const Tensor& x, const std::vector<int64_t>& axes, bool keepdim) {
+    auto* ctx = x.context();
+    auto axes_const = const_vec(ctx, axes);
+    auto node = std::make_shared<ov::op::v1::ReduceSum>(x.output(), axes_const, keepdim);
+    return Tensor(node, ctx);
+}
+
 }  // namespace ops
 }  // namespace modeling
 }  // namespace genai
