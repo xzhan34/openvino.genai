@@ -16,8 +16,14 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "modeling/models/qwen3_tts/modeling_qwen3_tts.hpp"
+#include "modeling/module.hpp"
+#include "modeling/ops/tensor.hpp"
+#include "modeling/layers/rms_norm.hpp"
+#include "modeling/layers/lm_head.hpp"
+#include "modeling/layers/vocab_embedding.hpp"
 
 namespace ov {
 class Model;
@@ -26,28 +32,163 @@ class Model;
 namespace ov {
 namespace genai {
 namespace modeling {
+
+class BuilderContext;
+
 namespace weights {
 class WeightFinalizer;
 class WeightSource;
 }  // namespace weights
-}  // namespace modeling
-}  // namespace genai
-}  // namespace ov
 
-namespace ov {
-namespace genai {
-namespace modeling {
 namespace models {
 
 //===----------------------------------------------------------------------===//
-// Forward Declarations - Code Predictor Modules
+// Code Predictor Attention - Standard RoPE (not mRoPE)
 //===----------------------------------------------------------------------===//
+class Qwen3TTSCodePredictorAttention : public Module {
+public:
+    Qwen3TTSCodePredictorAttention(BuilderContext& ctx,
+                                   const std::string& name,
+                                   const Qwen3TTSCodePredictorConfig& cfg,
+                                   Module* parent = nullptr);
 
-class Qwen3TTSCodePredictorAttention;
-class Qwen3TTSCodePredictorMLP;
-class Qwen3TTSCodePredictorDecoderLayer;
-class Qwen3TTSCodePredictorModel;
-class Qwen3TTSCodePredictorForConditionalGeneration;
+    // Forward without KV cache
+    Tensor forward_no_cache(const Tensor& hidden_states,
+                            const Tensor& rope_cos,
+                            const Tensor& rope_sin,
+                            const Tensor& causal_mask) const;
+
+private:
+    const Tensor& q_proj_weight() const;
+    const Tensor& k_proj_weight() const;
+    const Tensor& v_proj_weight() const;
+    const Tensor& o_proj_weight() const;
+
+    WeightParameter* q_proj_param_ = nullptr;
+    WeightParameter* k_proj_param_ = nullptr;
+    WeightParameter* v_proj_param_ = nullptr;
+    WeightParameter* o_proj_param_ = nullptr;
+
+    // Q/K normalization (standard for Qwen3)
+    RMSNorm q_norm_;
+    RMSNorm k_norm_;
+
+    int32_t num_heads_ = 0;
+    int32_t num_kv_heads_ = 0;
+    int32_t head_dim_ = 0;
+    float scaling_ = 0.0f;
+};
+
+//===----------------------------------------------------------------------===//
+// Code Predictor MLP - SwiGLU
+//===----------------------------------------------------------------------===//
+class Qwen3TTSCodePredictorMLP : public Module {
+public:
+    Qwen3TTSCodePredictorMLP(BuilderContext& ctx,
+                             const std::string& name,
+                             const Qwen3TTSCodePredictorConfig& cfg,
+                             Module* parent = nullptr);
+
+    Tensor forward(const Tensor& x) const;
+
+private:
+    const Tensor& gate_proj_weight() const;
+    const Tensor& up_proj_weight() const;
+    const Tensor& down_proj_weight() const;
+
+    WeightParameter* gate_proj_param_ = nullptr;
+    WeightParameter* up_proj_param_ = nullptr;
+    WeightParameter* down_proj_param_ = nullptr;
+};
+
+//===----------------------------------------------------------------------===//
+// Code Predictor Decoder Layer
+//===----------------------------------------------------------------------===//
+class Qwen3TTSCodePredictorDecoderLayer : public Module {
+public:
+    Qwen3TTSCodePredictorDecoderLayer(BuilderContext& ctx,
+                                      const std::string& name,
+                                      const Qwen3TTSCodePredictorConfig& cfg,
+                                      Module* parent = nullptr);
+
+    std::pair<Tensor, Tensor> forward_no_cache(const Tensor& hidden_states,
+                                               const Tensor& rope_cos,
+                                               const Tensor& rope_sin,
+                                               const Tensor& causal_mask,
+                                               const std::optional<Tensor>& residual) const;
+
+private:
+    Qwen3TTSCodePredictorAttention self_attn_;
+    Qwen3TTSCodePredictorMLP mlp_;
+    RMSNorm input_layernorm_;
+    RMSNorm post_attention_layernorm_;
+};
+
+//===----------------------------------------------------------------------===//
+// Code Predictor Model (5-layer transformer)
+//===----------------------------------------------------------------------===//
+class Qwen3TTSCodePredictorModel : public Module {
+public:
+    Qwen3TTSCodePredictorModel(BuilderContext& ctx,
+                               const Qwen3TTSCodePredictorConfig& cfg,
+                               Module* parent = nullptr);
+
+    // Forward without KV cache
+    // Input: inputs_embeds [B, T, hidden_size=1024]
+    // Output: hidden_states [B, T, hidden_size=1024]
+    Tensor forward_no_cache(const Tensor& inputs_embeds,
+                            const Tensor& position_ids) const;
+
+private:
+    Qwen3TTSCodePredictorConfig cfg_;
+    std::vector<Qwen3TTSCodePredictorDecoderLayer> layers_;
+    RMSNorm norm_;
+
+    int32_t head_dim_ = 0;
+    float rope_theta_ = 0.0f;
+};
+
+//===----------------------------------------------------------------------===//
+// Code Predictor For Conditional Generation
+// Contains: model + 15 codec_embeddings (layers 1-15) + 15 lm_heads
+//===----------------------------------------------------------------------===//
+class Qwen3TTSCodePredictorForConditionalGeneration : public Module {
+public:
+    Qwen3TTSCodePredictorForConditionalGeneration(BuilderContext& ctx,
+                                                  const Qwen3TTSCodePredictorConfig& cfg,
+                                                  Module* parent = nullptr);
+
+    // Forward for a specific generation step (predicting layer `step+1`)
+    // Input:
+    //   - inputs_embeds: [B, T, hidden_size] (sum of talker projection + previous codec embeds)
+    //   - position_ids: [B, T]
+    //   - step: 0..14 (generation step for layers 1..15)
+    // Output: logits [B, T, vocab_size]
+    Tensor forward_no_cache(const Tensor& inputs_embeds,
+                            const Tensor& position_ids,
+                            int step) const;
+
+    // Get codec embedding for a specific layer (0..14 -> layers 1..15)
+    Tensor get_codec_embed(const Tensor& codec_ids, int layer_idx) const;
+
+    // Get sum of all codec embeddings for layers 0..layer_idx
+    Tensor get_codec_embeds_sum(const std::vector<Tensor>& codec_ids_list) const;
+
+    // Access sub-modules
+    Qwen3TTSCodePredictorModel& model();
+    VocabEmbedding& codec_embedding(int layer_idx);
+    LMHead& lm_head(int step);
+
+private:
+    Qwen3TTSCodePredictorConfig cfg_;
+    Qwen3TTSCodePredictorModel model_;
+
+    // 15 codec embeddings for layers 1-15
+    std::vector<VocabEmbedding> codec_embeddings_;
+
+    // 15 lm_heads for predicting layers 1-15
+    std::vector<LMHead> lm_heads_;
+};
 
 //===----------------------------------------------------------------------===//
 // Factory Functions - Code Predictor Models
