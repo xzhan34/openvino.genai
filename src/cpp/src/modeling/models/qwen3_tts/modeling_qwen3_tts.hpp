@@ -90,15 +90,17 @@ struct SpeechDecoderConfig {
 
     // Pre-transformer
     int32_t latent_dim = 512;            // rvq_output_dim
-    int32_t pre_transformer_hidden = 512;
-    int32_t pre_transformer_heads = 8;
-    int32_t pre_transformer_layers = 8;
-    int32_t pre_transformer_intermediate = 2048;
+    int32_t transformer_hidden = 1024;   // pre_transformer hidden size
+    int32_t transformer_heads = 8;       // pre_transformer attention heads
+    int32_t transformer_head_dim = 64;   // head dimension (hidden / heads)
+    int32_t transformer_layers = 8;      // pre_transformer layers
+    int32_t transformer_intermediate = 2048;
     int32_t sliding_window = 72;
     float layer_scale_init = 0.1f;
+    float rms_norm_eps = 1e-6f;
 
     // Decoder
-    int32_t decoder_channels = 512;
+    int32_t decoder_dim = 1536;          // initial decoder channel
     std::vector<int32_t> decoder_channel_mults = {1, 1, 1, 1};  // 4 stages
     std::vector<int32_t> decoder_dilations = {1, 3, 9};  // per-stage dilations
 
