@@ -268,6 +268,226 @@ Tensor upsample_nearest_3d(const Tensor& input, int64_t scale_t, int64_t scale_h
     return Tensor(interp, ctx);
 }
 
+// ================= Activation Functions =================
+
+Tensor relu(const Tensor& input) {
+    auto* ctx = input.context();
+    auto node = std::make_shared<ov::op::v0::Relu>(input.output());
+    return Tensor(node, ctx);
+}
+
+Tensor sigmoid(const Tensor& input) {
+    auto* ctx = input.context();
+    auto node = std::make_shared<ov::op::v0::Sigmoid>(input.output());
+    return Tensor(node, ctx);
+}
+
+Tensor tanh_activation(const Tensor& input) {
+    auto* ctx = input.context();
+    auto node = std::make_shared<ov::op::v0::Tanh>(input.output());
+    return Tensor(node, ctx);
+}
+
+// ================= 1D Convolution Operations =================
+
+namespace {
+Tensor reshape_conv1d_bias(const Tensor& bias, const Tensor& conv_output) {
+    auto bias_rank = bias.output().get_partial_shape().rank();
+    if (!bias_rank.is_static()) {
+        return bias;
+    }
+    auto bias_rank_len = static_cast<size_t>(bias_rank.get_length());
+    if (bias_rank_len != 1) {
+        return bias;
+    }
+
+    auto out_pshape = conv_output.output().get_partial_shape();
+    auto out_rank = out_pshape.rank();
+    if (out_rank.is_static() && out_rank.get_length() == 3) {
+        const auto& bias_dim = bias.output().get_partial_shape()[0];
+        const auto& out_c = out_pshape[1];
+        const auto& out_l = out_pshape[2];
+
+        if (bias_dim.is_static() && out_c.is_static() && bias_dim.get_length() == out_c.get_length()) {
+            // NCL: [N, C, L]
+            return bias.unsqueeze({0, 2});
+        }
+        if (bias_dim.is_static() && out_l.is_static() && bias_dim.get_length() == out_l.get_length()) {
+            // NLC: [N, L, C]
+            return bias.unsqueeze({0, 1});
+        }
+    }
+
+    // Default to NCL broadcast: [1, C, 1]
+    return bias.unsqueeze({0, 2});
+}
+}  // namespace
+
+Tensor conv1d(const Tensor& input,
+              const Tensor& weight,
+              const std::vector<int64_t>& strides,
+              const std::vector<int64_t>& pads_begin,
+              const std::vector<int64_t>& pads_end,
+              const std::vector<int64_t>& dilations,
+              int64_t groups) {
+    auto* ctx = resolve_context(input, weight);
+    if (groups == 1) {
+        auto node = std::make_shared<ov::op::v1::Convolution>(
+            input.output(),
+            weight.output(),
+            to_size_t(strides),
+            ov::CoordinateDiff(pads_begin.begin(), pads_begin.end()),
+            ov::CoordinateDiff(pads_end.begin(), pads_end.end()),
+            to_size_t(dilations));
+        return Tensor(node, ctx);
+    } else {
+        auto node = std::make_shared<ov::op::v1::GroupConvolution>(
+            input.output(),
+            weight.output(),
+            to_size_t(strides),
+            ov::CoordinateDiff(pads_begin.begin(), pads_begin.end()),
+            ov::CoordinateDiff(pads_end.begin(), pads_end.end()),
+            to_size_t(dilations));
+        return Tensor(node, ctx);
+    }
+}
+
+Tensor conv1d(const Tensor& input,
+              const Tensor& weight,
+              const Tensor& bias,
+              const std::vector<int64_t>& strides,
+              const std::vector<int64_t>& pads_begin,
+              const std::vector<int64_t>& pads_end,
+              const std::vector<int64_t>& dilations,
+              int64_t groups) {
+    auto conv = conv1d(input, weight, strides, pads_begin, pads_end, dilations, groups);
+    auto bias_reshaped = reshape_conv1d_bias(bias, conv);
+    auto node = std::make_shared<ov::op::v1::Add>(conv.output(),
+                                                  bias_reshaped.output(),
+                                                  ov::op::AutoBroadcastType::NUMPY);
+    return Tensor(node, conv.context());
+}
+
+Tensor conv_transpose1d(const Tensor& input,
+                        const Tensor& weight,
+                        const std::vector<int64_t>& strides,
+                        const std::vector<int64_t>& pads_begin,
+                        const std::vector<int64_t>& pads_end,
+                        const std::vector<int64_t>& output_padding,
+                        const std::vector<int64_t>& dilations,
+                        int64_t groups) {
+    auto* ctx = resolve_context(input, weight);
+    if (groups == 1) {
+        auto node = std::make_shared<ov::op::v1::ConvolutionBackpropData>(
+            input.output(),
+            weight.output(),
+            to_size_t(strides),
+            ov::CoordinateDiff(pads_begin.begin(), pads_begin.end()),
+            ov::CoordinateDiff(pads_end.begin(), pads_end.end()),
+            to_size_t(dilations),
+            ov::op::PadType::EXPLICIT,
+            ov::CoordinateDiff(output_padding.begin(), output_padding.end()));
+        return Tensor(node, ctx);
+    } else {
+        auto node = std::make_shared<ov::op::v1::GroupConvolutionBackpropData>(
+            input.output(),
+            weight.output(),
+            to_size_t(strides),
+            ov::CoordinateDiff(pads_begin.begin(), pads_begin.end()),
+            ov::CoordinateDiff(pads_end.begin(), pads_end.end()),
+            to_size_t(dilations),
+            ov::op::PadType::EXPLICIT,
+            ov::CoordinateDiff(output_padding.begin(), output_padding.end()));
+        return Tensor(node, ctx);
+    }
+}
+
+Tensor conv_transpose1d(const Tensor& input,
+                        const Tensor& weight,
+                        const Tensor& bias,
+                        const std::vector<int64_t>& strides,
+                        const std::vector<int64_t>& pads_begin,
+                        const std::vector<int64_t>& pads_end,
+                        const std::vector<int64_t>& output_padding,
+                        const std::vector<int64_t>& dilations,
+                        int64_t groups) {
+    auto conv = conv_transpose1d(input, weight, strides, pads_begin, pads_end, output_padding, dilations, groups);
+    auto bias_reshaped = reshape_conv1d_bias(bias, conv);
+    auto node = std::make_shared<ov::op::v1::Add>(conv.output(),
+                                                  bias_reshaped.output(),
+                                                  ov::op::AutoBroadcastType::NUMPY);
+    return Tensor(node, conv.context());
+}
+
+// ================= Batch Normalization =================
+
+Tensor batch_norm(const Tensor& input,
+                  const Tensor& gamma,
+                  const Tensor& beta,
+                  const Tensor& running_mean,
+                  const Tensor& running_var,
+                  float eps) {
+    auto* ctx = input.context();
+    if (!ctx) ctx = gamma.context();
+    if (!ctx) ctx = beta.context();
+    if (!ctx) ctx = running_mean.context();
+    if (!ctx) ctx = running_var.context();
+    
+    auto node = std::make_shared<ov::op::v5::BatchNormInference>(
+        input.output(),
+        gamma.output(),
+        beta.output(),
+        running_mean.output(),
+        running_var.output(),
+        eps);
+    return Tensor(node, ctx);
+}
+
+// ================= Pooling Operations =================
+
+Tensor adaptive_avg_pool1d(const Tensor& input, int64_t output_size) {
+    auto* ctx = input.context();
+    auto output_shape = ops::const_vec(ctx, std::vector<int64_t>{output_size});
+    auto node = std::make_shared<ov::op::v8::AdaptiveAvgPool>(input.output(), output_shape);
+    return Tensor(node, ctx);
+}
+
+Tensor avg_pool1d(const Tensor& input,
+                  int64_t kernel_size,
+                  int64_t stride,
+                  int64_t padding) {
+    auto* ctx = input.context();
+    auto node = std::make_shared<ov::op::v1::AvgPool>(
+        input.output(),
+        ov::Strides{static_cast<size_t>(stride)},
+        ov::Shape{static_cast<size_t>(padding)},
+        ov::Shape{static_cast<size_t>(padding)},
+        ov::Shape{static_cast<size_t>(kernel_size)},
+        true,  // exclude_pad
+        ov::op::RoundingType::FLOOR,
+        ov::op::PadType::EXPLICIT);
+    return Tensor(node, ctx);
+}
+
+Tensor max_pool1d(const Tensor& input,
+                  int64_t kernel_size,
+                  int64_t stride,
+                  int64_t padding) {
+    auto* ctx = input.context();
+    auto node = std::make_shared<ov::op::v8::MaxPool>(
+        input.output(),
+        ov::Strides{static_cast<size_t>(stride)},
+        ov::Strides{1},  // dilations
+        ov::Shape{static_cast<size_t>(padding)},
+        ov::Shape{static_cast<size_t>(padding)},
+        ov::Shape{static_cast<size_t>(kernel_size)},
+        ov::op::RoundingType::FLOOR,
+        ov::op::PadType::EXPLICIT,
+        ov::element::i64,
+        0);
+    return Tensor(node->output(0), ctx);
+}
+
 }  // namespace nn
 }  // namespace ops
 }  // namespace modeling
