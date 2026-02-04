@@ -90,6 +90,42 @@ Tensor pad(const Tensor& input,
     return Tensor(node, ctx);
 }
 
+std::vector<Tensor> split(const Tensor& input, int64_t num_splits, int64_t axis) {
+    auto* ctx = input.context();
+    auto axis_node = ops::const_scalar(ctx, axis);
+    auto node = std::make_shared<ov::op::v1::Split>(input.output(), axis_node, static_cast<size_t>(num_splits));
+    
+    std::vector<Tensor> results;
+    results.reserve(num_splits);
+    for (size_t i = 0; i < static_cast<size_t>(num_splits); ++i) {
+        results.push_back(Tensor(node->output(i), ctx));
+    }
+    return results;
+}
+
+std::vector<Tensor> split(const Tensor& input, const std::vector<int64_t>& split_sizes, int64_t axis) {
+    auto* ctx = input.context();
+    auto axis_node = ops::const_scalar(ctx, axis);
+    auto split_lengths = ops::const_vec(ctx, split_sizes);
+    auto node = std::make_shared<ov::op::v1::VariadicSplit>(input.output(), axis_node, split_lengths);
+    
+    std::vector<Tensor> results;
+    results.reserve(split_sizes.size());
+    for (size_t i = 0; i < split_sizes.size(); ++i) {
+        results.push_back(Tensor(node->output(i), ctx));
+    }
+    return results;
+}
+
+Tensor flip(const Tensor& input, int64_t axis) {
+    auto* ctx = input.context();
+    auto axes_node = ops::const_vec(ctx, std::vector<int64_t>{axis});
+    // mode="reflect" with begin=0 and end=0 effectively reverses the tensor
+    // Use Reverse op for flipping
+    auto node = std::make_shared<ov::op::v1::Reverse>(input.output(), axes_node, ov::op::v1::Reverse::Mode::INDEX);
+    return Tensor(node, ctx);
+}
+
 }  // namespace tensor
 }  // namespace ops
 }  // namespace modeling

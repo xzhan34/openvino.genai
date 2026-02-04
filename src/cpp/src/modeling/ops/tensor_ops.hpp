@@ -27,6 +27,11 @@ Tensor pad(const Tensor& input,
            const std::vector<int64_t>& pads_end,
            float value = 0.0f);
 
+std::vector<Tensor> split(const Tensor& input, int64_t num_splits, int64_t axis);
+std::vector<Tensor> split(const Tensor& input, const std::vector<int64_t>& split_sizes, int64_t axis);
+
+Tensor flip(const Tensor& input, int64_t axis);
+
 }  // namespace tensor
 }  // namespace ops
 }  // namespace modeling
