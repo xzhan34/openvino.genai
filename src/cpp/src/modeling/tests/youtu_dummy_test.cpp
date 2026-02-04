@@ -11,7 +11,7 @@
 #include <openvino/openvino.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/youtu_llm.hpp"
+#include "modeling/models/youtu/modeling_youtu.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

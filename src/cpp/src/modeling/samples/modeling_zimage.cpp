@@ -33,9 +33,9 @@
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_dense.hpp"
-#include "modeling/models/zimage_dit.hpp"
-#include "modeling/models/zimage_vae.hpp"
+#include "modeling/models/qwen3/modeling_qwen3.hpp"
+#include "modeling/models/zimage/modeling_zimage_dit.hpp"
+#include "modeling/models/zimage/modeling_zimage_vae.hpp"
 #include "modeling/weights/weight_loader.hpp"
 
 namespace {

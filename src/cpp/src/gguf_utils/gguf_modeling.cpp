@@ -20,9 +20,9 @@
 #include "gguf_utils/gguf_weight_finalizer.hpp"
 #include "gguf_utils/gguf_weight_source.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
-#include "modeling/models/qwen3_dense.hpp"
-#include "modeling/models/qwen3_moe.hpp"
-#include "modeling/models/smollm3.hpp"
+#include "modeling/models/qwen3/modeling_qwen3.hpp"
+#include "modeling/models/qwen3_moe/modeling_qwen3_moe.hpp"
+#include "modeling/models/smollm3/modeling_smollm3.hpp"
 #include "utils.hpp"
 
 using namespace ov;

@@ -5,7 +5,7 @@
 
 #include <openvino/core/except.hpp>
 
-#include "modeling/models/wan_utils.hpp"
+#include "modeling/models/wan/processing_wan.hpp"
 
 TEST(WanT2VCfg, MatchesExpectedFormula) {
     std::vector<float> noise_pred = {1.0f, 2.0f, 3.0f};

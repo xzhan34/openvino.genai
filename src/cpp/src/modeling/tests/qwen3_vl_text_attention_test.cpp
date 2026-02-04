@@ -14,7 +14,7 @@
 #include <openvino/pass/serialize.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_vl_text.hpp"
+#include "modeling/models/qwen3_vl/modeling_qwen3_vl_text.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

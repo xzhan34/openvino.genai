@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/models/deepseek_ocr2_utils.hpp"
+#include "modeling/models/deepseek_ocr2/processing_deepseek_ocr2.hpp"
 
 #include <gtest/gtest.h>
 

@@ -9,7 +9,7 @@
 
 #include <openvino/openvino.hpp>
 
-#include "modeling/models/wan_vae.hpp"
+#include "modeling/models/wan/modeling_wan_vae.hpp"
 #include "modeling/tests/test_utils.hpp"
 
 namespace test_utils = ov::genai::modeling::tests;

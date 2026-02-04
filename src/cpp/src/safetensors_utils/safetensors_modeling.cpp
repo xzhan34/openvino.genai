@@ -32,10 +32,10 @@
 #include "utils.hpp"
 
 // Include modeling API components
-#include "modeling/models/qwen3_dense.hpp"
-#include "modeling/models/qwen3_moe.hpp"
-#include "modeling/models/smollm3.hpp"
-#include "modeling/models/youtu_llm.hpp"
+#include "modeling/models/qwen3/modeling_qwen3.hpp"
+#include "modeling/models/qwen3_moe/modeling_qwen3_moe.hpp"
+#include "modeling/models/smollm3/modeling_smollm3.hpp"
+#include "modeling/models/youtu/modeling_youtu.hpp"
 #include "modeling/weights/quantization_config.hpp"
 
 using namespace ov;
@@ -536,7 +536,7 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
 /**
  * @brief Create model using new modeling API
  *
- * This uses the Qwen3ForCausalLM class from modeling/models/qwen3_dense.hpp
+ * This uses the Qwen3ForCausalLM class from modeling/models/qwen3/modeling_qwen3.hpp
  * Supports both zero-copy mode (SafetensorsData with mmap) and legacy mode (tensors map)
  */
 std::shared_ptr<ov::Model> create_model_with_modeling_api(

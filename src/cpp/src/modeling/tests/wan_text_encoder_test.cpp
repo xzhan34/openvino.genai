@@ -9,8 +9,8 @@
 
 #include <openvino/openvino.hpp>
 
-#include "modeling/models/wan_umt5.hpp"
-#include "modeling/models/wan_utils.hpp"
+#include "modeling/models/wan/modeling_wan_umt5.hpp"
+#include "modeling/models/wan/processing_wan.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

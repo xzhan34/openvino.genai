@@ -9,7 +9,7 @@
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset13.hpp>
 
-#include "modeling/models/qwen3_dense.hpp"
+#include "modeling/models/qwen3/modeling_qwen3.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

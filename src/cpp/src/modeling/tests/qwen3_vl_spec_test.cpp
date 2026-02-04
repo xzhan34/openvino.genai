@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/models/qwen3_vl_utils.hpp"
+#include "modeling/models/qwen3_vl/processing_qwen3_vl.hpp"
 
 #include <gtest/gtest.h>
 

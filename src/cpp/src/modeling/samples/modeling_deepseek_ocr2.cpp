@@ -21,11 +21,11 @@
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
-#include "modeling/models/deepseek_ocr2_projector.hpp"
-#include "modeling/models/deepseek_ocr2_utils.hpp"
-#include "modeling/models/deepseek_qwen2_vision.hpp"
-#include "modeling/models/deepseek_sam_vit.hpp"
-#include "modeling/models/deepseek_v2_text.hpp"
+#include "modeling/models/deepseek_ocr2/modeling_deepseek_ocr2_projector.hpp"
+#include "modeling/models/deepseek_ocr2/processing_deepseek_ocr2.hpp"
+#include "modeling/models/deepseek_ocr2/modeling_deepseek_qwen2_vision.hpp"
+#include "modeling/models/deepseek_ocr2/modeling_deepseek_sam_vit.hpp"
+#include "modeling/models/deepseek_v2/modeling_deepseek_v2.hpp"
 #include "modeling/weights/quantization_config.hpp"
 
 namespace {

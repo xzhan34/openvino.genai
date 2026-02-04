@@ -9,7 +9,7 @@
 
 #include <openvino/openvino.hpp>
 
-#include "modeling/models/deepseek_qwen2_vision.hpp"
+#include "modeling/models/deepseek_ocr2/modeling_deepseek_qwen2_vision.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

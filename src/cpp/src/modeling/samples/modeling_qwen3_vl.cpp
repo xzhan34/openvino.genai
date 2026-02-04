@@ -21,9 +21,9 @@
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
-#include "modeling/models/qwen3_vl_text.hpp"
-#include "modeling/models/qwen3_vl_utils.hpp"
-#include "modeling/models/qwen3_vl_vision.hpp"
+#include "modeling/models/qwen3_vl/modeling_qwen3_vl_text.hpp"
+#include "modeling/models/qwen3_vl/processing_qwen3_vl.hpp"
+#include "modeling/models/qwen3_vl/modeling_qwen3_vl_vision.hpp"
 #include "safetensors_utils/quantization_utils.hpp"
 
 namespace {

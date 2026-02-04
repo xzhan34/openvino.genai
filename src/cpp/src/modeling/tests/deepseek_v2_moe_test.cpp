@@ -9,7 +9,7 @@
 #include <openvino/openvino.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/deepseek_v2_text.hpp"
+#include "modeling/models/deepseek_v2/modeling_deepseek_v2.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

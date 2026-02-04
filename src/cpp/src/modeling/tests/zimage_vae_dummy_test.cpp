@@ -10,7 +10,7 @@
 #include <openvino/openvino.hpp>
 #include <openvino/opsets/opset13.hpp>
 
-#include "modeling/models/zimage_vae.hpp"
+#include "modeling/models/zimage/modeling_zimage_vae.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

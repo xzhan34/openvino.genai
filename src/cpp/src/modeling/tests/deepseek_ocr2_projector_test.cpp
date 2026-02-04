@@ -8,7 +8,7 @@
 
 #include <openvino/openvino.hpp>
 
-#include "modeling/models/deepseek_ocr2_projector.hpp"
+#include "modeling/models/deepseek_ocr2/modeling_deepseek_ocr2_projector.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

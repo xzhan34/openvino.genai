@@ -9,7 +9,7 @@
 #include <openvino/openvino.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/deepseek_sam_vit.hpp"
+#include "modeling/models/deepseek_ocr2/modeling_deepseek_sam_vit.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 

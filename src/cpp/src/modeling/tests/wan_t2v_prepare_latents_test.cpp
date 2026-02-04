@@ -5,7 +5,7 @@
 
 #include <openvino/openvino.hpp>
 
-#include "modeling/models/wan_utils.hpp"
+#include "modeling/models/wan/processing_wan.hpp"
 
 TEST(WanT2VPrepareLatents, ReturnsF32AndShape) {
     const size_t batch = 1;

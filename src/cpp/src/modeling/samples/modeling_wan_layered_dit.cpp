@@ -46,9 +46,9 @@
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
-#include "modeling/models/wan_dit.hpp"
-#include "modeling/models/wan_dit_layered.hpp"
-#include "modeling/models/wan_utils.hpp"
+#include "modeling/models/wan/modeling_wan_dit.hpp"
+#include "modeling/models/wan/modeling_wan_dit_layered.hpp"
+#include "modeling/models/wan/processing_wan.hpp"
 
 namespace {
 

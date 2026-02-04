@@ -22,10 +22,10 @@
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
 #include "image_generation/schedulers/flow_match_euler_discrete.hpp"
-#include "modeling/models/wan_dit.hpp"
-#include "modeling/models/wan_vae.hpp"
-#include "modeling/models/wan_utils.hpp"
-#include "modeling/models/wan_umt5.hpp"
+#include "modeling/models/wan/modeling_wan_dit.hpp"
+#include "modeling/models/wan/modeling_wan_vae.hpp"
+#include "modeling/models/wan/processing_wan.hpp"
+#include "modeling/models/wan/modeling_wan_umt5.hpp"
 
 namespace {
 
