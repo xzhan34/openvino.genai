@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <iomanip>
 #include <iostream>
@@ -372,6 +374,94 @@ int64_t argmax_last_token(const ov::Tensor& logits) {
     return argmax_logits_slice(logits, seq_len - 1, 1).front();
 }
 
+// Temperature sampling for a single logits row
+template <typename T>
+int64_t sample_row(const T* logits, size_t vocab, float temperature) {
+    if (temperature <= 0.0f) {
+        // Greedy decoding (argmax)
+        return argmax_row(logits, vocab);
+    }
+    
+    // Apply temperature and compute softmax
+    std::vector<float> probs(vocab);
+    float max_logit = static_cast<float>(logits[0]);
+    for (size_t i = 1; i < vocab; ++i) {
+        max_logit = std::max(max_logit, static_cast<float>(logits[i]));
+    }
+    
+    float sum_exp = 0.0f;
+    for (size_t i = 0; i < vocab; ++i) {
+        probs[i] = std::exp((static_cast<float>(logits[i]) - max_logit) / temperature);
+        sum_exp += probs[i];
+    }
+    
+    for (size_t i = 0; i < vocab; ++i) {
+        probs[i] /= sum_exp;
+    }
+    
+    // Multinomial sampling
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+    float rand_val = dis(gen);
+    
+    float cumsum = 0.0f;
+    for (size_t i = 0; i < vocab; ++i) {
+        cumsum += probs[i];
+        if (rand_val < cumsum) {
+            return static_cast<int64_t>(i);
+        }
+    }
+    return static_cast<int64_t>(vocab - 1);
+}
+
+std::vector<int64_t> sample_logits_slice(const ov::Tensor& logits, size_t start, size_t count, float temperature) {
+    const auto shape = logits.get_shape();
+    if (shape.size() != 3 || shape[0] != 1) {
+        throw std::runtime_error("logits tensor must have shape [1, S, V]");
+    }
+    const size_t seq_len = shape[1];
+    const size_t vocab = shape[2];
+    if (start + count > seq_len) {
+        throw std::runtime_error("logits slice out of range");
+    }
+
+    std::vector<int64_t> tokens;
+    tokens.reserve(count);
+
+    if (logits.get_element_type() == ov::element::f16) {
+        const auto* data = logits.data<const ov::float16>();
+        for (size_t i = 0; i < count; ++i) {
+            tokens.push_back(sample_row(data + (start + i) * vocab, vocab, temperature));
+        }
+        return tokens;
+    }
+    if (logits.get_element_type() == ov::element::bf16) {
+        const auto* data = logits.data<const ov::bfloat16>();
+        for (size_t i = 0; i < count; ++i) {
+            tokens.push_back(sample_row(data + (start + i) * vocab, vocab, temperature));
+        }
+        return tokens;
+    }
+    if (logits.get_element_type() == ov::element::f32) {
+        const auto* data = logits.data<const float>();
+        for (size_t i = 0; i < count; ++i) {
+            tokens.push_back(sample_row(data + (start + i) * vocab, vocab, temperature));
+        }
+        return tokens;
+    }
+    throw std::runtime_error("Unsupported logits dtype");
+}
+
+int64_t sample_last_token(const ov::Tensor& logits, float temperature) {
+    const auto shape = logits.get_shape();
+    if (shape.size() != 3 || shape[0] != 1) {
+        throw std::runtime_error("logits tensor must have shape [1, S, V]");
+    }
+    const size_t seq_len = shape[1];
+    return sample_logits_slice(logits, seq_len - 1, 1, temperature).front();
+}
+
 int64_t resolve_mask_token_id(ov::genai::Tokenizer tokenizer) {
     const auto vocab = tokenizer.get_vocab();
     const auto it = vocab.find("<|MASK|>");
@@ -559,11 +649,12 @@ int main(int argc, char* argv[]) try {
         dflash_cfg, draft_source, draft_finalizer, draft_compute_type);
     auto embed_model = ov::genai::modeling::models::create_qwen3_embedding_model(
         qwen_cfg, target_source, target_finalizer);
+    // Use f32 for lm_head to avoid weight dtype mismatch (weights are f32)
     auto lm_head_model = ov::genai::modeling::models::create_qwen3_lm_head_model(
-        qwen_cfg, target_source, target_finalizer, draft_compute_type);
+        qwen_cfg, target_source, target_finalizer, ov::element::f32);
     
     ov::Core core;
-    // Force all sub-models to run in FP32 to rule out BF16/F16 precision issues.
+    // Use F32 for maximum compatibility and numerical stability
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f32}
     };
@@ -573,7 +664,9 @@ int main(int argc, char* argv[]) try {
     const int64_t eos_token_id = tokenizer.get_eos_token_id();
     std::cout << "[DEBUG] mask_token_id=" << mask_token_id << " eos_token_id=" << eos_token_id << std::endl;
 
-    auto encoded = tokenizer.encode(prompt, {ov::genai::add_special_tokens(false)});
+    // CRITICAL: Enable special tokens for proper chat formatting
+    // This matches Python's behavior and is essential for correct model output
+    auto encoded = tokenizer.encode(prompt, {ov::genai::add_special_tokens(true)});
     const std::vector<int64_t> prompt_ids = tensor_to_ids(encoded.input_ids);
     std::vector<int64_t> output_ids = prompt_ids;
     const size_t prompt_len = output_ids.size();
@@ -617,14 +710,29 @@ int main(int argc, char* argv[]) try {
         auto prefill_end = Clock::now();
         perf.ttft_ms = duration_ms(prefill_start, prefill_end);
         output_ids.push_back(next_token);
+        
+        // Check if first token is already EOS (rare but possible)
+        if (next_token == eos_token_id) {
+            std::cout << "\n[Early Stop] EOS token generated after prefill" << std::endl;
+        }
 
         const double prefill_ms = duration_ms(prefill_start, prefill_end);
         perf.prefill_wall.add(prefill_ms);
 
+        // Print prompt and first token for streaming output
+        std::cout << "\n[Streaming Output]\n";
+        auto prompt_text = tokenizer.decode(prompt_ids, {ov::genai::skip_special_tokens(true)});
+        std::cout << prompt_text;
+        auto first_token_text = tokenizer.decode({next_token}, {ov::genai::skip_special_tokens(true)});
+        std::cout << first_token_text << std::flush;
+
         const auto generation_start = Clock::now();
 
+        bool stopped_by_eos = false;
         while (output_ids.size() < max_length) {
             if (next_token == eos_token_id) {
+                stopped_by_eos = true;
+                std::cout << "\n[Early Stop] EOS token detected at position " << output_ids.size() << std::endl;
                 break;
             }
             const auto step_start = Clock::now();
@@ -687,12 +795,16 @@ int main(int argc, char* argv[]) try {
             const double get_draft_ms = duration_ms(get_draft_start, get_draft_end);
             perf.get_tensor_wall.add(get_draft_ms);
 
-            // Align dtype for lm_head input if needed.
+            // Convert draft_hidden to f32 for lm_head (runtime type conversion)
+            // This allows draft model to run in bf16 while lm_head expects f32
             const auto& lm_head_port = compiled_lm_head.input("hidden_states");
             if (draft_hidden.get_element_type() != lm_head_port.get_element_type()) {
+                auto convert_start = Clock::now();
                 ov::Tensor converted(lm_head_port.get_element_type(), draft_hidden.get_shape());
                 draft_hidden.copy_to(converted);
                 draft_hidden = converted;
+                auto convert_end = Clock::now();
+                perf.other_wall.add(duration_ms(convert_start, convert_end));
             }
             auto set_lm_start = Clock::now();
             lm_head_request.set_tensor("hidden_states", draft_hidden);
@@ -719,82 +831,74 @@ int main(int argc, char* argv[]) try {
             const double argmax_draft_ms = duration_ms(argmax_draft_start, argmax_draft_end);
             perf.argmax_wall.add(argmax_draft_ms);
 
-            // Verify token-by-token to avoid trimming KV cache.
-            auto verify_one = [&](int64_t token) -> int64_t {
-                const size_t pos = target_hidden_len;
-                auto make_verify_start = Clock::now();
-                auto verify_ids = make_ids_tensor({token});
-                auto verify_mask = make_attention_mask(1);
-                auto verify_pos = make_position_ids_range(pos, 1);
-                auto make_verify_end = Clock::now();
-                const double make_verify_ms = duration_ms(make_verify_start, make_verify_end);
-                perf.make_tensor_wall.add(make_verify_ms);
+            // Batch verification: construct block_output_ids like Python
+            std::vector<int64_t> block_output_ids;
+            block_output_ids.reserve(block_ids.size());
+            block_output_ids.push_back(output_ids.back());  // Last accepted token
+            block_output_ids.insert(block_output_ids.end(), draft_tokens.begin(), draft_tokens.end());
 
-                auto set_verify_start = Clock::now();
-                target_request.set_tensor("input_ids", verify_ids);
-                target_request.set_tensor("attention_mask", verify_mask);
-                target_request.set_tensor("position_ids", verify_pos);
-                target_request.set_tensor("beam_idx", beam_idx);
-                auto set_verify_end = Clock::now();
-                const double set_verify_ms = duration_ms(set_verify_start, set_verify_end);
-                perf.set_tensor_wall.add(set_verify_ms);
+            const size_t verify_len = block_output_ids.size();
+            auto verify_start = Clock::now();
+            target_request.set_tensor("input_ids", make_ids_tensor(block_output_ids));
+            target_request.set_tensor("attention_mask", make_attention_mask(verify_len));
+            target_request.set_tensor("position_ids", make_position_ids_range(target_hidden_len, verify_len));
+            target_request.set_tensor("beam_idx", beam_idx);
+            target_request.infer();
+            auto verify_end = Clock::now();
+            const double verify_ms = duration_ms(verify_start, verify_end);
+            perf.verify_wall.add(verify_ms);
+            step_tracked_ms += verify_ms;
 
-                auto verify_start = Clock::now();
-                target_request.infer();
-                auto verify_end = Clock::now();
-                const double verify_ms = duration_ms(verify_start, verify_end);
-                perf.verify_wall.add(verify_ms);
-                step_tracked_ms += verify_ms;
-                target_kv_state.add_inputs(verify_ids);
-
-                auto get_verify_start = Clock::now();
-                logits = target_request.get_tensor("logits");
-                target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
-                auto get_verify_end = Clock::now();
-                const double get_verify_ms = duration_ms(get_verify_start, get_verify_end);
-                perf.get_tensor_wall.add(get_verify_ms);
-
-                auto hidden_append_start = Clock::now();
-                ov::Tensor accepted_slice(target_hidden_block, {0, 0, 0}, {1, 1, hidden_dim});
-                ov::Tensor append_dst(target_hidden_storage,
-                                      {0, target_hidden_len, 0},
-                                      {1, target_hidden_len + 1, hidden_dim});
-                accepted_slice.copy_to(append_dst);
-                target_hidden_len += 1;
-                auto hidden_append_end = Clock::now();
-                const double hidden_append_ms = duration_ms(hidden_append_start, hidden_append_end);
-                perf.hidden_append_wall.add(hidden_append_ms);
-
-                auto argmax_post_start = Clock::now();
-                const int64_t posterior_token = argmax_last_token(logits);
-                auto argmax_post_end = Clock::now();
-                const double argmax_post_ms = duration_ms(argmax_post_start, argmax_post_end);
-                perf.argmax_wall.add(argmax_post_ms);
-
-                return posterior_token;
-            };
-
-            auto postproc_start = Clock::now();
+            logits = target_request.get_tensor("logits");
+            auto posterior_tokens = argmax_logits_slice(logits, 0, verify_len);
+            
+            // Find acceptance length: compare draft with posterior
+            // Python: (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum()
+            // block_output_ids[:, 1:] are draft_tokens (at positions 1..15)
+            // posterior[:, :-1] are target predictions (at positions 0..14)
+            // So: draft_tokens[i] vs posterior_tokens[i] (NOT i+1)
             size_t accepted = 0;
-            int64_t posterior_next = verify_one(output_ids.back());
-            if (draft_tokens[0] == posterior_next) {
-                accepted = 1;
-                for (size_t i = 1; i < draft_len; ++i) {
-                    posterior_next = verify_one(draft_tokens[i - 1]);
-                    if (draft_tokens[i] != posterior_next) {
-                        break;
-                    }
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                if (draft_tokens[i] == posterior_tokens[i]) {
                     ++accepted;
-                }
-                if (accepted == draft_len) {
-                    posterior_next = verify_one(draft_tokens[draft_len - 1]);
+                } else {
+                    break;
                 }
             }
-            std::vector<int64_t> posterior = {posterior_next};
-            auto postproc_end = Clock::now();
-            const double postproc_ms = duration_ms(postproc_start, postproc_end);
-            perf.postproc_wall.add(postproc_ms);
+            
+            // Next token: if all drafts accepted, use posterior[15]; else use posterior[accepted]
+            int64_t posterior_next = posterior_tokens[accepted];
+            std::vector<int64_t> posterior = {posterior_next};  // For debug output compatibility
+            
+            // Update target_kv_state and target_hidden for accepted tokens
+            const size_t num_accepted_verify = accepted + 1;
+            std::vector<int64_t> accepted_ids(block_output_ids.begin(), block_output_ids.begin() + num_accepted_verify);
+            
+            // CRITICAL: Trim KV cache to remove unaccepted tokens from batch verification
+            // After batch inference with verify_len tokens, we only keep num_accepted_verify
+            const size_t tokens_to_trim = verify_len - num_accepted_verify;
+            if (tokens_to_trim > 0) {
+                target_kv_state.num_tokens_to_trim = tokens_to_trim;
+                ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
+                target_kv_state.num_tokens_to_trim = 0;
+            }
+            
+            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            
+            // CRITICAL: Ensure we don't exceed max_length when appending hidden states
+            const size_t available_space = max_length - target_hidden_len;
+            const size_t num_to_append = std::min(num_accepted_verify, available_space);
+            
+            if (num_to_append > 0) {
+                ov::Tensor accepted_hidden_slice(target_hidden_block, {0, 0, 0}, {1, num_to_append, hidden_dim});
+                ov::Tensor hidden_append_dst(target_hidden_storage,
+                                             {0, target_hidden_len, 0},
+                                             {1, target_hidden_len + num_to_append, hidden_dim});
+                accepted_hidden_slice.copy_to(hidden_append_dst);
+                target_hidden_len += num_to_append;
+            }
 
+            auto postproc_start = Clock::now();
             // Debug: dump alignment for the first few draft steps.
             // if (perf.draft_steps < 5) {
             if (false) {
@@ -815,7 +919,6 @@ int main(int argc, char* argv[]) try {
                           << "] block_ids" << block_preview
                           << " pos_ids" << pos_preview
                           << " draft_tokens" << preview_vec(draft_tokens, preview_n)
-                          << " posterior" << preview_vec(posterior, preview_n)
                           << " target_hidden_shape=[" << target_hidden_shape[0] << "," << target_hidden_shape[1] << ","
                           << target_hidden_shape[2] << "] draft_hidden_shape=[" << draft_hidden_shape[0] << ","
                           << draft_hidden_shape[1] << "," << draft_hidden_shape[2] << "]"
@@ -828,18 +931,39 @@ int main(int argc, char* argv[]) try {
             }
 
             const size_t before_accept = output_ids.size();
+            std::vector<int64_t> newly_accepted;
             for (size_t i = 0; i < accepted && output_ids.size() < max_length; ++i) {
                 output_ids.push_back(draft_tokens[i]);
+                newly_accepted.push_back(draft_tokens[i]);
+            }
+            // Stream print accepted draft tokens
+            if (!newly_accepted.empty()) {
+                auto accepted_text = tokenizer.decode(newly_accepted, {ov::genai::skip_special_tokens(true)});
+                std::cout << accepted_text << std::flush;
             }
             const size_t accepted_pushed = output_ids.size() - before_accept;
             ++perf.draft_steps;
             perf.accepted_tokens += accepted_pushed + 1;
             perf.accepted_per_step.push_back(accepted_pushed + 1);
+            auto postproc_end = Clock::now();
+            const double postproc_ms = duration_ms(postproc_start, postproc_end);
+            perf.postproc_wall.add(postproc_ms);
+
             if (output_ids.size() >= max_length) {
                 break;
             }
             next_token = posterior_next;
             output_ids.push_back(next_token);
+            // Stream print posterior token
+            auto posterior_text = tokenizer.decode({posterior_next}, {ov::genai::skip_special_tokens(true)});
+            std::cout << posterior_text << std::flush;
+            
+            // Check if posterior token is EOS
+            if (posterior_next == eos_token_id) {
+                stopped_by_eos = true;
+                std::cout << "\n[Early Stop] EOS token in posterior at position " << output_ids.size() << std::endl;
+                break;
+            }
 
             const double step_ms = duration_ms(step_start, Clock::now());
             const double other_ms = std::max(0.0, step_ms - step_tracked_ms);
@@ -849,6 +973,9 @@ int main(int argc, char* argv[]) try {
         const auto generation_end = Clock::now();
         perf.total_generate_ms = duration_ms(generation_start, generation_end);
         perf.generated_tokens = output_ids.size() - prompt_len;
+
+        std::cout << "\n\n[Generation Complete]" << std::endl;
+        std::cout << "[Stop Reason] " << (stopped_by_eos ? "EOS token detected" : "Max length reached") << "\n" << std::endl;
 
         const size_t tokens_after_first = perf.generated_tokens > 0 ? perf.generated_tokens - 1 : 0;
         const double tpot_ms = tokens_after_first > 0
@@ -871,6 +998,8 @@ int main(int argc, char* argv[]) try {
         std::cout << "[Latency] TTFT=" << perf.ttft_ms << " ms, TPOT=" << tpot_ms
                   << " ms/token, total_generate=" << perf.total_generate_ms
                   << " ms, throughput=" << dflash_throughput << " tokens/s" << std::endl;
+        std::cout << "[Verify Stats] total verify calls=" << perf.verify_wall.count 
+                  << ", draft_steps=" << perf.draft_steps << std::endl;
         std::cout << "[Stage timings] wall-clock (ms):" << std::endl;
         print_stage_stats("prefill target", perf.prefill_wall);
         print_stage_stats("target ctx", perf.target_ctx_wall);
@@ -898,10 +1027,6 @@ int main(int argc, char* argv[]) try {
             std::cout << "]" << std::endl;
         }
     }
-
-    std::vector<int64_t> generated(output_ids.begin() + static_cast<std::ptrdiff_t>(prompt_len), output_ids.end());
-    auto text = tokenizer.decode(generated, {ov::genai::skip_special_tokens(true)});
-    std::cout << text << std::endl;
 
     std::cout << std::endl << "=====Run Baseline model for comparison . =====" << std::endl;
 
