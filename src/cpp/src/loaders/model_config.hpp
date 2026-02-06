@@ -120,6 +120,59 @@ struct ModelConfig {
     
     /// Activation function (e.g., "silu", "gelu")
     std::string hidden_act = "silu";
+
+    // ========== Qwen3-Next specific ==========
+
+    /// Layer types for hybrid attention (e.g., linear_attention/full_attention)
+    std::vector<std::string> layer_types;
+
+    /// Full attention insertion interval when layer_types is not explicitly provided
+    int32_t full_attention_interval = 4;
+
+    /// Partial rotary factor for RoPE (Qwen3-Next uses 0.25)
+    float partial_rotary_factor = 1.0f;
+
+    /// Linear attention Conv1D kernel size
+    int32_t linear_conv_kernel_dim = 0;
+
+    /// Linear attention key head dimension
+    int32_t linear_key_head_dim = 0;
+
+    /// Linear attention value head dimension
+    int32_t linear_value_head_dim = 0;
+
+    /// Linear attention number of key heads
+    int32_t linear_num_key_heads = 0;
+
+    /// Linear attention number of value heads
+    int32_t linear_num_value_heads = 0;
+
+    /// MoE sparsity frequency in decoder
+    int32_t decoder_sparse_step = 0;
+
+    /// MoE routed expert hidden dimension
+    int32_t moe_intermediate_size = 0;
+
+    /// MoE shared expert hidden dimension
+    int32_t shared_expert_intermediate_size = 0;
+
+    /// Number of routed experts
+    int32_t num_experts = 0;
+
+    /// Number of selected experts per token
+    int32_t num_experts_per_tok = 0;
+
+    /// Whether to normalize top-k probabilities in routing
+    bool norm_topk_prob = true;
+
+    /// Whether to output router logits
+    bool output_router_logits = false;
+
+    /// Router auxiliary loss coefficient
+    float router_aux_loss_coef = 0.0f;
+
+    /// Optional list of dense MLP-only layer indices
+    std::vector<int32_t> mlp_only_layers;
     
     // ========== Quantization ==========
     

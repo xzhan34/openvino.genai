@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <memory>
+#include <vector>
 
 #include "openvino/genai/visibility.hpp"
 #include <openvino/openvino.hpp>
@@ -83,6 +84,25 @@ private:
         const rtn::QuantizedWeight& quant_result,
         const ov::Shape& original_shape,
         ov::genai::modeling::OpContext& ctx);
+
+    bool has_fp8_scale_inv(ov::genai::modeling::weights::WeightSource& source,
+                           const std::string& name) const;
+
+    ov::Output<ov::Node> create_fp8_dequant_subgraph(
+        const std::string& name,
+        const ov::Tensor& weight_fp8,
+        const ov::Tensor& scale_inv,
+        ov::genai::modeling::OpContext& ctx);
+
+    ov::Output<ov::Node> expand_block_scale_to_weight(
+        const ov::Tensor& scale_inv,
+        const ov::Shape& weight_shape,
+        ov::genai::modeling::OpContext& ctx) const;
+
+    std::vector<int64_t> make_interleaved_scale_shape(const ov::Shape& scale_shape) const;
+
+    std::vector<int64_t> make_interleaved_tile_repeats(const ov::Shape& scale_shape,
+                                                       const ov::Shape& weight_shape) const;
 
     std::unordered_map<std::string, ov::Output<ov::Node>> cache_;
     ov::genai::modeling::weights::QuantizationSelector selector_;

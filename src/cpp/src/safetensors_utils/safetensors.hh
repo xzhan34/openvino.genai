@@ -36,6 +36,7 @@ enum dtype {
   kUINT16,
   kFLOAT16,
   kBFLOAT16,
+  kFLOAT8_E4M3,
   kINT32,
   kUINT32,
   kFLOAT32,
@@ -3615,6 +3616,8 @@ bool parse_dtype(const ::minijson::value &v, safetensors::dtype &dtype,
       dtype = safetensors::dtype::kFLOAT16;
     } else if ((*so) == "BF16") {
       dtype = safetensors::dtype::kBFLOAT16;
+    } else if ((*so) == "F8_E4M3" || (*so) == "F8E4M3" || (*so) == "F8_E4M3FN") {
+      dtype = safetensors::dtype::kFLOAT8_E4M3;
     } else if ((*so) == "F32") {
       dtype = safetensors::dtype::kFLOAT32;
     } else if ((*so) == "F64") {
@@ -4562,6 +4565,9 @@ size_t get_dtype_bytes(const safetensors::dtype dtype) {
     case safetensors::dtype::kBFLOAT16:
       sz = 2;
       break;
+    case safetensors::dtype::kFLOAT8_E4M3:
+      sz = 1;
+      break;
     case safetensors::dtype::kFLOAT32:
       sz = 4;
       break;
@@ -4599,6 +4605,8 @@ std::string get_dtype_str(const safetensors::dtype dtype) {
       return "F16";
     case safetensors::dtype::kBFLOAT16:
       return "BF16";
+    case safetensors::dtype::kFLOAT8_E4M3:
+      return "F8_E4M3";
     case safetensors::dtype::kFLOAT32:
       return "F32";
     case safetensors::dtype::kFLOAT64:

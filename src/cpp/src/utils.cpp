@@ -539,6 +539,23 @@ size_t get_first_history_difference(const ov::Tensor& encoded_history, const std
     return idx;
 }
 
+namespace {
+
+bool is_attention_kv_state_name(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    if (name.find("past_key_values.") != std::string::npos) {
+        return true;
+    }
+    if (name.find(".key_cache") != std::string::npos || name.find(".value_cache") != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 KVAxesPosition get_kv_axes_pos(std::shared_ptr<const ov::Model> model) {
     // sequence length axis in key/values tensors, for most cases [BATCH_SIZE, num_kv_heads, seq_len, head_size],
     // therefore usually seq_length_axis = 2 and batch = 0
@@ -547,14 +564,22 @@ KVAxesPosition get_kv_axes_pos(std::shared_ptr<const ov::Model> model) {
     // "ReadValue" node is KV cache representation in stateful model
     std::string kv_node_type_name = std::string(ov::op::v6::ReadValue::get_type_info_static().name);
 
-    for (const auto op : model->get_ops()) {
+    for (const auto& op : model->get_ops()) {
         // check input size, as in LoRA adapters case it could be 0
         if (op->get_type_name() != kv_node_type_name || op->get_input_size() < 1) {
             continue;
         }
 
+        auto read = ov::as_type_ptr<ov::op::v6::ReadValue>(op);
+        if (!read || !is_attention_kv_state_name(read->get_variable_id())) {
+            continue;
+        }
+
         // Shape example: [-1,4,0,64]
         auto shape = op->get_input_partial_shape(0);
+        if (!shape.rank().is_static()) {
+            continue;
+        }
 
         for (size_t i = 0; i < shape.rank().get_length(); i++) {
             // Find axis = 0. This would be sequence length axis.
@@ -598,13 +623,26 @@ void trim_kv_cache(ov::InferRequest request, KVCacheState& kv_cache_state, std::
         if(adapter_controller && adapter_controller->has_state_name(state.get_name()))
             continue;
 
-        ov::Tensor old_tensor = state.get_state();
-        // [BATCH_SIZE, num_kv_heads, seq_len, head_size]
-        auto shape = old_tensor.get_shape();
-        shape[kv_cache_state.seq_length_axis] -= kv_cache_state.num_tokens_to_trim;
+        if (!is_attention_kv_state_name(state.get_name())) {
+            continue;
+        }
 
-        ov::Coordinate new_shape_begin{0, 0, 0, 0};
-        ov::Coordinate new_shape_end{shape};
+        ov::Tensor old_tensor = state.get_state();
+        auto shape = old_tensor.get_shape();
+        if (kv_cache_state.seq_length_axis >= shape.size()) {
+            continue;
+        }
+
+        const size_t seq_axis = kv_cache_state.seq_length_axis;
+        const size_t old_seq_len = shape[seq_axis];
+        const size_t trim = std::min<size_t>(old_seq_len, kv_cache_state.num_tokens_to_trim);
+        if (trim == 0) {
+            continue;
+        }
+        shape[seq_axis] = old_seq_len - trim;
+
+        ov::Coordinate new_shape_begin(shape.size(), 0);
+        ov::Coordinate new_shape_end(shape.begin(), shape.end());
 
         auto trimmed_tensor = ov::Tensor(old_tensor, new_shape_begin, new_shape_end);
 

@@ -142,6 +142,42 @@ std::vector<int32_t> extract_json_int_array(const std::string& json, const std::
     return result;
 }
 
+std::vector<std::string> extract_json_string_array(const std::string& json, const std::string& key) {
+    std::vector<std::string> result;
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return result;
+
+    pos = json.find("[", pos);
+    if (pos == std::string::npos) return result;
+
+    auto end = json.find("]", pos);
+    if (end == std::string::npos) return result;
+
+    std::string array_content = json.substr(pos + 1, end - pos - 1);
+    size_t i = 0;
+    while (i < array_content.size()) {
+        while (i < array_content.size() && std::isspace(static_cast<unsigned char>(array_content[i]))) i++;
+        if (i >= array_content.size()) break;
+        if (array_content[i] == ',') {
+            i++;
+            continue;
+        }
+        if (array_content[i] != '"') {
+            i++;
+            continue;
+        }
+        i++;  // skip opening quote
+        size_t start = i;
+        while (i < array_content.size() && array_content[i] != '"') i++;
+        if (i > start) {
+            result.push_back(array_content.substr(start, i - start));
+        }
+        if (i < array_content.size() && array_content[i] == '"') i++;  // skip closing quote
+    }
+    return result;
+}
+
 }  // namespace
 
 ModelConfig ModelConfig::from_gguf(const std::map<std::string, GGUFMetaData>& meta) {
@@ -200,12 +236,20 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     std::string arch = extract_json_string(json, "architectures");
     if (!arch.empty()) {
         // First architecture in the list
-        if (arch.find("DFlashDraftModel") != std::string::npos) config.architecture = "dflash";
+        // Order matters: check Qwen3Next before Qwen3 to avoid misclassification.
+        if (arch.find("Qwen3Next") != std::string::npos) config.architecture = "qwen3_next";
+        else if (arch.find("Qwen3Moe") != std::string::npos) config.architecture = "qwen3_moe";
         else if (arch.find("Qwen3") != std::string::npos) config.architecture = "qwen3";
         else if (arch.find("Qwen2") != std::string::npos) config.architecture = "qwen2";
         else if (arch.find("Llama") != std::string::npos) config.architecture = "llama";
         else if (arch.find("Mistral") != std::string::npos) config.architecture = "mistral";
         else if (arch.find("SmolLM3") != std::string::npos) config.architecture = "smollm3";
+    }
+
+    if (config.model_type == "qwen3_next") {
+        config.architecture = "qwen3_next";
+    } else if (config.model_type == "qwen3_moe") {
+        config.architecture = "qwen3_moe";
     }
     
     // Also check model_type for SmolLM3
@@ -226,10 +270,6 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     config.head_dim = extract_json_int(json, "head_dim", 0);
     config.vocab_size = extract_json_int(json, "vocab_size");
     config.max_position_embeddings = extract_json_int(json, "max_position_embeddings");
-
-    // DFlash-specific
-    config.block_size = extract_json_int(json, "block_size", 0);
-    config.num_target_layers = extract_json_int(json, "num_target_layers", 0);
     
     // Normalization
     config.rms_norm_eps = extract_json_float(json, "rms_norm_eps", 1e-6f);
@@ -249,17 +289,33 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
     // SmolLM3-specific
     config.no_rope_layer_interval = extract_json_int(json, "no_rope_layer_interval", 0);
     config.no_rope_layers = extract_json_int_array(json, "no_rope_layers");
+
+    // Qwen3-Next specific fields
+    config.full_attention_interval = extract_json_int(json, "full_attention_interval", 4);
+    config.partial_rotary_factor = extract_json_float(json, "partial_rotary_factor", 1.0f);
+    config.linear_conv_kernel_dim = extract_json_int(json, "linear_conv_kernel_dim", 0);
+    config.linear_key_head_dim = extract_json_int(json, "linear_key_head_dim", 0);
+    config.linear_value_head_dim = extract_json_int(json, "linear_value_head_dim", 0);
+    config.linear_num_key_heads = extract_json_int(json, "linear_num_key_heads", 0);
+    config.linear_num_value_heads = extract_json_int(json, "linear_num_value_heads", 0);
+    config.decoder_sparse_step = extract_json_int(json, "decoder_sparse_step", 0);
+    config.moe_intermediate_size = extract_json_int(json, "moe_intermediate_size", 0);
+    config.shared_expert_intermediate_size = extract_json_int(json, "shared_expert_intermediate_size", 0);
+    config.num_experts = extract_json_int(json, "num_experts", 0);
+    config.num_experts_per_tok = extract_json_int(json, "num_experts_per_tok", 0);
+    config.norm_topk_prob = extract_json_bool(json, "norm_topk_prob", true);
+    config.output_router_logits = extract_json_bool(json, "output_router_logits", false);
+    config.router_aux_loss_coef = extract_json_float(json, "router_aux_loss_coef", 0.0f);
+    config.mlp_only_layers = extract_json_int_array(json, "mlp_only_layers");
+    config.layer_types = extract_json_string_array(json, "layer_types");
     
     // Compute head_dim if not provided
     if (config.head_dim == 0 && config.hidden_size > 0 && config.num_attention_heads > 0) {
         config.head_dim = config.hidden_size / config.num_attention_heads;
     }
     
-    // Parse torch_dtype (fallback to "dtype")
+    // Parse torch_dtype
     std::string dtype_str = extract_json_string(json, "torch_dtype");
-    if (dtype_str.empty()) {
-        dtype_str = extract_json_string(json, "dtype");
-    }
     if (dtype_str == "bfloat16") config.dtype = ov::element::bf16;
     else if (dtype_str == "float16") config.dtype = ov::element::f16;
     else if (dtype_str == "float32") config.dtype = ov::element::f32;
@@ -295,10 +351,6 @@ void ModelConfig::validate() const {
     if (num_hidden_layers <= 0) missing.push_back("num_hidden_layers");
     if (num_attention_heads <= 0) missing.push_back("num_attention_heads");
     if (vocab_size <= 0) missing.push_back("vocab_size");
-    if (architecture == "dflash") {
-        if (block_size <= 0) missing.push_back("block_size");
-        if (num_target_layers <= 0) missing.push_back("num_target_layers");
-    }
     
     if (!missing.empty()) {
         std::string msg = "Missing required config fields: ";
@@ -323,12 +375,22 @@ std::string ModelConfig::summary() const {
        << "  head_dim: " << head_dim << "\n"
        << "  vocab_size: " << vocab_size << "\n"
        << "  max_position_embeddings: " << max_position_embeddings << "\n"
-       << "  block_size: " << block_size << "\n"
-       << "  num_target_layers: " << num_target_layers << "\n"
        << "  rms_norm_eps: " << rms_norm_eps << "\n"
        << "  rope_theta: " << rope_theta << "\n"
        << "  tie_word_embeddings: " << (tie_word_embeddings ? "true" : "false") << "\n"
        << "  hidden_act: " << hidden_act << "\n"
+       << "  full_attention_interval: " << full_attention_interval << "\n"
+       << "  partial_rotary_factor: " << partial_rotary_factor << "\n"
+       << "  linear_conv_kernel_dim: " << linear_conv_kernel_dim << "\n"
+       << "  linear_key_head_dim: " << linear_key_head_dim << "\n"
+       << "  linear_value_head_dim: " << linear_value_head_dim << "\n"
+       << "  linear_num_key_heads: " << linear_num_key_heads << "\n"
+       << "  linear_num_value_heads: " << linear_num_value_heads << "\n"
+       << "  decoder_sparse_step: " << decoder_sparse_step << "\n"
+       << "  moe_intermediate_size: " << moe_intermediate_size << "\n"
+       << "  shared_expert_intermediate_size: " << shared_expert_intermediate_size << "\n"
+       << "  num_experts: " << num_experts << "\n"
+       << "  num_experts_per_tok: " << num_experts_per_tok << "\n"
        << "}";
     return ss.str();
 }

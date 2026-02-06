@@ -98,6 +98,15 @@ bool is_modeling_api_enabled() {
     return (val == "1" || val == "true" || val == "TRUE");
 }
 
+bool is_unified_loader_enabled() {
+    const char* env = std::getenv("OV_GENAI_USE_UNIFIED_LOADER");
+    if (env == nullptr) {
+        return false;
+    }
+    std::string val(env);
+    return (val == "1" || val == "true" || val == "TRUE");
+}
+
 /**
  * @brief Check if zero-copy mode is enabled via environment variable
  * 
@@ -109,9 +118,9 @@ bool is_modeling_api_enabled() {
 bool is_zero_copy_enabled() {
     const char* env = std::getenv("OV_GENAI_USE_ZERO_COPY");
     if (env == nullptr) {
-        // Default: enable only if modeling API is enabled
-        // Building blocks path doesn't support zero-copy
-        return is_modeling_api_enabled();
+        // Default: enable for modeling API and unified loader path.
+        // Building-blocks path does not support zero-copy safely.
+        return is_modeling_api_enabled() || is_unified_loader_enabled();
     }
     std::string val(env);
     return !(val == "0" || val == "false" || val == "FALSE");
@@ -167,6 +176,7 @@ ov::element::Type convert_dtype(int safetensors_dtype) {
         case kUINT16:   return ov::element::u16;
         case kFLOAT16:  return ov::element::f16;
         case kBFLOAT16: return ov::element::bf16;
+        case kFLOAT8_E4M3: return ov::element::f8e4m3;
         case kINT32:    return ov::element::i32;
         case kUINT32:   return ov::element::u32;
         case kFLOAT32:  return ov::element::f32;

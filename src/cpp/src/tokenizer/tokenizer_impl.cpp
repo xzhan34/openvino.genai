@@ -335,11 +335,15 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
         return;
     }
     
-    // Check if we need to convert a HuggingFace tokenizer (tokenizer.json is enough).
+    // Check if we need to convert a HuggingFace tokenizer.
+    // Support both tokenizer.json (modern) and vocab.json+merges.txt (GPT2-style)
     bool has_tokenizer_json = std::filesystem::exists(models_path / "tokenizer.json");
+    bool has_gpt2_tokenizer = std::filesystem::exists(models_path / "vocab.json") && 
+                              std::filesystem::exists(models_path / "merges.txt");
+    bool has_hf_tokenizer = has_tokenizer_json || has_gpt2_tokenizer;
     bool has_ov_tokenizer = std::filesystem::exists(models_path / "openvino_tokenizer.xml");
     bool has_ov_detokenizer = std::filesystem::exists(models_path / "openvino_detokenizer.xml");
-    bool needs_tokenizer_conversion = has_tokenizer_json && (!has_ov_tokenizer || !has_ov_detokenizer);
+    bool needs_tokenizer_conversion = has_hf_tokenizer && (!has_ov_tokenizer || !has_ov_detokenizer);
 
     if (needs_tokenizer_conversion) {
         // Convert HuggingFace tokenizer to OpenVINO format

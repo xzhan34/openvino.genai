@@ -133,7 +133,14 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
     double graph_ms = 0;
     bool logged = false;
 
-    if (selector_.enabled() && selector_.should_quantize(name, shape, element_type)) {
+    if (element_type == ov::element::f8e4m3 && has_fp8_scale_inv(source, name)) {
+        auto start_graph = std::chrono::high_resolution_clock::now();
+        const ov::Tensor& scale_inv = source.get_tensor(name + "_scale_inv");
+        output = create_fp8_dequant_subgraph(name, tensor, scale_inv, ctx);
+        auto end_graph = std::chrono::high_resolution_clock::now();
+        graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+        total_graph_time_ms_ += graph_ms;
+    } else if (selector_.enabled() && selector_.should_quantize(name, shape, element_type)) {
         quantized_weights_++;
         // Quantize the weight during finalization
         // Tensor reference is already fetched above, no need to fetch again
@@ -173,7 +180,8 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
         // Convert to F32 if needed (matching GGUF behavior)
         // This ensures consistency with how GGUF weights are processed
         if (element_type == ov::element::bf16 || 
-            element_type == ov::element::f16) {
+            element_type == ov::element::f16 ||
+            element_type == ov::element::f8e4m3) {
             auto converted = std::make_shared<ov::op::v0::Convert>(constant, ov::element::f32);
             output = converted->output(0);
         } else {
@@ -194,6 +202,104 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
     return ov::genai::modeling::weights::FinalizedWeight(
         ov::genai::modeling::Tensor(output, &ctx),
         auxiliary);
+}
+
+bool SafetensorsWeightFinalizer::has_fp8_scale_inv(ov::genai::modeling::weights::WeightSource& source,
+                                                    const std::string& name) const {
+    static const std::string weight_suffix = ".weight";
+    if (name.size() < weight_suffix.size() ||
+        name.compare(name.size() - weight_suffix.size(), weight_suffix.size(), weight_suffix) != 0) {
+        return false;
+    }
+    return source.has(name + "_scale_inv");
+}
+
+ov::Output<ov::Node> SafetensorsWeightFinalizer::create_fp8_dequant_subgraph(
+    const std::string& name,
+    const ov::Tensor& weight_fp8,
+    const ov::Tensor& scale_inv,
+    ov::genai::modeling::OpContext& ctx) {
+    auto weight_const = std::make_shared<ov::op::v0::Constant>(weight_fp8);
+    weight_const->set_friendly_name(name);
+    weight_const->output(0).set_names({name});
+
+    auto weight_f32 = std::make_shared<ov::op::v0::Convert>(weight_const, ov::element::f32);
+    auto expanded_scale = expand_block_scale_to_weight(scale_inv, weight_fp8.get_shape(), ctx);
+    auto scale_f32 = std::make_shared<ov::op::v0::Convert>(expanded_scale, ov::element::f32);
+    auto dequant = std::make_shared<ov::op::v1::Multiply>(
+        weight_f32->output(0),
+        scale_f32->output(0),
+        ov::op::AutoBroadcastType::NUMPY);
+    return dequant->output(0);
+}
+
+ov::Output<ov::Node> SafetensorsWeightFinalizer::expand_block_scale_to_weight(
+    const ov::Tensor& scale_inv,
+    const ov::Shape& weight_shape,
+    ov::genai::modeling::OpContext& ctx) const {
+    auto scale_const = std::make_shared<ov::op::v0::Constant>(scale_inv);
+    const ov::Shape scale_shape = scale_inv.get_shape();
+
+    if (scale_shape == weight_shape) {
+        return scale_const->output(0);
+    }
+
+    OPENVINO_ASSERT(scale_shape.size() == weight_shape.size(),
+                    "FP8 scale rank must match weight rank. scale_shape=",
+                    scale_shape,
+                    ", weight_shape=",
+                    weight_shape);
+
+    auto interleaved_scale_shape = make_interleaved_scale_shape(scale_shape);
+    auto interleaved_repeats = make_interleaved_tile_repeats(scale_shape, weight_shape);
+
+    auto reshape_scale = std::make_shared<ov::op::v1::Reshape>(
+        scale_const->output(0),
+        ctx.const_i64_vec(interleaved_scale_shape),
+        false);
+    auto tiled = std::make_shared<ov::op::v0::Tile>(
+        reshape_scale->output(0),
+        ctx.const_i64_vec(interleaved_repeats));
+
+    std::vector<int64_t> weight_shape_i64(weight_shape.begin(), weight_shape.end());
+    auto final_reshape = std::make_shared<ov::op::v1::Reshape>(
+        tiled->output(0),
+        ctx.const_i64_vec(weight_shape_i64),
+        false);
+    return final_reshape->output(0);
+}
+
+std::vector<int64_t> SafetensorsWeightFinalizer::make_interleaved_scale_shape(const ov::Shape& scale_shape) const {
+    std::vector<int64_t> result;
+    result.reserve(scale_shape.size() * 2);
+    for (size_t i = 0; i < scale_shape.size(); ++i) {
+        result.push_back(static_cast<int64_t>(scale_shape[i]));
+        result.push_back(1);
+    }
+    return result;
+}
+
+std::vector<int64_t> SafetensorsWeightFinalizer::make_interleaved_tile_repeats(const ov::Shape& scale_shape,
+                                                                                const ov::Shape& weight_shape) const {
+    OPENVINO_ASSERT(scale_shape.size() == weight_shape.size(),
+                    "Scale and weight rank mismatch while expanding FP8 scales.");
+    std::vector<int64_t> repeats;
+    repeats.reserve(scale_shape.size() * 2);
+    for (size_t i = 0; i < scale_shape.size(); ++i) {
+        const auto s = scale_shape[i];
+        const auto w = weight_shape[i];
+        OPENVINO_ASSERT(s > 0 && w > 0, "Scale/weight dimensions must be > 0 for FP8 block expansion.");
+        OPENVINO_ASSERT(w % s == 0,
+                        "Weight dimension must be divisible by scale dimension for FP8 block expansion. dim ",
+                        i,
+                        ": weight=",
+                        w,
+                        ", scale=",
+                        s);
+        repeats.push_back(1);
+        repeats.push_back(static_cast<int64_t>(w / s));
+    }
+    return repeats;
 }
 
 rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
