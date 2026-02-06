@@ -17,6 +17,16 @@
 
 namespace {
 
+bool can_try_auto_pa_backend(const std::filesystem::path& models_path) {
+    if (!std::filesystem::is_directory(models_path)) {
+        return true;
+    }
+    // Auto-probing PA backend may attempt model loading and then silently fall back.
+    // Limit probing to pre-exported IR directories to avoid double-loading raw model formats.
+    return std::filesystem::exists(models_path / "openvino_model.xml") ||
+           std::filesystem::exists(models_path / "openvino_language_model.xml");
+}
+
 // This is a decorator function that wraps a generation callable to apply parsers and reset them before generation if needed.
 ov::genai::DecodedResults run_generate_with_parsers(const ov::genai::OptionalGenerationConfig& generation_config,
                  const ov::genai::StreamerVariant& streamer,
@@ -187,7 +197,7 @@ ov::genai::LLMPipeline::LLMPipeline(
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, tokenizer, scheduler_config, device, device_properties);
-    } else if (attention_backend == PA_BACKEND) {
+    } else if (attention_backend == PA_BACKEND && can_try_auto_pa_backend(models_path)) {
         // try to call CB adapter one more time, but with safe guard to silent exception
         try {
             // we need use CB only for x86 and arm64, as for other architectures like risc-v we can create Paged Attention based model
@@ -225,7 +235,7 @@ ov::genai::LLMPipeline::LLMPipeline(
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, scheduler_config, device, device_properties);
-    } else if (attention_backend == PA_BACKEND) {
+    } else if (attention_backend == PA_BACKEND && can_try_auto_pa_backend(models_path)) {
         // try to call CB adapter one more time, but with safe guard to silent exception
         try {
             // we need use CB only for x86 and arm64, as for other architectures like risc-v we can create Paged Attention based model
