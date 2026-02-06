@@ -593,11 +593,10 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.group_size = quant_config.group_size;
         ov_model = ov::genai::modeling::models::create_qwen3_moe_model(cfg, source, finalizer);
     } else if (hf_config.model_type == "qwen3_next") {
-        constexpr int32_t kDebugBuildNumLayers = 4;
         ov::genai::modeling::models::Qwen3NextConfig cfg;
         cfg.architecture = hf_config.model_type;
         cfg.hidden_size = hf_config.hidden_size;
-        cfg.num_hidden_layers = std::min(hf_config.num_hidden_layers, kDebugBuildNumLayers);
+        cfg.num_hidden_layers = hf_config.num_hidden_layers;
         cfg.num_attention_heads = hf_config.num_attention_heads;
         cfg.num_key_value_heads = hf_config.kv_heads();
         cfg.head_dim = hf_config.head_size();

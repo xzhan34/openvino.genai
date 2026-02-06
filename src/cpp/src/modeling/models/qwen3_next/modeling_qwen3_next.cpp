@@ -966,7 +966,6 @@ namespace {
 
 ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::genai::loaders::ModelConfig& config) {
     using ov::genai::modeling::models::Qwen3NextConfig;
-    constexpr int32_t kDebugBuildNumLayers = 4;
 
     Qwen3NextConfig cfg;
     cfg.architecture = "qwen3_next";
@@ -975,7 +974,7 @@ ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::gena
     cfg.num_key_value_heads = config.num_key_value_heads > 0 ? config.num_key_value_heads : config.num_attention_heads;
     cfg.head_dim = config.head_dim > 0 ? config.head_dim : (config.hidden_size / config.num_attention_heads);
     cfg.intermediate_size = config.intermediate_size;
-    cfg.num_hidden_layers = std::min<int32_t>(config.num_hidden_layers, kDebugBuildNumLayers);
+    cfg.num_hidden_layers = config.num_hidden_layers;
     cfg.vocab_size = config.vocab_size;
     cfg.max_position_embeddings = config.max_position_embeddings;
     cfg.rms_norm_eps = config.rms_norm_eps;
@@ -990,7 +989,7 @@ ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::gena
                                ? build_default_layer_types(config.num_hidden_layers, cfg.full_attention_interval)
                                : config.layer_types;
     if (all_layer_types.size() < static_cast<size_t>(cfg.num_hidden_layers)) {
-        OPENVINO_THROW("Qwen3Next layer_types size is smaller than requested debug layer count. layer_types=",
+        OPENVINO_THROW("Qwen3Next layer_types size is smaller than requested layer count. layer_types=",
                        all_layer_types.size(),
                        ", requested_layers=",
                        cfg.num_hidden_layers);
