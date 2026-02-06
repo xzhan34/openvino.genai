@@ -1018,3 +1018,422 @@ inline QuantizedWeight quantize_int8_asym(const ov::Tensor& weight, int group_si
 }  // namespace rtn
 }  // namespace genai
 }  // namespace ov
+
+// Include FP8 support in a separate section to keep the file organized
+#include "openvino/core/type/float8_e4m3.hpp"
+
+namespace ov {
+namespace genai {
+namespace rtn {
+
+/**
+ * @brief Convert FP8 E4M3 value to float, applying scale
+ * This is used for direct FP8 -> INT4/INT8 quantization
+ */
+inline float fp8_to_float_scaled(uint8_t fp8_val, float scale) {
+    return static_cast<float>(ov::float8_e4m3::from_bits(fp8_val)) * scale;
+}
+
+/**
+ * @brief Quantize FP8 weights directly to INT4 symmetric without intermediate F32 tensor
+ * 
+ * This optimized version processes FP8 weights in groups, converting to F32 only within
+ * each group's scope to minimize memory usage. The scale from FP8 quantization is applied
+ * during the conversion.
+ * 
+ * Memory optimization: Only allocates group_size floats at a time instead of full tensor
+ * 
+ * @param weight_fp8 Input FP8 weight tensor
+ * @param scale_inv FP8 scale tensor (per-channel or block-wise)
+ * @param group_size Group size for INT4 quantization
+ * @return QuantizedWeight with INT4 weights packed as U8, FP16 scales
+ */
+inline QuantizedWeight quantize_fp8_to_int4_sym(
+    const ov::Tensor& weight_fp8, 
+    const ov::Tensor& scale_inv, 
+    int group_size = 128
+) {
+    auto shape = weight_fp8.get_shape();
+    auto scale_shape = scale_inv.get_shape();
+    
+    if (shape.size() != 2) {
+        throw std::runtime_error("FP8 weight tensor must be 2D for direct quantization");
+    }
+    
+    size_t out_features = shape[0];
+    size_t in_features = shape[1];
+    
+    // FP8 scale can be [out_features, num_fp8_groups] or [out_features, 1]
+    size_t fp8_num_groups = (scale_shape.size() >= 2) ? scale_shape[1] : 1;
+    size_t fp8_group_size = in_features / fp8_num_groups;
+    
+    if (group_size <= 0) {
+        group_size = static_cast<int>(in_features);
+    }
+    
+    size_t num_groups = (in_features + group_size - 1) / group_size;
+    size_t packed_in_features = (in_features + 1) / 2;
+    
+    ov::Tensor compressed(ov::element::u8, {out_features, packed_in_features});
+    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    
+    auto* compressed_data = static_cast<uint8_t*>(compressed.data());
+    auto* scale_data = static_cast<uint16_t*>(scale.data());
+    const uint8_t* fp8_ptr = static_cast<const uint8_t*>(weight_fp8.data());
+    const float* fp8_scale_ptr = scale_inv.data<float>();
+    
+    std::memset(compressed_data, 0, out_features * packed_in_features);
+    
+    constexpr float factor = 8.0f;  // 2^(4-1) = 8
+    constexpr int8_t level_low = -8;
+    constexpr int8_t level_high = 7;
+    constexpr float eps = 1.1920929e-7f;
+    
+    ov::parallel_for(out_features, [&](size_t row) {
+        const uint8_t* row_fp8 = fp8_ptr + row * in_features;
+        uint8_t* row_compressed = compressed_data + row * packed_in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        const float* row_fp8_scale = fp8_scale_ptr + row * fp8_num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            size_t actual_group_size = group_end - group_start;
+            
+            // Find min/max by converting FP8 to F32 on-the-fly
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            // Compute scale for INT4
+            float max_abs = std::max(std::abs(w_min), std::abs(w_max));
+            float scale_val = max_abs / factor;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            row_scale[g] = float_to_fp16(scale_val);
+            
+            // Quantize
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                
+                int8_t q = static_cast<int8_t>(std::round(val * inv_scale));
+                q = std::max(level_low, std::min(level_high, q));
+                
+                size_t byte_idx = i / 2;
+                if (i % 2 == 0) {
+                    row_compressed[byte_idx] = static_cast<uint8_t>(q) & 0x0F;
+                } else {
+                    row_compressed[byte_idx] |= (static_cast<uint8_t>(q) & 0x0F) << 4;
+                }
+            }
+        }
+    });
+    
+    QuantizedWeight result;
+    result.compressed = compressed;
+    result.scale = scale;
+    result.has_zero_point = false;
+    result.compressed_type = ov::element::i4;
+    return result;
+}
+
+/**
+ * @brief Quantize FP8 weights directly to INT4 asymmetric without intermediate F32 tensor
+ */
+inline QuantizedWeight quantize_fp8_to_int4_asym(
+    const ov::Tensor& weight_fp8, 
+    const ov::Tensor& scale_inv, 
+    int group_size = 128
+) {
+    auto shape = weight_fp8.get_shape();
+    auto scale_shape = scale_inv.get_shape();
+    
+    if (shape.size() != 2) {
+        throw std::runtime_error("FP8 weight tensor must be 2D for direct quantization");
+    }
+    
+    size_t out_features = shape[0];
+    size_t in_features = shape[1];
+    
+    size_t fp8_num_groups = (scale_shape.size() >= 2) ? scale_shape[1] : 1;
+    size_t fp8_group_size = in_features / fp8_num_groups;
+    
+    if (group_size <= 0) {
+        group_size = static_cast<int>(in_features);
+    }
+    
+    size_t num_groups = (in_features + group_size - 1) / group_size;
+    size_t packed_in_features = (in_features + 1) / 2;
+    
+    ov::Tensor compressed(ov::element::u8, {out_features, packed_in_features});
+    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    ov::Tensor zero_point(ov::element::u8, {out_features, num_groups});
+    
+    auto* compressed_data = static_cast<uint8_t*>(compressed.data());
+    auto* scale_data = static_cast<uint16_t*>(scale.data());
+    auto* zp_data = static_cast<uint8_t*>(zero_point.data());
+    const uint8_t* fp8_ptr = static_cast<const uint8_t*>(weight_fp8.data());
+    const float* fp8_scale_ptr = scale_inv.data<float>();
+    
+    std::memset(compressed_data, 0, out_features * packed_in_features);
+    
+    constexpr float levels = 15.0f;
+    constexpr int32_t level_low = 0;
+    constexpr int32_t level_high = 15;
+    constexpr float eps = 1.1920929e-7f;
+    
+    ov::parallel_for(out_features, [&](size_t row) {
+        const uint8_t* row_fp8 = fp8_ptr + row * in_features;
+        uint8_t* row_compressed = compressed_data + row * packed_in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        uint8_t* row_zp = zp_data + row * num_groups;
+        const float* row_fp8_scale = fp8_scale_ptr + row * fp8_num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            float scale_val = (w_max - w_min) / levels;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            int32_t zp = static_cast<int32_t>(std::round(-w_min * inv_scale));
+            zp = std::max(level_low, std::min(level_high, zp));
+            
+            row_scale[g] = float_to_fp16(scale_val);
+            row_zp[g] = static_cast<uint8_t>(zp);
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                
+                int32_t q = static_cast<int32_t>(std::round(val * inv_scale)) + zp;
+                q = std::max(level_low, std::min(level_high, q));
+                
+                size_t byte_idx = i / 2;
+                if (i % 2 == 0) {
+                    row_compressed[byte_idx] = static_cast<uint8_t>(q) & 0x0F;
+                } else {
+                    row_compressed[byte_idx] |= (static_cast<uint8_t>(q) & 0x0F) << 4;
+                }
+            }
+        }
+    });
+    
+    QuantizedWeight result;
+    result.compressed = compressed;
+    result.scale = scale;
+    result.zero_point = zero_point;
+    result.has_zero_point = true;
+    result.compressed_type = ov::element::u4;
+    return result;
+}
+
+/**
+ * @brief Quantize FP8 weights directly to INT8 symmetric without intermediate F32 tensor
+ */
+inline QuantizedWeight quantize_fp8_to_int8_sym(
+    const ov::Tensor& weight_fp8, 
+    const ov::Tensor& scale_inv, 
+    int group_size = 128
+) {
+    auto shape = weight_fp8.get_shape();
+    auto scale_shape = scale_inv.get_shape();
+    
+    if (shape.size() != 2) {
+        throw std::runtime_error("FP8 weight tensor must be 2D for direct quantization");
+    }
+    
+    size_t out_features = shape[0];
+    size_t in_features = shape[1];
+    
+    size_t fp8_num_groups = (scale_shape.size() >= 2) ? scale_shape[1] : 1;
+    size_t fp8_group_size = in_features / fp8_num_groups;
+    
+    if (group_size <= 0) {
+        group_size = static_cast<int>(in_features);
+    }
+    
+    size_t num_groups = (in_features + group_size - 1) / group_size;
+    
+    ov::Tensor compressed(ov::element::i8, {out_features, in_features});
+    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    
+    auto* compressed_data = static_cast<int8_t*>(compressed.data());
+    auto* scale_data = static_cast<uint16_t*>(scale.data());
+    const uint8_t* fp8_ptr = static_cast<const uint8_t*>(weight_fp8.data());
+    const float* fp8_scale_ptr = scale_inv.data<float>();
+    
+    constexpr float factor = 128.0f;
+    constexpr int8_t level_low = -128;
+    constexpr int8_t level_high = 127;
+    constexpr float eps = 1.1920929e-7f;
+    
+    ov::parallel_for(out_features, [&](size_t row) {
+        const uint8_t* row_fp8 = fp8_ptr + row * in_features;
+        int8_t* row_compressed = compressed_data + row * in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        const float* row_fp8_scale = fp8_scale_ptr + row * fp8_num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            float max_abs = std::max(std::abs(w_min), std::abs(w_max));
+            float scale_val = max_abs / factor;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            row_scale[g] = float_to_fp16(scale_val);
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                
+                int32_t q = static_cast<int32_t>(std::round(val * inv_scale));
+                q = std::max(static_cast<int32_t>(level_low), std::min(static_cast<int32_t>(level_high), q));
+                row_compressed[i] = static_cast<int8_t>(q);
+            }
+        }
+    });
+    
+    QuantizedWeight result;
+    result.compressed = compressed;
+    result.scale = scale;
+    result.has_zero_point = false;
+    result.compressed_type = ov::element::i8;
+    return result;
+}
+
+/**
+ * @brief Quantize FP8 weights directly to INT8 asymmetric without intermediate F32 tensor
+ */
+inline QuantizedWeight quantize_fp8_to_int8_asym(
+    const ov::Tensor& weight_fp8, 
+    const ov::Tensor& scale_inv, 
+    int group_size = 128
+) {
+    auto shape = weight_fp8.get_shape();
+    auto scale_shape = scale_inv.get_shape();
+    
+    if (shape.size() != 2) {
+        throw std::runtime_error("FP8 weight tensor must be 2D for direct quantization");
+    }
+    
+    size_t out_features = shape[0];
+    size_t in_features = shape[1];
+    
+    size_t fp8_num_groups = (scale_shape.size() >= 2) ? scale_shape[1] : 1;
+    size_t fp8_group_size = in_features / fp8_num_groups;
+    
+    if (group_size <= 0) {
+        group_size = static_cast<int>(in_features);
+    }
+    
+    size_t num_groups = (in_features + group_size - 1) / group_size;
+    
+    ov::Tensor compressed(ov::element::u8, {out_features, in_features});
+    ov::Tensor scale(ov::element::f16, {out_features, num_groups});
+    ov::Tensor zero_point(ov::element::u8, {out_features, num_groups});
+    
+    auto* compressed_data = static_cast<uint8_t*>(compressed.data());
+    auto* scale_data = static_cast<uint16_t*>(scale.data());
+    auto* zp_data = static_cast<uint8_t*>(zero_point.data());
+    const uint8_t* fp8_ptr = static_cast<const uint8_t*>(weight_fp8.data());
+    const float* fp8_scale_ptr = scale_inv.data<float>();
+    
+    constexpr float levels = 255.0f;
+    constexpr int32_t level_low = 0;
+    constexpr int32_t level_high = 255;
+    constexpr float eps = 1.1920929e-7f;
+    
+    ov::parallel_for(out_features, [&](size_t row) {
+        const uint8_t* row_fp8 = fp8_ptr + row * in_features;
+        uint8_t* row_compressed = compressed_data + row * in_features;
+        uint16_t* row_scale = scale_data + row * num_groups;
+        uint8_t* row_zp = zp_data + row * num_groups;
+        const float* row_fp8_scale = fp8_scale_ptr + row * fp8_num_groups;
+        
+        for (size_t g = 0; g < num_groups; g++) {
+            size_t group_start = g * group_size;
+            size_t group_end = std::min(group_start + static_cast<size_t>(group_size), in_features);
+            
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                w_min = std::min(w_min, val);
+                w_max = std::max(w_max, val);
+            }
+            
+            float scale_val = (w_max - w_min) / levels;
+            if (scale_val < eps) scale_val = eps;
+            float inv_scale = 1.0f / scale_val;
+            
+            int32_t zp = static_cast<int32_t>(std::round(-w_min * inv_scale));
+            zp = std::max(level_low, std::min(level_high, zp));
+            
+            row_scale[g] = float_to_fp16(scale_val);
+            row_zp[g] = static_cast<uint8_t>(zp);
+            
+            for (size_t i = group_start; i < group_end; ++i) {
+                size_t fp8_group_idx = i / fp8_group_size;
+                float fp8_scale = row_fp8_scale[fp8_group_idx];
+                float val = fp8_to_float_scaled(row_fp8[i], fp8_scale);
+                
+                int32_t q = static_cast<int32_t>(std::round(val * inv_scale)) + zp;
+                q = std::max(level_low, std::min(level_high, q));
+                row_compressed[i] = static_cast<uint8_t>(q);
+            }
+        }
+    });
+    
+    QuantizedWeight result;
+    result.compressed = compressed;
+    result.scale = scale;
+    result.zero_point = zero_point;
+    result.has_zero_point = true;
+    result.compressed_type = ov::element::u8;
+    return result;
+}
+
+}  // namespace rtn
+}  // namespace genai
+}  // namespace ov

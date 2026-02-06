@@ -36,9 +36,10 @@ bool QuantizationSelector::should_quantize(const std::string& name,
         return false;
     }
     
-    // Only quantize FP16/FP32 weights if dtype is specified
+    // Only quantize FP16/FP32/BF16/FP8 weights if dtype is specified
     if (dtype != ov::element::undefined) {
-        if (dtype != ov::element::f16 && dtype != ov::element::f32 && dtype != ov::element::bf16) {
+        if (dtype != ov::element::f16 && dtype != ov::element::f32 && 
+            dtype != ov::element::bf16 && dtype != ov::element::f8e4m3) {
             if (sel.verbose) {
                 std::cout << "[QuantizationSelector] Skipping " << name << " - not float type" << std::endl;
             }

@@ -278,7 +278,8 @@ Qwen3NextSparseMoeBlock::Qwen3NextSparseMoeBlock(BuilderContext& ctx,
       shared_intermediate_size_(cfg.shared_expert_intermediate_size),
       num_experts_(cfg.num_experts),
       top_k_(cfg.num_experts_per_tok > 0 ? cfg.num_experts_per_tok : 1),
-      norm_topk_prob_(cfg.norm_topk_prob) {
+      norm_topk_prob_(cfg.norm_topk_prob),
+      group_size_((cfg.group_size > 0) ? static_cast<size_t>(cfg.group_size) : 128) {
     if (!cfg.hidden_act.empty() && cfg.hidden_act != "silu") {
         OPENVINO_THROW("Unsupported Qwen3Next MoE activation: ", cfg.hidden_act);
     }
@@ -295,15 +296,83 @@ Qwen3NextSparseMoeBlock::Qwen3NextSparseMoeBlock(BuilderContext& ctx,
     shared_up_proj_param_ = &register_parameter("shared_expert.up_proj.weight");
     shared_down_proj_param_ = &register_parameter("shared_expert.down_proj.weight");
 
+    // Initialize expert parameter vectors
     gate_experts_param_.resize(static_cast<size_t>(num_experts_));
     up_experts_param_.resize(static_cast<size_t>(num_experts_));
     down_experts_param_.resize(static_cast<size_t>(num_experts_));
+    
+    // Initialize scales and zps vectors for quantized MoE weights
+    gate_exps_scales_.resize(static_cast<size_t>(num_experts_));
+    gate_exps_zps_.resize(static_cast<size_t>(num_experts_));
+    up_exps_scales_.resize(static_cast<size_t>(num_experts_));
+    up_exps_zps_.resize(static_cast<size_t>(num_experts_));
+    down_exps_scales_.resize(static_cast<size_t>(num_experts_));
+    down_exps_zps_.resize(static_cast<size_t>(num_experts_));
 
     for (int32_t i = 0; i < num_experts_; ++i) {
         const std::string prefix = "experts." + std::to_string(i) + ".";
-        gate_experts_param_[static_cast<size_t>(i)] = &register_parameter(prefix + "gate_proj.weight");
-        up_experts_param_[static_cast<size_t>(i)] = &register_parameter(prefix + "up_proj.weight");
-        down_experts_param_[static_cast<size_t>(i)] = &register_parameter(prefix + "down_proj.weight");
+        const size_t idx = static_cast<size_t>(i);
+        
+        gate_experts_param_[idx] = &register_parameter(prefix + "gate_proj.weight");
+        up_experts_param_[idx] = &register_parameter(prefix + "up_proj.weight");
+        down_experts_param_[idx] = &register_parameter(prefix + "down_proj.weight");
+        
+        // Set custom weight_loader for gate_proj to capture scales/zps
+        gate_experts_param_[idx]->set_weight_loader([this, idx](WeightParameter& param,
+                                                   weights::WeightSource& source,
+                                                   weights::WeightFinalizer& finalizer,
+                                                   const std::string& weight_name,
+                                                   const std::optional<int>& shard_id) {
+            (void)shard_id;
+            if (!param.context()) {
+                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+            }
+            auto weight = finalizer.finalize(weight_name, source, *param.context());
+            param.bind(weight);
+            if (weight.get_auxiliary("scales") != std::nullopt &&
+                weight.get_auxiliary("zps") != std::nullopt) {
+                gate_exps_scales_[idx] = weight.auxiliary.at("scales");
+                gate_exps_zps_[idx] = weight.auxiliary.at("zps");
+            }
+        });
+
+        // Set custom weight_loader for up_proj
+        up_experts_param_[idx]->set_weight_loader([this, idx](WeightParameter& param,
+                                                 weights::WeightSource& source,
+                                                 weights::WeightFinalizer& finalizer,
+                                                 const std::string& weight_name,
+                                                 const std::optional<int>& shard_id) {
+            (void)shard_id;
+            if (!param.context()) {
+                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+            }
+            auto weight = finalizer.finalize(weight_name, source, *param.context());
+            param.bind(weight);
+            if (weight.get_auxiliary("scales") != std::nullopt &&
+                weight.get_auxiliary("zps") != std::nullopt) {
+                up_exps_scales_[idx] = weight.auxiliary.at("scales");
+                up_exps_zps_[idx] = weight.auxiliary.at("zps");
+            }
+        });
+
+        // Set custom weight_loader for down_proj
+        down_experts_param_[idx]->set_weight_loader([this, idx](WeightParameter& param,
+                                                   weights::WeightSource& source,
+                                                   weights::WeightFinalizer& finalizer,
+                                                   const std::string& weight_name,
+                                                   const std::optional<int>& shard_id) {
+            (void)shard_id;
+            if (!param.context()) {
+                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
+            }
+            auto weight = finalizer.finalize(weight_name, source, *param.context());
+            param.bind(weight);
+            if (weight.get_auxiliary("scales") != std::nullopt &&
+                weight.get_auxiliary("zps") != std::nullopt) {
+                down_exps_scales_[idx] = weight.auxiliary.at("scales");
+                down_exps_zps_[idx] = weight.auxiliary.at("zps");
+            }
+        });
     }
 }
 
@@ -348,7 +417,7 @@ Tensor Qwen3NextSparseMoeBlock::gate_expert_weights() const {
     for (auto* p : gate_experts_param_) {
         ws.push_back(p->value());
     }
-    return ops::tensor::stack(ws, 0);
+    return ops::concat(ws, 0);
 }
 
 Tensor Qwen3NextSparseMoeBlock::up_expert_weights() const {
@@ -357,7 +426,7 @@ Tensor Qwen3NextSparseMoeBlock::up_expert_weights() const {
     for (auto* p : up_experts_param_) {
         ws.push_back(p->value());
     }
-    return ops::tensor::stack(ws, 0);
+    return ops::concat(ws, 0);
 }
 
 Tensor Qwen3NextSparseMoeBlock::down_expert_weights() const {
@@ -366,7 +435,31 @@ Tensor Qwen3NextSparseMoeBlock::down_expert_weights() const {
     for (auto* p : down_experts_param_) {
         ws.push_back(p->value());
     }
-    return ops::tensor::stack(ws, 0);
+    return ops::concat(ws, 0);
+}
+
+Tensor Qwen3NextSparseMoeBlock::gate_exps_scales() const {
+    return ops::concat(gate_exps_scales_, 0);
+}
+
+Tensor Qwen3NextSparseMoeBlock::gate_exps_zps() const {
+    return ops::concat(gate_exps_zps_, 0);
+}
+
+Tensor Qwen3NextSparseMoeBlock::up_exps_scales() const {
+    return ops::concat(up_exps_scales_, 0);
+}
+
+Tensor Qwen3NextSparseMoeBlock::up_exps_zps() const {
+    return ops::concat(up_exps_zps_, 0);
+}
+
+Tensor Qwen3NextSparseMoeBlock::down_exps_scales() const {
+    return ops::concat(down_exps_scales_, 0);
+}
+
+Tensor Qwen3NextSparseMoeBlock::down_exps_zps() const {
+    return ops::concat(down_exps_zps_, 0);
 }
 
 Tensor Qwen3NextSparseMoeBlock::forward(const Tensor& hidden_states) const {
@@ -375,59 +468,34 @@ Tensor Qwen3NextSparseMoeBlock::forward(const Tensor& hidden_states) const {
 
     auto flat = hidden_states.reshape({-1, hidden_size_});
     auto flat_f32 = flat.to(ov::element::f32);
-    auto logits = ops::linear(flat_f32, gate_weight().to(ov::element::f32));
-    auto scores = logits.softmax(1);
+    
+    // Use optimized MoE kernel for routed experts
+    auto routed_out = ops::moe3gemm_fused_compressed(
+        flat_f32,
+        gate_weight(),
+        gate_expert_weights(),
+        gate_exps_scales(),
+        gate_exps_zps(),
+        up_expert_weights(),
+        up_exps_scales(),
+        up_exps_zps(),
+        down_expert_weights(),
+        down_exps_scales(),
+        down_exps_zps(),
+        hidden_size_,
+        expert_intermediate_size_,
+        num_experts_,
+        top_k_,
+        group_size_,
+        ov::element::f16);
 
-    auto k_node = ops::const_scalar(op_ctx, static_cast<int64_t>(top_k_));
-    auto topk = std::make_shared<ov::op::v11::TopK>(scores.output(),
-                                                    k_node,
-                                                    -1,
-                                                    ov::op::v11::TopK::Mode::MAX,
-                                                    ov::op::v11::TopK::SortType::SORT_VALUES,
-                                                    ov::element::i64);
-    Tensor topk_vals(topk->output(0), op_ctx);
-    Tensor topk_idx(topk->output(1), op_ctx);
-
-    if (norm_topk_prob_) {
-        auto reduce_axis = ops::const_vec(op_ctx, std::vector<int64_t>{-1});
-        auto sum = std::make_shared<ov::op::v1::ReduceSum>(topk_vals.output(), reduce_axis, true);
-        topk_vals = topk_vals / Tensor(sum, op_ctx);
-    }
-
-    auto zeros = shape::broadcast_to(Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx), shape::of(scores));
-    auto scatter_axis = ops::const_scalar(op_ctx, static_cast<int64_t>(1));
-    auto scatter = std::make_shared<ov::op::v12::ScatterElementsUpdate>(
-        zeros.output(),
-        topk_idx.output(),
-        topk_vals.output(),
-        scatter_axis);
-    Tensor routing(scatter, op_ctx);  // [T, E]
-
-    auto perm = ops::const_vec(op_ctx, std::vector<int64_t>{1, 0});
-    auto routing_t = Tensor(std::make_shared<ov::op::v1::Transpose>(routing.output(), perm), op_ctx);
-    auto routing_3d = routing_t.unsqueeze(-1);  // [E, T, 1]
-
-    auto tiled_input = ops::tensor::tile(flat_f32.unsqueeze(0), {num_experts_, 1, 1});  // [E, T, H]
-
-    auto gate_w = gate_expert_weights().to(ov::element::f32);
-    auto up_w = up_expert_weights().to(ov::element::f32);
-    auto down_w = down_expert_weights().to(ov::element::f32);
-
-    auto gate_bmm = ops::matmul(tiled_input, gate_w, false, true);   // [E, T, I]
-    auto up_bmm = ops::matmul(tiled_input, up_w, false, true);       // [E, T, I]
-    auto swiglu = ops::silu(gate_bmm) * up_bmm;
-    auto down_bmm = ops::matmul(swiglu, down_w, false, true);        // [E, T, H]
-
-    auto weighted = down_bmm * routing_3d;
-    auto reduce_axis = ops::const_vec(op_ctx, std::vector<int64_t>{0});
-    auto reduced = std::make_shared<ov::op::v1::ReduceSum>(weighted.output(), reduce_axis, false);
-    auto routed_out = Tensor(reduced, op_ctx);                       // [T, H]
-
+    // Shared expert computation (using standard linear ops)
     auto shared_gate = ops::linear(flat_f32, shared_gate_proj_weight().to(ov::element::f32));
     auto shared_up = ops::linear(flat_f32, shared_up_proj_weight().to(ov::element::f32));
     auto shared_hidden = ops::silu(shared_gate) * shared_up;
     auto shared_out = ops::linear(shared_hidden, shared_down_proj_weight().to(ov::element::f32));
 
+    // Gated combination of routed and shared expert outputs
     auto shared_gate_logits = ops::linear(flat_f32, shared_expert_gate_weight().to(ov::element::f32));
     auto shared_gate_sigmoid = Tensor(std::make_shared<ov::op::v0::Sigmoid>(shared_gate_logits.output()), op_ctx);
     auto combined = routed_out + (shared_out * shared_gate_sigmoid);

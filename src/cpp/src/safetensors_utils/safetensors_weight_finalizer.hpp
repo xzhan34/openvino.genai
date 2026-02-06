@@ -62,6 +62,23 @@ private:
         ov::genai::modeling::OpContext& ctx);
     
     /**
+     * @brief Direct FP8 to INT4/INT8 quantization without intermediate F32 tensor
+     * 
+     * This is a memory-optimized version that processes FP8 weights directly,
+     * avoiding the creation of a full F32 tensor which would consume 4x memory.
+     * 
+     * @param fp8_tensor Input FP8 weight tensor
+     * @param scale_inv FP8 scale tensor
+     * @return QuantizedWeight struct containing compressed weights, scales, and zero-points
+     */
+    rtn::QuantizedWeight quantize_fp8_weight_direct(
+        const std::string& name,
+        const ov::Tensor& fp8_tensor,
+        const ov::Tensor& scale_inv,
+        ov::genai::modeling::weights::WeightSource& source,
+        ov::genai::modeling::OpContext& ctx);
+    
+    /**
      * @brief Create dequantization subgraph from quantized result
      * Supports both INT4 (packed in U8) and INT8 quantization
      */
@@ -93,6 +110,14 @@ private:
         const ov::Tensor& weight_fp8,
         const ov::Tensor& scale_inv,
         ov::genai::modeling::OpContext& ctx);
+
+    /**
+     * @brief Dequantize FP8 tensor to F32 in CPU memory
+     * Used when we want to further quantize the weight to INT4/INT8
+     */
+    ov::Tensor dequantize_fp8_to_f32(
+        const ov::Tensor& weight_fp8,
+        const ov::Tensor& scale_inv) const;
 
     ov::Output<ov::Node> expand_block_scale_to_weight(
         const ov::Tensor& scale_inv,

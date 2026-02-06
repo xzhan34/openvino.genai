@@ -69,6 +69,7 @@ struct Qwen3NextConfig {
     bool output_router_logits = false;
     float router_aux_loss_coef = 0.0f;
     std::vector<int32_t> mlp_only_layers;
+    int32_t group_size = 128;  // MoE quantization group size
 };
 
 class Qwen3NextRMSNorm : public Module {
@@ -195,9 +196,19 @@ private:
     const Tensor& shared_gate_proj_weight() const;
     const Tensor& shared_up_proj_weight() const;
     const Tensor& shared_down_proj_weight() const;
+    
+    // MoE expert weights (stacked)
     Tensor gate_expert_weights() const;
     Tensor up_expert_weights() const;
     Tensor down_expert_weights() const;
+    
+    // MoE quantization scales and zero-points (stacked)
+    Tensor gate_exps_scales() const;
+    Tensor gate_exps_zps() const;
+    Tensor up_exps_scales() const;
+    Tensor up_exps_zps() const;
+    Tensor down_exps_scales() const;
+    Tensor down_exps_zps() const;
 
     int32_t hidden_size_ = 0;
     int32_t expert_intermediate_size_ = 0;
@@ -205,6 +216,7 @@ private:
     int32_t num_experts_ = 0;
     int32_t top_k_ = 1;
     bool norm_topk_prob_ = true;
+    size_t group_size_ = 128;
 
     WeightParameter* gate_param_ = nullptr;
     WeightParameter* shared_expert_gate_param_ = nullptr;
@@ -214,6 +226,14 @@ private:
     std::vector<WeightParameter*> gate_experts_param_;
     std::vector<WeightParameter*> up_experts_param_;
     std::vector<WeightParameter*> down_experts_param_;
+    
+    // Quantization scales and zero-points for each expert
+    std::vector<Tensor> gate_exps_scales_;
+    std::vector<Tensor> gate_exps_zps_;
+    std::vector<Tensor> up_exps_scales_;
+    std::vector<Tensor> up_exps_zps_;
+    std::vector<Tensor> down_exps_scales_;
+    std::vector<Tensor> down_exps_zps_;
 };
 
 class Qwen3NextDecoderLayer : public Module {

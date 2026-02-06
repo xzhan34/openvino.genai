@@ -6,6 +6,7 @@
 #include "gguf_utils/rtn_quantize.hpp"
 
 #include <openvino/core/except.hpp>
+#include <openvino/core/type/float8_e4m3.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/ops.hpp>
 #include <openvino/op/reshape.hpp>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include <atomic>
 
 namespace ov {
 namespace genai {
@@ -133,14 +135,82 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::finali
     double graph_ms = 0;
     bool logged = false;
 
+    // Check if we should do in-flight quantization for this weight
+    // For FP8 weights, we use direct FP8->INT4/INT8 quantization to save memory
+    bool should_quantize_weight = selector_.enabled() && selector_.should_quantize(name, shape, element_type);
+    
     if (element_type == ov::element::f8e4m3 && has_fp8_scale_inv(source, name)) {
-        auto start_graph = std::chrono::high_resolution_clock::now();
-        const ov::Tensor& scale_inv = source.get_tensor(name + "_scale_inv");
-        output = create_fp8_dequant_subgraph(name, tensor, scale_inv, ctx);
-        auto end_graph = std::chrono::high_resolution_clock::now();
-        graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
-        total_graph_time_ms_ += graph_ms;
-    } else if (selector_.enabled() && selector_.should_quantize(name, shape, element_type)) {
+        if (should_quantize_weight && shape.size() == 2) {
+            // FP8 weight with quantization enabled: use direct FP8->INT4/INT8 quantization
+            // This avoids creating intermediate F32 tensor, saving ~4x memory per weight
+            quantized_weights_++;
+            auto start_quant = std::chrono::high_resolution_clock::now();
+            
+            const ov::Tensor& scale_inv = source.get_tensor(name + "_scale_inv");
+            auto quant_result = quantize_fp8_weight_direct(name, tensor, scale_inv, source, ctx);
+            
+            auto end_quant = std::chrono::high_resolution_clock::now();
+            quant_ms = std::chrono::duration<double, std::milli>(end_quant - start_quant).count();
+            total_quant_time_ms_ += quant_ms;
+            
+            auto start_graph = std::chrono::high_resolution_clock::now();
+            // FP8 MoE models (like Qwen3-Next) now support MoE optimization with custom weight_loaders
+            if (is_moe_weight(name)) {
+                auto res = create_moe_subgraph(name, quant_result, shape, ctx);
+                auto end_graph = std::chrono::high_resolution_clock::now();
+                graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+                total_graph_time_ms_ += graph_ms;
+                if (logged) {
+                    std::cout << "[Weight: " << name << "] Fetch=" << std::fixed << std::setprecision(2) << fetch_ms 
+                          << "ms, Quant=" << quant_ms << "ms, Graph=" << graph_ms << "ms" << std::endl;
+                }
+                return res;
+            }
+            output = create_dequant_subgraph(name, quant_result, shape);
+            auto end_graph = std::chrono::high_resolution_clock::now();
+            graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+            total_graph_time_ms_ += graph_ms;
+        } else if (should_quantize_weight) {
+            // FP8 weight with non-2D shape: fallback to F32 intermediate (less common)
+            quantized_weights_++;
+            auto start_quant = std::chrono::high_resolution_clock::now();
+            
+            const ov::Tensor& scale_inv = source.get_tensor(name + "_scale_inv");
+            ov::Tensor f32_tensor = dequantize_fp8_to_f32(tensor, scale_inv);
+            auto quant_result = quantize_weight(name, f32_tensor, source, ctx);
+            // f32_tensor goes out of scope here and memory is released
+            
+            auto end_quant = std::chrono::high_resolution_clock::now();
+            quant_ms = std::chrono::duration<double, std::milli>(end_quant - start_quant).count();
+            total_quant_time_ms_ += quant_ms;
+            
+            auto start_graph = std::chrono::high_resolution_clock::now();
+            // FP8 MoE weights also go through MoE subgraph for optimization
+            if (is_moe_weight(name)) {
+                auto res = create_moe_subgraph(name, quant_result, shape, ctx);
+                auto end_graph = std::chrono::high_resolution_clock::now();
+                graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+                total_graph_time_ms_ += graph_ms;
+                if (logged) {
+                    std::cout << "[Weight: " << name << "] Fetch=" << std::fixed << std::setprecision(2) << fetch_ms 
+                          << "ms, Quant=" << quant_ms << "ms, Graph=" << graph_ms << "ms" << std::endl;
+                }
+                return res;
+            }
+            output = create_dequant_subgraph(name, quant_result, shape);
+            auto end_graph = std::chrono::high_resolution_clock::now();
+            graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+            total_graph_time_ms_ += graph_ms;
+        } else {
+            // FP8 weight without quantization: just dequantize FP8 to F32
+            auto start_graph = std::chrono::high_resolution_clock::now();
+            const ov::Tensor& scale_inv = source.get_tensor(name + "_scale_inv");
+            output = create_fp8_dequant_subgraph(name, tensor, scale_inv, ctx);
+            auto end_graph = std::chrono::high_resolution_clock::now();
+            graph_ms = std::chrono::duration<double, std::milli>(end_graph - start_graph).count();
+            total_graph_time_ms_ += graph_ms;
+        }
+    } else if (should_quantize_weight) {
         quantized_weights_++;
         // Quantize the weight during finalization
         // Tensor reference is already fetched above, no need to fetch again
@@ -212,6 +282,88 @@ bool SafetensorsWeightFinalizer::has_fp8_scale_inv(ov::genai::modeling::weights:
         return false;
     }
     return source.has(name + "_scale_inv");
+}
+
+ov::Tensor SafetensorsWeightFinalizer::dequantize_fp8_to_f32(
+    const ov::Tensor& weight_fp8,
+    const ov::Tensor& scale_inv) const {
+    // Get shapes
+    const ov::Shape& weight_shape = weight_fp8.get_shape();
+    const ov::Shape& scale_shape = scale_inv.get_shape();
+    
+    // Calculate total elements
+    size_t total_elements = 1;
+    for (auto dim : weight_shape) {
+        total_elements *= dim;
+    }
+    
+    // Create output F32 tensor
+    ov::Tensor result(ov::element::f32, weight_shape);
+    float* out_ptr = result.data<float>();
+    
+    // Get input pointers - use raw void* for FP8 since data<uint8_t>() is not allowed
+    const uint8_t* fp8_ptr = static_cast<const uint8_t*>(weight_fp8.data());
+    const float* scale_ptr = scale_inv.data<float>();
+    
+    // Determine block size for scale expansion
+    // For per-tensor scale: scale_shape == {1} or {1, 1}
+    // For block-wise scale: scale_shape[i] < weight_shape[i]
+    
+    if (scale_shape.size() == weight_shape.size()) {
+        // Block-wise or per-channel scaling
+        if (weight_shape.size() == 2) {
+            // 2D weight: [out_features, in_features]
+            // Scale shape: [out_features, num_groups] or [out_features, 1]
+            size_t out_features = weight_shape[0];
+            size_t in_features = weight_shape[1];
+            size_t num_groups = scale_shape[1];
+            size_t group_size = in_features / num_groups;
+            
+            for (size_t o = 0; o < out_features; ++o) {
+                for (size_t i = 0; i < in_features; ++i) {
+                    size_t group_idx = i / group_size;
+                    size_t fp8_idx = o * in_features + i;
+                    size_t scale_idx = o * num_groups + group_idx;
+                    
+                    // FP8 E4M3 to F32 conversion using from_bits()
+                    uint8_t fp8_val = fp8_ptr[fp8_idx];
+                    float f32_val = static_cast<float>(ov::float8_e4m3::from_bits(fp8_val));
+                    out_ptr[fp8_idx] = f32_val * scale_ptr[scale_idx];
+                }
+            }
+        } else if (weight_shape.size() == 1) {
+            // 1D weight: [features]
+            size_t features = weight_shape[0];
+            size_t num_groups = scale_shape[0];
+            size_t group_size = features / num_groups;
+            
+            for (size_t i = 0; i < features; ++i) {
+                size_t group_idx = i / group_size;
+                uint8_t fp8_val = fp8_ptr[i];
+                float f32_val = static_cast<float>(ov::float8_e4m3::from_bits(fp8_val));
+                out_ptr[i] = f32_val * scale_ptr[group_idx];
+            }
+        } else {
+            // Generic N-D case: assume last dim is grouped
+            // For simplicity, flatten and apply per-tensor or approximate
+            float scale = scale_ptr[0];
+            for (size_t i = 0; i < total_elements; ++i) {
+                uint8_t fp8_val = fp8_ptr[i];
+                float f32_val = static_cast<float>(ov::float8_e4m3::from_bits(fp8_val));
+                out_ptr[i] = f32_val * scale;
+            }
+        }
+    } else {
+        // Per-tensor scaling (scale is scalar or broadcastable)
+        float scale = scale_ptr[0];
+        for (size_t i = 0; i < total_elements; ++i) {
+            uint8_t fp8_val = fp8_ptr[i];
+            float f32_val = static_cast<float>(ov::float8_e4m3::from_bits(fp8_val));
+            out_ptr[i] = f32_val * scale;
+        }
+    }
+    
+    return result;
 }
 
 ov::Output<ov::Node> SafetensorsWeightFinalizer::create_fp8_dequant_subgraph(
@@ -347,6 +499,48 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
     return quant_result;
 }
 
+rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_fp8_weight_direct(
+    const std::string& name,
+    const ov::Tensor& fp8_tensor,
+    const ov::Tensor& scale_inv,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::OpContext& ctx) {
+    
+    using namespace ov::genai::rtn;
+    using Mode = QuantizationConfig::Mode;
+    
+    // Get quantization mode and group size for this weight
+    Mode quant_mode = selector_.get_quantization_mode(name, fp8_tensor.get_shape(), fp8_tensor.get_element_type());
+    int group_size = selector_.get_group_size(name);
+    
+    // Direct FP8 -> INT4/INT8 quantization without intermediate F32 tensor
+    // This saves ~4x memory compared to creating a full F32 tensor
+    rtn::QuantizedWeight quant_result;
+    
+    switch (quant_mode) {
+        case Mode::INT4_SYM:
+            quant_result = rtn::quantize_fp8_to_int4_sym(fp8_tensor, scale_inv, group_size);
+            break;
+            
+        case Mode::INT4_ASYM:
+            quant_result = rtn::quantize_fp8_to_int4_asym(fp8_tensor, scale_inv, group_size);
+            break;
+            
+        case Mode::INT8_SYM:
+            quant_result = rtn::quantize_fp8_to_int8_sym(fp8_tensor, scale_inv, group_size);
+            break;
+            
+        case Mode::INT8_ASYM:
+            quant_result = rtn::quantize_fp8_to_int8_asym(fp8_tensor, scale_inv, group_size);
+            break;
+            
+        default:
+            OPENVINO_THROW("Unsupported quantization mode for FP8 direct quantization");
+    }
+    
+    return quant_result;
+}
+
 ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     const std::string& name,
     const rtn::QuantizedWeight& quant_result,
@@ -356,73 +550,90 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3 || original_shape.size() == 1, 
                     "Original shape must be 1D, 2D or 3D for dequantization");
     
-    size_t out_features = 1;
-    size_t in_features = original_shape[0];
-
-    if (original_shape.size() == 2) {
-        out_features = original_shape[0];
-        in_features = original_shape[1];
-    } else if (original_shape.size() == 3) {
-        out_features = original_shape[0] * original_shape[1];
-        in_features = original_shape[2];
-    }
-    
     // Create scale constant
     auto scale_const = std::make_shared<ov::op::v0::Constant>(quant_result.scale);
     scale_const->set_friendly_name(name + "_scale");
     
     const ov::Shape& scale_shape = scale_const->get_shape();
-    // For 3D, scale_shape will be [batch, out, num_groups]
-    // For 2D, scale_shape will be [out, num_groups]
-    size_t num_groups = scale_shape.back();
-    size_t group_size = in_features / num_groups;
+    const ov::Shape& compressed_shape = quant_result.compressed.get_shape();
     
     // Determine element type based on compressed type from result
     ov::element::Type elem_type = quant_result.compressed_type;
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
     
-    size_t num_elements = out_features * in_features;
+    // RTN quantization flattens 3D [batch, out, in] to 2D [batch*out, in] for processing,
+    // but output shapes are preserved as 3D [batch, out, packed_in/num_groups].
+    // We need to handle this correctly:
+    // - For 3D original: flatten to 2D for dequant, then reshape back to 3D
+    // - For 2D/1D: process directly
     
-    // Validation check
-    if (elem_type == ov::element::u4 || elem_type == ov::element::i4) {
-        // Check if size matches packed 4-bit expectation
-        size_t expected_size = (out_features * ((in_features + 1) / 2)); 
-        // Note: For grouped quantization, shapes might slightly differ due to padding, 
-        // but generally packed size should be roughly half.
-        // We skip strict size check here relying on the quantization function correctness.
-    } else if (elem_type == ov::element::u8 || elem_type == ov::element::i8) {
-        OPENVINO_ASSERT(quant_result.compressed.get_size() == num_elements, 
-                        "INT8 compressed size mismatch");
-    } else {
-        OPENVINO_THROW("Unsupported compressed type for dequantization: ", elem_type);
+    size_t in_features = original_shape.back();
+    size_t num_groups = scale_shape.back();
+    size_t group_size = in_features / num_groups;
+    
+    // Calculate flattened out_features (for 3D, this is batch*out)
+    size_t out_features = 1;
+    for (size_t i = 0; i < original_shape.size() - 1; ++i) {
+        out_features *= original_shape[i];
     }
     
-    // Step 1: Create grouped constant with appropriate element type
-    // We treat everything as [out_features, num_groups, group_size] for logic simplicity
-    ov::Shape grouped_shape = {out_features, num_groups, group_size};
+    // For dequantization, we work with 2D layout: [out_features, num_groups, group_size]
+    // This matches how RTN processed the data internally
+    ov::Shape grouped_shape_2d = {out_features, num_groups, group_size};
+    
+    // Create compressed constant with 2D grouped shape
     const void* data_ptr = quant_result.compressed.data();
-    auto grouped_const = std::make_shared<ov::op::v0::Constant>(elem_type, grouped_shape, data_ptr);
+    auto grouped_const = std::make_shared<ov::op::v0::Constant>(elem_type, grouped_shape_2d, data_ptr);
     grouped_const->set_friendly_name(name + "_compressed");
     
-    // Step 2: Convert to F16 for arithmetic operations
+    // Convert to F16 for arithmetic operations
     auto weights_f16 = std::make_shared<ov::op::v0::Convert>(grouped_const, ov::element::f16);
     
-    // Step 3: Reshape scale to [out_features, num_groups, 1] for broadcasting
+    // Reshape scale to 2D [out_features, num_groups] first if it's 3D
+    std::shared_ptr<ov::Node> scale_2d;
+    if (scale_shape.size() == 3) {
+        // Flatten from [batch, out, num_groups] to [batch*out, num_groups]
+        auto flatten_shape = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i64,
+            ov::Shape{2},
+            std::vector<int64_t>{static_cast<int64_t>(out_features), static_cast<int64_t>(num_groups)}
+        );
+        scale_2d = std::make_shared<ov::op::v1::Reshape>(scale_const, flatten_shape, false);
+    } else {
+        scale_2d = scale_const;
+    }
+    
+    // Build scale broadcast shape: [out_features, num_groups, 1]
     ov::Shape scale_broadcast_shape = {out_features, num_groups, 1};
+    
     auto scale_reshape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64,
         ov::Shape{scale_broadcast_shape.size()},
         std::vector<int64_t>(scale_broadcast_shape.begin(), scale_broadcast_shape.end())
     );
-    auto scale_reshaped = std::make_shared<ov::op::v1::Reshape>(scale_const, scale_reshape, false);
+    auto scale_reshaped = std::make_shared<ov::op::v1::Reshape>(scale_2d, scale_reshape, false);
     
-    // Step 4: Apply dequantization formula
+    // Apply dequantization formula
     std::shared_ptr<ov::Node> dequantized;
     if (has_zero_point) {
         // Asymmetric: weight_fp = (weight - zero_point) * scale
         auto zp_const = std::make_shared<ov::op::v0::Constant>(quant_result.zero_point);
         zp_const->set_friendly_name(name + "_zp");
-        auto zp_reshaped = std::make_shared<ov::op::v1::Reshape>(zp_const, scale_reshape, false);
+        
+        // Flatten zero_point if 3D
+        std::shared_ptr<ov::Node> zp_2d;
+        if (quant_result.zero_point.get_shape().size() == 3) {
+            auto flatten_shape = std::make_shared<ov::op::v0::Constant>(
+                ov::element::i64,
+                ov::Shape{2},
+                std::vector<int64_t>{static_cast<int64_t>(out_features), static_cast<int64_t>(num_groups)}
+            );
+            zp_2d = std::make_shared<ov::op::v1::Reshape>(zp_const, flatten_shape, false);
+        } else {
+            zp_2d = zp_const;
+        }
+        
+        auto zp_reshaped = std::make_shared<ov::op::v1::Reshape>(zp_2d, scale_reshape, false);
         auto zp_f16 = std::make_shared<ov::op::v0::Convert>(zp_reshaped, ov::element::f16);
         auto shifted = std::make_shared<ov::op::v1::Subtract>(
             weights_f16, zp_f16, ov::op::AutoBroadcastType::NUMPY);
@@ -434,7 +645,7 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
             weights_f16, scale_reshaped, ov::op::AutoBroadcastType::NUMPY);
     }
     
-    // Step 5: Reshape back to original shape [out_features, in_features] or [batch, out, in]
+    // Reshape back to original shape
     auto final_shape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64,
         ov::Shape{original_shape.size()},
@@ -442,19 +653,39 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     );
     auto reshaped = std::make_shared<ov::op::v1::Reshape>(dequantized, final_shape, false);
     
-    // Step 6: Convert to F32
+    // Convert to F32
     return std::make_shared<ov::op::v0::Convert>(reshaped, ov::element::f32);
 }
 
 bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
-    // Check for MoE weight patterns:
-    // - model.layers[X].mlp.experts.X.gate_proj.weight
-    // - model.layers[X].mlp.experts.X.up_proj.weight
-    // - model.layers[X].mlp.experts.X.down_proj.weight
-    return name.find("experts") != std::string::npos && 
-           (name.find("gate_proj") != std::string::npos ||
-            name.find("up_proj") != std::string::npos ||
-            name.find("down_proj") != std::string::npos);
+    // Match MoE weight patterns that need special handling (return INT4 + scales + zps)
+    //
+    // Pattern 1: Qwen3-MoE per-expert weights (not yet fused):
+    // - model.layers[X].mlp.experts.{i}.gate_proj.weight
+    // - model.layers[X].mlp.experts.{i}.up_proj.weight  
+    // - model.layers[X].mlp.experts.{i}.down_proj.weight
+    //
+    // Pattern 2: Pre-fused MoE weights (GGUF-style):
+    // - model.layers[X].moe.gate_exps.weight
+    // - model.layers[X].moe.up_exps.weight
+    // - model.layers[X].moe.down_exps.weight
+    //
+    // These all need create_moe_subgraph to return INT4 compressed + auxiliary scales/zps
+    
+    // Pattern 1: Per-expert weights (Qwen3-MoE native format)
+    if (name.find(".mlp.experts.") != std::string::npos) {
+        // Check if it's an expert projection weight
+        if (name.find("gate_proj.weight") != std::string::npos ||
+            name.find("up_proj.weight") != std::string::npos ||
+            name.find("down_proj.weight") != std::string::npos) {
+            return true;
+        }
+    }
+    
+    // Pattern 2: Pre-fused weights  
+    return name.find("moe.gate_exps") != std::string::npos ||
+           name.find("moe.up_exps") != std::string::npos ||
+           name.find("moe.down_exps") != std::string::npos;
 }
 
 ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create_moe_subgraph(
@@ -463,24 +694,79 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     const ov::Shape& original_shape,
     ov::genai::modeling::OpContext& ctx) {
     
-    // MoE weights: [out_features, in_features]
-    OPENVINO_ASSERT(original_shape.size() == 2, "MoE original shape must be 2D");
+    // MoE weights can be:
+    // - 2D per-expert: [out_features, in_features] - Qwen3-MoE native format
+    // - 3D pre-fused: [num_experts, out_features, in_features] - GGUF-style
+    // Qwen3-MoE expects INT4 compressed weights + scales + zps in auxiliary
+    OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3, 
+                    "MoE original shape must be 2D or 3D, got: ", original_shape.size());
     
     // Determine element type based on compressed type
+    ov::element::Type compressed_type = quant_result.compressed.get_element_type();
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
-    ov::element::Type elem_type = quant_result.compressed_type;
+    ov::element::Type elem_type;
+    
+    if (compressed_type == ov::element::u8) {
+        // INT4 packed in U8: use u4 for asymmetric, i4 for symmetric
+        elem_type = has_zero_point ? ov::element::u4 : ov::element::i4;
+    } else if (compressed_type == ov::element::u4) {
+        elem_type = ov::element::u4;
+    } else if (compressed_type == ov::element::i4) {
+        elem_type = ov::element::i4;
+    } else if (compressed_type == ov::element::i8) {
+        elem_type = ov::element::i8;
+    } else {
+        OPENVINO_THROW("Unsupported compressed type for MoE dequantization: ", compressed_type);
+    }
     
     ov::Shape scale_shape = quant_result.scale.get_shape();
-    ov::Shape ZERO_SHAPE = quant_result.zero_point.get_shape();
-    size_t num_groups = scale_shape[1];
-    size_t group_size = original_shape[1] / num_groups;
-
-   // Create INT4 weight tensor with proper shape
-    // [out_features, group_num, group_size]
-    ov::Shape packed_shape{original_shape[0],
-                           scale_shape[1],     // group_num
-                           group_size};
-    ;
+    
+    // Handle both 2D (per-expert) and 3D (fused) shapes
+    size_t out_features, in_features, num_groups, group_size;
+    ov::Shape packed_shape;
+    
+    // Static counters to print summary only once per type
+    static std::atomic<int> moe_2d_count{0};
+    static std::atomic<int> moe_3d_count{0};
+    
+    if (original_shape.size() == 2) {
+        // Per-expert 2D shape: [out_features, in_features]
+        out_features = original_shape[0];
+        in_features = original_shape[1];
+        
+        // Scale shape for 2D: [out_features, num_groups]
+        OPENVINO_ASSERT(scale_shape.size() == 2, "Scale shape must be 2D for per-expert weights");
+        num_groups = scale_shape[1];
+        group_size = in_features / num_groups;
+        
+        // Packed shape: [out_features, num_groups, group_size]
+        packed_shape = ov::Shape{out_features, num_groups, group_size};
+        
+        // Print only once for 2D MoE weights
+        if (moe_2d_count.fetch_add(1) == 0) {
+            std::cout << "[MoE] First 2D per-expert weight: " << name 
+                      << ", shape=" << original_shape << ", type=" << elem_type << std::endl;
+        }
+    } else {
+        // Pre-fused 3D shape: [num_experts, out_features, in_features]
+        size_t num_experts = original_shape[0];
+        out_features = original_shape[1];
+        in_features = original_shape[2];
+        
+        // Scale shape for 3D: [num_experts, out_features, num_groups]
+        OPENVINO_ASSERT(scale_shape.size() == 3, "Scale shape must be 3D for fused weights");
+        num_groups = scale_shape[2];
+        group_size = in_features / num_groups;
+        
+        // Packed shape: [num_experts, out_features, num_groups, group_size]
+        packed_shape = ov::Shape{num_experts, out_features, num_groups, group_size};
+        
+        // Print only once for 3D MoE weights
+        if (moe_3d_count.fetch_add(1) == 0) {
+            std::cout << "[MoE] First 3D fused weight: " << name 
+                      << ", shape=" << original_shape << ", type=" << elem_type << std::endl;
+        }
+    }
 
     const void* data_ptr = quant_result.compressed.data();
     auto weight_compressed = std::make_shared<ov::op::v0::Constant>(elem_type, packed_shape, data_ptr);
@@ -490,47 +776,61 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     auto scale_const = std::make_shared<ov::op::v0::Constant>(quant_result.scale);
     scale_const->set_friendly_name(name + "_scale");
 
+    // Handle zero-point: pack from u8 to u4 if needed
     std::shared_ptr<ov::op::v0::Constant> zp_const;
-    ov::Tensor zero_point_tensor(ov::element::u4, scale_shape);
-    uint8_t* zero_point_data = static_cast<uint8_t*>(zero_point_tensor.data());
     if (has_zero_point) {
-        // Handle zero-point packing if needed
         ov::element::Type zp_type = quant_result.zero_point.get_element_type();
         if (zp_type == ov::element::u8 && elem_type == ov::element::u4) {
             // Zero-points need to be packed from u8 to u4 nibbles
+            ov::Tensor zero_point_tensor(ov::element::u4, scale_shape);
+            uint8_t* zero_point_data = static_cast<uint8_t*>(zero_point_tensor.data());
             const uint8_t* zp_data = quant_result.zero_point.data<uint8_t>();
             for (size_t i = 0; i < zero_point_tensor.get_byte_size(); ++i) {
                 uint8_t bias1 = zp_data[i * 2];
                 uint8_t bias2 = zp_data[i * 2 + 1];
                 zero_point_data[i] = (bias2 << 4) | (bias1 & 0x0F);
             }
+            zp_const = std::make_shared<ov::op::v0::Constant>(zero_point_tensor);
         } else {
-           OPENVINO_THROW("Unsupported zero-point type in MoE weight finalization");
+            zp_const = std::make_shared<ov::op::v0::Constant>(quant_result.zero_point);
         }
+        zp_const->set_friendly_name(name + "_zp");
     } else {
-        OPENVINO_THROW("Unsupported: no zps");
+        OPENVINO_THROW("MoE weights require zero points for asymmetric quantization");
     }
 
-    zp_const = std::make_shared<ov::op::v0::Constant>(zero_point_tensor);
-    zp_const->set_friendly_name(name + "_zp");
-    // Transpose from [I, H] to [H, I]
-    auto transpose_order = std::make_shared<ov::op::v0::Constant>(
-        ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
-    
-    auto scales_transposed = std::make_shared<ov::op::v1::Transpose>(scale_const, transpose_order);
-    scales_transposed->set_friendly_name(name + "_scales_transposed");
-
-    // Build auxiliary map with transposed scales and zero-points
+    // Build auxiliary map with scales and zero-points
     std::unordered_map<std::string, ov::genai::modeling::Tensor> auxiliary;
-    auxiliary["scales"] = ov::genai::modeling::Tensor(scales_transposed, &ctx);
-
-    if (has_zero_point && zp_const) {
+    
+    if (original_shape.size() == 2) {
+        // For 2D weights, transpose from [O, G] to [G, O]
+        auto transpose_order = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
+        
+        auto scales_transposed = std::make_shared<ov::op::v1::Transpose>(scale_const, transpose_order);
+        scales_transposed->set_friendly_name(name + "_scales_transposed");
+        
         auto zero_points_transposed = std::make_shared<ov::op::v1::Transpose>(zp_const, transpose_order);
         zero_points_transposed->set_friendly_name(name + "_zps_transposed");
+        
+        auxiliary["scales"] = ov::genai::modeling::Tensor(scales_transposed, &ctx);
+        auxiliary["zps"] = ov::genai::modeling::Tensor(zero_points_transposed, &ctx);
+    } else {
+        // For 3D weights, transpose from [E, O, G] to [E, G, O]
+        auto transpose_order = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i64, ov::Shape{3}, std::vector<int64_t>{0, 2, 1});
+        
+        auto scales_transposed = std::make_shared<ov::op::v1::Transpose>(scale_const, transpose_order);
+        scales_transposed->set_friendly_name(name + "_scales_transposed");
+        
+        auto zero_points_transposed = std::make_shared<ov::op::v1::Transpose>(zp_const, transpose_order);
+        zero_points_transposed->set_friendly_name(name + "_zps_transposed");
+        
+        auxiliary["scales"] = ov::genai::modeling::Tensor(scales_transposed, &ctx);
         auxiliary["zps"] = ov::genai::modeling::Tensor(zero_points_transposed, &ctx);
     }
 
-    // Cache the weight
+    // Cache the compressed weight
     cache_.emplace(name, weight_compressed);
 
     return ov::genai::modeling::weights::FinalizedWeight(
