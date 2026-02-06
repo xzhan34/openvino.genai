@@ -4,6 +4,7 @@
 #include "modeling/models/qwen3_next/modeling_qwen3_next.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <unordered_set>
 
@@ -33,6 +34,35 @@ bool starts_with(const std::string& s, const std::string& prefix) {
 
 bool ends_with(const std::string& s, const std::string& suffix) {
     return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+int extract_layer_index_from_weight_name(const std::string& name) {
+    static const std::string bracket_prefix = "model.layers[";
+    static const std::string dot_prefix = "model.layers.";
+
+    if (starts_with(name, bracket_prefix)) {
+        size_t pos = bracket_prefix.size();
+        size_t end = pos;
+        while (end < name.size() && std::isdigit(static_cast<unsigned char>(name[end]))) {
+            end++;
+        }
+        if (end > pos && end < name.size() && name[end] == ']') {
+            return std::stoi(name.substr(pos, end - pos));
+        }
+    }
+
+    if (starts_with(name, dot_prefix)) {
+        size_t pos = dot_prefix.size();
+        size_t end = pos;
+        while (end < name.size() && std::isdigit(static_cast<unsigned char>(name[end]))) {
+            end++;
+        }
+        if (end > pos && end < name.size() && name[end] == '.') {
+            return std::stoi(name.substr(pos, end - pos));
+        }
+    }
+
+    return -1;
 }
 
 std::unordered_set<int32_t> make_index_set(const std::vector<int32_t>& idx) {
@@ -894,6 +924,11 @@ std::shared_ptr<ov::Model> create_qwen3_next_model(
     auto report = ov::genai::modeling::weights::load_model(model, source, finalizer, options);
 
     for (const auto& name : report.unmatched) {
+        const int layer_idx = extract_layer_index_from_weight_name(name);
+        if (layer_idx >= cfg.num_hidden_layers) {
+            // Allow unused deeper layers when we intentionally build a truncated layer stack.
+            continue;
+        }
         if (starts_with(name, "mtp.") || ends_with(name, "_scale_inv")) {
             continue;
         }
@@ -931,6 +966,8 @@ namespace {
 
 ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::genai::loaders::ModelConfig& config) {
     using ov::genai::modeling::models::Qwen3NextConfig;
+    constexpr int32_t kDebugBuildNumLayers = 4;
+
     Qwen3NextConfig cfg;
     cfg.architecture = "qwen3_next";
     cfg.hidden_size = config.hidden_size;
@@ -938,7 +975,7 @@ ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::gena
     cfg.num_key_value_heads = config.num_key_value_heads > 0 ? config.num_key_value_heads : config.num_attention_heads;
     cfg.head_dim = config.head_dim > 0 ? config.head_dim : (config.hidden_size / config.num_attention_heads);
     cfg.intermediate_size = config.intermediate_size;
-    cfg.num_hidden_layers = config.num_hidden_layers;
+    cfg.num_hidden_layers = std::min<int32_t>(config.num_hidden_layers, kDebugBuildNumLayers);
     cfg.vocab_size = config.vocab_size;
     cfg.max_position_embeddings = config.max_position_embeddings;
     cfg.rms_norm_eps = config.rms_norm_eps;
@@ -949,9 +986,16 @@ ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::gena
     cfg.tie_word_embeddings = config.tie_word_embeddings;
 
     cfg.full_attention_interval = config.full_attention_interval > 0 ? config.full_attention_interval : 4;
-    cfg.layer_types = config.layer_types.empty()
-                          ? build_default_layer_types(cfg.num_hidden_layers, cfg.full_attention_interval)
-                          : config.layer_types;
+    auto all_layer_types = config.layer_types.empty()
+                               ? build_default_layer_types(config.num_hidden_layers, cfg.full_attention_interval)
+                               : config.layer_types;
+    if (all_layer_types.size() < static_cast<size_t>(cfg.num_hidden_layers)) {
+        OPENVINO_THROW("Qwen3Next layer_types size is smaller than requested debug layer count. layer_types=",
+                       all_layer_types.size(),
+                       ", requested_layers=",
+                       cfg.num_hidden_layers);
+    }
+    cfg.layer_types.assign(all_layer_types.begin(), all_layer_types.begin() + cfg.num_hidden_layers);
 
     cfg.linear_conv_kernel_dim = config.linear_conv_kernel_dim > 0 ? config.linear_conv_kernel_dim : 4;
     cfg.linear_key_head_dim = config.linear_key_head_dim > 0 ? config.linear_key_head_dim : 128;
@@ -968,7 +1012,11 @@ ov::genai::modeling::models::Qwen3NextConfig to_qwen3_next_config(const ov::gena
     cfg.norm_topk_prob = config.norm_topk_prob;
     cfg.output_router_logits = config.output_router_logits;
     cfg.router_aux_loss_coef = config.router_aux_loss_coef;
-    cfg.mlp_only_layers = config.mlp_only_layers;
+    for (int32_t layer_idx : config.mlp_only_layers) {
+        if (layer_idx >= 0 && layer_idx < cfg.num_hidden_layers) {
+            cfg.mlp_only_layers.push_back(layer_idx);
+        }
+    }
     return cfg;
 }
 

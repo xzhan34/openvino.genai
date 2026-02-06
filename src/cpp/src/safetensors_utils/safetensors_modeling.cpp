@@ -34,6 +34,7 @@
 // Include modeling API components
 #include "modeling/models/qwen3/modeling_qwen3.hpp"
 #include "modeling/models/qwen3_moe/modeling_qwen3_moe.hpp"
+#include "modeling/models/qwen3_next/modeling_qwen3_next.hpp"
 #include "modeling/models/smollm3/modeling_smollm3.hpp"
 #include "modeling/models/youtu/modeling_youtu.hpp"
 #include "modeling/weights/quantization_config.hpp"
@@ -591,6 +592,32 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
             : hf_config.intermediate_size;
         cfg.group_size = quant_config.group_size;
         ov_model = ov::genai::modeling::models::create_qwen3_moe_model(cfg, source, finalizer);
+    } else if (hf_config.model_type == "qwen3_next") {
+        constexpr int32_t kDebugBuildNumLayers = 4;
+        ov::genai::modeling::models::Qwen3NextConfig cfg;
+        cfg.architecture = hf_config.model_type;
+        cfg.hidden_size = hf_config.hidden_size;
+        cfg.num_hidden_layers = std::min(hf_config.num_hidden_layers, kDebugBuildNumLayers);
+        cfg.num_attention_heads = hf_config.num_attention_heads;
+        cfg.num_key_value_heads = hf_config.kv_heads();
+        cfg.head_dim = hf_config.head_size();
+        cfg.intermediate_size = hf_config.intermediate_size;
+        cfg.vocab_size = hf_config.vocab_size;
+        cfg.max_position_embeddings = hf_config.max_position_embeddings;
+        cfg.rms_norm_eps = hf_config.rms_norm_eps;
+        cfg.rope_theta = hf_config.rope_theta;
+        cfg.hidden_act = hf_config.hidden_act;
+        cfg.attention_bias = has_key("model.layers[0].self_attn.q_proj.bias");
+        cfg.tie_word_embeddings = !has_key("lm_head.weight");
+        cfg.num_experts = hf_config.expert_count;
+        cfg.num_experts_per_tok = hf_config.expert_used_count > 0 ? hf_config.expert_used_count : 1;
+        cfg.moe_intermediate_size = hf_config.moe_intermediate_size > 0
+            ? hf_config.moe_intermediate_size
+            : hf_config.intermediate_size;
+        cfg.shared_expert_intermediate_size = hf_config.moe_intermediate_size > 0
+            ? hf_config.moe_intermediate_size
+            : hf_config.intermediate_size;
+        ov_model = ov::genai::modeling::models::create_qwen3_next_model(cfg, source, finalizer);
     } else if (hf_config.model_type == "smollm3") {
         ov::genai::modeling::models::SmolLM3Config cfg;
         cfg.architecture = hf_config.model_type;
@@ -951,7 +978,9 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    if ((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "smollm3" || model_type == "youtu_llm") && use_modeling_api()) {
+    const bool force_modeling_api = (model_type == "qwen3_next");
+    if (((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "qwen3_next" || model_type == "smollm3" || model_type == "youtu_llm") &&
+         (use_modeling_api() || force_modeling_api))) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
         model = create_model_with_modeling_api(config, st_data, final_quant_config);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
