@@ -185,10 +185,10 @@ TEST(Qwen3TTSCodePredictorSingleCodecEmbed, GraphStructure) {
     test_utils::DummyWeightSource weights;
 
     // Code Predictor codec embeddings for layers 1-15 (0-indexed 0-14)
-    // Module naming uses bracket notation: "code_predictor.codec_embeddings[i].weight"
+    // Module path: talker.code_predictor.model.codec_embedding[i].weight
     for (int i = 0; i < 15; ++i) {
         auto embed_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f + i * 0.001f, 0.0001f);
-        weights.add("code_predictor.codec_embeddings[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.model.codec_embedding[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(embed_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
@@ -196,7 +196,7 @@ TEST(Qwen3TTSCodePredictorSingleCodecEmbed, GraphStructure) {
     // LM heads (needed for model construction, but not used in this test)
     for (int i = 0; i < 15; ++i) {
         auto lm_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.02f, 0.0001f);
-        weights.add("code_predictor.lm_heads[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.lm_head[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(lm_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
@@ -255,14 +255,14 @@ TEST(Qwen3TTSCodePredictorSingleCodecEmbed, MatchesReference) {
 
     for (int i = 0; i < 15; ++i) {
         all_embed_weights[i] = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.1f + i * 0.05f, 0.01f);
-        weights.add("code_predictor.codec_embeddings[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.model.codec_embedding[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(all_embed_weights[i],
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
 
     for (int i = 0; i < 15; ++i) {
         auto lm_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.02f, 0.001f);
-        weights.add("code_predictor.lm_heads[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.lm_head[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(lm_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
@@ -305,14 +305,14 @@ TEST(Qwen3TTSCodePredictorCodecEmbedSum, GraphStructure) {
 
     for (int i = 0; i < 15; ++i) {
         auto embed_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f, 0.0001f);
-        weights.add("code_predictor.codec_embeddings[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.model.codec_embedding[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(embed_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
 
     for (int i = 0; i < 15; ++i) {
         auto lm_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.02f, 0.0001f);
-        weights.add("code_predictor.lm_heads[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.lm_head[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(lm_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
@@ -344,14 +344,14 @@ TEST(Qwen3TTSCodePredictorCodecEmbedSum, MatchesReference) {
 
     for (int i = 0; i < 15; ++i) {
         all_embed_weights[i] = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.05f + i * 0.02f, 0.005f);
-        weights.add("code_predictor.codec_embeddings[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.model.codec_embedding[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(all_embed_weights[i],
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
 
     for (int i = 0; i < 15; ++i) {
         auto lm_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f, 0.001f);
-        weights.add("code_predictor.lm_heads[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.lm_head[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(lm_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
@@ -405,6 +405,7 @@ TEST(Qwen3TTSCodePredictorARModel, GraphStructure) {
     ov::genai::modeling::models::Qwen3TTSCodePredictorConfig cfg;
     cfg.vocab_size = 2048;
     cfg.hidden_size = 16;       // Small for testing
+    cfg.talker_hidden_size = 16; // Same as hidden_size to skip projection
     cfg.intermediate_size = 32;
     cfg.num_hidden_layers = 2;  // Reduced layers for testing
     cfg.num_attention_heads = 4;
@@ -420,7 +421,7 @@ TEST(Qwen3TTSCodePredictorARModel, GraphStructure) {
 
     // Model layers
     for (int layer = 0; layer < cfg.num_hidden_layers; ++layer) {
-        std::string prefix = "code_predictor.model.layers[" + std::to_string(layer) + "]";
+        std::string prefix = "talker.code_predictor.model.layers[" + std::to_string(layer) + "]";
 
         // Attention weights
         auto q_w = test_utils::make_seq(cfg.num_attention_heads * cfg.head_dim * cfg.hidden_size, 0.01f, 0.001f);
@@ -474,18 +475,18 @@ TEST(Qwen3TTSCodePredictorARModel, GraphStructure) {
 
     // Final norm
     auto norm_w = test_utils::make_seq(cfg.hidden_size, 1.0f, 0.0f);
-    weights.add("code_predictor.model.norm.weight",
+    weights.add("talker.code_predictor.model.norm.weight",
         test_utils::make_tensor(norm_w, {static_cast<size_t>(cfg.hidden_size)}));
 
     // Codec embeddings and LM heads
     for (int i = 0; i < 15; ++i) {
         auto embed_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f, 0.0001f);
-        weights.add("code_predictor.codec_embeddings[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.model.codec_embedding[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(embed_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
 
         auto lm_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f, 0.0001f);
-        weights.add("code_predictor.lm_heads[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.lm_head[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(lm_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }
@@ -499,7 +500,7 @@ TEST(Qwen3TTSCodePredictorARModel, GraphStructure) {
     EXPECT_EQ(model->inputs().size(), 2);   // inputs_embeds, position_ids
     EXPECT_EQ(model->outputs().size(), 1);  // logits
 
-    // Verify output shape: [batch, seq, vocab_size]
+    // Verify output shape: [batch, 1, vocab_size] (last position only)
     auto output_shape = model->output(0).get_partial_shape();
     EXPECT_TRUE(output_shape.rank().is_static());
     EXPECT_EQ(output_shape.rank().get_length(), 3);
@@ -527,7 +528,7 @@ TEST(Qwen3TTSCodePredictorARModel, GraphStructure) {
 
     auto output_tensor = request.get_output_tensor();
     EXPECT_EQ(output_tensor.get_shape()[0], batch);
-    EXPECT_EQ(output_tensor.get_shape()[1], seq_len);
+    EXPECT_EQ(output_tensor.get_shape()[1], 1u);  // AR model returns last position only
     EXPECT_EQ(output_tensor.get_shape()[2], static_cast<size_t>(cfg.vocab_size));
 }
 
@@ -552,7 +553,7 @@ TEST(Qwen3TTSCodePredictorFullModel, GraphStructure) {
     test_utils::DummyWeightSource weights;
 
     // Single layer weights
-    std::string prefix = "code_predictor.model.layers[0]";
+    std::string prefix = "talker.code_predictor.model.layers[0]";
 
     auto q_w = test_utils::make_seq(cfg.num_attention_heads * cfg.head_dim * cfg.hidden_size, 0.01f, 0.001f);
     auto k_w = test_utils::make_seq(cfg.num_key_value_heads * cfg.head_dim * cfg.hidden_size, 0.01f, 0.001f);
@@ -601,17 +602,17 @@ TEST(Qwen3TTSCodePredictorFullModel, GraphStructure) {
         test_utils::make_tensor(post_attn_ln_w, {static_cast<size_t>(cfg.hidden_size)}));
 
     auto norm_w = test_utils::make_seq(cfg.hidden_size, 1.0f, 0.0f);
-    weights.add("code_predictor.model.norm.weight",
+    weights.add("talker.code_predictor.model.norm.weight",
         test_utils::make_tensor(norm_w, {static_cast<size_t>(cfg.hidden_size)}));
 
     for (int i = 0; i < 15; ++i) {
         auto embed_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f, 0.0001f);
-        weights.add("code_predictor.codec_embeddings[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.model.codec_embedding[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(embed_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
 
         auto lm_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.01f, 0.0001f);
-        weights.add("code_predictor.lm_heads[" + std::to_string(i) + "].weight",
+        weights.add("talker.code_predictor.lm_head[" + std::to_string(i) + "].weight",
             test_utils::make_tensor(lm_w,
                 {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     }

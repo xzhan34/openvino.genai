@@ -10,7 +10,7 @@
 
 #include <openvino/openvino.hpp>
 
-#include "modeling/models/dflash_draft.hpp"
+#include "modeling/models/dflash_draft/dflash_draft.hpp"
 #include "modeling/ops/llm.hpp"
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"

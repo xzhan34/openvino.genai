@@ -126,6 +126,7 @@ private:
 
 //===----------------------------------------------------------------------===//
 // Code Predictor Model (5-layer transformer)
+// Contains: layers + norm + 15 codec_embeddings (in model namespace)
 //===----------------------------------------------------------------------===//
 class Qwen3TTSCodePredictorModel : public Module {
 public:
@@ -139,10 +140,19 @@ public:
     Tensor forward_no_cache(const Tensor& inputs_embeds,
                             const Tensor& position_ids) const;
 
+    // Get codec embedding for a specific layer (0..14 -> layers 1..15)
+    Tensor get_codec_embed(const Tensor& codec_ids, int layer_idx) const;
+
+    // Access codec embedding
+    VocabEmbedding& codec_embedding(int layer_idx);
+
 private:
     Qwen3TTSCodePredictorConfig cfg_;
     std::vector<Qwen3TTSCodePredictorDecoderLayer> layers_;
     RMSNorm norm_;
+    // 15 codec embeddings for layers 1-15
+    // HF path: talker.code_predictor.model.codec_embedding.N.weight
+    std::vector<VocabEmbedding> codec_embeddings_;
 
     int32_t head_dim_ = 0;
     float rope_theta_ = 0.0f;
@@ -150,7 +160,8 @@ private:
 
 //===----------------------------------------------------------------------===//
 // Code Predictor For Conditional Generation
-// Contains: model + 15 codec_embeddings (layers 1-15) + 15 lm_heads
+// Contains: model (with codec_embeddings) + 15 lm_heads + small_to_mtp_projection
+// Module path: talker.code_predictor
 //===----------------------------------------------------------------------===//
 class Qwen3TTSCodePredictorForConditionalGeneration : public Module {
 public:
@@ -160,10 +171,11 @@ public:
 
     // Forward for a specific generation step (predicting layer `step+1`)
     // Input:
-    //   - inputs_embeds: [B, T, hidden_size] (sum of talker projection + previous codec embeds)
+    //   - inputs_embeds: [B, T, talker_hidden_size] (sum of talker hidden + codec embeds)
     //   - position_ids: [B, T]
     //   - step: 0..14 (generation step for layers 1..15)
     // Output: logits [B, T, vocab_size]
+    // Note: inputs_embeds is projected from talker_hidden_size to hidden_size internally
     Tensor forward_no_cache(const Tensor& inputs_embeds,
                             const Tensor& position_ids,
                             int step) const;
@@ -183,11 +195,16 @@ private:
     Qwen3TTSCodePredictorConfig cfg_;
     Qwen3TTSCodePredictorModel model_;
 
-    // 15 codec embeddings for layers 1-15
-    std::vector<VocabEmbedding> codec_embeddings_;
-
     // 15 lm_heads for predicting layers 1-15
+    // HF path: talker.code_predictor.lm_head.N.weight
     std::vector<LMHead> lm_heads_;
+
+    // Projection from talker hidden_size to code predictor hidden_size
+    // HF path: talker.code_predictor.small_to_mtp_projection.weight/bias
+    // Only used when talker_hidden_size != hidden_size
+    WeightParameter* projection_weight_ = nullptr;
+    WeightParameter* projection_bias_ = nullptr;
+    bool needs_projection_ = false;
 };
 
 //===----------------------------------------------------------------------===//

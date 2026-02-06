@@ -118,6 +118,17 @@ std::string WeightNameMapper::from_hf(const std::string& hf_name) {
                                     std::regex_constants::format_first_only);
     }
     
+    // Convert specific array patterns that model builders use [N] indexing for
+    // Only convert known array patterns, NOT nn.Sequential child modules (.0., .1., etc.)
+    
+    // Pattern: lm_head.N. or lm_head.N.weight/bias (Qwen3-TTS Code Predictor)
+    static const std::regex lm_head_pattern(R"(\.lm_head\.(\d+)\.)");
+    result = std::regex_replace(result, lm_head_pattern, ".lm_head[$1].");
+    
+    // Pattern: codec_embedding.N. (Qwen3-TTS Code Predictor)
+    static const std::regex codec_embedding_pattern(R"(\.codec_embedding\.(\d+)\.)");
+    result = std::regex_replace(result, codec_embedding_pattern, ".codec_embedding[$1].");
+    
     return result;
 }
 

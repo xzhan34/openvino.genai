@@ -27,8 +27,8 @@
 #include "safetensors_utils/safetensors_weight_source.hpp"
 #include "utils.hpp"
 
-#include "modeling/models/dflash_draft.hpp"
-#include "modeling/models/qwen3_dense.hpp"
+#include "modeling/models/dflash_draft/dflash_draft.hpp"
+#include "modeling/models/qwen3/modeling_qwen3.hpp"
 
 namespace {
 

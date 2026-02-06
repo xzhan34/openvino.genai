@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-#include "modeling/models/dflash_draft.hpp"
+#include "modeling/models/dflash_draft/dflash_draft.hpp"
 
 TEST(DFlashUtils, BuildTargetLayerIds) {
     const auto ids = ov::genai::modeling::models::build_target_layer_ids(36, 5);

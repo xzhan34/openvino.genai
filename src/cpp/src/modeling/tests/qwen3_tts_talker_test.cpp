@@ -277,12 +277,12 @@ TEST(Qwen3TTSTalkerEmbedding, GraphStructure) {
 
     // Text embedding: [text_vocab_size, text_hidden_size]
     auto text_embed_w = test_utils::make_seq(cfg.text_vocab_size * cfg.text_hidden_size, 0.01f, 0.001f);
-    weights.add("talker.text_embedding.weight", test_utils::make_tensor(text_embed_w,
+    weights.add("talker.model.text_embedding.weight", test_utils::make_tensor(text_embed_w,
         {static_cast<size_t>(cfg.text_vocab_size), static_cast<size_t>(cfg.text_hidden_size)}));
 
     // Codec embedding: [vocab_size, hidden_size]
     auto codec_embed_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.02f, 0.001f);
-    weights.add("talker.codec_embedding.weight", test_utils::make_tensor(codec_embed_w,
+    weights.add("talker.model.codec_embedding.weight", test_utils::make_tensor(codec_embed_w,
         {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
 
     // Text projection: fc1 [hidden, text_hidden], fc2 [hidden, hidden]
@@ -306,7 +306,7 @@ TEST(Qwen3TTSTalkerEmbedding, GraphStructure) {
 
     // Verify model structure
     ASSERT_NE(model, nullptr);
-    EXPECT_EQ(model->inputs().size(), 2);   // text_input_ids, codec_input_ids
+    EXPECT_EQ(model->inputs().size(), 3);   // text_input_ids, codec_input_ids, codec_mask
     EXPECT_EQ(model->outputs().size(), 1);  // inputs_embeds
 
     // Verify output shape: [batch, seq, hidden_size]
@@ -323,6 +323,7 @@ TEST(Qwen3TTSTalkerEmbedding, GraphStructure) {
     // Input data
     std::vector<int64_t> text_ids = {1, 5, 10};
     std::vector<int64_t> codec_ids = {0, 2, 4};
+    std::vector<float> codec_mask_data = {1.0f, 1.0f, 1.0f};
 
     ov::Tensor text_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(text_tensor.data(), text_ids.data(), text_ids.size() * sizeof(int64_t));
@@ -331,6 +332,10 @@ TEST(Qwen3TTSTalkerEmbedding, GraphStructure) {
     ov::Tensor codec_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(codec_tensor.data(), codec_ids.data(), codec_ids.size() * sizeof(int64_t));
     request.set_input_tensor(1, codec_tensor);
+
+    ov::Tensor mask_tensor(ov::element::f32, {batch, seq_len});
+    std::memcpy(mask_tensor.data(), codec_mask_data.data(), codec_mask_data.size() * sizeof(float));
+    request.set_input_tensor(2, mask_tensor);
 
     // Should not throw
     EXPECT_NO_THROW(request.infer());
@@ -354,9 +359,9 @@ TEST(Qwen3TTSTalkerCodecEmbedding, GraphStructure) {
 
     test_utils::DummyWeightSource weights;
 
-    // Note: factory uses "talker." prefix for codec_embedding
+    // Note: factory uses "talker.model." prefix for codec_embedding
     auto codec_embed_w = test_utils::make_seq(cfg.vocab_size * cfg.hidden_size, 0.02f, 0.001f);
-    weights.add("talker.codec_embedding.weight", test_utils::make_tensor(codec_embed_w,
+    weights.add("talker.model.codec_embedding.weight", test_utils::make_tensor(codec_embed_w,
         {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
 
     test_utils::DummyWeightFinalizer finalizer;
@@ -410,9 +415,9 @@ TEST(Qwen3TTSTalkerEmbedding, MatchesReference) {
     const auto fc2_b = test_utils::make_seq(cfg.hidden_size, -0.005f, 0.001f);
 
     test_utils::DummyWeightSource weights;
-    weights.add("talker.text_embedding.weight", test_utils::make_tensor(text_embed_w,
+    weights.add("talker.model.text_embedding.weight", test_utils::make_tensor(text_embed_w,
         {static_cast<size_t>(cfg.text_vocab_size), static_cast<size_t>(cfg.text_hidden_size)}));
-    weights.add("talker.codec_embedding.weight", test_utils::make_tensor(codec_embed_w,
+    weights.add("talker.model.codec_embedding.weight", test_utils::make_tensor(codec_embed_w,
         {static_cast<size_t>(cfg.vocab_size), static_cast<size_t>(cfg.hidden_size)}));
     weights.add("talker.text_projection.linear_fc1.weight", test_utils::make_tensor(fc1_w,
         {static_cast<size_t>(cfg.hidden_size), static_cast<size_t>(cfg.text_hidden_size)}));
@@ -433,6 +438,7 @@ TEST(Qwen3TTSTalkerEmbedding, MatchesReference) {
 
     std::vector<int64_t> text_ids = {3, 7};
     std::vector<int64_t> codec_ids = {1, 4};
+    std::vector<float> codec_mask_data = {1.0f, 1.0f};
 
     ov::Tensor text_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(text_tensor.data(), text_ids.data(), text_ids.size() * sizeof(int64_t));
@@ -441,6 +447,10 @@ TEST(Qwen3TTSTalkerEmbedding, MatchesReference) {
     ov::Tensor codec_tensor(ov::element::i64, {batch, seq_len});
     std::memcpy(codec_tensor.data(), codec_ids.data(), codec_ids.size() * sizeof(int64_t));
     request.set_input_tensor(1, codec_tensor);
+
+    ov::Tensor mask_tensor(ov::element::f32, {batch, seq_len});
+    std::memcpy(mask_tensor.data(), codec_mask_data.data(), codec_mask_data.size() * sizeof(float));
+    request.set_input_tensor(2, mask_tensor);
 
     request.infer();
 

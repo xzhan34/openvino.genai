@@ -91,10 +91,11 @@ public:
                             const Tensor& causal_mask) const;
 
     // Forward with KV cache (for decode phase)
+    // attention_mask: [batch, kv_len] where 1=attend, 0=mask
     AttentionKVOutput forward_with_cache(const Tensor& hidden_states,
                                          const Tensor& rope_cos,
                                          const Tensor& rope_sin,
-                                         const Tensor& causal_mask,
+                                         const Tensor& attention_mask,
                                          const std::optional<Tensor>& past_key,
                                          const std::optional<Tensor>& past_value) const;
 
@@ -168,10 +169,11 @@ public:
                                                const std::optional<Tensor>& residual) const;
 
     // Forward with KV cache
+    // attention_mask: [batch, kv_len] where 1=attend, 0=mask
     DecoderLayerKVOutput forward_with_cache(const Tensor& hidden_states,
                                             const Tensor& rope_cos,
                                             const Tensor& rope_sin,
-                                            const Tensor& causal_mask,
+                                            const Tensor& attention_mask,
                                             const std::optional<Tensor>& residual,
                                             const std::optional<Tensor>& past_key,
                                             const std::optional<Tensor>& past_value) const;
@@ -199,8 +201,10 @@ public:
                                                const Tensor& position_ids);
 
     // Forward with KV cache (decode phase)
+    // attention_mask: [batch, kv_len] where 1=attend, 0=mask
     TalkerModelKVOutput forward_with_cache(const Tensor& inputs_embeds,
                                            const Tensor& position_ids,
+                                           const Tensor& attention_mask,
                                            const std::vector<Tensor>& past_keys,
                                            const std::vector<Tensor>& past_values);
 
@@ -241,8 +245,10 @@ public:
                                                const Tensor& position_ids);
 
     // Forward with KV cache
+    // attention_mask: [batch, kv_len] where 1=attend, 0=mask
     TalkerGenerationKVOutput forward_with_cache(const Tensor& inputs_embeds,
                                                 const Tensor& position_ids,
+                                                const Tensor& attention_mask,
                                                 const std::vector<Tensor>& past_keys,
                                                 const std::vector<Tensor>& past_values);
 

@@ -89,10 +89,10 @@ struct SpeechDecoderConfig {
     int32_t codebook_dim = 32;           // Each codebook entry dimension
 
     // Pre-transformer
-    int32_t latent_dim = 512;            // rvq_output_dim
-    int32_t transformer_hidden = 1024;   // pre_transformer hidden size
+    int32_t latent_dim = 512;            // rvq_output_dim (input/output dim of pre_transformer)
+    int32_t transformer_hidden = 1024;   // pre_transformer attention hidden size (num_heads * head_dim)
     int32_t transformer_heads = 8;       // pre_transformer attention heads
-    int32_t transformer_head_dim = 64;   // head dimension (hidden / heads)
+    int32_t transformer_head_dim = 128;  // head dimension (transformer_hidden / transformer_heads)
     int32_t transformer_layers = 8;      // pre_transformer layers
     int32_t transformer_intermediate = 2048;
     int32_t sliding_window = 72;
