@@ -654,11 +654,27 @@ int main(int argc, char* argv[]) try {
         qwen_cfg, target_source, target_finalizer, ov::element::f32);
     
     ov::Core core;
-    // Use F32 for maximum compatibility and numerical stability
+    // Use f16 for maximum compatibility and numerical stability
     ov::AnyMap compile_cfg = {
-        {ov::hint::inference_precision.name(), ov::element::f32}
+        {ov::hint::inference_precision.name(), ov::element::f16},
+        {ov::hint::kv_cache_precision.name(), ov::element::f16},
+        {ov::hint::activations_scale_factor.name(), 8.0f}
     };
-
+    
+    //
+    std::cout << "[compile_cfg] ";
+    for (const auto& kv : compile_cfg) {
+        std::cout << kv.first << "=";
+        if (kv.second.is<ov::element::Type>()) {
+            std::cout << kv.second.as<ov::element::Type>().get_type_name();
+        } else if (kv.second.is<float>()) {
+            std::cout << kv.second.as<float>();
+        } else {
+            std::cout << "(unknown)";
+        }
+        std::cout << " ";
+    }
+    std::cout << std::endl;
     ov::genai::Tokenizer tokenizer(target_dir);
     const int64_t mask_token_id = resolve_mask_token_id(tokenizer);
     const int64_t eos_token_id = tokenizer.get_eos_token_id();
