@@ -30,8 +30,16 @@ std::shared_ptr<ov::Model> build_stateful_axes_model() {
     auto kv_read = std::make_shared<ov::op::v6::ReadValue>(kv_init, kv_var);
     auto kv_assign = std::make_shared<ov::opset13::Assign>(kv_read->output(0), kv_var);
 
-    auto zero = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1}, {0.f});
-    auto out = std::make_shared<ov::opset13::Add>(input->output(0), zero->output(0));
+    auto axis_3d = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {0, 1, 2});
+    auto axis_4d = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 1, 2, 3});
+    auto linear_sum = std::make_shared<ov::opset13::ReduceSum>(linear_read->output(0), axis_3d->output(0), false);
+    auto kv_sum = std::make_shared<ov::opset13::ReduceSum>(kv_read->output(0), axis_4d->output(0), false);
+    auto state_sum = std::make_shared<ov::opset13::Add>(linear_sum->output(0), kv_sum->output(0));
+    auto state_sum_2d = std::make_shared<ov::opset13::Reshape>(
+        state_sum->output(0),
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {1, 1}),
+        false);
+    auto out = std::make_shared<ov::opset13::Add>(input->output(0), state_sum_2d->output(0));
     auto result = std::make_shared<ov::op::v0::Result>(out->output(0));
 
     auto model = std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input});
@@ -54,8 +62,16 @@ std::shared_ptr<ov::Model> build_stateful_trim_model() {
     auto kv_read = std::make_shared<ov::op::v6::ReadValue>(kv_init, kv_var);
     auto kv_assign = std::make_shared<ov::opset13::Assign>(kv_read->output(0), kv_var);
 
-    auto zero = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1}, {0.f});
-    auto out = std::make_shared<ov::opset13::Add>(input->output(0), zero->output(0));
+    auto axis_3d = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, {0, 1, 2});
+    auto axis_4d = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 1, 2, 3});
+    auto linear_sum = std::make_shared<ov::opset13::ReduceSum>(linear_read->output(0), axis_3d->output(0), false);
+    auto kv_sum = std::make_shared<ov::opset13::ReduceSum>(kv_read->output(0), axis_4d->output(0), false);
+    auto state_sum = std::make_shared<ov::opset13::Add>(linear_sum->output(0), kv_sum->output(0));
+    auto state_sum_2d = std::make_shared<ov::opset13::Reshape>(
+        state_sum->output(0),
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {1, 1}),
+        false);
+    auto out = std::make_shared<ov::opset13::Add>(input->output(0), state_sum_2d->output(0));
     auto result = std::make_shared<ov::op::v0::Result>(out->output(0));
 
     auto model = std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input});
@@ -76,7 +92,7 @@ TEST(Qwen3NextCacheRuntime, KVAxesDetectionSkipsLinearStates) {
 TEST(Qwen3NextCacheRuntime, TrimOnlyAffectsAttentionStates) {
     auto model = build_stateful_trim_model();
     ov::Core core;
-    auto compiled = core.compile_model(model, "CPU");
+    auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
     auto states = request.query_state();
