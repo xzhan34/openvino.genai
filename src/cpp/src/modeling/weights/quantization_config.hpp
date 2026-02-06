@@ -48,7 +48,7 @@ struct WeightSelectionConfig {
     bool quantize_embeddings = false;   // embed_tokens
     bool quantize_lm_head = false;      // lm_head
     bool quantize_norm = false;         // Normalization layers (usually not beneficial)
-    bool quantize_routers = true;      // MoE router/gate weights (usually not beneficial)
+    bool quantize_routers = false;      // MoE router/gate weights (usually not beneficial)
     
     // Explicit weight lists (highest priority)
     std::vector<std::string> include_weights;  // Exact weight names to quantize

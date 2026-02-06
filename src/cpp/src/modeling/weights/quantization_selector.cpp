@@ -149,7 +149,8 @@ bool QuantizationSelector::should_quantize(const std::string& name,
                   name.find("moe.down_exps") != std::string::npos ||
                   name.find(".mlp.experts.") != std::string::npos;
     bool is_router = name.find(".mlp.gate.weight") != std::string::npos ||
-                     name.find(".moe.gate_inp") != std::string::npos;
+                     name.find(".moe.gate_inp") != std::string::npos ||
+                     name.find("shared_expert_gate") != std::string::npos;  // Skip shared_expert_gate (small BF16 weight)
 
     
     // Skip bias and norm by default
