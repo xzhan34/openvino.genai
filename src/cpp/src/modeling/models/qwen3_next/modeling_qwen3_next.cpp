@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <unordered_set>
 
 #include <openvino/core/except.hpp>
@@ -77,6 +79,52 @@ std::vector<std::string> build_default_layer_types(int32_t num_layers, int32_t i
         out.push_back(((i + 1) % safe_interval) == 0 ? "full_attention" : "linear_attention");
     }
     return out;
+}
+
+std::optional<int32_t> get_qwen3_next_layer_limit_from_env() {
+    static constexpr const char* kEnvName = "OV_GENAI_QWEN3_NEXT_NUM_LAYERS";
+    const char* raw = std::getenv(kEnvName);
+    if (!raw || raw[0] == '\0') {
+        return std::nullopt;
+    }
+
+    try {
+        const int64_t parsed = std::stoll(raw);
+        if (parsed < 0 || parsed > std::numeric_limits<int32_t>::max()) {
+            OPENVINO_THROW(kEnvName, " must be an integer in [0, INT32_MAX], got: ", raw);
+        }
+        return static_cast<int32_t>(parsed);
+    } catch (const std::exception&) {
+        OPENVINO_THROW(kEnvName, " must be an integer in [0, INT32_MAX], got: ", raw);
+    }
+}
+
+ov::genai::modeling::models::Qwen3NextConfig apply_qwen3_next_layer_limit(
+    const ov::genai::modeling::models::Qwen3NextConfig& input_cfg) {
+    auto cfg = input_cfg;
+    const auto env_limit = get_qwen3_next_layer_limit_from_env();
+    if (!env_limit.has_value()) {
+        return cfg;
+    }
+
+    const int32_t limited_layers = std::clamp(*env_limit, 0, cfg.num_hidden_layers);
+    cfg.num_hidden_layers = limited_layers;
+
+    if (!cfg.layer_types.empty() && cfg.layer_types.size() >= static_cast<size_t>(limited_layers)) {
+        cfg.layer_types.resize(static_cast<size_t>(limited_layers));
+    }
+
+    if (!cfg.mlp_only_layers.empty()) {
+        std::vector<int32_t> filtered;
+        filtered.reserve(cfg.mlp_only_layers.size());
+        for (int32_t idx : cfg.mlp_only_layers) {
+            if (idx >= 0 && idx < limited_layers) {
+                filtered.push_back(idx);
+            }
+        }
+        cfg.mlp_only_layers = std::move(filtered);
+    }
+    return cfg;
 }
 
 }  // namespace
@@ -981,8 +1029,10 @@ std::shared_ptr<ov::Model> create_qwen3_next_model(
     const Qwen3NextConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    const auto effective_cfg = apply_qwen3_next_layer_limit(cfg);
+
     BuilderContext ctx;
-    Qwen3NextForCausalLM model(ctx, cfg);
+    Qwen3NextForCausalLM model(ctx, effective_cfg);
 
     ov::genai::modeling::weights::LoadOptions options;
     options.allow_missing = false;
@@ -993,7 +1043,7 @@ std::shared_ptr<ov::Model> create_qwen3_next_model(
 
     for (const auto& name : report.unmatched) {
         const int layer_idx = extract_layer_index_from_weight_name(name);
-        if (layer_idx >= cfg.num_hidden_layers) {
+        if (layer_idx >= effective_cfg.num_hidden_layers) {
             // Allow unused deeper layers when we intentionally build a truncated layer stack.
             continue;
         }
