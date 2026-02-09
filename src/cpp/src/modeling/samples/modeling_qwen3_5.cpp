@@ -1,0 +1,589 @@
+// Copyright (C) 2025 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <openvino/core/type/bfloat16.hpp>
+#include <openvino/core/type/float16.hpp>
+#include <openvino/openvino.hpp>
+
+#include "load_image.hpp"
+#include "openvino/genai/tokenizer.hpp"
+#include "safetensors_utils/quantization_utils.hpp"
+#include "safetensors_utils/safetensors_loader.hpp"
+#include "safetensors_utils/safetensors_weight_finalizer.hpp"
+#include "safetensors_utils/safetensors_weight_source.hpp"
+
+#include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
+#include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
+#include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
+#include "modeling/weights/synthetic_weight_source.hpp"
+
+namespace {
+
+const char* get_env(const char* name) {
+    const char* value = std::getenv(name);
+    return (value && value[0] != '\0') ? value : nullptr;
+}
+
+bool env_enabled(const char* name) {
+    const char* value = get_env(name);
+    if (!value) {
+        return false;
+    }
+    const std::string v(value);
+    return v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON";
+}
+
+bool has_safetensors_file(const std::filesystem::path& model_dir) {
+    if (!std::filesystem::exists(model_dir) || !std::filesystem::is_directory(model_dir)) {
+        return false;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(model_dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() == ".safetensors") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool should_use_dummy_mode(const std::filesystem::path& model_dir) {
+    if (env_enabled("OV_GENAI_QWEN3_5_DUMMY_ENABLE")) {
+        return true;
+    }
+    const bool has_config = std::filesystem::exists(model_dir / "config.json");
+    const bool has_safetensors = has_safetensors_file(model_dir);
+    return !(has_config && has_safetensors);
+}
+
+uint32_t read_env_u32(const char* name, uint32_t default_value) {
+    const char* raw = get_env(name);
+    if (!raw) {
+        return default_value;
+    }
+    try {
+        return static_cast<uint32_t>(std::stoul(raw));
+    } catch (const std::exception&) {
+        return default_value;
+    }
+}
+
+float read_env_float(const char* name, float default_value) {
+    const char* raw = get_env(name);
+    if (!raw) {
+        return default_value;
+    }
+    try {
+        return std::stof(raw);
+    } catch (const std::exception&) {
+        return default_value;
+    }
+}
+
+int read_env_i32(const char* name, int default_value) {
+    const char* raw = get_env(name);
+    if (!raw) {
+        return default_value;
+    }
+    try {
+        return std::stoi(raw);
+    } catch (const std::exception&) {
+        return default_value;
+    }
+}
+
+std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens) {
+    std::string prompt = "<|im_start|>user\n<|vision_start|>";
+    prompt.reserve(prompt.size() + static_cast<size_t>(image_tokens) * 12 + user_prompt.size() + 64);
+    for (int64_t i = 0; i < image_tokens; ++i) {
+        prompt += "<|image_pad|>";
+    }
+    prompt += "<|vision_end|>\n";
+    prompt += user_prompt;
+    prompt += "<|im_end|>\n<|im_start|>assistant\n";
+    return prompt;
+}
+
+int64_t argmax_last_token(const ov::Tensor& logits) {
+    const auto shape = logits.get_shape();
+    if (shape.size() != 3 || shape[0] != 1) {
+        throw std::runtime_error("logits must have shape [1, S, V]");
+    }
+    const size_t seq_len = shape[1];
+    const size_t vocab = shape[2];
+    const size_t offset = (seq_len - 1) * vocab;
+
+    if (logits.get_element_type() == ov::element::f16) {
+        const auto* data = logits.data<const ov::float16>() + offset;
+        ov::float16 max_val = data[0];
+        size_t max_idx = 0;
+        for (size_t i = 1; i < vocab; ++i) {
+            if (data[i] > max_val) {
+                max_val = data[i];
+                max_idx = i;
+            }
+        }
+        return static_cast<int64_t>(max_idx);
+    }
+    if (logits.get_element_type() == ov::element::bf16) {
+        const auto* data = logits.data<const ov::bfloat16>() + offset;
+        ov::bfloat16 max_val = data[0];
+        size_t max_idx = 0;
+        for (size_t i = 1; i < vocab; ++i) {
+            if (data[i] > max_val) {
+                max_val = data[i];
+                max_idx = i;
+            }
+        }
+        return static_cast<int64_t>(max_idx);
+    }
+    if (logits.get_element_type() != ov::element::f32) {
+        throw std::runtime_error("Unsupported logits dtype");
+    }
+    const auto* data = logits.data<const float>() + offset;
+    float max_val = data[0];
+    size_t max_idx = 0;
+    for (size_t i = 1; i < vocab; ++i) {
+        if (data[i] > max_val) {
+            max_val = data[i];
+            max_idx = i;
+        }
+    }
+    return static_cast<int64_t>(max_idx);
+}
+
+ov::Tensor make_beam_idx(size_t batch) {
+    ov::Tensor beam_idx(ov::element::i32, {batch});
+    auto* data = beam_idx.data<int32_t>();
+    for (size_t i = 0; i < batch; ++i) {
+        data[i] = static_cast<int32_t>(i);
+    }
+    return beam_idx;
+}
+
+ov::Tensor make_zero_tensor(const ov::element::Type& type, const ov::Shape& shape) {
+    ov::Tensor tensor(type, shape);
+    std::memset(tensor.data(), 0, tensor.get_byte_size());
+    return tensor;
+}
+
+std::string resolve_pos_embed_name(ov::genai::modeling::weights::WeightSource& source) {
+    const std::vector<std::string> candidates = {
+        "model.visual.pos_embed.weight",
+        "visual.pos_embed.weight",
+        "pos_embed.weight",
+    };
+    for (const auto& name : candidates) {
+        if (source.has(name)) {
+            return name;
+        }
+    }
+    for (const auto& name : source.keys()) {
+        if (name.find("pos_embed.weight") != std::string::npos) {
+            return name;
+        }
+    }
+    throw std::runtime_error("Failed to locate visual.pos_embed.weight");
+}
+
+double elapsed_ms(const std::chrono::steady_clock::time_point& start,
+                  const std::chrono::steady_clock::time_point& end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+std::vector<int64_t> build_dummy_prompt_ids(const ov::genai::modeling::models::Qwen3_5Config& cfg,
+                                            const std::string& prompt,
+                                            bool with_vision,
+                                            int64_t image_tokens) {
+    std::vector<int64_t> ids;
+    ids.reserve(static_cast<size_t>(prompt.size()) + 16 + static_cast<size_t>(std::max<int64_t>(0, image_tokens)));
+
+    if (with_vision) {
+        ids.push_back(cfg.vision_start_token_id);
+        for (int64_t i = 0; i < image_tokens; ++i) {
+            ids.push_back(cfg.image_token_id);
+        }
+        ids.push_back(cfg.vision_end_token_id);
+    }
+
+    const int64_t vocab_base = std::max<int64_t>(100, cfg.text.vocab_size - 100);
+    for (unsigned char c : prompt) {
+        ids.push_back(static_cast<int64_t>(c % vocab_base));
+    }
+    if (ids.empty()) {
+        ids = {1, 2, 3, 4, 5, 6};
+    }
+    return ids;
+}
+
+std::pair<ov::Tensor, ov::Tensor> to_batch_tensors(const std::vector<int64_t>& ids) {
+    ov::Tensor input_ids(ov::element::i64, {1, ids.size()});
+    std::memcpy(input_ids.data(), ids.data(), ids.size() * sizeof(int64_t));
+
+    ov::Tensor attention_mask(ov::element::i64, {1, ids.size()});
+    auto* mask = attention_mask.data<int64_t>();
+    for (size_t i = 0; i < ids.size(); ++i) {
+        mask[i] = 1;
+    }
+    return {input_ids, attention_mask};
+}
+
+ov::Tensor make_dummy_image() {
+    ov::Tensor image(ov::element::u8, {1, 224, 224, 3});
+    std::memset(image.data(), 127, image.get_byte_size());
+    return image;
+}
+
+ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config_from_env() {
+    using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
+    ov::genai::modeling::weights::QuantizationConfig cfg;
+
+    std::string mode = "FP32";
+    if (const char* raw = get_env("OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE")) {
+        mode = raw;
+    }
+    for (auto& c : mode) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    if (mode == "INT4_SYM") {
+        cfg.mode = Mode::INT4_SYM;
+    } else if (mode == "INT4_ASYM" || mode == "INT4") {
+        cfg.mode = Mode::INT4_ASYM;
+    } else {
+        cfg.mode = Mode::NONE;
+    }
+
+    cfg.group_size = read_env_i32("OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE", 128);
+    cfg.backup_mode = cfg.mode;
+    cfg.selection.exclude_patterns.clear();
+    return cfg;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) try {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <MODEL_DIR> [text|vl] [IMAGE_PATH] [PROMPT] [DEVICE] [MAX_NEW_TOKENS] "
+                  << "[VISION_QUANT] [VISION_GS] [VISION_BACKUP] [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP]\n";
+        return 1;
+    }
+
+    const std::filesystem::path model_dir = argv[1];
+    int arg_idx = 2;
+
+    std::string mode;
+    if (const char* env_mode = get_env("OV_GENAI_QWEN3_5_SAMPLE_MODE")) {
+        mode = env_mode;
+    }
+    if (argc > arg_idx) {
+        const std::string arg_mode = argv[arg_idx];
+        if (arg_mode == "text" || arg_mode == "vl") {
+            mode = arg_mode;
+            arg_idx++;
+        }
+    }
+    if (mode.empty()) {
+        if (argc > arg_idx && std::string(argv[arg_idx]) != "-" && std::filesystem::exists(argv[arg_idx])) {
+            mode = "vl";
+        } else {
+            mode = "text";
+        }
+    }
+    if (mode != "text" && mode != "vl") {
+        throw std::runtime_error("Mode must be 'text' or 'vl'");
+    }
+    const bool use_vl = (mode == "vl");
+
+    std::filesystem::path image_path;
+    if (use_vl && argc > arg_idx && std::string(argv[arg_idx]) != "-" && std::filesystem::exists(argv[arg_idx])) {
+        image_path = argv[arg_idx++];
+    }
+
+    const std::string user_prompt = (argc > arg_idx) ? argv[arg_idx++] :
+        (use_vl ? "Describe the image." : "Write one sentence about OpenVINO.");
+    const std::string device = (argc > arg_idx) ? argv[arg_idx++] : "GPU";
+    const int max_new_tokens = (argc > arg_idx) ? std::stoi(argv[arg_idx++]) : 64;
+
+    std::string vision_quant_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
+    int vision_group_size = (argc > arg_idx) ? std::stoi(argv[arg_idx++]) : 128;
+    std::string vision_backup_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
+    std::string text_quant_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
+    int text_group_size = (argc > arg_idx) ? std::stoi(argv[arg_idx++]) : 128;
+    std::string text_backup_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
+
+    const bool use_dummy_mode = should_use_dummy_mode(model_dir);
+
+    ov::genai::modeling::models::Qwen3_5Config cfg =
+        use_dummy_mode ? ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config()
+                       : ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
+
+    ov::genai::modeling::weights::QuantizationConfig vision_quant_config;
+    ov::genai::modeling::weights::QuantizationConfig text_quant_config;
+    if (use_dummy_mode) {
+        const auto dummy_quant = build_dummy_quant_config_from_env();
+        vision_quant_config = dummy_quant;
+        text_quant_config = dummy_quant;
+    } else {
+        vision_quant_config = create_quantization_config(vision_quant_mode, vision_group_size, vision_backup_mode);
+        text_quant_config = create_quantization_config(text_quant_mode, text_group_size, text_backup_mode);
+    }
+
+    std::unique_ptr<ov::genai::modeling::weights::WeightSource> source;
+    if (use_dummy_mode) {
+        const uint32_t seed = read_env_u32("OV_GENAI_QWEN3_5_DUMMY_SEED", 2026u);
+        const float init_range = read_env_float("OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE", 0.02f);
+        auto specs = ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg);
+        source = std::make_unique<ov::genai::modeling::weights::SyntheticWeightSource>(
+            std::move(specs),
+            seed,
+            -init_range,
+            init_range);
+    } else {
+        auto data = ov::genai::safetensors::load_safetensors(model_dir);
+        source = std::make_unique<ov::genai::safetensors::SafetensorsWeightSource>(std::move(data));
+    }
+
+    ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig pre_cfg;
+    const auto pre_cfg_path = model_dir / "preprocessor_config.json";
+    if (!use_dummy_mode && std::filesystem::exists(pre_cfg_path)) {
+        pre_cfg = ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig::from_json_file(pre_cfg_path);
+    }
+
+    std::shared_ptr<ov::Model> vision_model;
+    if (use_vl) {
+        ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer(vision_quant_config);
+        vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(cfg, *source, vision_finalizer);
+    }
+
+    std::shared_ptr<ov::Model> text_model;
+    {
+        ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
+        text_model = ov::genai::modeling::models::create_qwen3_5_text_model(
+            cfg,
+            *source,
+            text_finalizer,
+            false,
+            use_vl);
+    }
+
+    ov::Core core;
+    std::optional<ov::CompiledModel> compiled_vision;
+    if (use_vl) {
+        compiled_vision = core.compile_model(vision_model, device);
+    }
+    auto compiled_text = core.compile_model(text_model, device);
+
+    ov::Tensor visual_embeds;
+    ov::Tensor grid_thw;
+    if (use_vl) {
+        ov::Tensor image = image_path.empty() ? make_dummy_image() : utils::load_image(image_path);
+        const std::string pos_embed_name = resolve_pos_embed_name(*source);
+        const ov::Tensor pos_embed_weight = source->get_tensor(pos_embed_name);
+
+        ov::genai::modeling::models::Qwen3_5VisionPreprocessor preprocessor(cfg.vision, pre_cfg);
+        const auto preprocess_start = std::chrono::steady_clock::now();
+        auto vision_inputs = preprocessor.preprocess(image, pos_embed_weight);
+        const auto preprocess_end = std::chrono::steady_clock::now();
+
+        auto vision_request = compiled_vision->create_infer_request();
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kPixelValues, vision_inputs.pixel_values);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kGridThw, vision_inputs.grid_thw);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kPosEmbeds, vision_inputs.pos_embeds);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kRotaryCos, vision_inputs.rotary_cos);
+        vision_request.set_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kRotarySin, vision_inputs.rotary_sin);
+        const auto vision_start = std::chrono::steady_clock::now();
+        vision_request.infer();
+        const auto vision_end = std::chrono::steady_clock::now();
+
+        visual_embeds = vision_request.get_tensor(ov::genai::modeling::models::Qwen3_5VisionIO::kVisualEmbeds);
+        grid_thw = vision_inputs.grid_thw;
+
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "[vision] preprocess: " << elapsed_ms(preprocess_start, preprocess_end) << " ms" << std::endl;
+        std::cout << "[vision] encode: " << elapsed_ms(vision_start, vision_end) << " ms" << std::endl;
+    }
+
+    std::unique_ptr<ov::genai::Tokenizer> tokenizer;
+    if (!use_dummy_mode) {
+        try {
+            tokenizer = std::make_unique<ov::genai::Tokenizer>(model_dir);
+        } catch (const std::exception&) {
+            tokenizer.reset();
+        }
+    }
+
+    ov::Tensor input_ids;
+    ov::Tensor attention_mask;
+    if (tokenizer) {
+        std::string prompt;
+        if (use_vl) {
+            const int64_t image_tokens =
+                ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+                    grid_thw,
+                    cfg.vision.spatial_merge_size);
+            prompt = build_vl_prompt(user_prompt, image_tokens);
+        } else {
+            prompt = user_prompt;
+        }
+        auto tokenized = tokenizer->encode(prompt, ov::genai::add_special_tokens(false));
+        input_ids = tokenized.input_ids;
+        attention_mask = tokenized.attention_mask;
+    } else {
+        const int64_t image_tokens = use_vl
+                                         ? ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+                                               grid_thw,
+                                               cfg.vision.spatial_merge_size)
+                                         : 0;
+        auto ids = build_dummy_prompt_ids(cfg, user_prompt, use_vl, image_tokens);
+        auto tensors = to_batch_tensors(ids);
+        input_ids = tensors.first;
+        attention_mask = tensors.second;
+    }
+
+    const size_t batch = input_ids.get_shape().at(0);
+    const int64_t prompt_len = static_cast<int64_t>(input_ids.get_shape().at(1));
+
+    ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
+    auto plan = planner.build_plan(input_ids, &attention_mask, use_vl ? &grid_thw : nullptr);
+
+    ov::Tensor visual_padded;
+    if (use_vl) {
+        visual_padded = ov::genai::modeling::models::Qwen3_5InputPlanner::scatter_visual_embeds(
+            visual_embeds,
+            plan.visual_pos_mask);
+    }
+
+    auto beam_idx = make_beam_idx(batch);
+    auto text_request = compiled_text.create_infer_request();
+    text_request.reset_state();
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, input_ids);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, attention_mask);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, plan.position_ids);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, beam_idx);
+    if (use_vl) {
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, visual_padded);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, plan.visual_pos_mask);
+    }
+
+    const auto prefill_start = std::chrono::steady_clock::now();
+    text_request.infer();
+    ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
+    int64_t next_id = argmax_last_token(logits);
+    const auto prefill_end = std::chrono::steady_clock::now();
+
+    std::vector<int64_t> generated;
+    generated.reserve(static_cast<size_t>(max_new_tokens));
+    generated.push_back(next_id);
+
+    int64_t eos_token_id = -1;
+    if (tokenizer) {
+        eos_token_id = tokenizer->get_eos_token_id();
+    }
+
+    ov::Tensor step_ids(ov::element::i64, {batch, 1});
+    ov::Tensor step_mask(ov::element::i64, {batch, 1});
+    auto* step_mask_data = step_mask.data<int64_t>();
+    for (size_t b = 0; b < batch; ++b) {
+        step_mask_data[b] = 1;
+    }
+
+    ov::Tensor decode_visual;
+    ov::Tensor decode_visual_mask;
+    if (use_vl) {
+        decode_visual = make_zero_tensor(ov::element::f32, {batch, 1, static_cast<size_t>(cfg.text.hidden_size)});
+        decode_visual_mask = make_zero_tensor(ov::element::boolean, {batch, 1});
+    }
+
+    int64_t past_len = prompt_len;
+    size_t decode_steps = 0;
+    const auto decode_start = std::chrono::steady_clock::now();
+    for (int step = 1; step < max_new_tokens; ++step) {
+        if (eos_token_id >= 0 && next_id == eos_token_id) {
+            break;
+        }
+        auto* step_data = step_ids.data<int64_t>();
+        for (size_t b = 0; b < batch; ++b) {
+            step_data[b] = next_id;
+        }
+
+        auto position_ids = ov::genai::modeling::models::Qwen3_5InputPlanner::build_decode_position_ids(
+            plan.rope_deltas,
+            past_len,
+            1);
+
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, position_ids);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, beam_idx);
+        if (use_vl) {
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, decode_visual);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask);
+        }
+
+        text_request.infer();
+        logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
+        next_id = argmax_last_token(logits);
+        generated.push_back(next_id);
+        decode_steps += 1;
+        past_len += 1;
+    }
+    const auto decode_end = std::chrono::steady_clock::now();
+
+    const double ttft_ms = elapsed_ms(prefill_start, prefill_end);
+    const double decode_ms = elapsed_ms(decode_start, decode_end);
+    const double tpot_ms = decode_steps > 0 ? (decode_ms / static_cast<double>(decode_steps)) : 0.0;
+    const double throughput = decode_steps > 0 && decode_ms > 0.0
+                                  ? (static_cast<double>(decode_steps) * 1000.0 / decode_ms)
+                                  : 0.0;
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Mode: " << (use_dummy_mode ? "dummy" : "hf") << " / " << mode << std::endl;
+    std::cout << "Prompt token size: " << prompt_len << std::endl;
+    std::cout << "Output token size: " << generated.size() << std::endl;
+    std::cout << "TTFT: " << ttft_ms << " ms" << std::endl;
+    std::cout << "Decode time: " << decode_ms << " ms" << std::endl;
+    if (decode_steps > 0) {
+        std::cout << "TPOT: " << tpot_ms << " ms/token" << std::endl;
+        std::cout << "Throughput: " << throughput << " tokens/s" << std::endl;
+    } else {
+        std::cout << "TPOT: N/A" << std::endl;
+        std::cout << "Throughput: N/A" << std::endl;
+    }
+
+    if (tokenizer) {
+        std::cout << tokenizer->decode(generated, ov::genai::skip_special_tokens(true)) << std::endl;
+    } else {
+        std::cout << "Generated token ids:";
+        for (const auto id : generated) {
+            std::cout << ' ' << id;
+        }
+        std::cout << std::endl;
+    }
+
+    return 0;
+} catch (const std::exception& error) {
+    try {
+        std::cerr << error.what() << '\n';
+    } catch (const std::ios_base::failure&) {
+    }
+    return 1;
+}
