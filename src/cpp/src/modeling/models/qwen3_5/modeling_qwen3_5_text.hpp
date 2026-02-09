@@ -66,9 +66,9 @@ struct Qwen3_5TextModelConfig {
     std::vector<int32_t> mrope_section = {11, 11, 10};
 };
 
-class EmbeddingInjector : public Module {
+class Qwen3_5EmbeddingInjector : public Module {
 public:
-    EmbeddingInjector(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
+    Qwen3_5EmbeddingInjector(BuilderContext& ctx, const std::string& name, Module* parent = nullptr);
 
     Tensor forward(const Tensor& inputs_embeds,
                    const Tensor& visual_embeds,
@@ -253,7 +253,7 @@ private:
 
     Qwen3_5TextModelConfig cfg_;
     VocabEmbedding embed_tokens_;
-    EmbeddingInjector embedding_injector_;
+    Qwen3_5EmbeddingInjector embedding_injector_;
     std::vector<Qwen3_5DecoderLayer> layers_;
     Qwen3_5RMSNorm norm_;
     int32_t head_dim_ = 0;

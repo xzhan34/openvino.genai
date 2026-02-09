@@ -82,12 +82,12 @@ namespace genai {
 namespace modeling {
 namespace models {
 
-EmbeddingInjector::EmbeddingInjector(BuilderContext& ctx, const std::string& name, Module* parent)
+Qwen3_5EmbeddingInjector::Qwen3_5EmbeddingInjector(BuilderContext& ctx, const std::string& name, Module* parent)
     : Module(name, ctx, parent) {}
 
-Tensor EmbeddingInjector::forward(const Tensor& inputs_embeds,
-                                  const Tensor& visual_embeds,
-                                  const Tensor& visual_pos_mask) const {
+Tensor Qwen3_5EmbeddingInjector::forward(const Tensor& inputs_embeds,
+                                         const Tensor& visual_embeds,
+                                         const Tensor& visual_pos_mask) const {
     auto mask = visual_pos_mask.unsqueeze(2);
     auto updates = visual_embeds.to(inputs_embeds.dtype());
     return ops::tensor::masked_scatter(inputs_embeds, mask, updates);
@@ -903,6 +903,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
 
     BuilderContext ctx;
     Qwen3_5ForCausalLM model(ctx, effective_cfg);
+    model.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    model.packed_mapping().rules.push_back({"language_model.", "model.", 0});
 
     ov::genai::modeling::weights::LoadOptions options;
     options.allow_missing = false;
