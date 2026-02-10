@@ -14,6 +14,7 @@
 #include <openvino/op/add.hpp>
 #include <openvino/op/subtract.hpp>
 #include <openvino/op/convert.hpp>
+#include <openvino/op/gather.hpp>
 
 #include <iostream>
 #include <chrono>
@@ -545,50 +546,141 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     const std::string& name,
     const rtn::QuantizedWeight& quant_result,
     const ov::Shape& original_shape) {
-    
+
     // Support 1D [in], 2D [out, in] and 3D [batch, out, in] weights
-    OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3 || original_shape.size() == 1, 
+    OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3 || original_shape.size() == 1,
                     "Original shape must be 1D, 2D or 3D for dequantization");
-    
+
     // Create scale constant
     auto scale_const = std::make_shared<ov::op::v0::Constant>(quant_result.scale);
     scale_const->set_friendly_name(name + "_scale");
-    
+
     const ov::Shape& scale_shape = scale_const->get_shape();
     const ov::Shape& compressed_shape = quant_result.compressed.get_shape();
-    
+
     // Determine element type based on compressed type from result
     ov::element::Type elem_type = quant_result.compressed_type;
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
-    
+
     // RTN quantization flattens 3D [batch, out, in] to 2D [batch*out, in] for processing,
     // but output shapes are preserved as 3D [batch, out, packed_in/num_groups].
     // We need to handle this correctly:
     // - For 3D original: flatten to 2D for dequant, then reshape back to 3D
     // - For 2D/1D: process directly
-    
+
     size_t in_features = original_shape.back();
     size_t num_groups = scale_shape.back();
-    size_t group_size = in_features / num_groups;
-    
+
     // Calculate flattened out_features (for 3D, this is batch*out)
     size_t out_features = 1;
     for (size_t i = 0; i < original_shape.size() - 1; ++i) {
         out_features *= original_shape[i];
     }
-    
+
+    // Get the actual group_size used during quantization to detect non-divisible cases.
+    // When in_features is not evenly divisible by group_size (e.g., 4304 % 128 = 80),
+    // we cannot use a uniform 3D [out, num_groups, group_size] layout because
+    // num_groups * computed_group_size != in_features. Instead, we use a flat layout
+    // with Gather-based scale/zero_point expansion.
+    int configured_gs = selector_.get_group_size(name);
+    if (configured_gs <= 0) {
+        configured_gs = static_cast<int>(in_features);
+    }
+    bool evenly_divisible = (in_features % static_cast<size_t>(configured_gs) == 0);
+
+    if (!evenly_divisible && num_groups > 1) {
+        // Non-divisible case: use flat dequantization with Gather-based scale expansion.
+        // The compressed data is stored contiguously as [out_features, in_features] elements.
+        // We expand scales/zero_points from [out_features, num_groups] to
+        // [out_features, in_features] using Gather with group index mapping.
+
+        const void* data_ptr = quant_result.compressed.data();
+        auto flat_const = std::make_shared<ov::op::v0::Constant>(
+            elem_type, ov::Shape{out_features, in_features}, data_ptr);
+        flat_const->set_friendly_name(name + "_compressed");
+        auto weights_f16 = std::make_shared<ov::op::v0::Convert>(flat_const, ov::element::f16);
+
+        // Flatten scale to 2D [out_features, num_groups] if it's 3D
+        std::shared_ptr<ov::Node> scale_2d;
+        if (scale_shape.size() == 3) {
+            auto flatten_shape = std::make_shared<ov::op::v0::Constant>(
+                ov::element::i64, ov::Shape{2},
+                std::vector<int64_t>{static_cast<int64_t>(out_features),
+                                     static_cast<int64_t>(num_groups)});
+            scale_2d = std::make_shared<ov::op::v1::Reshape>(scale_const, flatten_shape, false);
+        } else {
+            scale_2d = scale_const;
+        }
+
+        // Build group index mapping: indices[i] = i / configured_group_size
+        // This maps each element position to its quantization group.
+        size_t gs = static_cast<size_t>(configured_gs);
+        std::vector<int32_t> group_indices(in_features);
+        for (size_t i = 0; i < in_features; ++i) {
+            group_indices[i] = static_cast<int32_t>(i / gs);
+        }
+        auto indices_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i32, ov::Shape{in_features}, group_indices);
+        auto axis_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i32, ov::Shape{}, 1);
+
+        // Expand scale: [out_features, num_groups] -> [out_features, in_features]
+        auto scale_expanded = std::make_shared<ov::op::v8::Gather>(
+            scale_2d, indices_const, axis_const);
+
+        std::shared_ptr<ov::Node> dequantized;
+        if (has_zero_point) {
+            auto zp_const = std::make_shared<ov::op::v0::Constant>(quant_result.zero_point);
+            zp_const->set_friendly_name(name + "_zp");
+
+            std::shared_ptr<ov::Node> zp_2d;
+            if (quant_result.zero_point.get_shape().size() == 3) {
+                auto flatten_shape = std::make_shared<ov::op::v0::Constant>(
+                    ov::element::i64, ov::Shape{2},
+                    std::vector<int64_t>{static_cast<int64_t>(out_features),
+                                         static_cast<int64_t>(num_groups)});
+                zp_2d = std::make_shared<ov::op::v1::Reshape>(zp_const, flatten_shape, false);
+            } else {
+                zp_2d = zp_const;
+            }
+
+            // Expand zero_point: [out_features, num_groups] -> [out_features, in_features]
+            auto zp_expanded = std::make_shared<ov::op::v8::Gather>(
+                zp_2d, indices_const, axis_const);
+            auto zp_f16 = std::make_shared<ov::op::v0::Convert>(zp_expanded, ov::element::f16);
+            auto shifted = std::make_shared<ov::op::v1::Subtract>(
+                weights_f16, zp_f16, ov::op::AutoBroadcastType::NUMPY);
+            dequantized = std::make_shared<ov::op::v1::Multiply>(
+                shifted, scale_expanded, ov::op::AutoBroadcastType::NUMPY);
+        } else {
+            dequantized = std::make_shared<ov::op::v1::Multiply>(
+                weights_f16, scale_expanded, ov::op::AutoBroadcastType::NUMPY);
+        }
+
+        // Reshape to original shape (needed for 1D and 3D; no-op for 2D)
+        auto final_shape = std::make_shared<ov::op::v0::Constant>(
+            ov::element::i64,
+            ov::Shape{original_shape.size()},
+            std::vector<int64_t>(original_shape.begin(), original_shape.end()));
+        auto reshaped = std::make_shared<ov::op::v1::Reshape>(dequantized, final_shape, false);
+        return std::make_shared<ov::op::v0::Convert>(reshaped, ov::element::f32);
+    }
+
+    // Evenly-divisible case: use 3D grouped layout [out_features, num_groups, group_size]
+    size_t group_size = in_features / num_groups;
+
     // For dequantization, we work with 2D layout: [out_features, num_groups, group_size]
     // This matches how RTN processed the data internally
     ov::Shape grouped_shape_2d = {out_features, num_groups, group_size};
-    
+
     // Create compressed constant with 2D grouped shape
     const void* data_ptr = quant_result.compressed.data();
     auto grouped_const = std::make_shared<ov::op::v0::Constant>(elem_type, grouped_shape_2d, data_ptr);
     grouped_const->set_friendly_name(name + "_compressed");
-    
+
     // Convert to F16 for arithmetic operations
     auto weights_f16 = std::make_shared<ov::op::v0::Convert>(grouped_const, ov::element::f16);
-    
+
     // Reshape scale to 2D [out_features, num_groups] first if it's 3D
     std::shared_ptr<ov::Node> scale_2d;
     if (scale_shape.size() == 3) {
@@ -602,24 +694,24 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
     } else {
         scale_2d = scale_const;
     }
-    
+
     // Build scale broadcast shape: [out_features, num_groups, 1]
     ov::Shape scale_broadcast_shape = {out_features, num_groups, 1};
-    
+
     auto scale_reshape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64,
         ov::Shape{scale_broadcast_shape.size()},
         std::vector<int64_t>(scale_broadcast_shape.begin(), scale_broadcast_shape.end())
     );
     auto scale_reshaped = std::make_shared<ov::op::v1::Reshape>(scale_2d, scale_reshape, false);
-    
+
     // Apply dequantization formula
     std::shared_ptr<ov::Node> dequantized;
     if (has_zero_point) {
         // Asymmetric: weight_fp = (weight - zero_point) * scale
         auto zp_const = std::make_shared<ov::op::v0::Constant>(quant_result.zero_point);
         zp_const->set_friendly_name(name + "_zp");
-        
+
         // Flatten zero_point if 3D
         std::shared_ptr<ov::Node> zp_2d;
         if (quant_result.zero_point.get_shape().size() == 3) {
@@ -632,7 +724,7 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
         } else {
             zp_2d = zp_const;
         }
-        
+
         auto zp_reshaped = std::make_shared<ov::op::v1::Reshape>(zp_2d, scale_reshape, false);
         auto zp_f16 = std::make_shared<ov::op::v0::Convert>(zp_reshaped, ov::element::f16);
         auto shifted = std::make_shared<ov::op::v1::Subtract>(
@@ -644,7 +736,7 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
         dequantized = std::make_shared<ov::op::v1::Multiply>(
             weights_f16, scale_reshaped, ov::op::AutoBroadcastType::NUMPY);
     }
-    
+
     // Reshape back to original shape
     auto final_shape = std::make_shared<ov::op::v0::Constant>(
         ov::element::i64,
@@ -652,7 +744,7 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
         std::vector<int64_t>(original_shape.begin(), original_shape.end())
     );
     auto reshaped = std::make_shared<ov::op::v1::Reshape>(dequantized, final_shape, false);
-    
+
     // Convert to F32
     return std::make_shared<ov::op::v0::Convert>(reshaped, ov::element::f32);
 }
