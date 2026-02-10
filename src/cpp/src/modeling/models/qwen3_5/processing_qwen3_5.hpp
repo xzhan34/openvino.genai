@@ -83,10 +83,10 @@ struct Qwen3_5Config {
     std::vector<std::string> architectures;
     Qwen3_5TextConfig text;
     Qwen3_5VisionConfig vision;
-    int32_t image_token_id = 0;
-    int32_t video_token_id = 0;
-    int32_t vision_start_token_id = 0;
-    int32_t vision_end_token_id = 0;
+    int32_t image_token_id = 248056;
+    int32_t video_token_id = 248057;
+    int32_t vision_start_token_id = 248053;
+    int32_t vision_end_token_id = 248054;
     bool tie_word_embeddings = false;
 
     void finalize();
@@ -148,7 +148,8 @@ public:
 
     Qwen3_5InputPlan build_plan(const ov::Tensor& input_ids,
                                 const ov::Tensor* attention_mask = nullptr,
-                                const ov::Tensor* image_grid_thw = nullptr) const;
+                                const ov::Tensor* image_grid_thw = nullptr,
+                                const ov::Tensor* video_grid_thw = nullptr) const;
 
     ov::Tensor build_visual_pos_mask(const ov::Tensor& input_ids,
                                      const ov::Tensor* attention_mask = nullptr) const;
@@ -165,6 +166,7 @@ public:
 
 private:
     int64_t image_token_id_ = 0;
+    int64_t video_token_id_ = 0;
     int64_t vision_start_token_id_ = 0;
     int32_t spatial_merge_size_ = 1;
 };

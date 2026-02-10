@@ -58,6 +58,14 @@ ov::genai::modeling::models::Qwen3_5Config make_small_cfg() {
 
 }  // namespace
 
+TEST(Qwen3_5Config, DummyDense9bUsesUpdatedSpecialTokenIds) {
+    const auto cfg = ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config();
+    EXPECT_EQ(cfg.image_token_id, 248056);
+    EXPECT_EQ(cfg.video_token_id, 248057);
+    EXPECT_EQ(cfg.vision_start_token_id, 248053);
+    EXPECT_EQ(cfg.vision_end_token_id, 248054);
+}
+
 TEST(Qwen3_5RopePlanner, BuildPlanProducesThreeChannelPositionIds) {
     const auto cfg = make_small_cfg();
     ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
@@ -97,6 +105,92 @@ TEST(Qwen3_5RopePlanner, BuildPlanProducesThreeChannelPositionIds) {
     ASSERT_EQ(rope_shape.size(), 2u);
     EXPECT_EQ(rope_shape[0], 1u);
     EXPECT_EQ(rope_shape[1], 1u);
+}
+
+TEST(Qwen3_5RopePlanner, BuildPlanHandlesImageAndVideoPlaceholders) {
+    const auto cfg = make_small_cfg();
+    ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
+
+    ov::Tensor input_ids(ov::element::i64, {1, 7});
+    auto* ids = input_ids.data<int64_t>();
+    ids[0] = 11;
+    ids[1] = cfg.vision_start_token_id;
+    ids[2] = cfg.image_token_id;
+    ids[3] = 12;
+    ids[4] = cfg.vision_start_token_id;
+    ids[5] = cfg.video_token_id;
+    ids[6] = 13;
+
+    ov::Tensor attention_mask(ov::element::i64, {1, 7});
+    auto* mask = attention_mask.data<int64_t>();
+    for (size_t i = 0; i < 7; ++i) {
+        mask[i] = 1;
+    }
+
+    ov::Tensor image_grid_thw(ov::element::i64, {1, 3});
+    auto* image_grid = image_grid_thw.data<int64_t>();
+    image_grid[0] = 1;
+    image_grid[1] = 2;
+    image_grid[2] = 2;
+
+    ov::Tensor video_grid_thw(ov::element::i64, {1, 3});
+    auto* video_grid = video_grid_thw.data<int64_t>();
+    video_grid[0] = 1;
+    video_grid[1] = 2;
+    video_grid[2] = 2;
+
+    auto plan = planner.build_plan(input_ids, &attention_mask, &image_grid_thw, &video_grid_thw);
+
+    const char* visual_mask = plan.visual_pos_mask.data<const char>();
+    EXPECT_EQ(visual_mask[2], 1);
+    EXPECT_EQ(visual_mask[5], 1);
+
+    const int64_t* pos = plan.position_ids.data<const int64_t>();
+    for (int64_t i = 0; i < 7; ++i) {
+        EXPECT_EQ(pos[i], i);
+        EXPECT_EQ(pos[7 + i], i);
+        EXPECT_EQ(pos[14 + i], i);
+    }
+
+    EXPECT_EQ(plan.rope_deltas.data<const int64_t>()[0], 0);
+}
+
+TEST(Qwen3_5RopePlanner, BuildPlanExpandsVideoGridByFrameCount) {
+    const auto cfg = make_small_cfg();
+    ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
+
+    ov::Tensor input_ids(ov::element::i64, {1, 4});
+    auto* ids = input_ids.data<int64_t>();
+    ids[0] = cfg.vision_start_token_id;
+    ids[1] = cfg.video_token_id;
+    ids[2] = cfg.vision_start_token_id;
+    ids[3] = cfg.video_token_id;
+
+    ov::Tensor attention_mask(ov::element::i64, {1, 4});
+    auto* mask = attention_mask.data<int64_t>();
+    mask[0] = 1;
+    mask[1] = 1;
+    mask[2] = 1;
+    mask[3] = 1;
+
+    ov::Tensor video_grid_thw(ov::element::i64, {1, 3});
+    auto* video_grid = video_grid_thw.data<int64_t>();
+    video_grid[0] = 2;
+    video_grid[1] = 2;
+    video_grid[2] = 2;
+
+    auto plan = planner.build_plan(input_ids, &attention_mask, nullptr, &video_grid_thw);
+
+    const char* visual_mask = plan.visual_pos_mask.data<const char>();
+    EXPECT_EQ(visual_mask[1], 1);
+    EXPECT_EQ(visual_mask[3], 1);
+
+    const int64_t* pos = plan.position_ids.data<const int64_t>();
+    EXPECT_EQ(pos[0], 0);
+    EXPECT_EQ(pos[1], 1);
+    EXPECT_EQ(pos[2], 2);
+    EXPECT_EQ(pos[3], 3);
+    EXPECT_EQ(plan.rope_deltas.data<const int64_t>()[0], 0);
 }
 
 TEST(Qwen3_5RopePlanner, DecodePositionIdsApplyRopeDeltas) {

@@ -697,7 +697,7 @@ void Qwen3_5Config::validate() const {
     }
     text.validate();
     vision.validate();
-    if (image_token_id < 0 || vision_start_token_id < 0 || vision_end_token_id < 0) {
+    if (image_token_id < 0 || video_token_id < 0 || vision_start_token_id < 0 || vision_end_token_id < 0) {
         OPENVINO_THROW("Invalid token ids in Qwen3_5Config");
     }
 }
@@ -782,10 +782,10 @@ Qwen3_5Config Qwen3_5Config::make_dummy_dense9b_config() {
     cfg.vision.num_position_embeddings = 2304;
     cfg.vision.deepstack_visual_indexes.clear();
 
-    cfg.image_token_id = 151655;
-    cfg.video_token_id = 151656;
-    cfg.vision_start_token_id = 151652;
-    cfg.vision_end_token_id = 151653;
+    cfg.image_token_id = 248056;
+    cfg.video_token_id = 248057;
+    cfg.vision_start_token_id = 248053;
+    cfg.vision_end_token_id = 248054;
     cfg.tie_word_embeddings = false;
 
     if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_NUM_LAYERS")) {
@@ -902,6 +902,7 @@ std::vector<std::string> Qwen3_5GraphSpec::text_optional_inputs() {
 
 Qwen3_5InputPlanner::Qwen3_5InputPlanner(const Qwen3_5Config& cfg)
     : image_token_id_(cfg.image_token_id),
+      video_token_id_(cfg.video_token_id),
       vision_start_token_id_(cfg.vision_start_token_id),
       spatial_merge_size_(cfg.vision.spatial_merge_size) {}
 
@@ -922,7 +923,7 @@ ov::Tensor Qwen3_5InputPlanner::build_visual_pos_mask(const ov::Tensor& input_id
     const size_t total = input_ids.get_size();
 
     for (size_t idx = 0; idx < total; ++idx) {
-        bool active = ids[idx] == image_token_id_;
+        bool active = ids[idx] == image_token_id_ || ids[idx] == video_token_id_;
         if (attention_mask && !mask_value(*attention_mask, idx)) {
             active = false;
         }
@@ -933,7 +934,8 @@ ov::Tensor Qwen3_5InputPlanner::build_visual_pos_mask(const ov::Tensor& input_id
 
 Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
                                                  const ov::Tensor* attention_mask,
-                                                 const ov::Tensor* image_grid_thw) const {
+                                                 const ov::Tensor* image_grid_thw,
+                                                 const ov::Tensor* video_grid_thw) const {
     if (input_ids.get_element_type() != ov::element::i64) {
         OPENVINO_THROW("input_ids must be i64 for Qwen3_5InputPlanner");
     }
@@ -953,6 +955,15 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
             OPENVINO_THROW("image_grid_thw must have shape [N, 3]");
         }
     }
+    if (video_grid_thw) {
+        const auto grid_shape = video_grid_thw->get_shape();
+        if (video_grid_thw->get_element_type() != ov::element::i64) {
+            OPENVINO_THROW("video_grid_thw must be i64");
+        }
+        if (grid_shape.size() != 2 || grid_shape[1] != 3) {
+            OPENVINO_THROW("video_grid_thw must have shape [N, 3]");
+        }
+    }
     if (spatial_merge_size_ <= 0) {
         OPENVINO_THROW("spatial_merge_size must be > 0");
     }
@@ -968,9 +979,27 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
     auto visual_pos_mask = build_visual_pos_mask(input_ids, attention_mask);
 
     const int64_t* ids = input_ids.data<const int64_t>();
-    const int64_t* grid = image_grid_thw ? image_grid_thw->data<const int64_t>() : nullptr;
-    const size_t grid_rows = image_grid_thw ? image_grid_thw->get_shape().at(0) : 0;
-    size_t grid_index = 0;
+    const int64_t* image_grid = image_grid_thw ? image_grid_thw->data<const int64_t>() : nullptr;
+    const size_t image_grid_rows = image_grid_thw ? image_grid_thw->get_shape().at(0) : 0;
+    size_t image_grid_index = 0;
+
+    std::vector<std::array<int64_t, 3>> expanded_video_grid;
+    if (video_grid_thw) {
+        const int64_t* raw_video_grid = video_grid_thw->data<const int64_t>();
+        const size_t raw_video_rows = video_grid_thw->get_shape().at(0);
+        for (size_t i = 0; i < raw_video_rows; ++i) {
+            const int64_t t = raw_video_grid[i * 3 + 0];
+            const int64_t h = raw_video_grid[i * 3 + 1];
+            const int64_t w = raw_video_grid[i * 3 + 2];
+            if (t <= 0 || h <= 0 || w <= 0) {
+                OPENVINO_THROW("Invalid video_grid_thw values in Qwen3_5InputPlanner");
+            }
+            for (int64_t frame = 0; frame < t; ++frame) {
+                expanded_video_grid.push_back({1, h, w});
+            }
+        }
+    }
+    size_t video_grid_index = 0;
 
     auto pos_data = position_ids.data<int64_t>();
     auto delta_data = rope_deltas.data<int64_t>();
@@ -1004,7 +1033,8 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
 
         int64_t last_max = -1;
         size_t st = 0;
-        size_t local_grid_index = grid_index;
+        size_t local_image_grid_index = image_grid_index;
+        size_t local_video_grid_index = video_grid_index;
 
         auto append_text = [&](size_t length) {
             if (length == 0) {
@@ -1045,31 +1075,67 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
             last_max = base + max_dim;
         };
 
-        if (image_grid_thw) {
-            while (true) {
-                auto start_it = tokens.begin() + static_cast<std::vector<int64_t>::difference_type>(st);
-                auto it = std::find(start_it, tokens.end(), image_token_id_);
-                if (it == tokens.end()) {
-                    break;
+        if (image_grid_thw || video_grid_thw) {
+            std::vector<std::pair<size_t, bool>> visual_starts;
+            if (tokens.size() > 1) {
+                visual_starts.reserve(tokens.size() / 4);
+                for (size_t idx = 0; idx + 1 < tokens.size(); ++idx) {
+                    if (tokens[idx] != vision_start_token_id_) {
+                        continue;
+                    }
+                    const int64_t next = tokens[idx + 1];
+                    if (next == image_token_id_) {
+                        visual_starts.emplace_back(idx + 1, true);
+                    } else if (next == video_token_id_) {
+                        visual_starts.emplace_back(idx + 1, false);
+                    }
                 }
-                const size_t ed = static_cast<size_t>(std::distance(tokens.begin(), it));
-                if (local_grid_index >= grid_rows) {
-                    OPENVINO_THROW("image_grid_thw entries are fewer than image tokens");
+            }
+
+            for (const auto& visual_start : visual_starts) {
+                const size_t ed = visual_start.first;
+                const bool is_image = visual_start.second;
+                if (ed < st) {
+                    continue;
                 }
                 append_text(ed - st);
-                const int64_t t = grid[local_grid_index * 3 + 0];
-                const int64_t h = grid[local_grid_index * 3 + 1];
-                const int64_t w = grid[local_grid_index * 3 + 2];
+
+                int64_t t = 0;
+                int64_t h = 0;
+                int64_t w = 0;
+                if (is_image) {
+                    if (!image_grid_thw) {
+                        OPENVINO_THROW("image_grid_thw is required for image placeholders");
+                    }
+                    if (local_image_grid_index >= image_grid_rows) {
+                        OPENVINO_THROW("image_grid_thw entries are fewer than image placeholders");
+                    }
+                    t = image_grid[local_image_grid_index * 3 + 0];
+                    h = image_grid[local_image_grid_index * 3 + 1];
+                    w = image_grid[local_image_grid_index * 3 + 2];
+                    local_image_grid_index += 1;
+                } else {
+                    if (!video_grid_thw) {
+                        OPENVINO_THROW("video_grid_thw is required for video placeholders");
+                    }
+                    if (local_video_grid_index >= expanded_video_grid.size()) {
+                        OPENVINO_THROW("video_grid_thw entries are fewer than video placeholders");
+                    }
+                    t = expanded_video_grid[local_video_grid_index][0];
+                    h = expanded_video_grid[local_video_grid_index][1];
+                    w = expanded_video_grid[local_video_grid_index][2];
+                    local_video_grid_index += 1;
+                }
+
                 append_visual(t, h, w);
 
                 const int64_t llm_grid_h = h / spatial_merge_size_;
                 const int64_t llm_grid_w = w / spatial_merge_size_;
                 const int64_t visual_len = t * llm_grid_h * llm_grid_w;
                 if (ed + static_cast<size_t>(visual_len) > tokens.size()) {
-                    OPENVINO_THROW("Image tokens length does not match grid_thw");
+                    OPENVINO_THROW("Visual token length does not match grid_thw");
                 }
                 st = ed + static_cast<size_t>(visual_len);
-                local_grid_index += 1;
             }
         }
 
@@ -1109,7 +1175,8 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
         }
 
         delta_data[b] = max_pos + 1 - static_cast<int64_t>(seq_len);
-        grid_index = local_grid_index;
+        image_grid_index = local_image_grid_index;
+        video_grid_index = local_video_grid_index;
     }
 
     return {position_ids, visual_pos_mask, rope_deltas};
