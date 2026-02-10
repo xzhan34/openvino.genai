@@ -757,6 +757,10 @@ bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
     // - model.layers[X].mlp.experts.{i}.up_proj.weight  
     // - model.layers[X].mlp.experts.{i}.down_proj.weight
     //
+    // Pattern 1b: Qwen3.5-MoE packed expert weights:
+    // - model.layers[X].mlp.experts.gate_up_proj
+    // - model.layers[X].mlp.experts.down_proj
+    //
     // Pattern 2: Pre-fused MoE weights (GGUF-style):
     // - model.layers[X].moe.gate_exps.weight
     // - model.layers[X].moe.up_exps.weight
@@ -770,6 +774,12 @@ bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
         if (name.find("gate_proj.weight") != std::string::npos ||
             name.find("up_proj.weight") != std::string::npos ||
             name.find("down_proj.weight") != std::string::npos) {
+            return true;
+        }
+
+        // Packed format used by Qwen3.5-MoE (gate+up fused by expert).
+        if (name.find(".mlp.experts.gate_up_proj") != std::string::npos ||
+            name.find(".mlp.experts.down_proj") != std::string::npos) {
             return true;
         }
     }

@@ -51,10 +51,10 @@ std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_tex
     auto cfg = cfg_in;
     cfg.finalize();
     cfg.validate();
+    const bool is_moe = cfg.is_moe_enabled();
 
     const size_t hidden = to_sz(cfg.hidden_size, "hidden_size");
     const size_t vocab = to_sz(cfg.vocab_size, "vocab_size");
-    const size_t intermediate = to_sz(cfg.intermediate_size, "intermediate_size");
     const size_t num_layers = to_sz(cfg.num_hidden_layers, "num_hidden_layers");
     const size_t num_heads = to_sz(cfg.num_attention_heads, "num_attention_heads");
     const size_t num_kv_heads = to_sz(cfg.kv_heads(), "num_key_value_heads");
@@ -70,9 +70,14 @@ std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_tex
     const size_t conv_dim = key_dim * 2 + value_dim;
     const size_t q_proj_out = num_heads * head_dim * 2;
     const size_t kv_proj_out = num_kv_heads * head_dim;
+    const size_t intermediate = is_moe ? 0 : to_sz(cfg.intermediate_size, "intermediate_size");
+    const size_t num_experts = is_moe ? to_sz(cfg.num_experts, "num_experts") : 0;
+    const size_t moe_intermediate = is_moe ? to_sz(cfg.moe_intermediate_size, "moe_intermediate_size") : 0;
+    const size_t shared_intermediate =
+        is_moe ? to_sz(cfg.shared_expert_intermediate_size, "shared_expert_intermediate_size") : 0;
 
     std::vector<Spec> specs;
-    specs.reserve(3 + num_layers * 14);
+    specs.reserve(is_moe ? (3 + num_layers * 18) : (3 + num_layers * 14));
 
     add(specs, "model.embed_tokens.weight", {vocab, hidden});
     add(specs, "model.norm.weight", {hidden});
@@ -112,9 +117,19 @@ std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_tex
         }
 
         const std::string mlp = layer_prefix + "mlp.";
-        add(specs, mlp + "gate_proj.weight", {intermediate, hidden});
-        add(specs, mlp + "up_proj.weight", {intermediate, hidden});
-        add(specs, mlp + "down_proj.weight", {hidden, intermediate});
+        if (is_moe) {
+            add(specs, mlp + "gate.weight", {num_experts, hidden});
+            add(specs, mlp + "experts.gate_up_proj", {num_experts, 2 * moe_intermediate, hidden});
+            add(specs, mlp + "experts.down_proj", {num_experts, hidden, moe_intermediate});
+            add(specs, mlp + "shared_expert.gate_proj.weight", {shared_intermediate, hidden});
+            add(specs, mlp + "shared_expert.up_proj.weight", {shared_intermediate, hidden});
+            add(specs, mlp + "shared_expert.down_proj.weight", {hidden, shared_intermediate});
+            add(specs, mlp + "shared_expert_gate.weight", {1, hidden});
+        } else {
+            add(specs, mlp + "gate_proj.weight", {intermediate, hidden});
+            add(specs, mlp + "up_proj.weight", {intermediate, hidden});
+            add(specs, mlp + "down_proj.weight", {hidden, intermediate});
+        }
     }
 
     return specs;

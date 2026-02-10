@@ -73,6 +73,13 @@ void parse_text_config(const nlohmann::json& data, ov::genai::modeling::models::
     read_json_param(data, "linear_value_head_dim", cfg.linear_value_head_dim);
     read_json_param(data, "linear_num_key_heads", cfg.linear_num_key_heads);
     read_json_param(data, "linear_num_value_heads", cfg.linear_num_value_heads);
+    read_json_param(data, "moe_intermediate_size", cfg.moe_intermediate_size);
+    read_json_param(data, "shared_expert_intermediate_size", cfg.shared_expert_intermediate_size);
+    read_json_param(data, "num_experts", cfg.num_experts);
+    read_json_param(data, "num_experts_per_tok", cfg.num_experts_per_tok);
+    read_json_param(data, "norm_topk_prob", cfg.norm_topk_prob);
+    read_json_param(data, "output_router_logits", cfg.output_router_logits);
+    read_json_param(data, "router_aux_loss_coef", cfg.router_aux_loss_coef);
 
     if (data.contains("rope_scaling")) {
         parse_rope_config(data.at("rope_scaling"), cfg.rope);
@@ -545,6 +552,10 @@ int32_t Qwen3_5TextConfig::resolved_head_dim() const {
     return 0;
 }
 
+bool Qwen3_5TextConfig::is_moe_enabled() const {
+    return num_experts > 0 && moe_intermediate_size > 0 && shared_expert_intermediate_size > 0;
+}
+
 void Qwen3_5TextConfig::finalize() {
     if (num_key_value_heads <= 0) {
         num_key_value_heads = num_attention_heads;
@@ -578,6 +589,12 @@ void Qwen3_5TextConfig::finalize() {
     }
     if (linear_num_value_heads <= 0) {
         linear_num_value_heads = num_attention_heads;
+    }
+    if (num_experts < 0) {
+        num_experts = 0;
+    }
+    if (num_experts > 0 && num_experts_per_tok <= 0) {
+        num_experts_per_tok = 1;
     }
 }
 
@@ -633,6 +650,26 @@ void Qwen3_5TextConfig::validate() const {
     }
     if (linear_key_head_dim <= 0 || linear_value_head_dim <= 0) {
         OPENVINO_THROW("Qwen3_5TextConfig linear head dims must be > 0");
+    }
+    if (!model_type.empty() && model_type != "qwen3_5_text" && model_type != "qwen3_5_moe_text") {
+        OPENVINO_THROW("Unsupported Qwen3_5TextConfig.model_type: ", model_type);
+    }
+
+    if (is_moe_enabled()) {
+        if (num_experts_per_tok <= 0) {
+            OPENVINO_THROW("Qwen3_5TextConfig.num_experts_per_tok must be > 0 when MoE is enabled");
+        }
+        if (num_experts_per_tok > num_experts) {
+            OPENVINO_THROW("Qwen3_5TextConfig.num_experts_per_tok must be <= num_experts");
+        }
+    } else {
+        if (intermediate_size <= 0) {
+            OPENVINO_THROW("Qwen3_5TextConfig.intermediate_size must be > 0 for Dense MLP");
+        }
+        if (num_experts > 0 || moe_intermediate_size > 0 || shared_expert_intermediate_size > 0) {
+            OPENVINO_THROW("Qwen3_5TextConfig has partial MoE fields configured. ",
+                           "Set num_experts/moe_intermediate_size/shared_expert_intermediate_size consistently.");
+        }
     }
 }
 
@@ -691,8 +728,14 @@ void Qwen3_5Config::finalize() {
 }
 
 void Qwen3_5Config::validate() const {
-    if (model_type != "qwen3_5") {
+    if (model_type != "qwen3_5" && model_type != "qwen3_5_moe") {
         OPENVINO_THROW("Unsupported model_type: ", model_type);
+    }
+    if (!text.model_type.empty() && text.model_type != "qwen3_5_text" && text.model_type != "qwen3_5_moe_text") {
+        OPENVINO_THROW("Unsupported text model_type: ", text.model_type);
+    }
+    if (!vision.model_type.empty() && vision.model_type != "qwen3_5" && vision.model_type != "qwen3_5_moe") {
+        OPENVINO_THROW("Unsupported vision model_type: ", vision.model_type);
     }
     text.validate();
     vision.validate();
@@ -788,6 +831,66 @@ Qwen3_5Config Qwen3_5Config::make_dummy_dense9b_config() {
     cfg.tie_word_embeddings = false;
 
     cfg.vision.out_hidden_size = cfg.text.hidden_size;
+
+    cfg.finalize();
+    cfg.validate();
+    return cfg;
+}
+
+Qwen3_5Config Qwen3_5Config::make_dummy_moe35b_config() {
+    Qwen3_5Config cfg;
+    cfg.model_type = "qwen3_5_moe";
+
+    cfg.text.model_type = "qwen3_5_moe_text";
+    cfg.text.vocab_size = 248320;
+    cfg.text.hidden_size = 2048;
+    cfg.text.intermediate_size = 0;
+    cfg.text.moe_intermediate_size = 512;
+    cfg.text.shared_expert_intermediate_size = 512;
+    cfg.text.num_experts = 256;
+    cfg.text.num_experts_per_tok = 8;
+    cfg.text.norm_topk_prob = true;
+    cfg.text.output_router_logits = false;
+    cfg.text.router_aux_loss_coef = 0.001f;
+    cfg.text.num_hidden_layers = 40;
+    cfg.text.num_attention_heads = 16;
+    cfg.text.num_key_value_heads = 2;
+    cfg.text.head_dim = 256;
+    cfg.text.max_position_embeddings = 32768;
+    cfg.text.rms_norm_eps = 1e-6f;
+    cfg.text.rope_theta = 10000.0f;
+    cfg.text.hidden_act = "silu";
+    cfg.text.attention_bias = false;
+    cfg.text.tie_word_embeddings = false;
+    cfg.text.partial_rotary_factor = 0.25f;
+    cfg.text.full_attention_interval = 4;
+    cfg.text.linear_conv_kernel_dim = 4;
+    cfg.text.linear_key_head_dim = 128;
+    cfg.text.linear_value_head_dim = 128;
+    cfg.text.linear_num_key_heads = 16;
+    cfg.text.linear_num_value_heads = 32;
+    cfg.text.rope.mrope_interleaved = true;
+    cfg.text.rope.mrope_section = {11, 11, 10};
+
+    cfg.vision.model_type = "qwen3_5_moe";
+    cfg.vision.depth = 27;
+    cfg.vision.hidden_size = 1152;
+    cfg.vision.hidden_act = "gelu_pytorch_tanh";
+    cfg.vision.intermediate_size = 4304;
+    cfg.vision.num_heads = 16;
+    cfg.vision.in_channels = 3;
+    cfg.vision.patch_size = 16;
+    cfg.vision.spatial_merge_size = 2;
+    cfg.vision.temporal_patch_size = 2;
+    cfg.vision.out_hidden_size = cfg.text.hidden_size;
+    cfg.vision.num_position_embeddings = 2304;
+    cfg.vision.deepstack_visual_indexes.clear();
+
+    cfg.image_token_id = 248056;
+    cfg.video_token_id = 248057;
+    cfg.vision_start_token_id = 248053;
+    cfg.vision_end_token_id = 248054;
+    cfg.tie_word_embeddings = false;
 
     cfg.finalize();
     cfg.validate();

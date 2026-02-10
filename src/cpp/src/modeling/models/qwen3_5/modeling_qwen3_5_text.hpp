@@ -28,6 +28,7 @@ class WeightSource;
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
 #include "modeling/layers/vocab_embedding.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_moe.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/module.hpp"
 #include "modeling/ops/tensor.hpp"
@@ -61,9 +62,20 @@ struct Qwen3_5TextModelConfig {
     int32_t linear_value_head_dim = 128;
     int32_t linear_num_key_heads = 16;
     int32_t linear_num_value_heads = 32;
+    int32_t moe_intermediate_size = 0;
+    int32_t shared_expert_intermediate_size = 0;
+    int32_t num_experts = 0;
+    int32_t num_experts_per_tok = 0;
+    bool norm_topk_prob = true;
+    bool output_router_logits = false;
+    float router_aux_loss_coef = 0.0f;
 
     bool mrope_interleaved = false;
     std::vector<int32_t> mrope_section = {11, 11, 10};
+
+    bool is_moe_enabled() const {
+        return num_experts > 0 && moe_intermediate_size > 0 && shared_expert_intermediate_size > 0;
+    }
 };
 
 class Qwen3_5EmbeddingInjector : public Module {
@@ -212,6 +224,7 @@ private:
     std::unique_ptr<Qwen3_5Attention> self_attn_;
     std::unique_ptr<Qwen3_5GatedDeltaNet> linear_attn_;
     std::unique_ptr<Qwen3_5MLP> dense_mlp_;
+    std::unique_ptr<Qwen3_5SparseMoeBlock> moe_mlp_;
     Qwen3_5RMSNorm input_layernorm_;
     Qwen3_5RMSNorm post_attention_layernorm_;
 };

@@ -63,6 +63,7 @@ struct SampleOptions {
     float dummy_init_range = 0.02f;
     std::string dummy_weight_mode = "INT4_ASYM";
     int dummy_group_size = 128;
+    std::string dummy_text_arch = "dense";
 
     int dummy_num_layers = 0;
     int dummy_hidden_size = 0;
@@ -207,6 +208,7 @@ void print_usage(const char* argv0) {
         << "  --dummy-init-range F            Synthetic init range, sampled in [-F, F]\n"
         << "  --dummy-weight-mode MODE        FP32 | INT4_ASYM | INT4_SYM (default: INT4_ASYM)\n"
         << "  --dummy-group-size N            Dummy quant group size\n"
+        << "  --dummy-text-arch MODE          dense | moe (dummy mode only, default: dense)\n"
         << "  --dummy-num-layers N            Override dummy text num_hidden_layers\n"
         << "  --dummy-hidden-size N           Override dummy text hidden_size\n"
         << "  --dummy-num-heads N             Override dummy text num_attention_heads\n"
@@ -228,6 +230,9 @@ SampleOptions parse_cli(int argc, char* argv[]) {
     opts.dummy_init_range = read_env_float("OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE", opts.dummy_init_range);
     if (const char* mode = get_env("OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE")) {
         opts.dummy_weight_mode = mode;
+    }
+    if (const char* arch = get_env("OV_GENAI_QWEN3_5_DUMMY_TEXT_ARCH")) {
+        opts.dummy_text_arch = arch;
     }
     opts.dummy_group_size = read_env_i32("OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE", opts.dummy_group_size);
     opts.vision_group_size = read_env_i32("OV_GENAI_QWEN3_5_VISION_GROUP_SIZE", opts.vision_group_size);
@@ -294,6 +299,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.dummy_weight_mode = take_value("--dummy-weight-mode");
         } else if (arg == "--dummy-group-size") {
             opts.dummy_group_size = parse_i32(take_value("--dummy-group-size"), "--dummy-group-size");
+        } else if (arg == "--dummy-text-arch") {
+            opts.dummy_text_arch = take_value("--dummy-text-arch");
         } else if (arg == "--dummy-num-layers") {
             opts.dummy_num_layers = parse_i32(take_value("--dummy-num-layers"), "--dummy-num-layers");
         } else if (arg == "--dummy-hidden-size") {
@@ -384,6 +391,10 @@ SampleOptions parse_cli(int argc, char* argv[]) {
     if (opts.user_prompt.empty()) {
         opts.user_prompt = (opts.mode == "vl") ? "Describe the image." : "Write one sentence about OpenVINO.";
     }
+    opts.dummy_text_arch = to_lower(opts.dummy_text_arch);
+    if (opts.dummy_text_arch != "dense" && opts.dummy_text_arch != "moe") {
+        throw std::runtime_error("dummy-text-arch must be 'dense' or 'moe'");
+    }
 
     return opts;
 }
@@ -420,7 +431,7 @@ void apply_dummy_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cf
     if (opts.dummy_head_dim > 0) {
         cfg.text.head_dim = opts.dummy_head_dim;
     }
-    if (opts.dummy_intermediate_size > 0) {
+    if (!cfg.text.is_moe_enabled() && opts.dummy_intermediate_size > 0) {
         cfg.text.intermediate_size = opts.dummy_intermediate_size;
     }
     if (opts.dummy_vocab_size > 0) {
@@ -618,9 +629,14 @@ int main(int argc, char* argv[]) try {
         throw std::runtime_error("Image path does not exist: " + opts.image_path.string());
     }
 
-    ov::genai::modeling::models::Qwen3_5Config cfg =
-        use_dummy_mode_flag ? ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config()
-                            : ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
+    ov::genai::modeling::models::Qwen3_5Config cfg;
+    if (use_dummy_mode_flag) {
+        cfg = (opts.dummy_text_arch == "moe")
+                  ? ov::genai::modeling::models::Qwen3_5Config::make_dummy_moe35b_config()
+                  : ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config();
+    } else {
+        cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
+    }
     if (use_dummy_mode_flag) {
         apply_dummy_config_overrides(cfg, opts);
     }
@@ -859,6 +875,9 @@ int main(int argc, char* argv[]) try {
 
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "Mode: " << (use_dummy_mode_flag ? "dummy" : "hf") << " / " << opts.mode << std::endl;
+    if (use_dummy_mode_flag) {
+        std::cout << "Dummy text arch: " << (cfg.text.is_moe_enabled() ? "moe" : "dense") << std::endl;
+    }
     std::cout << "Prompt token size: " << prompt_len << std::endl;
     std::cout << "Output token size: " << generated.size() << std::endl;
     std::cout << "TTFT: " << ttft_ms << " ms" << std::endl;

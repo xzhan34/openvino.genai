@@ -49,10 +49,18 @@ struct Qwen3_5TextConfig {
     int32_t linear_value_head_dim = 128;
     int32_t linear_num_key_heads = 16;
     int32_t linear_num_value_heads = 32;
+    int32_t moe_intermediate_size = 0;
+    int32_t shared_expert_intermediate_size = 0;
+    int32_t num_experts = 0;
+    int32_t num_experts_per_tok = 0;
+    bool norm_topk_prob = true;
+    bool output_router_logits = false;
+    float router_aux_loss_coef = 0.0f;
     Qwen3_5RopeConfig rope;
 
     int32_t kv_heads() const;
     int32_t resolved_head_dim() const;
+    bool is_moe_enabled() const;
     void finalize();
     void validate() const;
 };
@@ -95,6 +103,7 @@ struct Qwen3_5Config {
     static Qwen3_5Config from_json(const nlohmann::json& data);
     static Qwen3_5Config from_json_file(const std::filesystem::path& config_path);
     static Qwen3_5Config make_dummy_dense9b_config();
+    static Qwen3_5Config make_dummy_moe35b_config();
 };
 
 struct Qwen3_5ModuleNames {

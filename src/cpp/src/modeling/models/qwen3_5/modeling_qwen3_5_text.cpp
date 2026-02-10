@@ -616,7 +616,11 @@ Qwen3_5DecoderLayer::Qwen3_5DecoderLayer(BuilderContext& ctx,
         OPENVINO_THROW("Unsupported Qwen3_5 layer type: ", layer_type_);
     }
 
-    dense_mlp_ = std::make_unique<Qwen3_5MLP>(ctx, "mlp", cfg, cfg.intermediate_size, this);
+    if (cfg.is_moe_enabled()) {
+        moe_mlp_ = std::make_unique<Qwen3_5SparseMoeBlock>(ctx, "mlp", cfg, this);
+    } else {
+        dense_mlp_ = std::make_unique<Qwen3_5MLP>(ctx, "mlp", cfg, cfg.intermediate_size, this);
+    }
 }
 
 std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_states,
@@ -646,7 +650,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
     }
 
     auto post = post_attention_layernorm_.forward(mixed, next_residual);
-    Tensor mlp_out = dense_mlp_->forward(post.first);
+    Tensor mlp_out = dense_mlp_ ? dense_mlp_->forward(post.first) : moe_mlp_->forward(post.first);
     return {mlp_out, post.second};
 }
 
@@ -896,6 +900,13 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     text_cfg.linear_value_head_dim = cfg.text.linear_value_head_dim;
     text_cfg.linear_num_key_heads = cfg.text.linear_num_key_heads;
     text_cfg.linear_num_value_heads = cfg.text.linear_num_value_heads;
+    text_cfg.moe_intermediate_size = cfg.text.moe_intermediate_size;
+    text_cfg.shared_expert_intermediate_size = cfg.text.shared_expert_intermediate_size;
+    text_cfg.num_experts = cfg.text.num_experts;
+    text_cfg.num_experts_per_tok = cfg.text.num_experts_per_tok;
+    text_cfg.norm_topk_prob = cfg.text.norm_topk_prob;
+    text_cfg.output_router_logits = cfg.text.output_router_logits;
+    text_cfg.router_aux_loss_coef = cfg.text.router_aux_loss_coef;
     text_cfg.mrope_interleaved = cfg.text.rope.mrope_interleaved;
     text_cfg.mrope_section = cfg.text.rope.mrope_section;
 
