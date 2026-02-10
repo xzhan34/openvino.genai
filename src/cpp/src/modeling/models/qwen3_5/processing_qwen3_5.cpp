@@ -601,6 +601,22 @@ void Qwen3_5TextConfig::validate() const {
     if (resolved_head_dim() <= 0) {
         OPENVINO_THROW("Qwen3_5TextConfig.head_dim must be > 0");
     }
+    if (partial_rotary_factor <= 0.0f || partial_rotary_factor > 1.0f) {
+        OPENVINO_THROW("Qwen3_5TextConfig.partial_rotary_factor must be in (0, 1]");
+    }
+    const int32_t head_dim = resolved_head_dim();
+    int32_t rotary_dim = static_cast<int32_t>(std::floor(static_cast<float>(head_dim) * partial_rotary_factor));
+    rotary_dim = std::max<int32_t>(0, std::min<int32_t>(rotary_dim, head_dim));
+    if ((rotary_dim % 2) != 0) {
+        rotary_dim -= 1;
+    }
+    if (rotary_dim <= 0) {
+        OPENVINO_THROW("Qwen3_5TextConfig produces invalid rotary_dim (<=0). ",
+                       "Increase head_dim or partial_rotary_factor. head_dim=",
+                       head_dim,
+                       ", partial_rotary_factor=",
+                       partial_rotary_factor);
+    }
     if (hidden_size % num_attention_heads != 0) {
         OPENVINO_THROW("Qwen3_5TextConfig.hidden_size must be divisible by num_attention_heads");
     }

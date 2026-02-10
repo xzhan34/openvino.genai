@@ -30,6 +30,7 @@ ov::genai::modeling::models::Qwen3_5Config make_small_cfg() {
     cfg.text.num_attention_heads = 4;
     cfg.text.num_key_value_heads = 2;
     cfg.text.head_dim = 4;
+    cfg.text.partial_rotary_factor = 0.5f;
     cfg.text.max_position_embeddings = 256;
     cfg.text.layer_types = {"linear_attention", "full_attention"};
     cfg.text.linear_conv_kernel_dim = 2;
