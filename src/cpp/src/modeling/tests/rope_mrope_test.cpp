@@ -45,7 +45,7 @@ TEST(RopeOps, MropeInterleaved) {
     std::vector<float> expected = {0.0f, 11.0f, 22.0f, 3.0f, 4.0f, 5.0f};
 
     ov::Core core;
-    auto compiled = core.compile_model(model, "CPU");
+    auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
     request.set_input_tensor(input_tensor);
     request.infer();

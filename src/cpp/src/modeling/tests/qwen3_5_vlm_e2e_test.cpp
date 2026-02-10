@@ -77,8 +77,8 @@ TEST(Qwen3_5VLME2E, DummyPrefillAndDecode) {
     auto text_model = ov::genai::modeling::models::create_qwen3_5_text_model(cfg, source, finalizer, false, true);
 
     ov::Core core;
-    auto compiled_vision = core.compile_model(vision_model, "CPU");
-    auto compiled_text = core.compile_model(text_model, "CPU");
+    auto compiled_vision = core.compile_model(vision_model, "GPU");
+    auto compiled_text = core.compile_model(text_model, "GPU");
 
     ov::Tensor pixel_values(ov::element::f32, {4, 3, 1, 2, 2});
     std::memset(pixel_values.data(), 0, pixel_values.get_byte_size());

@@ -98,6 +98,6 @@ TEST(Qwen3_5DummyINT4Binding, BuildsTextAndVisionWithQuantizedFinalizer) {
     ASSERT_NE(vision_model, nullptr);
 
     ov::Core core;
-    EXPECT_NO_THROW((void)core.compile_model(text_model, "CPU"));
-    EXPECT_NO_THROW((void)core.compile_model(vision_model, "CPU"));
+    EXPECT_NO_THROW((void)core.compile_model(text_model, "GPU"));
+    EXPECT_NO_THROW((void)core.compile_model(vision_model, "GPU"));
 }

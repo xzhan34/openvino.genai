@@ -83,7 +83,7 @@ TEST(Qwen3_5CacheRuntime, TrimsOnlyAttentionStatesAndKeepsLinearStates) {
 
     auto text_model = ov::genai::modeling::models::create_qwen3_5_text_model(cfg, source, finalizer, false, false);
     ov::Core core;
-    auto compiled = core.compile_model(text_model, "CPU");
+    auto compiled = core.compile_model(text_model, "GPU");
     auto request = compiled.create_infer_request();
 
     ov::Tensor input_ids(ov::element::i64, {1, 3});
