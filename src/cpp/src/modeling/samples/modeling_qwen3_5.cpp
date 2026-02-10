@@ -61,7 +61,7 @@ struct SampleOptions {
 
     uint32_t dummy_seed = 2026u;
     float dummy_init_range = 0.02f;
-    std::string dummy_weight_mode = "FP32";
+    std::string dummy_weight_mode = "INT4_ASYM";
     int dummy_group_size = 128;
 
     int dummy_num_layers = 0;
@@ -205,7 +205,7 @@ void print_usage(const char* argv0) {
         << "  --text-backup MODE              Text backup quant mode (real mode only)\n"
         << "  --dummy-seed N                  Synthetic weight RNG seed\n"
         << "  --dummy-init-range F            Synthetic init range, sampled in [-F, F]\n"
-        << "  --dummy-weight-mode MODE        FP32 | INT4_ASYM | INT4_SYM\n"
+        << "  --dummy-weight-mode MODE        FP32 | INT4_ASYM | INT4_SYM (default: INT4_ASYM)\n"
         << "  --dummy-group-size N            Dummy quant group size\n"
         << "  --dummy-num-layers N            Override dummy text num_hidden_layers\n"
         << "  --dummy-hidden-size N           Override dummy text hidden_size\n"
@@ -675,6 +675,13 @@ int main(int argc, char* argv[]) try {
             use_vl);
     }
 
+    if (use_dummy_mode_flag && source) {
+        source->release_all_cached_tensors();
+        if (!use_vl) {
+            source.reset();
+        }
+    }
+
     ov::Core core;
     std::optional<ov::CompiledModel> compiled_vision;
     if (use_vl) {
@@ -710,6 +717,11 @@ int main(int argc, char* argv[]) try {
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "[vision] preprocess: " << elapsed_ms(preprocess_start, preprocess_end) << " ms" << std::endl;
         std::cout << "[vision] encode: " << elapsed_ms(vision_start, vision_end) << " ms" << std::endl;
+
+        if (use_dummy_mode_flag && source) {
+            source->release_all_cached_tensors();
+            source.reset();
+        }
     }
 
     std::unique_ptr<ov::genai::Tokenizer> tokenizer;

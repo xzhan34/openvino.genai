@@ -81,6 +81,14 @@ const ov::Tensor& SyntheticWeightSource::get_tensor(const std::string& name) con
     return inserted.first->second;
 }
 
+void SyntheticWeightSource::release_tensor(const std::string& name) {
+    cache_.erase(name);
+}
+
+void SyntheticWeightSource::release_all_cached_tensors() {
+    cache_.clear();
+}
+
 ov::Tensor SyntheticWeightSource::make_tensor(const SyntheticWeightSpec& spec, uint32_t local_seed) const {
     ov::Tensor tensor(spec.dtype, spec.shape);
     const size_t total = num_elements(spec.shape);

@@ -63,6 +63,7 @@ LoadReport load_model(Module& model, WeightSource& source, WeightFinalizer& fina
                 } else {
                     default_weight_loader(*param, source, finalizer, weight_name, rule.shard_id);
                 }
+                source.release_tensor(weight_name);
                 report.matched.push_back(weight_name);
                 matched = true;
                 break;
@@ -87,6 +88,7 @@ LoadReport load_model(Module& model, WeightSource& source, WeightFinalizer& fina
             } else {
                 default_weight_loader(*param, source, finalizer, weight_name, std::nullopt);
             }
+            source.release_tensor(weight_name);
             report.matched.push_back(weight_name);
         }
     }

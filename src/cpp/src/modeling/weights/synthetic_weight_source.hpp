@@ -33,6 +33,8 @@ public:
     std::vector<std::string> keys() const override;
     bool has(const std::string& name) const override;
     const ov::Tensor& get_tensor(const std::string& name) const override;
+    void release_tensor(const std::string& name) override;
+    void release_all_cached_tensors() override;
 
 private:
     ov::Tensor make_tensor(const SyntheticWeightSpec& spec, uint32_t local_seed) const;
