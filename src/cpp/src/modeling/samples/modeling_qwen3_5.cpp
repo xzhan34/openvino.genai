@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,6 +35,41 @@
 #include "modeling/weights/synthetic_weight_source.hpp"
 
 namespace {
+
+enum class WeightModeSelection {
+    Auto,
+    Dummy,
+    Real,
+};
+
+struct SampleOptions {
+    std::optional<std::filesystem::path> model_dir;
+    std::string mode;
+    std::filesystem::path image_path;
+    std::string user_prompt;
+    std::string device = "CPU";
+    int max_new_tokens = 64;
+
+    std::string vision_quant_mode;
+    int vision_group_size = 128;
+    std::string vision_backup_mode;
+    std::string text_quant_mode;
+    int text_group_size = 128;
+    std::string text_backup_mode;
+
+    WeightModeSelection weight_mode = WeightModeSelection::Auto;
+
+    uint32_t dummy_seed = 2026u;
+    float dummy_init_range = 0.02f;
+    std::string dummy_weight_mode = "FP32";
+    int dummy_group_size = 128;
+
+    int dummy_num_layers = 0;
+    int dummy_hidden_size = 0;
+    int dummy_num_heads = 0;
+    int dummy_num_kv_heads = 0;
+    int dummy_head_dim = 0;
+};
 
 const char* get_env(const char* name) {
     const char* value = std::getenv(name);
@@ -64,12 +100,15 @@ bool has_safetensors_file(const std::filesystem::path& model_dir) {
     return false;
 }
 
-bool should_use_dummy_mode(const std::filesystem::path& model_dir) {
+bool should_use_dummy_mode(const std::optional<std::filesystem::path>& model_dir) {
     if (env_enabled("OV_GENAI_QWEN3_5_DUMMY_ENABLE")) {
         return true;
     }
-    const bool has_config = std::filesystem::exists(model_dir / "config.json");
-    const bool has_safetensors = has_safetensors_file(model_dir);
+    if (!model_dir.has_value()) {
+        return true;
+    }
+    const bool has_config = std::filesystem::exists(*model_dir / "config.json");
+    const bool has_safetensors = has_safetensors_file(*model_dir);
     return !(has_config && has_safetensors);
 }
 
@@ -107,6 +146,276 @@ int read_env_i32(const char* name, int default_value) {
     } catch (const std::exception&) {
         return default_value;
     }
+}
+
+int parse_i32(const std::string& raw, const char* option_name) {
+    try {
+        return std::stoi(raw);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid integer for ") + option_name + ": " + raw);
+    }
+}
+
+uint32_t parse_u32(const std::string& raw, const char* option_name) {
+    try {
+        return static_cast<uint32_t>(std::stoul(raw));
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid unsigned integer for ") + option_name + ": " + raw);
+    }
+}
+
+float parse_f32(const std::string& raw, const char* option_name) {
+    try {
+        return std::stof(raw);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid float for ") + option_name + ": " + raw);
+    }
+}
+
+std::string to_lower(std::string value) {
+    for (auto& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+void print_usage(const char* argv0) {
+    std::cout
+        << "Usage:\n"
+        << "  " << argv0 << " --dummy [--mode text|vl] [--prompt TEXT] [--device CPU] [--max-new-tokens N]\n"
+        << "  " << argv0 << " --real --model-dir <MODEL_DIR> [--mode text|vl] [--image IMAGE_PATH]\n"
+        << "  " << argv0 << " [legacy positional args are still supported]\n\n"
+        << "Options:\n"
+        << "  --dummy                         Force synthetic random weights (no model dir required)\n"
+        << "  --real                          Force real HF safetensors+config loading\n"
+        << "  --model-dir PATH                HF model directory (config.json + *.safetensors)\n"
+        << "  --mode text|vl                  Run text-only or vision-language path\n"
+        << "  --image PATH                    Image path for vl mode (if omitted: built-in dummy image)\n"
+        << "  --prompt TEXT                   User prompt\n"
+        << "  --device NAME                   OpenVINO device name (default: CPU)\n"
+        << "  --max-new-tokens N              Number of generated tokens (default: 64)\n"
+        << "  --vision-quant MODE             Vision quant mode (real mode only)\n"
+        << "  --vision-gs N                   Vision quant group size (real mode only)\n"
+        << "  --vision-backup MODE            Vision backup quant mode (real mode only)\n"
+        << "  --text-quant MODE               Text quant mode (real mode only)\n"
+        << "  --text-gs N                     Text quant group size (real mode only)\n"
+        << "  --text-backup MODE              Text backup quant mode (real mode only)\n"
+        << "  --dummy-seed N                  Synthetic weight RNG seed\n"
+        << "  --dummy-init-range F            Synthetic init range, sampled in [-F, F]\n"
+        << "  --dummy-weight-mode MODE        FP32 | INT4_ASYM | INT4_SYM\n"
+        << "  --dummy-group-size N            Dummy quant group size\n"
+        << "  --dummy-num-layers N            Override dummy text num_hidden_layers\n"
+        << "  --dummy-hidden-size N           Override dummy text hidden_size\n"
+        << "  --dummy-num-heads N             Override dummy text num_attention_heads\n"
+        << "  --dummy-num-kv-heads N          Override dummy text num_key_value_heads\n"
+        << "  --dummy-head-dim N              Override dummy text head_dim\n"
+        << "  -h, --help                      Show this help\n";
+}
+
+SampleOptions parse_cli(int argc, char* argv[]) {
+    SampleOptions opts;
+
+    if (const char* env_mode = get_env("OV_GENAI_QWEN3_5_SAMPLE_MODE")) {
+        opts.mode = env_mode;
+    }
+    opts.dummy_seed = read_env_u32("OV_GENAI_QWEN3_5_DUMMY_SEED", opts.dummy_seed);
+    opts.dummy_init_range = read_env_float("OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE", opts.dummy_init_range);
+    if (const char* mode = get_env("OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE")) {
+        opts.dummy_weight_mode = mode;
+    }
+    opts.dummy_group_size = read_env_i32("OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE", opts.dummy_group_size);
+    opts.vision_group_size = read_env_i32("OV_GENAI_QWEN3_5_VISION_GROUP_SIZE", opts.vision_group_size);
+    opts.text_group_size = read_env_i32("OV_GENAI_QWEN3_5_TEXT_GROUP_SIZE", opts.text_group_size);
+
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+        if (arg.rfind("--", 0) != 0) {
+            positional.push_back(arg);
+            continue;
+        }
+
+        auto take_value = [&](const char* option_name) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(std::string("Missing value for ") + option_name);
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--dummy") {
+            if (opts.weight_mode == WeightModeSelection::Real) {
+                throw std::runtime_error("--dummy conflicts with --real");
+            }
+            opts.weight_mode = WeightModeSelection::Dummy;
+        } else if (arg == "--real") {
+            if (opts.weight_mode == WeightModeSelection::Dummy) {
+                throw std::runtime_error("--real conflicts with --dummy");
+            }
+            opts.weight_mode = WeightModeSelection::Real;
+        } else if (arg == "--model-dir") {
+            opts.model_dir = take_value("--model-dir");
+        } else if (arg == "--mode") {
+            opts.mode = take_value("--mode");
+        } else if (arg == "--image") {
+            opts.image_path = take_value("--image");
+        } else if (arg == "--prompt") {
+            opts.user_prompt = take_value("--prompt");
+        } else if (arg == "--device") {
+            opts.device = take_value("--device");
+        } else if (arg == "--max-new-tokens") {
+            opts.max_new_tokens = parse_i32(take_value("--max-new-tokens"), "--max-new-tokens");
+        } else if (arg == "--vision-quant") {
+            opts.vision_quant_mode = take_value("--vision-quant");
+        } else if (arg == "--vision-gs") {
+            opts.vision_group_size = parse_i32(take_value("--vision-gs"), "--vision-gs");
+        } else if (arg == "--vision-backup") {
+            opts.vision_backup_mode = take_value("--vision-backup");
+        } else if (arg == "--text-quant") {
+            opts.text_quant_mode = take_value("--text-quant");
+        } else if (arg == "--text-gs") {
+            opts.text_group_size = parse_i32(take_value("--text-gs"), "--text-gs");
+        } else if (arg == "--text-backup") {
+            opts.text_backup_mode = take_value("--text-backup");
+        } else if (arg == "--dummy-seed") {
+            opts.dummy_seed = parse_u32(take_value("--dummy-seed"), "--dummy-seed");
+        } else if (arg == "--dummy-init-range") {
+            opts.dummy_init_range = parse_f32(take_value("--dummy-init-range"), "--dummy-init-range");
+        } else if (arg == "--dummy-weight-mode") {
+            opts.dummy_weight_mode = take_value("--dummy-weight-mode");
+        } else if (arg == "--dummy-group-size") {
+            opts.dummy_group_size = parse_i32(take_value("--dummy-group-size"), "--dummy-group-size");
+        } else if (arg == "--dummy-num-layers") {
+            opts.dummy_num_layers = parse_i32(take_value("--dummy-num-layers"), "--dummy-num-layers");
+        } else if (arg == "--dummy-hidden-size") {
+            opts.dummy_hidden_size = parse_i32(take_value("--dummy-hidden-size"), "--dummy-hidden-size");
+        } else if (arg == "--dummy-num-heads") {
+            opts.dummy_num_heads = parse_i32(take_value("--dummy-num-heads"), "--dummy-num-heads");
+        } else if (arg == "--dummy-num-kv-heads") {
+            opts.dummy_num_kv_heads = parse_i32(take_value("--dummy-num-kv-heads"), "--dummy-num-kv-heads");
+        } else if (arg == "--dummy-head-dim") {
+            opts.dummy_head_dim = parse_i32(take_value("--dummy-head-dim"), "--dummy-head-dim");
+        } else {
+            throw std::runtime_error("Unknown option: " + arg);
+        }
+    }
+
+    size_t pos = 0;
+    if (pos < positional.size()) {
+        const std::string first = positional[pos];
+        const bool looks_like_mode = (first == "text" || first == "vl");
+        if (!looks_like_mode && !opts.model_dir.has_value()) {
+            opts.model_dir = first;
+            pos++;
+        }
+    }
+    if (pos < positional.size() && opts.mode.empty()) {
+        const std::string maybe_mode = positional[pos];
+        if (maybe_mode == "text" || maybe_mode == "vl") {
+            opts.mode = maybe_mode;
+            pos++;
+        }
+    }
+    if (pos < positional.size() && opts.mode == "vl" && opts.image_path.empty()) {
+        if (positional[pos] != "-" && std::filesystem::exists(positional[pos])) {
+            opts.image_path = positional[pos];
+            pos++;
+        }
+    }
+    if (pos < positional.size() && opts.user_prompt.empty()) {
+        opts.user_prompt = positional[pos++];
+    }
+    if (pos < positional.size()) {
+        opts.device = positional[pos++];
+    }
+    if (pos < positional.size()) {
+        opts.max_new_tokens = parse_i32(positional[pos++], "MAX_NEW_TOKENS");
+    }
+    if (pos < positional.size() && opts.vision_quant_mode.empty()) {
+        opts.vision_quant_mode = positional[pos++];
+    }
+    if (pos < positional.size()) {
+        opts.vision_group_size = parse_i32(positional[pos++], "VISION_GS");
+    }
+    if (pos < positional.size() && opts.vision_backup_mode.empty()) {
+        opts.vision_backup_mode = positional[pos++];
+    }
+    if (pos < positional.size() && opts.text_quant_mode.empty()) {
+        opts.text_quant_mode = positional[pos++];
+    }
+    if (pos < positional.size()) {
+        opts.text_group_size = parse_i32(positional[pos++], "TEXT_GS");
+    }
+    if (pos < positional.size() && opts.text_backup_mode.empty()) {
+        opts.text_backup_mode = positional[pos++];
+    }
+    if (pos != positional.size()) {
+        std::ostringstream oss;
+        oss << "Too many positional arguments. Unexpected token: " << positional[pos];
+        throw std::runtime_error(oss.str());
+    }
+
+    if (opts.mode.empty()) {
+        opts.mode = opts.image_path.empty() ? "text" : "vl";
+    }
+    opts.mode = to_lower(opts.mode);
+    if (opts.mode != "text" && opts.mode != "vl") {
+        throw std::runtime_error("Mode must be 'text' or 'vl'");
+    }
+
+    if (opts.max_new_tokens <= 0) {
+        throw std::runtime_error("max_new_tokens must be > 0");
+    }
+    if (opts.user_prompt.empty()) {
+        opts.user_prompt = (opts.mode == "vl") ? "Describe the image." : "Write one sentence about OpenVINO.";
+    }
+
+    return opts;
+}
+
+bool use_dummy_mode(const SampleOptions& opts) {
+    switch (opts.weight_mode) {
+    case WeightModeSelection::Dummy:
+        return true;
+    case WeightModeSelection::Real:
+        return false;
+    case WeightModeSelection::Auto:
+        return should_use_dummy_mode(opts.model_dir);
+    }
+    return should_use_dummy_mode(opts.model_dir);
+}
+
+void apply_dummy_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cfg, const SampleOptions& opts) {
+    bool layer_schedule_needs_refresh = false;
+    bool hidden_size_changed = false;
+    if (opts.dummy_num_layers > 0) {
+        cfg.text.num_hidden_layers = opts.dummy_num_layers;
+        layer_schedule_needs_refresh = true;
+    }
+    if (opts.dummy_hidden_size > 0) {
+        cfg.text.hidden_size = opts.dummy_hidden_size;
+        hidden_size_changed = true;
+    }
+    if (opts.dummy_num_heads > 0) {
+        cfg.text.num_attention_heads = opts.dummy_num_heads;
+    }
+    if (opts.dummy_num_kv_heads > 0) {
+        cfg.text.num_key_value_heads = opts.dummy_num_kv_heads;
+    }
+    if (opts.dummy_head_dim > 0) {
+        cfg.text.head_dim = opts.dummy_head_dim;
+    }
+    if (hidden_size_changed) {
+        cfg.vision.out_hidden_size = cfg.text.hidden_size;
+    }
+    if (layer_schedule_needs_refresh) {
+        cfg.text.layer_types.clear();
+    }
+    cfg.finalize();
+    cfg.validate();
 }
 
 std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens) {
@@ -251,14 +560,11 @@ ov::Tensor make_dummy_image() {
     return image;
 }
 
-ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config_from_env() {
+ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config(const SampleOptions& opts) {
     using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
     ov::genai::modeling::weights::QuantizationConfig cfg;
 
-    std::string mode = "FP32";
-    if (const char* raw = get_env("OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE")) {
-        mode = raw;
-    }
+    std::string mode = opts.dummy_weight_mode;
     for (auto& c : mode) {
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
@@ -271,7 +577,7 @@ ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config_from_e
         cfg.mode = Mode::NONE;
     }
 
-    cfg.group_size = read_env_i32("OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE", 128);
+    cfg.group_size = opts.dummy_group_size;
     cfg.backup_mode = cfg.mode;
     cfg.selection.exclude_patterns.clear();
     return cfg;
@@ -280,78 +586,41 @@ ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config_from_e
 }  // namespace
 
 int main(int argc, char* argv[]) try {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> [text|vl] [IMAGE_PATH] [PROMPT] [DEVICE] [MAX_NEW_TOKENS] "
-                  << "[VISION_QUANT] [VISION_GS] [VISION_BACKUP] [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP]\n";
-        return 1;
+    const SampleOptions opts = parse_cli(argc, argv);
+    const bool use_vl = (opts.mode == "vl");
+    const bool use_dummy_mode_flag = use_dummy_mode(opts);
+    if (!use_dummy_mode_flag && !opts.model_dir.has_value()) {
+        throw std::runtime_error("Real mode requires --model-dir (or legacy MODEL_DIR positional argument).");
     }
-
-    const std::filesystem::path model_dir = argv[1];
-    int arg_idx = 2;
-
-    std::string mode;
-    if (const char* env_mode = get_env("OV_GENAI_QWEN3_5_SAMPLE_MODE")) {
-        mode = env_mode;
+    const std::filesystem::path model_dir = opts.model_dir.value_or(std::filesystem::path{});
+    if (use_vl && !opts.image_path.empty() && !std::filesystem::exists(opts.image_path)) {
+        throw std::runtime_error("Image path does not exist: " + opts.image_path.string());
     }
-    if (argc > arg_idx) {
-        const std::string arg_mode = argv[arg_idx];
-        if (arg_mode == "text" || arg_mode == "vl") {
-            mode = arg_mode;
-            arg_idx++;
-        }
-    }
-    if (mode.empty()) {
-        if (argc > arg_idx && std::string(argv[arg_idx]) != "-" && std::filesystem::exists(argv[arg_idx])) {
-            mode = "vl";
-        } else {
-            mode = "text";
-        }
-    }
-    if (mode != "text" && mode != "vl") {
-        throw std::runtime_error("Mode must be 'text' or 'vl'");
-    }
-    const bool use_vl = (mode == "vl");
-
-    std::filesystem::path image_path;
-    if (use_vl && argc > arg_idx && std::string(argv[arg_idx]) != "-" && std::filesystem::exists(argv[arg_idx])) {
-        image_path = argv[arg_idx++];
-    }
-
-    const std::string user_prompt = (argc > arg_idx) ? argv[arg_idx++] :
-        (use_vl ? "Describe the image." : "Write one sentence about OpenVINO.");
-    const std::string device = (argc > arg_idx) ? argv[arg_idx++] : "GPU";
-    const int max_new_tokens = (argc > arg_idx) ? std::stoi(argv[arg_idx++]) : 64;
-
-    std::string vision_quant_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
-    int vision_group_size = (argc > arg_idx) ? std::stoi(argv[arg_idx++]) : 128;
-    std::string vision_backup_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
-    std::string text_quant_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
-    int text_group_size = (argc > arg_idx) ? std::stoi(argv[arg_idx++]) : 128;
-    std::string text_backup_mode = (argc > arg_idx) ? argv[arg_idx++] : "";
-
-    const bool use_dummy_mode = should_use_dummy_mode(model_dir);
 
     ov::genai::modeling::models::Qwen3_5Config cfg =
-        use_dummy_mode ? ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config()
-                       : ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
+        use_dummy_mode_flag ? ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config()
+                            : ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
+    if (use_dummy_mode_flag) {
+        apply_dummy_config_overrides(cfg, opts);
+    }
 
     ov::genai::modeling::weights::QuantizationConfig vision_quant_config;
     ov::genai::modeling::weights::QuantizationConfig text_quant_config;
-    if (use_dummy_mode) {
-        const auto dummy_quant = build_dummy_quant_config_from_env();
+    if (use_dummy_mode_flag) {
+        const auto dummy_quant = build_dummy_quant_config(opts);
         vision_quant_config = dummy_quant;
         text_quant_config = dummy_quant;
     } else {
-        vision_quant_config = create_quantization_config(vision_quant_mode, vision_group_size, vision_backup_mode);
-        text_quant_config = create_quantization_config(text_quant_mode, text_group_size, text_backup_mode);
+        vision_quant_config = create_quantization_config(opts.vision_quant_mode, opts.vision_group_size, opts.vision_backup_mode);
+        text_quant_config = create_quantization_config(opts.text_quant_mode, opts.text_group_size, opts.text_backup_mode);
     }
 
     std::unique_ptr<ov::genai::modeling::weights::WeightSource> source;
-    if (use_dummy_mode) {
-        const uint32_t seed = read_env_u32("OV_GENAI_QWEN3_5_DUMMY_SEED", 2026u);
-        const float init_range = read_env_float("OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE", 0.02f);
-        auto specs = ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg);
+    if (use_dummy_mode_flag) {
+        const uint32_t seed = opts.dummy_seed;
+        const float init_range = opts.dummy_init_range;
+        auto specs = use_vl ? ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg)
+                            : ov::genai::modeling::models::build_qwen3_5_text_weight_specs(cfg.text);
         source = std::make_unique<ov::genai::modeling::weights::SyntheticWeightSource>(
             std::move(specs),
             seed,
@@ -364,7 +633,7 @@ int main(int argc, char* argv[]) try {
 
     ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig pre_cfg;
     const auto pre_cfg_path = model_dir / "preprocessor_config.json";
-    if (!use_dummy_mode && std::filesystem::exists(pre_cfg_path)) {
+    if (!use_dummy_mode_flag && std::filesystem::exists(pre_cfg_path)) {
         pre_cfg = ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig::from_json_file(pre_cfg_path);
     }
 
@@ -388,14 +657,14 @@ int main(int argc, char* argv[]) try {
     ov::Core core;
     std::optional<ov::CompiledModel> compiled_vision;
     if (use_vl) {
-        compiled_vision = core.compile_model(vision_model, device);
+        compiled_vision = core.compile_model(vision_model, opts.device);
     }
-    auto compiled_text = core.compile_model(text_model, device);
+    auto compiled_text = core.compile_model(text_model, opts.device);
 
     ov::Tensor visual_embeds;
     ov::Tensor grid_thw;
     if (use_vl) {
-        ov::Tensor image = image_path.empty() ? make_dummy_image() : utils::load_image(image_path);
+        ov::Tensor image = opts.image_path.empty() ? make_dummy_image() : utils::load_image(opts.image_path);
         const std::string pos_embed_name = resolve_pos_embed_name(*source);
         const ov::Tensor pos_embed_weight = source->get_tensor(pos_embed_name);
 
@@ -423,7 +692,7 @@ int main(int argc, char* argv[]) try {
     }
 
     std::unique_ptr<ov::genai::Tokenizer> tokenizer;
-    if (!use_dummy_mode) {
+    if (!use_dummy_mode_flag) {
         try {
             tokenizer = std::make_unique<ov::genai::Tokenizer>(model_dir);
         } catch (const std::exception&) {
@@ -440,9 +709,9 @@ int main(int argc, char* argv[]) try {
                 ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
                     grid_thw,
                     cfg.vision.spatial_merge_size);
-            prompt = build_vl_prompt(user_prompt, image_tokens);
+            prompt = build_vl_prompt(opts.user_prompt, image_tokens);
         } else {
-            prompt = user_prompt;
+            prompt = opts.user_prompt;
         }
         auto tokenized = tokenizer->encode(prompt, ov::genai::add_special_tokens(false));
         input_ids = tokenized.input_ids;
@@ -453,7 +722,7 @@ int main(int argc, char* argv[]) try {
                                                grid_thw,
                                                cfg.vision.spatial_merge_size)
                                          : 0;
-        auto ids = build_dummy_prompt_ids(cfg, user_prompt, use_vl, image_tokens);
+        auto ids = build_dummy_prompt_ids(cfg, opts.user_prompt, use_vl, image_tokens);
         auto tensors = to_batch_tensors(ids);
         input_ids = tensors.first;
         attention_mask = tensors.second;
@@ -491,7 +760,7 @@ int main(int argc, char* argv[]) try {
     const auto prefill_end = std::chrono::steady_clock::now();
 
     std::vector<int64_t> generated;
-    generated.reserve(static_cast<size_t>(max_new_tokens));
+    generated.reserve(static_cast<size_t>(opts.max_new_tokens));
     generated.push_back(next_id);
 
     int64_t eos_token_id = -1;
@@ -516,7 +785,7 @@ int main(int argc, char* argv[]) try {
     int64_t past_len = prompt_len;
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
-    for (int step = 1; step < max_new_tokens; ++step) {
+    for (int step = 1; step < opts.max_new_tokens; ++step) {
         if (eos_token_id >= 0 && next_id == eos_token_id) {
             break;
         }
@@ -556,7 +825,7 @@ int main(int argc, char* argv[]) try {
                                   : 0.0;
 
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Mode: " << (use_dummy_mode ? "dummy" : "hf") << " / " << mode << std::endl;
+    std::cout << "Mode: " << (use_dummy_mode_flag ? "dummy" : "hf") << " / " << opts.mode << std::endl;
     std::cout << "Prompt token size: " << prompt_len << std::endl;
     std::cout << "Output token size: " << generated.size() << std::endl;
     std::cout << "TTFT: " << ttft_ms << " ms" << std::endl;
