@@ -14,6 +14,34 @@ void apply_paged_attention_transformations(std::shared_ptr<ov::Model> model, boo
     const ov::op::util::VariableVector& variables = model->get_variables();
     OPENVINO_ASSERT(!variables.empty(), "Model is supposed to be stateful");
 
+    std::cerr << "[PA Transform] Checking model with " << variables.size() << " variables..." << std::endl;
+
+    // Check for hybrid attention models (e.g., Qwen3-Next with linear attention)
+    // These models have non-KV-cache state variables that also use beam_idx,
+    // which SDPAToPagedAttention cannot handle properly.
+    bool has_linear_attention_states = false;
+    for (const auto& var : variables) {
+        const auto& name = var->get_info().variable_id;
+        // Linear attention uses states like "linear_states.N.conv" or "linear_states.N.recurrent"
+        if (name.find("linear_states.") != std::string::npos ||
+            name.find(".conv") != std::string::npos ||
+            name.find(".recurrent") != std::string::npos) {
+            std::cerr << "[PA Transform] Found linear attention state: " << name << std::endl;
+            has_linear_attention_states = true;
+            break;
+        }
+    }
+
+    if (has_linear_attention_states) {
+        std::cerr << "[PA Transform] REJECTING: hybrid attention model not supported for PA" << std::endl;
+        OPENVINO_THROW("PagedAttention transformation is not supported for hybrid attention models "
+                       "(models with both SDPA and linear attention layers). "
+                       "The model contains linear attention states that use beam_idx for reordering, "
+                       "which cannot be handled by SDPAToPagedAttention pass.");
+    }
+
+    std::cerr << "[PA Transform] Proceeding with SDPAToPagedAttention pass..." << std::endl;
+
     bool use_block_indices_inputs = per_layer_cache_control;
     bool use_score_outputs = per_layer_cache_control;
     ov::pass::SDPAToPagedAttention(use_block_indices_inputs, use_score_outputs, /* allow_score_aggregation = */ true, allow_cache_rotation, allow_xattention).run_on_model(model);
@@ -28,7 +56,9 @@ void apply_paged_attention_transformations(std::shared_ptr<ov::Model> model, boo
         }
     }
 
-    OPENVINO_ASSERT(key_cache_params.size() == value_cache_params.size() && key_cache_params.size() > 0);
+    OPENVINO_ASSERT(key_cache_params.size() == value_cache_params.size() && key_cache_params.size() > 0,
+        "Expected key_cache/value_cache parameters from SDPAToPagedAttention, got key_cache=", 
+        key_cache_params.size(), ", value_cache=", value_cache_params.size());
 
     size_t num_decoder_layers = key_cache_params.size();
     for (size_t idx = 0; idx < num_decoder_layers; idx++) {
