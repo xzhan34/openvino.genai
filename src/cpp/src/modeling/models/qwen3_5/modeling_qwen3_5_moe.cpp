@@ -19,6 +19,32 @@ namespace genai {
 namespace modeling {
 namespace models {
 
+namespace {
+
+Tensor dequantize_packed_moe_weight(const Tensor& packed_weight,
+                                    const Tensor& scales_e_g_o,
+                                    const Tensor& zps_e_g_o,
+                                    int32_t num_experts,
+                                    int32_t out_features,
+                                    int32_t in_features) {
+    auto* op_ctx = packed_weight.context();
+
+    // Convert auxiliary tensors from [E, G, O] to [E, O, G] to align with packed weight layout [E, O, G, GS].
+    auto perm = ops::const_vec(op_ctx, std::vector<int64_t>{0, 2, 1});
+    auto scales_e_o_g = Tensor(std::make_shared<ov::op::v1::Transpose>(scales_e_g_o.output(), perm), op_ctx);
+    auto zps_e_o_g = Tensor(std::make_shared<ov::op::v1::Transpose>(zps_e_g_o.output(), perm), op_ctx);
+
+    auto packed_f32 = packed_weight.to(ov::element::f32);
+    auto zps_f32 = zps_e_o_g.unsqueeze(-1).to(ov::element::f32);
+    auto scales_f32 = scales_e_o_g.unsqueeze(-1).to(ov::element::f32);
+
+    // Dequantize from packed groups: [E, O, G, GS] -> [E, O, I].
+    auto dequant_grouped = (packed_f32 - zps_f32) * scales_f32;
+    return dequant_grouped.reshape({num_experts, out_features, in_features}, false);
+}
+
+}  // namespace
+
 Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
                                              const std::string& name,
                                              const Qwen3_5TextModelConfig& cfg,
@@ -139,13 +165,11 @@ const Tensor& Qwen3_5SparseMoeBlock::shared_down_proj_weight() const {
 }
 
 bool Qwen3_5SparseMoeBlock::can_use_fused_path() const {
-    if (!gate_up_scales_.has_value() || !gate_up_zps_.has_value() || !down_scales_.has_value() || !down_zps_.has_value()) {
-        return false;
-    }
-
-    const auto gate_up_shape = gate_up_expert_weights().output().get_shape();
-    const auto down_shape = down_expert_weights().output().get_shape();
-    return gate_up_shape.size() == 4 && down_shape.size() == 4;
+    // NOTE:
+    // Current gate_up split relies on StridedSlice over low-bit packed constants (u4/i4).
+    // That path crashes during ConstantFolding on GPU in this branch.
+    // Keep fused path disabled until packed split is implemented without low-bit StridedSlice.
+    return false;
 }
 
 size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
@@ -223,10 +247,34 @@ Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
     auto flat_3d = flat_f32.unsqueeze(0);
     auto tiled = ops::tensor::tile(flat_3d, {num_experts_, 1, 1});  // [E, T, H]
 
-    auto gate_up = gate_up_expert_weights().to(ov::element::f32);
+    Tensor gate_up;
+    Tensor down_exps_w;
+    const bool has_quant_aux = gate_up_scales_.has_value() && gate_up_zps_.has_value() &&
+                               down_scales_.has_value() && down_zps_.has_value();
+
+    if (has_quant_aux &&
+        gate_up_expert_weights().output().get_shape().size() == 4 &&
+        down_expert_weights().output().get_shape().size() == 4) {
+        // Quantized packed MoE weights: dequantize explicitly for fallback path.
+        gate_up = dequantize_packed_moe_weight(gate_up_expert_weights(),
+                                               *gate_up_scales_,
+                                               *gate_up_zps_,
+                                               num_experts_,
+                                               2 * expert_intermediate_size_,
+                                               hidden_size_);
+        down_exps_w = dequantize_packed_moe_weight(down_expert_weights(),
+                                                   *down_scales_,
+                                                   *down_zps_,
+                                                   num_experts_,
+                                                   hidden_size_,
+                                                   expert_intermediate_size_);
+    } else {
+        gate_up = gate_up_expert_weights().to(ov::element::f32);
+        down_exps_w = down_expert_weights().to(ov::element::f32);
+    }
+
     auto gate_exps_w = ops::slice(gate_up, 0, expert_intermediate_size_, 1, 1);
     auto up_exps_w = ops::slice(gate_up, expert_intermediate_size_, 2 * expert_intermediate_size_, 1, 1);
-    auto down_exps_w = down_expert_weights().to(ov::element::f32);
 
     auto gate_bmm = ops::matmul(tiled, gate_exps_w, false, true);
     auto up_bmm = ops::matmul(tiled, up_exps_w, false, true);
