@@ -185,10 +185,26 @@ std::string to_lower(std::string value) {
 
 void print_usage(const char* argv0) {
     std::cout
-        << "Usage:\n"
-        << "  " << argv0 << " --dummy [--mode text|vl] [--prompt TEXT] [--device CPU] [--max-new-tokens N]\n"
-        << "  " << argv0 << " --real --model-dir <MODEL_DIR> [--mode text|vl] [--image IMAGE_PATH]\n"
-        << "  " << argv0 << " [legacy positional args are still supported]\n\n"
+        << "Qwen3.5 Modeling Sample CLI Helper\n"
+        << "==================================\n\n"
+        << "Overview:\n"
+        << "  - Run Qwen3.5 text-only or vision-language generation.\n"
+        << "  - Support dummy weights and real HF safetensors loading.\n"
+        << "  - Dummy mode supports both dense and moe text architectures.\n\n"
+        << "Primary Usage:\n"
+        << "  " << argv0 << " --dummy [--mode text|vl] [--prompt TEXT] [--device DEVICE]\n"
+        << "  " << argv0 << " --real --model-dir <MODEL_DIR> [--mode text|vl] [--image IMAGE_PATH]\n\n"
+        << "Examples:\n"
+        << "  1) Dummy dense text:\n"
+        << "     " << argv0 << " --dummy --mode text --dummy-text-arch dense --prompt \"Hello\"\n"
+        << "  2) Dummy moe text:\n"
+        << "     " << argv0 << " --dummy --mode text --dummy-text-arch moe --max-new-tokens 32\n"
+        << "  3) Dummy VL (uses built-in dummy image):\n"
+        << "     " << argv0 << " --dummy --mode vl --prompt \"Describe this image\"\n"
+        << "  4) Real HF text:\n"
+        << "     " << argv0 << " --real --model-dir C:\\models\\Qwen3.5 --mode text\n"
+        << "  5) Real HF VL:\n"
+        << "     " << argv0 << " --real --model-dir C:\\models\\Qwen3.5 --mode vl --image C:\\img\\a.jpg\n\n"
         << "Options:\n"
         << "  --dummy                         Force synthetic random weights (no model dir required)\n"
         << "  --real                          Force real HF safetensors+config loading\n"
@@ -217,7 +233,20 @@ void print_usage(const char* argv0) {
         << "  --dummy-intermediate-size N     Override dummy text intermediate_size\n"
         << "  --dummy-vocab-size N            Override dummy text vocab_size\n"
         << "  --dummy-max-position N          Override dummy text max_position_embeddings\n"
-        << "  -h, --help                      Show this help\n";
+        << "  -h, --help                      Show this helper\n\n"
+        << "Legacy Positional Form (backward-compatible):\n"
+        << "  " << argv0 << " [MODEL_DIR] [text|vl] [IMAGE_PATH] [PROMPT] [DEVICE] [MAX_NEW_TOKENS]\n"
+        << "  [VISION_QUANT] [VISION_GS] [VISION_BACKUP] [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP]\n\n"
+        << "Environment Variables:\n"
+        << "  OV_GENAI_QWEN3_5_DUMMY_ENABLE      Force dummy mode when set to 1/true/on\n"
+        << "  OV_GENAI_QWEN3_5_SAMPLE_MODE       Default mode: text or vl\n"
+        << "  OV_GENAI_QWEN3_5_DUMMY_SEED        Dummy seed\n"
+        << "  OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE  Dummy init range\n"
+        << "  OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE Dummy weight mode (FP32/INT4_ASYM/INT4_SYM)\n"
+        << "  OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE  Dummy quant group size\n"
+        << "  OV_GENAI_QWEN3_5_DUMMY_TEXT_ARCH   Dummy text arch (dense/moe)\n"
+        << "  OV_GENAI_QWEN3_5_VISION_GROUP_SIZE Default --vision-gs\n"
+        << "  OV_GENAI_QWEN3_5_TEXT_GROUP_SIZE   Default --text-gs\n";
 }
 
 SampleOptions parse_cli(int argc, char* argv[]) {
@@ -618,15 +647,27 @@ ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config(const 
 }  // namespace
 
 int main(int argc, char* argv[]) try {
-    const SampleOptions opts = parse_cli(argc, argv);
+    SampleOptions opts;
+    try {
+        opts = parse_cli(argc, argv);
+    } catch (const std::exception& cli_error) {
+        std::cerr << "Command line error: " << cli_error.what() << '\n' << '\n';
+        print_usage(argv[0]);
+        return 1;
+    }
+
     const bool use_vl = (opts.mode == "vl");
     const bool use_dummy_mode_flag = use_dummy_mode(opts);
     if (!use_dummy_mode_flag && !opts.model_dir.has_value()) {
-        throw std::runtime_error("Real mode requires --model-dir (or legacy MODEL_DIR positional argument).");
+        std::cerr << "Command line error: Real mode requires --model-dir (or legacy MODEL_DIR positional argument)." << '\n' << '\n';
+        print_usage(argv[0]);
+        return 1;
     }
     const std::filesystem::path model_dir = opts.model_dir.value_or(std::filesystem::path{});
     if (use_vl && !opts.image_path.empty() && !std::filesystem::exists(opts.image_path)) {
-        throw std::runtime_error("Image path does not exist: " + opts.image_path.string());
+        std::cerr << "Command line error: Image path does not exist: " << opts.image_path.string() << '\n' << '\n';
+        print_usage(argv[0]);
+        return 1;
     }
 
     ov::genai::modeling::models::Qwen3_5Config cfg;
