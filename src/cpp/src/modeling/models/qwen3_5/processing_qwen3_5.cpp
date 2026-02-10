@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -787,55 +786,6 @@ Qwen3_5Config Qwen3_5Config::make_dummy_dense9b_config() {
     cfg.vision_start_token_id = 248053;
     cfg.vision_end_token_id = 248054;
     cfg.tie_word_embeddings = false;
-
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_NUM_LAYERS")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.num_hidden_layers = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_HIDDEN_SIZE")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.hidden_size = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_NUM_HEADS")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.num_attention_heads = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_NUM_KV_HEADS")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.num_key_value_heads = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_HEAD_DIM")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.head_dim = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_INTERMEDIATE_SIZE")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.intermediate_size = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_VOCAB_SIZE")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.vocab_size = n;
-        }
-    }
-    if (const char* v = std::getenv("OV_GENAI_QWEN3_5_DUMMY_MAX_POSITION")) {
-        const int n = std::atoi(v);
-        if (n > 0) {
-            cfg.text.max_position_embeddings = n;
-        }
-    }
 
     cfg.vision.out_hidden_size = cfg.text.hidden_size;
 

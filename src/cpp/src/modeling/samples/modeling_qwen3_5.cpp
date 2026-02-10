@@ -69,6 +69,9 @@ struct SampleOptions {
     int dummy_num_heads = 0;
     int dummy_num_kv_heads = 0;
     int dummy_head_dim = 0;
+    int dummy_intermediate_size = 0;
+    int dummy_vocab_size = 0;
+    int dummy_max_position_embeddings = 0;
 };
 
 const char* get_env(const char* name) {
@@ -209,6 +212,9 @@ void print_usage(const char* argv0) {
         << "  --dummy-num-heads N             Override dummy text num_attention_heads\n"
         << "  --dummy-num-kv-heads N          Override dummy text num_key_value_heads\n"
         << "  --dummy-head-dim N              Override dummy text head_dim\n"
+        << "  --dummy-intermediate-size N     Override dummy text intermediate_size\n"
+        << "  --dummy-vocab-size N            Override dummy text vocab_size\n"
+        << "  --dummy-max-position N          Override dummy text max_position_embeddings\n"
         << "  -h, --help                      Show this help\n";
 }
 
@@ -298,6 +304,12 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.dummy_num_kv_heads = parse_i32(take_value("--dummy-num-kv-heads"), "--dummy-num-kv-heads");
         } else if (arg == "--dummy-head-dim") {
             opts.dummy_head_dim = parse_i32(take_value("--dummy-head-dim"), "--dummy-head-dim");
+        } else if (arg == "--dummy-intermediate-size") {
+            opts.dummy_intermediate_size = parse_i32(take_value("--dummy-intermediate-size"), "--dummy-intermediate-size");
+        } else if (arg == "--dummy-vocab-size") {
+            opts.dummy_vocab_size = parse_i32(take_value("--dummy-vocab-size"), "--dummy-vocab-size");
+        } else if (arg == "--dummy-max-position") {
+            opts.dummy_max_position_embeddings = parse_i32(take_value("--dummy-max-position"), "--dummy-max-position");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -407,6 +419,15 @@ void apply_dummy_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cf
     }
     if (opts.dummy_head_dim > 0) {
         cfg.text.head_dim = opts.dummy_head_dim;
+    }
+    if (opts.dummy_intermediate_size > 0) {
+        cfg.text.intermediate_size = opts.dummy_intermediate_size;
+    }
+    if (opts.dummy_vocab_size > 0) {
+        cfg.text.vocab_size = opts.dummy_vocab_size;
+    }
+    if (opts.dummy_max_position_embeddings > 0) {
+        cfg.text.max_position_embeddings = opts.dummy_max_position_embeddings;
     }
     if (hidden_size_changed) {
         cfg.vision.out_hidden_size = cfg.text.hidden_size;
