@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #include <openvino/op/read_value.hpp>
 #include <openvino/opsets/opset13.hpp>
@@ -13,7 +14,9 @@
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_next/modeling_qwen3_next.hpp"
 #include "modeling/tests/test_utils.hpp"
+#include "modeling/weights/quantization_config.hpp"
 #include "modeling/weights/weight_loader.hpp"
+#include "safetensors_utils/safetensors_weight_finalizer.hpp"
 
 namespace test_utils = ov::genai::modeling::tests;
 
@@ -111,7 +114,17 @@ TEST(Qwen3NextLinearAttention, CompilesAndInfersOnGPU) {
     ov::genai::modeling::models::Qwen3NextGatedDeltaNet linear_attn(ctx, "linear_attn", cfg, 0);
 
     test_utils::DummyWeightSource weights;
-    test_utils::DummyWeightFinalizer finalizer;
+    ov::genai::modeling::weights::QuantizationConfig quant_config;
+    quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+    quant_config.group_size = 128;
+    quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
+    quant_config.selection.only_2d_weights = true;
+    quant_config.selection.include_weights = {
+        "linear_attn.in_proj_qkvz.weight",
+        "linear_attn.in_proj_ba.weight",
+        "linear_attn.conv1d.weight",
+        "linear_attn.out_proj.weight"};
+    ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(quant_config);
 
     const int32_t key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
     const int32_t value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
@@ -150,9 +163,28 @@ TEST(Qwen3NextLinearAttention, CompilesAndInfersOnGPU) {
     auto out = linear_attn.forward(hidden_states, beam_idx, &attention_mask, nullptr);
     auto ov_model = ctx.build_model({out.output()});
 
+    const std::vector<std::string> expected_compressed_nodes = {
+        "linear_attn.in_proj_qkvz.weight_compressed",
+        "linear_attn.in_proj_ba.weight_compressed",
+        "linear_attn.conv1d.weight_compressed",
+        "linear_attn.out_proj.weight_compressed"};
+    for (const auto& expected_name : expected_compressed_nodes) {
+        bool found = false;
+        for (const auto& op : ov_model->get_ops()) {
+            if (op->get_friendly_name() == expected_name) {
+                found = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "Missing quantized node: " << expected_name;
+    }
+
+    ov::serialize(ov_model, "qwen3_next_linear_attention_original.xml");
+
     ov::Core core;
     auto compiled = core.compile_model(ov_model, "GPU");
     auto request = compiled.create_infer_request();
+    ov::serialize(compiled.get_runtime_model(), "qwen3_next_linear_attention_compiled.xml");
 
     ov::Tensor hidden_states_tensor(ov::element::f32, ov::Shape{1, 2, static_cast<size_t>(cfg.hidden_size)});
     ov::Tensor beam_idx_tensor(ov::element::i32, ov::Shape{1});
