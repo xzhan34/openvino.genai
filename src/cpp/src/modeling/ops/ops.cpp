@@ -4,6 +4,7 @@
 #include "modeling/ops/ops.hpp"
 
 #include <openvino/core/except.hpp>
+#include <openvino/op/linear_attn.hpp>
 #include <openvino/opsets/opset13.hpp>
 #include <openvino/op/placeholder_extension.hpp>
 #include <openvino/op/moe_3gemm_fused_compressed.hpp>
@@ -92,6 +93,29 @@ Tensor linear(const Tensor& x, const Tensor& weight) {
     // MatMul is serializable to IR, GPU will convert it back to FullyConnected at compile time
     auto node = std::make_shared<ov::op::v0::MatMul>(x.output(), weight.output(), false, true);
     return Tensor(node, ctx);
+}
+
+std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
+                                           const Tensor& k,
+                                           const Tensor& v,
+                                           const Tensor& beta,
+                                           const Tensor& g,
+                                           const Tensor& initial_state) {
+    auto* ctx = q.context();
+    const Tensor* inputs[] = {&k, &v, &beta, &g, &initial_state};
+    for (const auto* t : inputs) {
+        auto* t_ctx = t->context();
+        if (ctx && t_ctx && ctx != t_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = t_ctx;
+        }
+    }
+
+    ov::OutputVector args = {q.output(), k.output(), v.output(), beta.output(), g.output(), initial_state.output()};
+    auto node = std::make_shared<ov::op::LinearAttention>(args);
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
 
 Tensor moe3gemm_fused_compressed(const Tensor& input,

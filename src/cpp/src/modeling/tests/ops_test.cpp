@@ -107,6 +107,72 @@ TEST(Ops, Linear) {
     test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_default);
 }
 
+TEST(Ops, LinearAttention) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    const size_t batch = 2;
+    const size_t seq_len = 16;
+    const size_t num_heads = 16;
+    const size_t head_dim = 128;
+
+    auto q = ctx.parameter("q", ov::element::f32, ov::Shape{batch, seq_len, num_heads, head_dim});
+    auto k = ctx.parameter("k", ov::element::f32, ov::Shape{batch, seq_len, num_heads, head_dim});
+    auto v = ctx.parameter("v", ov::element::f32, ov::Shape{batch, seq_len, num_heads, head_dim});
+    auto g = ctx.parameter("g", ov::element::f32, ov::Shape{batch, seq_len, num_heads});
+    auto beta = ctx.parameter("beta", ov::element::f32, ov::Shape{batch, seq_len, num_heads});
+    auto init_state = ctx.parameter("init_state", ov::element::f32, ov::Shape{batch, num_heads, head_dim, head_dim});
+
+    auto out_pair = ov::genai::modeling::ops::linear_attention(q, k, v, beta, g, init_state);
+    auto model = ctx.build_model({out_pair.first.output(), out_pair.second.output()});
+    ov::serialize(model, "linear_attention_original.xml");
+    ov::Core core;
+    auto compiled = core.compile_model(model, "GPU");
+    ov::serialize(compiled.get_runtime_model(), "linear_attention_compiled.xml");
+    auto request = compiled.create_infer_request();
+
+    auto q_data = test_utils::random_f32(batch * seq_len * num_heads * head_dim, -0.5f, 0.5f, 11);
+    auto k_data = test_utils::random_f32(batch * seq_len * num_heads * head_dim, -0.5f, 0.5f, 23);
+    auto v_data = test_utils::random_f32(batch * seq_len * num_heads * head_dim, -0.5f, 0.5f, 37);
+    auto g_data = test_utils::random_f32(batch * seq_len * num_heads, -0.5f, 0.0f, 41);       // exp(g) in (0.6, 1]
+    auto beta_data = test_utils::random_f32(batch * seq_len * num_heads, 0.0f, 0.3f, 53);     // small learning rate
+    auto init_state_data = test_utils::random_f32(batch * num_heads * head_dim * head_dim, -0.01f, 0.01f, 59);
+
+    ov::Tensor q_tensor(ov::element::f32, {batch, seq_len, num_heads, head_dim});
+    ov::Tensor k_tensor(ov::element::f32, {batch, seq_len, num_heads, head_dim});
+    ov::Tensor v_tensor(ov::element::f32, {batch, seq_len, num_heads, head_dim});
+    ov::Tensor beta_tensor(ov::element::f32, {batch, seq_len, num_heads});
+    ov::Tensor g_tensor(ov::element::f32, {batch, seq_len, num_heads});
+    ov::Tensor init_state_tensor(ov::element::f32, {batch, num_heads, head_dim, head_dim});
+    std::memcpy(q_tensor.data(), q_data.data(), q_data.size() * sizeof(float));
+    std::memcpy(k_tensor.data(), k_data.data(), k_data.size() * sizeof(float));
+    std::memcpy(v_tensor.data(), v_data.data(), v_data.size() * sizeof(float));
+    std::memcpy(beta_tensor.data(), beta_data.data(), beta_data.size() * sizeof(float));
+    std::memcpy(g_tensor.data(), g_data.data(), g_data.size() * sizeof(float));
+    std::memcpy(init_state_tensor.data(), init_state_data.data(), init_state_data.size() * sizeof(float));
+
+    request.set_input_tensor(0, q_tensor);
+    request.set_input_tensor(1, k_tensor);
+    request.set_input_tensor(2, v_tensor);
+    request.set_input_tensor(3, beta_tensor);
+    request.set_input_tensor(4, g_tensor);
+    request.set_input_tensor(5, init_state_tensor);
+    request.infer();
+
+    auto expected_pair = test_utils::linear_attention_ref(q_data,
+                                                          k_data,
+                                                          v_data,
+                                                          beta_data,
+                                                          g_data,
+                                                          init_state_data,
+                                                          batch,
+                                                          seq_len,
+                                                          num_heads,
+                                                          head_dim);
+
+    test_utils::expect_tensor_near(request.get_output_tensor(0), expected_pair.first, test_utils::k_tol_linear_attn);
+    test_utils::expect_tensor_near(request.get_output_tensor(1), expected_pair.second, test_utils::k_tol_linear_attn);
+}
+
 TEST(Ops, ConstHelpers) {
     ov::genai::modeling::BuilderContext ctx;
     auto* op_ctx = &ctx.op_context();

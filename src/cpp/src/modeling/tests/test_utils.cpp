@@ -638,6 +638,105 @@ std::vector<float> moe_ref(const std::vector<float>& hidden_states,
     return output;
 }
 
+std::pair<std::vector<float>, std::vector<float>> linear_attention_ref(const std::vector<float>& q,
+                                                                        const std::vector<float>& k,
+                                                                        const std::vector<float>& v,
+                                                                        const std::vector<float>& beta,
+                                                                        const std::vector<float>& g,
+                                                                        const std::vector<float>& initial_state,
+                                                                        size_t batch,
+                                                                        size_t seq_len,
+                                                                        size_t num_heads,
+                                                                        size_t head_dim) {
+    const size_t K = head_dim;
+    const size_t V = head_dim;
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(K));
+    const float eps = 1e-6f;
+
+    auto l2norm = [&](std::vector<float>& x) {
+        float sum = 0.0f;
+        for (float v : x) {
+            sum += v * v;
+        }
+        float inv = 1.0f / std::sqrt(sum + eps);
+        for (auto& v : x) {
+            v *= inv;
+        }
+    };
+
+    std::vector<float> out(batch * seq_len * num_heads * V, 0.0f);
+    std::vector<float> out_state(batch * num_heads * K * V, 0.0f);
+
+    auto q_idx = [&](size_t b, size_t t, size_t h, size_t d) {
+        return ((b * seq_len + t) * num_heads + h) * K + d;
+    };
+    auto v_idx = [&](size_t b, size_t t, size_t h, size_t d) {
+        return ((b * seq_len + t) * num_heads + h) * V + d;
+    };
+    auto g_idx = [&](size_t b, size_t t, size_t h) {
+        return (b * seq_len + t) * num_heads + h;
+    };
+    auto state_idx = [&](size_t b, size_t h, size_t kdim, size_t vdim) {
+        return ((b * num_heads + h) * V + vdim) * K + kdim;
+    };
+
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t h = 0; h < num_heads; ++h) {
+            for (size_t vdim = 0; vdim < V; ++vdim) {
+                std::vector<float> state(K, 0.0f);
+                for (size_t kdim = 0; kdim < K; ++kdim) {
+                    state[kdim] = initial_state[state_idx(b, h, kdim, vdim)];
+                }
+
+                for (size_t t = 0; t < seq_len; ++t) {
+                    float b_g = std::exp(g[g_idx(b, t, h)]);
+                    float b_beta = beta[g_idx(b, t, h)];
+
+                    std::vector<float> b_k(K, 0.0f);
+                    std::vector<float> b_q(K, 0.0f);
+                    for (size_t kdim = 0; kdim < K; ++kdim) {
+                        b_k[kdim] = k[q_idx(b, t, h, kdim)];
+                        b_q[kdim] = q[q_idx(b, t, h, kdim)];
+                    }
+                    l2norm(b_k);
+                    l2norm(b_q);
+                    for (auto& vq : b_q) {
+                        vq *= q_scale;
+                    }
+
+                    for (auto& s : state) {
+                        s *= b_g;
+                    }
+
+                    float h_k = 0.0f;
+                    for (size_t kdim = 0; kdim < K; ++kdim) {
+                        h_k += state[kdim] * b_k[kdim];
+                    }
+
+                    float b_v = v[v_idx(b, t, h, vdim)];
+                    b_v = (b_v - h_k) * b_beta;
+
+                    for (size_t kdim = 0; kdim < K; ++kdim) {
+                        state[kdim] += b_k[kdim] * b_v;
+                    }
+
+                    float out_v = 0.0f;
+                    for (size_t kdim = 0; kdim < K; ++kdim) {
+                        out_v += state[kdim] * b_q[kdim];
+                    }
+                    out[v_idx(b, t, h, vdim)] = out_v;
+                }
+
+                for (size_t kdim = 0; kdim < K; ++kdim) {
+                    out_state[state_idx(b, h, kdim, vdim)] = state[kdim];
+                }
+            }
+        }
+    }
+
+    return {out, out_state};
+}
+
 std::vector<float> to_heads_ref(const std::vector<float>& x,
                                 size_t batch,
                                 size_t seq_len,
@@ -877,7 +976,6 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
 }
 
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
-    // abs_tol = rel_tol = tol。|expected| <= 1 用绝对 diff <= tol；|expected| > 1 用相对 diff/|x| <= tol。
     const float abs_tol = tol;
     const float rel_tol = tol;
 
@@ -923,26 +1021,7 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
                     << " (actual=" << actual << ", expected=" << expected_val << ")";
             }
         }
-
-        if (pass)
-            ++pass_count;
-        else
-            ++fail_count;
     }
-
-    // const char* mode_abs = (n_abs > 0 && n_rel == 0) ? "abs" : (n_abs == 0 && n_rel > 0) ? "rel" : "abs+rel";
-    // std::cerr << "\n[expect_tensor_near] ------" << std::endl;
-    // std::cerr << "  judge method: " << mode_abs;
-    // if (n_abs > 0 && n_rel == 0)
-    //     std::cerr << ", abs_tol=" << abs_tol;
-    // else if (n_abs == 0 && n_rel > 0)
-    //     std::cerr << ", rel_tol=" << rel_tol << " (" << (rel_tol * 100.0f) << "%)";
-    // else
-    //     std::cerr << ", abs_tol=" << abs_tol << ", rel_tol=" << rel_tol << " (" << (rel_tol * 100.0f) << "%)";
-    // std::cerr << std::endl;
-    // std::cerr << "max error value :" << max_error << std::endl;
-    // std::cerr.flush();
-
 }
 
 }  // namespace tests
