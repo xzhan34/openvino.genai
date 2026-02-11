@@ -1073,8 +1073,16 @@ int main(int argc, char* argv[]) try {
     auto text_original = tokenizer.decode(baseline.output_ids, {ov::genai::skip_special_tokens(true)});
     std::cout << text_original << std::endl;
 
+    const size_t dflash_tokens_after_first = perf.generated_tokens > 0 ? perf.generated_tokens - 1 : 0;
+    const double dflash_tpot_ms = dflash_tokens_after_first > 0
+                                     ? (perf.total_generate_ms - perf.ttft_ms)
+                                           / static_cast<double>(dflash_tokens_after_first)
+                                     : 0.0;
     if (baseline_throughput > 0.0 && dflash_throughput > 0.0) {
         std::cout << "[Compare] dflash / baseline throughput ratio=" << (dflash_throughput / baseline_throughput) << std::endl;
+    }
+    if (baseline_tpot_ms > 0.0 && dflash_tpot_ms > 0.0) {
+        std::cout << "[Compare] Decoding speedup: " << (baseline_tpot_ms / dflash_tpot_ms) << std::endl;
     }
     return 0;
 } catch (const std::exception& ex) {
