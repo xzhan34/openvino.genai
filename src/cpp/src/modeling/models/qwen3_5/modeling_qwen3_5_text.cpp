@@ -58,13 +58,10 @@ std::optional<int32_t> get_qwen3_5_layer_limit_from_env() {
 }
 
 bool use_linear_attention_op() {
-    static const bool enabled = [] {
-        const char* raw = std::getenv("OV_GENAI_USE_LINEAR_ATTENTION_OP");
-        if (!raw || raw[0] == '\0')
-            return true;  // enabled by default
-        return std::string(raw) != "0";
-    }();
-    return enabled;
+    const char* raw = std::getenv("OV_GENAI_USE_LINEAR_ATTENTION_OP");
+    if (!raw || raw[0] == '\0')
+        return true;  // enabled by default
+    return std::string(raw) != "0";
 }
 
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
@@ -515,11 +512,6 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     auto q_f32 = q_heads.to(ov::element::f32);
     auto k_f32 = k_heads.to(ov::element::f32);
     auto v_f32 = v_heads.to(ov::element::f32);
-    auto q_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(q_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
-    auto k_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(k_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
-    auto q_normed = q_f32 * (q_ss + 1e-6f).rsqrt();
-    auto k_normed = k_f32 * (k_ss + 1e-6f).rsqrt();
-    auto q_scaled = q_normed * (1.0f / std::sqrt(static_cast<float>(head_k_dim_)));
 
     auto beta = Tensor(std::make_shared<ov::op::v0::Sigmoid>(b.to(ov::element::f32).output()), op_ctx);
     auto softplus_in = a.to(ov::element::f32) + dt_bias().to(ov::element::f32);
@@ -543,13 +535,19 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
 
     if (use_linear_attention_op()) {
         // ── Fused LinearAttention op path ──
-        auto la_result = ops::linear_attention(q_scaled, k_normed, v_f32, beta, g, recurrent_cached);
+        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_cached);
         core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
         auto recurrent_final = la_result.second;  // [B, num_v_heads, head_k_dim, head_v_dim]
         auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final.output(), recurrent_var);
         ctx().register_sink(recurrent_assign);
     } else {
         // ── TensorIterator path (default) ──
+        auto q_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(q_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
+        auto k_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(k_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
+        auto q_normed = q_f32 * (q_ss + 1e-6f).rsqrt();
+        auto k_normed = k_f32 * (k_ss + 1e-6f).rsqrt();
+        auto q_scaled = q_normed * (1.0f / std::sqrt(static_cast<float>(head_k_dim_)));
+
         auto q_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
         auto k_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
         auto v_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_v_dim_});
