@@ -465,7 +465,9 @@ Tensor Qwen3NextSparseMoeBlock::gate_expert_weights() const {
     for (auto* p : gate_experts_param_) {
         ws.push_back(p->value());
     }
-    return ops::concat(ws, 0);
+    auto result = ops::concat(ws, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::up_expert_weights() const {
@@ -474,7 +476,9 @@ Tensor Qwen3NextSparseMoeBlock::up_expert_weights() const {
     for (auto* p : up_experts_param_) {
         ws.push_back(p->value());
     }
-    return ops::concat(ws, 0);
+    auto result = ops::concat(ws, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::down_expert_weights() const {
@@ -483,31 +487,45 @@ Tensor Qwen3NextSparseMoeBlock::down_expert_weights() const {
     for (auto* p : down_experts_param_) {
         ws.push_back(p->value());
     }
-    return ops::concat(ws, 0);
+    auto result = ops::concat(ws, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::gate_exps_scales() const {
-    return ops::concat(gate_exps_scales_, 0);
+    auto result = ops::concat(gate_exps_scales_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::gate_exps_zps() const {
-    return ops::concat(gate_exps_zps_, 0);
+    auto result = ops::concat(gate_exps_zps_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::up_exps_scales() const {
-    return ops::concat(up_exps_scales_, 0);
+    auto result = ops::concat(up_exps_scales_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::up_exps_zps() const {
-    return ops::concat(up_exps_zps_, 0);
+    auto result = ops::concat(up_exps_zps_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::down_exps_scales() const {
-    return ops::concat(down_exps_scales_, 0);
+    auto result = ops::concat(down_exps_scales_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::down_exps_zps() const {
-    return ops::concat(down_exps_zps_, 0);
+    auto result = ops::concat(down_exps_zps_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3NextSparseMoeBlock::forward(const Tensor& hidden_states) const {

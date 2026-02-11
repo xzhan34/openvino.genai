@@ -355,7 +355,9 @@ Tensor Qwen3MoE::gate_exps_weight() const {
     valid.reserve(gate_exps_param_.size());
     for(auto* p : gate_exps_param_) valid.push_back(p->value());
     if (valid.size() == 1) return valid[0];
-    return ops::concat(valid, 0);
+    auto result = ops::concat(valid, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::up_exps_weight() const {
@@ -366,7 +368,9 @@ Tensor Qwen3MoE::up_exps_weight() const {
     valid.reserve(up_exps_param_.size());
     for(auto* p : up_exps_param_) valid.push_back(p->value());
     if (valid.size() == 1) return valid[0];
-    return ops::concat(valid, 0);
+    auto result = ops::concat(valid, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::down_exps_weight() const {
@@ -377,37 +381,51 @@ Tensor Qwen3MoE::down_exps_weight() const {
     valid.reserve(down_exps_param_.size());
     for(auto* p : down_exps_param_) valid.push_back(p->value());
     if (valid.size() == 1) return valid[0];
-    return ops::concat(valid, 0);
+    auto result = ops::concat(valid, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::gate_exps_scales() const {
     if (gate_exps_scales_.size() == 1) return gate_exps_scales_[0];
-    return ops::concat(gate_exps_scales_, 0);
+    auto result = ops::concat(gate_exps_scales_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::gate_exps_zps() const {
     if (gate_exps_zps_.size() == 1) return gate_exps_zps_[0];
-    return ops::concat(gate_exps_zps_, 0);
+    auto result = ops::concat(gate_exps_zps_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::up_exps_scales() const {
     if (up_exps_scales_.size() == 1) return up_exps_scales_[0];
-    return ops::concat(up_exps_scales_, 0);
+    auto result = ops::concat(up_exps_scales_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::up_exps_zps() const {
     if (up_exps_zps_.size() == 1) return up_exps_zps_[0];
-    return ops::concat(up_exps_zps_, 0);
+    auto result = ops::concat(up_exps_zps_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::down_exps_scales() const {
     if (down_exps_scales_.size() == 1) return down_exps_scales_[0];
-    return ops::concat(down_exps_scales_, 0);
+    auto result = ops::concat(down_exps_scales_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::down_exps_zps() const {
     if (down_exps_zps_.size() == 1) return down_exps_zps_[0];
-    return ops::concat(down_exps_zps_, 0);
+    auto result = ops::concat(down_exps_zps_, 0);
+    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
+    return result;
 }
 
 Tensor Qwen3MoE::forward(const Tensor& x) const {

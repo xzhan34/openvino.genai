@@ -909,27 +909,49 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
         auto transpose_order = std::make_shared<ov::op::v0::Constant>(
             ov::element::i64, ov::Shape{2}, std::vector<int64_t>{1, 0});
         
+        // Create Transpose and immediately fold to Const for XML optimization
         auto scales_transposed = std::make_shared<ov::op::v1::Transpose>(scale_const, transpose_order);
-        scales_transposed->set_friendly_name(name + "_scales_transposed");
+        ov::OutputVector scales_outputs(1);
+        OPENVINO_ASSERT(scales_transposed->constant_fold(scales_outputs, {scale_const, transpose_order}),
+                        "Failed to constant fold scales transpose for ", name);
+        auto scales_folded = std::dynamic_pointer_cast<ov::op::v0::Constant>(scales_outputs[0].get_node_shared_ptr());
+        OPENVINO_ASSERT(scales_folded, "Scales constant fold did not produce Constant node for ", name);
+        scales_folded->set_friendly_name(name + "_scales");
         
         auto zero_points_transposed = std::make_shared<ov::op::v1::Transpose>(zp_const, transpose_order);
-        zero_points_transposed->set_friendly_name(name + "_zps_transposed");
+        ov::OutputVector zps_outputs(1);
+        OPENVINO_ASSERT(zero_points_transposed->constant_fold(zps_outputs, {zp_const, transpose_order}),
+                        "Failed to constant fold zero points transpose for ", name);
+        auto zps_folded = std::dynamic_pointer_cast<ov::op::v0::Constant>(zps_outputs[0].get_node_shared_ptr());
+        OPENVINO_ASSERT(zps_folded, "Zero points constant fold did not produce Constant node for ", name);
+        zps_folded->set_friendly_name(name + "_zps");
         
-        auxiliary["scales"] = ov::genai::modeling::Tensor(scales_transposed, &ctx);
-        auxiliary["zps"] = ov::genai::modeling::Tensor(zero_points_transposed, &ctx);
+        auxiliary["scales"] = ov::genai::modeling::Tensor(scales_folded, &ctx);
+        auxiliary["zps"] = ov::genai::modeling::Tensor(zps_folded, &ctx);
     } else {
         // For 3D weights, transpose from [E, O, G] to [E, G, O]
         auto transpose_order = std::make_shared<ov::op::v0::Constant>(
             ov::element::i64, ov::Shape{3}, std::vector<int64_t>{0, 2, 1});
         
+        // Create Transpose and immediately fold to Const for XML optimization
         auto scales_transposed = std::make_shared<ov::op::v1::Transpose>(scale_const, transpose_order);
-        scales_transposed->set_friendly_name(name + "_scales_transposed");
+        ov::OutputVector scales_outputs(1);
+        OPENVINO_ASSERT(scales_transposed->constant_fold(scales_outputs, {scale_const, transpose_order}),
+                        "Failed to constant fold scales transpose for ", name);
+        auto scales_folded = std::dynamic_pointer_cast<ov::op::v0::Constant>(scales_outputs[0].get_node_shared_ptr());
+        OPENVINO_ASSERT(scales_folded, "Scales constant fold did not produce Constant node for ", name);
+        scales_folded->set_friendly_name(name + "_scales");
         
         auto zero_points_transposed = std::make_shared<ov::op::v1::Transpose>(zp_const, transpose_order);
-        zero_points_transposed->set_friendly_name(name + "_zps_transposed");
+        ov::OutputVector zps_outputs(1);
+        OPENVINO_ASSERT(zero_points_transposed->constant_fold(zps_outputs, {zp_const, transpose_order}),
+                        "Failed to constant fold zero points transpose for ", name);
+        auto zps_folded = std::dynamic_pointer_cast<ov::op::v0::Constant>(zps_outputs[0].get_node_shared_ptr());
+        OPENVINO_ASSERT(zps_folded, "Zero points constant fold did not produce Constant node for ", name);
+        zps_folded->set_friendly_name(name + "_zps");
         
-        auxiliary["scales"] = ov::genai::modeling::Tensor(scales_transposed, &ctx);
-        auxiliary["zps"] = ov::genai::modeling::Tensor(zero_points_transposed, &ctx);
+        auxiliary["scales"] = ov::genai::modeling::Tensor(scales_folded, &ctx);
+        auxiliary["zps"] = ov::genai::modeling::Tensor(zps_folded, &ctx);
     }
 
     // Cache the compressed weight
