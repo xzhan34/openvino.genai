@@ -469,9 +469,10 @@ int main(int argc, char* argv[]) try {
     ov::genai::modeling::weights::QuantizationConfig vision_quant_config;
     ov::genai::modeling::weights::QuantizationConfig text_quant_config;
     if (use_dummy_mode_flag) {
-        const auto dummy_quant = build_dummy_quant_config(opts);
-        vision_quant_config = dummy_quant;
-        text_quant_config = dummy_quant;
+        // Vision encoder: disable quantization by default (INT4 has severe perf regression on small batch)
+        // Text decoder: use configured quantization
+        vision_quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
+        text_quant_config = build_dummy_quant_config(opts);
     } else {
         vision_quant_config = create_quantization_config(opts.vision_quant_mode, opts.vision_group_size, "none");
         text_quant_config = create_quantization_config(opts.text_quant_mode, opts.text_group_size, "none");
