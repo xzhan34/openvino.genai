@@ -57,6 +57,16 @@ std::optional<int32_t> get_qwen3_5_layer_limit_from_env() {
     }
 }
 
+bool use_linear_attention_op() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("OV_GENAI_USE_LINEAR_ATTENTION_OP");
+        if (!raw || raw[0] == '\0')
+            return true;  // enabled by default
+        return std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
     const ov::genai::modeling::models::Qwen3_5TextModelConfig& input_cfg) {
     auto cfg = input_cfg;
@@ -529,68 +539,80 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     auto recurrent_read = std::make_shared<ov::op::v6::ReadValue>(recurrent_init.output(), recurrent_var);
     auto recurrent_cached = ops::gather(Tensor(recurrent_read->output(0), op_ctx), beam_idx, 0);
 
-    auto q_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
-    auto k_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
-    auto v_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_v_dim_});
-    auto g_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
-    auto b_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
-    auto state_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, num_v_heads_, head_k_dim_, head_v_dim_});
+    Tensor core_attn_tensor;  // [B, S, num_v_heads, head_v_dim]
 
-    auto axis_seq = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
-    auto q_s = std::make_shared<ov::op::v0::Squeeze>(q_t, axis_seq);
-    auto k_s = std::make_shared<ov::op::v0::Squeeze>(k_t, axis_seq);
-    auto v_s = std::make_shared<ov::op::v0::Squeeze>(v_t, axis_seq);
-    auto g_s = std::make_shared<ov::op::v0::Squeeze>(g_t, axis_seq);
-    auto b_s = std::make_shared<ov::op::v0::Squeeze>(b_t, axis_seq);
+    if (use_linear_attention_op()) {
+        // ── Fused LinearAttention op path ──
+        auto la_result = ops::linear_attention(q_scaled, k_normed, v_f32, beta, g, recurrent_cached);
+        core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
+        auto recurrent_final = la_result.second;  // [B, num_v_heads, head_k_dim, head_v_dim]
+        auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final.output(), recurrent_var);
+        ctx().register_sink(recurrent_assign);
+    } else {
+        // ── TensorIterator path (default) ──
+        auto q_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
+        auto k_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
+        auto v_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_v_dim_});
+        auto g_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
+        auto b_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
+        auto state_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, num_v_heads_, head_k_dim_, head_v_dim_});
 
-    auto g_exp = std::make_shared<ov::op::v0::Exp>(g_s);
-    auto g_exp_u1 = std::make_shared<ov::op::v0::Unsqueeze>(g_exp, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto g_exp_e = std::make_shared<ov::op::v0::Unsqueeze>(g_exp_u1, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto state_decay = std::make_shared<ov::op::v1::Multiply>(state_t, g_exp_e, ov::op::AutoBroadcastType::NUMPY);
+        auto axis_seq = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+        auto q_s = std::make_shared<ov::op::v0::Squeeze>(q_t, axis_seq);
+        auto k_s = std::make_shared<ov::op::v0::Squeeze>(k_t, axis_seq);
+        auto v_s = std::make_shared<ov::op::v0::Squeeze>(v_t, axis_seq);
+        auto g_s = std::make_shared<ov::op::v0::Squeeze>(g_t, axis_seq);
+        auto b_s = std::make_shared<ov::op::v0::Squeeze>(b_t, axis_seq);
 
-    auto k_uns = std::make_shared<ov::op::v0::Unsqueeze>(k_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto state_k = std::make_shared<ov::op::v1::Multiply>(state_decay, k_uns, ov::op::AutoBroadcastType::NUMPY);
-    auto kv_mem = std::make_shared<ov::op::v1::ReduceSum>(state_k,
-                                                           ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
-                                                           false);
+        auto g_exp = std::make_shared<ov::op::v0::Exp>(g_s);
+        auto g_exp_u1 = std::make_shared<ov::op::v0::Unsqueeze>(g_exp, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto g_exp_e = std::make_shared<ov::op::v0::Unsqueeze>(g_exp_u1, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto state_decay = std::make_shared<ov::op::v1::Multiply>(state_t, g_exp_e, ov::op::AutoBroadcastType::NUMPY);
 
-    auto b_uns = std::make_shared<ov::op::v0::Unsqueeze>(b_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto delta = std::make_shared<ov::op::v1::Multiply>(
-        std::make_shared<ov::op::v1::Subtract>(v_s, kv_mem, ov::op::AutoBroadcastType::NUMPY),
-        b_uns,
-        ov::op::AutoBroadcastType::NUMPY);
+        auto k_uns = std::make_shared<ov::op::v0::Unsqueeze>(k_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto state_k = std::make_shared<ov::op::v1::Multiply>(state_decay, k_uns, ov::op::AutoBroadcastType::NUMPY);
+        auto kv_mem = std::make_shared<ov::op::v1::ReduceSum>(state_k,
+                                                               ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
+                                                               false);
 
-    auto delta_uns = std::make_shared<ov::op::v0::Unsqueeze>(delta, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-2}));
-    auto outer = std::make_shared<ov::op::v1::Multiply>(k_uns, delta_uns, ov::op::AutoBroadcastType::NUMPY);
-    auto state_new = std::make_shared<ov::op::v1::Add>(state_decay, outer, ov::op::AutoBroadcastType::NUMPY);
+        auto b_uns = std::make_shared<ov::op::v0::Unsqueeze>(b_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto delta = std::make_shared<ov::op::v1::Multiply>(
+            std::make_shared<ov::op::v1::Subtract>(v_s, kv_mem, ov::op::AutoBroadcastType::NUMPY),
+            b_uns,
+            ov::op::AutoBroadcastType::NUMPY);
 
-    auto q_uns = std::make_shared<ov::op::v0::Unsqueeze>(q_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto y_state = std::make_shared<ov::op::v1::Multiply>(state_new, q_uns, ov::op::AutoBroadcastType::NUMPY);
-    auto y_t_step = std::make_shared<ov::op::v1::ReduceSum>(y_state,
-                                                            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
-                                                            false);
-    auto y_t_unsq = std::make_shared<ov::op::v0::Unsqueeze>(y_t_step, axis_seq);
+        auto delta_uns = std::make_shared<ov::op::v0::Unsqueeze>(delta, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-2}));
+        auto outer = std::make_shared<ov::op::v1::Multiply>(k_uns, delta_uns, ov::op::AutoBroadcastType::NUMPY);
+        auto state_new = std::make_shared<ov::op::v1::Add>(state_decay, outer, ov::op::AutoBroadcastType::NUMPY);
 
-    auto state_result = std::make_shared<ov::op::v0::Result>(state_new);
-    auto y_result = std::make_shared<ov::op::v0::Result>(y_t_unsq);
-    auto body = std::make_shared<ov::Model>(ov::OutputVector{state_result->output(0), y_result->output(0)},
-                                            ov::ParameterVector{q_t, k_t, v_t, g_t, b_t, state_t});
+        auto q_uns = std::make_shared<ov::op::v0::Unsqueeze>(q_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto y_state = std::make_shared<ov::op::v1::Multiply>(state_new, q_uns, ov::op::AutoBroadcastType::NUMPY);
+        auto y_t_step = std::make_shared<ov::op::v1::ReduceSum>(y_state,
+                                                                ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
+                                                                false);
+        auto y_t_unsq = std::make_shared<ov::op::v0::Unsqueeze>(y_t_step, axis_seq);
 
-    auto ti = std::make_shared<ov::op::v0::TensorIterator>();
-    ti->set_body(body);
-    ti->set_sliced_input(q_t, q_scaled.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(k_t, k_normed.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(v_t, v_f32.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(g_t, g.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(b_t, beta.output(), 0, 1, 1, -1, 1);
-    ti->set_merged_input(state_t, recurrent_cached.output(), state_result);
+        auto state_result = std::make_shared<ov::op::v0::Result>(state_new);
+        auto y_result = std::make_shared<ov::op::v0::Result>(y_t_unsq);
+        auto body = std::make_shared<ov::Model>(ov::OutputVector{state_result->output(0), y_result->output(0)},
+                                                ov::ParameterVector{q_t, k_t, v_t, g_t, b_t, state_t});
 
-    auto recurrent_final = ti->get_iter_value(state_result, -1);
-    auto core_attn = ti->get_concatenated_slices(y_result, 0, 1, 1, -1, 1);
-    auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final, recurrent_var);
-    ctx().register_sink(recurrent_assign);
+        auto ti = std::make_shared<ov::op::v0::TensorIterator>();
+        ti->set_body(body);
+        ti->set_sliced_input(q_t, q_scaled.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(k_t, k_normed.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(v_t, v_f32.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(g_t, g.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(b_t, beta.output(), 0, 1, 1, -1, 1);
+        ti->set_merged_input(state_t, recurrent_cached.output(), state_result);
 
-    auto core_attn_tensor = Tensor(core_attn, op_ctx);
+        auto recurrent_final = ti->get_iter_value(state_result, -1);
+        auto core_attn = ti->get_concatenated_slices(y_result, 0, 1, 1, -1, 1);
+        auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final, recurrent_var);
+        ctx().register_sink(recurrent_assign);
+
+        core_attn_tensor = Tensor(core_attn, op_ctx);
+    }
     auto core_flat = core_attn_tensor.reshape({-1, head_v_dim_});
     auto z_flat = z.reshape({-1, head_v_dim_});
     auto gated = rms_norm_gated(core_flat, z_flat);
