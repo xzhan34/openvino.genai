@@ -19,16 +19,16 @@ inline ov::genai::modeling::weights::QuantizationConfig create_quantization_conf
     std::transform(quant_mode.begin(), quant_mode.end(), quant_mode.begin(), ::tolower);
     std::transform(backup_mode.begin(), backup_mode.end(), backup_mode.begin(), ::tolower);
 
-    if (quant_mode.find("int4") != std::string::npos) {
+    // Parse mode string: check for specific suffixes to avoid substring matching issues
+    // E.g., "int4_asym" contains "sym" but should be ASYM, not SYM
+    if (quant_mode == "int4_sym") {
+        config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
+    } else if (quant_mode == "int4_asym" || quant_mode == "int4") {
         config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
-        if (quant_mode.find("sym") != std::string::npos) {
-            config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
-        }
-    } else if (quant_mode.find("int8") != std::string::npos) {
-        config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM; // Default to ASYM for INT8 if unspecified? Or use creating logic
-         if (quant_mode.find("sym") != std::string::npos) {
-            config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
-        }
+    } else if (quant_mode == "int8_sym") {
+        config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
+    } else if (quant_mode == "int8_asym" || quant_mode == "int8") {
+        config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
     } else {
         // config.enabled = false; // "enabled" is a method, not a field. Setting mode to NONE disables it.
         config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
