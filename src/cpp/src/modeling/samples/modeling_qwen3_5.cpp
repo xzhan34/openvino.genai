@@ -12,7 +12,6 @@
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -75,20 +74,6 @@ struct SampleOptions {
     int dummy_max_position_embeddings = 0;
 };
 
-const char* get_env(const char* name) {
-    const char* value = std::getenv(name);
-    return (value && value[0] != '\0') ? value : nullptr;
-}
-
-bool env_enabled(const char* name) {
-    const char* value = get_env(name);
-    if (!value) {
-        return false;
-    }
-    const std::string v(value);
-    return v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON";
-}
-
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
     if (!std::filesystem::exists(model_dir) || !std::filesystem::is_directory(model_dir)) {
         return false;
@@ -105,51 +90,12 @@ bool has_safetensors_file(const std::filesystem::path& model_dir) {
 }
 
 bool should_use_dummy_mode(const std::optional<std::filesystem::path>& model_dir) {
-    if (env_enabled("OV_GENAI_QWEN3_5_DUMMY_ENABLE")) {
-        return true;
-    }
     if (!model_dir.has_value()) {
         return true;
     }
     const bool has_config = std::filesystem::exists(*model_dir / "config.json");
     const bool has_safetensors = has_safetensors_file(*model_dir);
     return !(has_config && has_safetensors);
-}
-
-uint32_t read_env_u32(const char* name, uint32_t default_value) {
-    const char* raw = get_env(name);
-    if (!raw) {
-        return default_value;
-    }
-    try {
-        return static_cast<uint32_t>(std::stoul(raw));
-    } catch (const std::exception&) {
-        return default_value;
-    }
-}
-
-float read_env_float(const char* name, float default_value) {
-    const char* raw = get_env(name);
-    if (!raw) {
-        return default_value;
-    }
-    try {
-        return std::stof(raw);
-    } catch (const std::exception&) {
-        return default_value;
-    }
-}
-
-int read_env_i32(const char* name, int default_value) {
-    const char* raw = get_env(name);
-    if (!raw) {
-        return default_value;
-    }
-    try {
-        return std::stoi(raw);
-    } catch (const std::exception&) {
-        return default_value;
-    }
 }
 
 int parse_i32(const std::string& raw, const char* option_name) {
@@ -233,41 +179,11 @@ void print_usage(const char* argv0) {
         << "  --dummy-intermediate-size N     Override dummy text intermediate_size\n"
         << "  --dummy-vocab-size N            Override dummy text vocab_size\n"
         << "  --dummy-max-position N          Override dummy text max_position_embeddings\n"
-        << "  -h, --help                      Show this helper\n\n"
-        << "Legacy Positional Form (backward-compatible):\n"
-        << "  " << argv0 << " [MODEL_DIR] [text|vl] [IMAGE_PATH] [PROMPT] [DEVICE] [MAX_NEW_TOKENS]\n"
-        << "  [VISION_QUANT] [VISION_GS] [VISION_BACKUP] [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP]\n\n"
-        << "Environment Variables:\n"
-        << "  OV_GENAI_QWEN3_5_DUMMY_ENABLE      Force dummy mode when set to 1/true/on\n"
-        << "  OV_GENAI_QWEN3_5_SAMPLE_MODE       Default mode: text or vl\n"
-        << "  OV_GENAI_QWEN3_5_DUMMY_SEED        Dummy seed\n"
-        << "  OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE  Dummy init range\n"
-        << "  OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE Dummy weight mode (FP32/INT4_ASYM/INT4_SYM)\n"
-        << "  OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE  Dummy quant group size\n"
-        << "  OV_GENAI_QWEN3_5_DUMMY_TEXT_ARCH   Dummy text arch (dense/moe)\n"
-        << "  OV_GENAI_QWEN3_5_VISION_GROUP_SIZE Default --vision-gs\n"
-        << "  OV_GENAI_QWEN3_5_TEXT_GROUP_SIZE   Default --text-gs\n";
+        << "  -h, --help                      Show this helper\n";
 }
 
 SampleOptions parse_cli(int argc, char* argv[]) {
     SampleOptions opts;
-
-    if (const char* env_mode = get_env("OV_GENAI_QWEN3_5_SAMPLE_MODE")) {
-        opts.mode = env_mode;
-    }
-    opts.dummy_seed = read_env_u32("OV_GENAI_QWEN3_5_DUMMY_SEED", opts.dummy_seed);
-    opts.dummy_init_range = read_env_float("OV_GENAI_QWEN3_5_DUMMY_INIT_RANGE", opts.dummy_init_range);
-    if (const char* mode = get_env("OV_GENAI_QWEN3_5_DUMMY_WEIGHT_MODE")) {
-        opts.dummy_weight_mode = mode;
-    }
-    if (const char* arch = get_env("OV_GENAI_QWEN3_5_DUMMY_TEXT_ARCH")) {
-        opts.dummy_text_arch = arch;
-    }
-    opts.dummy_group_size = read_env_i32("OV_GENAI_QWEN3_5_DUMMY_GROUP_SIZE", opts.dummy_group_size);
-    opts.vision_group_size = read_env_i32("OV_GENAI_QWEN3_5_VISION_GROUP_SIZE", opts.vision_group_size);
-    opts.text_group_size = read_env_i32("OV_GENAI_QWEN3_5_TEXT_GROUP_SIZE", opts.text_group_size);
-
-    std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -275,8 +191,7 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             std::exit(0);
         }
         if (arg.rfind("--", 0) != 0) {
-            positional.push_back(arg);
-            continue;
+            throw std::runtime_error("Positional arguments are not supported. Use --help and pass named options.");
         }
 
         auto take_value = [&](const char* option_name) -> std::string {
@@ -349,61 +264,6 @@ SampleOptions parse_cli(int argc, char* argv[]) {
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
-    }
-
-    size_t pos = 0;
-    if (pos < positional.size()) {
-        const std::string first = positional[pos];
-        const bool looks_like_mode = (first == "text" || first == "vl");
-        if (!looks_like_mode && !opts.model_dir.has_value()) {
-            opts.model_dir = first;
-            pos++;
-        }
-    }
-    if (pos < positional.size() && opts.mode.empty()) {
-        const std::string maybe_mode = positional[pos];
-        if (maybe_mode == "text" || maybe_mode == "vl") {
-            opts.mode = maybe_mode;
-            pos++;
-        }
-    }
-    if (pos < positional.size() && opts.mode == "vl" && opts.image_path.empty()) {
-        if (positional[pos] != "-" && std::filesystem::exists(positional[pos])) {
-            opts.image_path = positional[pos];
-            pos++;
-        }
-    }
-    if (pos < positional.size() && opts.user_prompt.empty()) {
-        opts.user_prompt = positional[pos++];
-    }
-    if (pos < positional.size()) {
-        opts.device = positional[pos++];
-    }
-    if (pos < positional.size()) {
-        opts.max_new_tokens = parse_i32(positional[pos++], "MAX_NEW_TOKENS");
-    }
-    if (pos < positional.size() && opts.vision_quant_mode.empty()) {
-        opts.vision_quant_mode = positional[pos++];
-    }
-    if (pos < positional.size()) {
-        opts.vision_group_size = parse_i32(positional[pos++], "VISION_GS");
-    }
-    if (pos < positional.size() && opts.vision_backup_mode.empty()) {
-        opts.vision_backup_mode = positional[pos++];
-    }
-    if (pos < positional.size() && opts.text_quant_mode.empty()) {
-        opts.text_quant_mode = positional[pos++];
-    }
-    if (pos < positional.size()) {
-        opts.text_group_size = parse_i32(positional[pos++], "TEXT_GS");
-    }
-    if (pos < positional.size() && opts.text_backup_mode.empty()) {
-        opts.text_backup_mode = positional[pos++];
-    }
-    if (pos != positional.size()) {
-        std::ostringstream oss;
-        oss << "Too many positional arguments. Unexpected token: " << positional[pos];
-        throw std::runtime_error(oss.str());
     }
 
     if (opts.mode.empty()) {
@@ -659,7 +519,7 @@ int main(int argc, char* argv[]) try {
     const bool use_vl = (opts.mode == "vl");
     const bool use_dummy_mode_flag = use_dummy_mode(opts);
     if (!use_dummy_mode_flag && !opts.model_dir.has_value()) {
-        std::cerr << "Command line error: Real mode requires --model-dir (or legacy MODEL_DIR positional argument)." << '\n' << '\n';
+        std::cerr << "Command line error: Real mode requires --model-dir." << '\n' << '\n';
         print_usage(argv[0]);
         return 1;
     }
