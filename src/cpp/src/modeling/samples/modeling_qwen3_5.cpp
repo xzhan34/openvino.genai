@@ -35,43 +35,24 @@
 
 namespace {
 
-enum class WeightModeSelection {
-    Auto,
-    Dummy,
-    Real,
-};
-
 struct SampleOptions {
     std::optional<std::filesystem::path> model_dir;
     std::string mode;
     std::filesystem::path image_path;
     std::string user_prompt;
-    std::string device = "CPU";
+    std::string device = "GPU";
     int max_new_tokens = 64;
 
     std::string vision_quant_mode;
     int vision_group_size = 128;
-    std::string vision_backup_mode;
     std::string text_quant_mode;
     int text_group_size = 128;
-    std::string text_backup_mode;
 
-    WeightModeSelection weight_mode = WeightModeSelection::Auto;
-
-    uint32_t dummy_seed = 2026u;
-    float dummy_init_range = 0.02f;
+    std::string dummy_model = "dense";
     std::string dummy_weight_mode = "INT4_ASYM";
     int dummy_group_size = 128;
-    std::string dummy_text_arch = "dense";
 
     int dummy_num_layers = 0;
-    int dummy_hidden_size = 0;
-    int dummy_num_heads = 0;
-    int dummy_num_kv_heads = 0;
-    int dummy_head_dim = 0;
-    int dummy_intermediate_size = 0;
-    int dummy_vocab_size = 0;
-    int dummy_max_position_embeddings = 0;
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -89,36 +70,11 @@ bool has_safetensors_file(const std::filesystem::path& model_dir) {
     return false;
 }
 
-bool should_use_dummy_mode(const std::optional<std::filesystem::path>& model_dir) {
-    if (!model_dir.has_value()) {
-        return true;
-    }
-    const bool has_config = std::filesystem::exists(*model_dir / "config.json");
-    const bool has_safetensors = has_safetensors_file(*model_dir);
-    return !(has_config && has_safetensors);
-}
-
 int parse_i32(const std::string& raw, const char* option_name) {
     try {
         return std::stoi(raw);
     } catch (const std::exception&) {
         throw std::runtime_error(std::string("Invalid integer for ") + option_name + ": " + raw);
-    }
-}
-
-uint32_t parse_u32(const std::string& raw, const char* option_name) {
-    try {
-        return static_cast<uint32_t>(std::stoul(raw));
-    } catch (const std::exception&) {
-        throw std::runtime_error(std::string("Invalid unsigned integer for ") + option_name + ": " + raw);
-    }
-}
-
-float parse_f32(const std::string& raw, const char* option_name) {
-    try {
-        return std::stof(raw);
-    } catch (const std::exception&) {
-        throw std::runtime_error(std::string("Invalid float for ") + option_name + ": " + raw);
     }
 }
 
@@ -135,51 +91,48 @@ void print_usage(const char* argv0) {
         << "==================================\n\n"
         << "Overview:\n"
         << "  - Run Qwen3.5 text-only or vision-language generation.\n"
-        << "  - Support dummy weights and real HF safetensors loading.\n"
-        << "  - Dummy mode supports both dense and moe text architectures.\n\n"
+        << "  - If --model is set: load real HF weights from that directory.\n"
+        << "  - If --model is not set: use synthetic dummy weights.\n\n"
         << "Primary Usage:\n"
-        << "  " << argv0 << " --dummy [--mode text|vl] [--prompt TEXT] [--device DEVICE]\n"
-        << "  " << argv0 << " --real --model-dir <MODEL_DIR> [--mode text|vl] [--image IMAGE_PATH]\n\n"
+        << "  " << argv0 << " [--model PATH] [--mode text|vl] [--image IMAGE_PATH] [--prompt TEXT]\n\n"
         << "Examples:\n"
-        << "  1) Dummy dense text:\n"
-        << "     " << argv0 << " --dummy --mode text --dummy-text-arch dense --prompt \"Hello\"\n"
-        << "  2) Dummy moe text:\n"
-        << "     " << argv0 << " --dummy --mode text --dummy-text-arch moe --max-new-tokens 32\n"
-        << "  3) Dummy VL (uses built-in dummy image):\n"
-        << "     " << argv0 << " --dummy --mode vl --prompt \"Describe this image\"\n"
-        << "  4) Real HF text:\n"
-        << "     " << argv0 << " --real --model-dir C:\\models\\Qwen3.5 --mode text\n"
-        << "  5) Real HF VL:\n"
-        << "     " << argv0 << " --real --model-dir C:\\models\\Qwen3.5 --mode vl --image C:\\img\\a.jpg\n\n"
+        << "  1) Dummy text:\n"
+        << "     " << argv0 << " --mode text --prompt \"Hello\"\n"
+        << "  2) Dummy VL (uses built-in 256x256 dummy image):\n"
+        << "     " << argv0 << " --mode vl --dummy-model moe --prompt \"Describe this image\"\n"
+        << "  3) Real HF text:\n"
+        << "     " << argv0 << " --model C:\\models\\Qwen3.5 --mode text\n"
+        << "  4) Real HF VL:\n"
+        << "     " << argv0 << " --model C:\\models\\Qwen3.5 --mode vl --image C:\\img\\a.jpg\n\n"
         << "Options:\n"
-        << "  --dummy                         Force synthetic random weights (no model dir required)\n"
-        << "  --real                          Force real HF safetensors+config loading\n"
-        << "  --model-dir PATH                HF model directory (config.json + *.safetensors)\n"
-        << "  --mode text|vl                  Run text-only or vision-language path\n"
-        << "  --image PATH                    Image path for vl mode (if omitted: built-in dummy image)\n"
+        << "  --model PATH                    HF model directory (config.json + *.safetensors). Omit for dummy weights\n"
+        << "  --mode text|vl                  Run path (default: text)\n"
+        << "  --image PATH                    Image path for vl mode. Required with --model --mode vl\n"
+        << "                                  In dummy vl mode, if omitted, built-in 256x256 dummy image is used\n"
         << "  --prompt TEXT                   User prompt\n"
-        << "  --device NAME                   OpenVINO device name (default: CPU)\n"
-        << "  --max-new-tokens N              Number of generated tokens (default: 64)\n"
-        << "  --vision-quant MODE             Vision quant mode (real mode only)\n"
-        << "  --vision-gs N                   Vision quant group size (real mode only)\n"
-        << "  --vision-backup MODE            Vision backup quant mode (real mode only)\n"
-        << "  --text-quant MODE               Text quant mode (real mode only)\n"
-        << "  --text-gs N                     Text quant group size (real mode only)\n"
-        << "  --text-backup MODE              Text backup quant mode (real mode only)\n"
-        << "  --dummy-seed N                  Synthetic weight RNG seed\n"
-        << "  --dummy-init-range F            Synthetic init range, sampled in [-F, F]\n"
+        << "  --device NAME                   OpenVINO device name (default: GPU)\n"
+        << "  --output-tokens N               Number of generated tokens (default: 64)\n"
+        << "  --vision-quant MODE             Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
+        << "  --vision-gs N                   Real mode only. Vision quant group size, integer > 0 (default: 128)\n"
+        << "  --text-quant MODE               Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
+        << "  --text-gs N                     Real mode only. Text quant group size, integer > 0 (default: 128)\n"
+        << "  --dummy-model MODE              Dummy mode only: dense | moe (default: dense)\n"
         << "  --dummy-weight-mode MODE        FP32 | INT4_ASYM | INT4_SYM (default: INT4_ASYM)\n"
-        << "  --dummy-group-size N            Dummy quant group size\n"
-        << "  --dummy-text-arch MODE          dense | moe (dummy mode only, default: dense)\n"
+        << "  --dummy-group-size N            Dummy quant group size, integer > 0 (default: 128)\n"
         << "  --dummy-num-layers N            Override dummy text num_hidden_layers\n"
-        << "  --dummy-hidden-size N           Override dummy text hidden_size\n"
-        << "  --dummy-num-heads N             Override dummy text num_attention_heads\n"
-        << "  --dummy-num-kv-heads N          Override dummy text num_key_value_heads\n"
-        << "  --dummy-head-dim N              Override dummy text head_dim\n"
-        << "  --dummy-intermediate-size N     Override dummy text intermediate_size\n"
-        << "  --dummy-vocab-size N            Override dummy text vocab_size\n"
-        << "  --dummy-max-position N          Override dummy text max_position_embeddings\n"
         << "  -h, --help                      Show this helper\n";
+}
+
+bool is_valid_quant_mode(std::string mode) {
+    mode = to_lower(std::move(mode));
+    return mode.empty() || mode == "none" || mode == "int4_asym" || mode == "int4_sym";
+}
+
+bool is_valid_dummy_weight_mode(std::string mode) {
+    for (auto& c : mode) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return mode == "FP32" || mode == "INT4_ASYM" || mode == "INT4_SYM" || mode == "INT4";
 }
 
 SampleOptions parse_cli(int argc, char* argv[]) {
@@ -201,18 +154,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             return argv[++i];
         };
 
-        if (arg == "--dummy") {
-            if (opts.weight_mode == WeightModeSelection::Real) {
-                throw std::runtime_error("--dummy conflicts with --real");
-            }
-            opts.weight_mode = WeightModeSelection::Dummy;
-        } else if (arg == "--real") {
-            if (opts.weight_mode == WeightModeSelection::Dummy) {
-                throw std::runtime_error("--real conflicts with --dummy");
-            }
-            opts.weight_mode = WeightModeSelection::Real;
-        } else if (arg == "--model-dir") {
-            opts.model_dir = take_value("--model-dir");
+        if (arg == "--model") {
+            opts.model_dir = take_value("--model");
         } else if (arg == "--mode") {
             opts.mode = take_value("--mode");
         } else if (arg == "--image") {
@@ -221,116 +164,77 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.user_prompt = take_value("--prompt");
         } else if (arg == "--device") {
             opts.device = take_value("--device");
-        } else if (arg == "--max-new-tokens") {
-            opts.max_new_tokens = parse_i32(take_value("--max-new-tokens"), "--max-new-tokens");
+        } else if (arg == "--output-tokens") {
+            opts.max_new_tokens = parse_i32(take_value("--output-tokens"), "--output-tokens");
         } else if (arg == "--vision-quant") {
             opts.vision_quant_mode = take_value("--vision-quant");
         } else if (arg == "--vision-gs") {
             opts.vision_group_size = parse_i32(take_value("--vision-gs"), "--vision-gs");
-        } else if (arg == "--vision-backup") {
-            opts.vision_backup_mode = take_value("--vision-backup");
         } else if (arg == "--text-quant") {
             opts.text_quant_mode = take_value("--text-quant");
         } else if (arg == "--text-gs") {
             opts.text_group_size = parse_i32(take_value("--text-gs"), "--text-gs");
-        } else if (arg == "--text-backup") {
-            opts.text_backup_mode = take_value("--text-backup");
-        } else if (arg == "--dummy-seed") {
-            opts.dummy_seed = parse_u32(take_value("--dummy-seed"), "--dummy-seed");
-        } else if (arg == "--dummy-init-range") {
-            opts.dummy_init_range = parse_f32(take_value("--dummy-init-range"), "--dummy-init-range");
+        } else if (arg == "--dummy-model") {
+            opts.dummy_model = take_value("--dummy-model");
         } else if (arg == "--dummy-weight-mode") {
             opts.dummy_weight_mode = take_value("--dummy-weight-mode");
         } else if (arg == "--dummy-group-size") {
             opts.dummy_group_size = parse_i32(take_value("--dummy-group-size"), "--dummy-group-size");
-        } else if (arg == "--dummy-text-arch") {
-            opts.dummy_text_arch = take_value("--dummy-text-arch");
         } else if (arg == "--dummy-num-layers") {
             opts.dummy_num_layers = parse_i32(take_value("--dummy-num-layers"), "--dummy-num-layers");
-        } else if (arg == "--dummy-hidden-size") {
-            opts.dummy_hidden_size = parse_i32(take_value("--dummy-hidden-size"), "--dummy-hidden-size");
-        } else if (arg == "--dummy-num-heads") {
-            opts.dummy_num_heads = parse_i32(take_value("--dummy-num-heads"), "--dummy-num-heads");
-        } else if (arg == "--dummy-num-kv-heads") {
-            opts.dummy_num_kv_heads = parse_i32(take_value("--dummy-num-kv-heads"), "--dummy-num-kv-heads");
-        } else if (arg == "--dummy-head-dim") {
-            opts.dummy_head_dim = parse_i32(take_value("--dummy-head-dim"), "--dummy-head-dim");
-        } else if (arg == "--dummy-intermediate-size") {
-            opts.dummy_intermediate_size = parse_i32(take_value("--dummy-intermediate-size"), "--dummy-intermediate-size");
-        } else if (arg == "--dummy-vocab-size") {
-            opts.dummy_vocab_size = parse_i32(take_value("--dummy-vocab-size"), "--dummy-vocab-size");
-        } else if (arg == "--dummy-max-position") {
-            opts.dummy_max_position_embeddings = parse_i32(take_value("--dummy-max-position"), "--dummy-max-position");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
     }
 
     if (opts.mode.empty()) {
-        opts.mode = opts.image_path.empty() ? "text" : "vl";
+        opts.mode = "text";
     }
     opts.mode = to_lower(opts.mode);
     if (opts.mode != "text" && opts.mode != "vl") {
         throw std::runtime_error("Mode must be 'text' or 'vl'");
     }
+    opts.dummy_model = to_lower(opts.dummy_model);
+    if (opts.dummy_model != "dense" && opts.dummy_model != "moe") {
+        throw std::runtime_error("dummy-model must be 'dense' or 'moe'");
+    }
+    if (!opts.image_path.empty() && opts.mode != "vl") {
+        throw std::runtime_error("--image can only be used with --mode vl");
+    }
 
     if (opts.max_new_tokens <= 0) {
         throw std::runtime_error("max_new_tokens must be > 0");
     }
+    if (opts.vision_group_size <= 0) {
+        throw std::runtime_error("vision-gs must be > 0");
+    }
+    if (opts.text_group_size <= 0) {
+        throw std::runtime_error("text-gs must be > 0");
+    }
+    if (opts.dummy_group_size <= 0) {
+        throw std::runtime_error("dummy-group-size must be > 0");
+    }
+    if (!is_valid_quant_mode(opts.vision_quant_mode)) {
+        throw std::runtime_error("vision-quant must be one of: none|int4_asym|int4_sym");
+    }
+    if (!is_valid_quant_mode(opts.text_quant_mode)) {
+        throw std::runtime_error("text-quant must be one of: none|int4_asym|int4_sym");
+    }
+    if (!is_valid_dummy_weight_mode(opts.dummy_weight_mode)) {
+        throw std::runtime_error("dummy-weight-mode must be one of: FP32|INT4_ASYM|INT4_SYM");
+    }
     if (opts.user_prompt.empty()) {
         opts.user_prompt = (opts.mode == "vl") ? "Describe the image." : "Write one sentence about OpenVINO.";
-    }
-    opts.dummy_text_arch = to_lower(opts.dummy_text_arch);
-    if (opts.dummy_text_arch != "dense" && opts.dummy_text_arch != "moe") {
-        throw std::runtime_error("dummy-text-arch must be 'dense' or 'moe'");
     }
 
     return opts;
 }
 
-bool use_dummy_mode(const SampleOptions& opts) {
-    switch (opts.weight_mode) {
-    case WeightModeSelection::Dummy:
-        return true;
-    case WeightModeSelection::Real:
-        return false;
-    case WeightModeSelection::Auto:
-        return should_use_dummy_mode(opts.model_dir);
-    }
-    return should_use_dummy_mode(opts.model_dir);
-}
-
 void apply_dummy_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cfg, const SampleOptions& opts) {
     bool layer_schedule_needs_refresh = false;
-    bool hidden_size_changed = false;
     if (opts.dummy_num_layers > 0) {
         cfg.text.num_hidden_layers = opts.dummy_num_layers;
         layer_schedule_needs_refresh = true;
-    }
-    if (opts.dummy_hidden_size > 0) {
-        cfg.text.hidden_size = opts.dummy_hidden_size;
-        hidden_size_changed = true;
-    }
-    if (opts.dummy_num_heads > 0) {
-        cfg.text.num_attention_heads = opts.dummy_num_heads;
-    }
-    if (opts.dummy_num_kv_heads > 0) {
-        cfg.text.num_key_value_heads = opts.dummy_num_kv_heads;
-    }
-    if (opts.dummy_head_dim > 0) {
-        cfg.text.head_dim = opts.dummy_head_dim;
-    }
-    if (!cfg.text.is_moe_enabled() && opts.dummy_intermediate_size > 0) {
-        cfg.text.intermediate_size = opts.dummy_intermediate_size;
-    }
-    if (opts.dummy_vocab_size > 0) {
-        cfg.text.vocab_size = opts.dummy_vocab_size;
-    }
-    if (opts.dummy_max_position_embeddings > 0) {
-        cfg.text.max_position_embeddings = opts.dummy_max_position_embeddings;
-    }
-    if (hidden_size_changed) {
-        cfg.vision.out_hidden_size = cfg.text.hidden_size;
     }
     if (layer_schedule_needs_refresh) {
         cfg.text.layer_types.clear();
@@ -476,7 +380,7 @@ std::pair<ov::Tensor, ov::Tensor> to_batch_tensors(const std::vector<int64_t>& i
 }
 
 ov::Tensor make_dummy_image() {
-    ov::Tensor image(ov::element::u8, {1, 224, 224, 3});
+    ov::Tensor image(ov::element::u8, {1, 256, 256, 3});
     std::memset(image.data(), 127, image.get_byte_size());
     return image;
 }
@@ -507,6 +411,11 @@ ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config(const 
 }  // namespace
 
 int main(int argc, char* argv[]) try {
+    if (argc == 1) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
     SampleOptions opts;
     try {
         opts = parse_cli(argc, argv);
@@ -517,13 +426,28 @@ int main(int argc, char* argv[]) try {
     }
 
     const bool use_vl = (opts.mode == "vl");
-    const bool use_dummy_mode_flag = use_dummy_mode(opts);
-    if (!use_dummy_mode_flag && !opts.model_dir.has_value()) {
-        std::cerr << "Command line error: Real mode requires --model-dir." << '\n' << '\n';
+    const bool use_dummy_mode_flag = !opts.model_dir.has_value();
+    if (!use_dummy_mode_flag && use_vl && opts.image_path.empty()) {
+        std::cerr << "Command line error: Real weights + --mode vl requires --image PATH." << '\n' << '\n';
         print_usage(argv[0]);
         return 1;
     }
     const std::filesystem::path model_dir = opts.model_dir.value_or(std::filesystem::path{});
+    if (!use_dummy_mode_flag) {
+        if (!std::filesystem::exists(model_dir) || !std::filesystem::is_directory(model_dir)) {
+            std::cerr << "Command line error: --model must point to an existing directory." << '\n' << '\n';
+            print_usage(argv[0]);
+            return 1;
+        }
+        const bool has_config = std::filesystem::exists(model_dir / "config.json");
+        if (!has_config || !has_safetensors_file(model_dir)) {
+            std::cerr << "Command line error: --model must contain config.json and at least one *.safetensors file."
+                      << '\n'
+                      << '\n';
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
     if (use_vl && !opts.image_path.empty() && !std::filesystem::exists(opts.image_path)) {
         std::cerr << "Command line error: Image path does not exist: " << opts.image_path.string() << '\n' << '\n';
         print_usage(argv[0]);
@@ -532,7 +456,7 @@ int main(int argc, char* argv[]) try {
 
     ov::genai::modeling::models::Qwen3_5Config cfg;
     if (use_dummy_mode_flag) {
-        cfg = (opts.dummy_text_arch == "moe")
+        cfg = (opts.dummy_model == "moe")
                   ? ov::genai::modeling::models::Qwen3_5Config::make_dummy_moe35b_config()
                   : ov::genai::modeling::models::Qwen3_5Config::make_dummy_dense9b_config();
     } else {
@@ -549,21 +473,21 @@ int main(int argc, char* argv[]) try {
         vision_quant_config = dummy_quant;
         text_quant_config = dummy_quant;
     } else {
-        vision_quant_config = create_quantization_config(opts.vision_quant_mode, opts.vision_group_size, opts.vision_backup_mode);
-        text_quant_config = create_quantization_config(opts.text_quant_mode, opts.text_group_size, opts.text_backup_mode);
+        vision_quant_config = create_quantization_config(opts.vision_quant_mode, opts.vision_group_size, "none");
+        text_quant_config = create_quantization_config(opts.text_quant_mode, opts.text_group_size, "none");
     }
 
     std::unique_ptr<ov::genai::modeling::weights::WeightSource> source;
     if (use_dummy_mode_flag) {
-        const uint32_t seed = opts.dummy_seed;
-        const float init_range = opts.dummy_init_range;
+        constexpr uint32_t kDummySeed = 2026u;
+        constexpr float kDummyInitRange = 0.02f;
         auto specs = use_vl ? ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg)
                             : ov::genai::modeling::models::build_qwen3_5_text_weight_specs(cfg.text);
         source = std::make_unique<ov::genai::modeling::weights::SyntheticWeightSource>(
             std::move(specs),
-            seed,
-            -init_range,
-            init_range);
+            kDummySeed,
+            -kDummyInitRange,
+            kDummyInitRange);
     } else {
         auto data = ov::genai::safetensors::load_safetensors(model_dir);
         source = std::make_unique<ov::genai::safetensors::SafetensorsWeightSource>(std::move(data));
