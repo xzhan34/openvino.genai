@@ -205,6 +205,35 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
     auto gate_exps_zps = ops::convert(gate_exps_zps_u8, ov::element::u4);
     auto up_exps_zps = ops::convert(up_exps_zps_u8, ov::element::u4);
 
+    auto* op_ctx = flat_f32.context();
+    auto sh_gate_w = shared_gate_proj_weight();
+    auto sh_up_w = shared_up_proj_weight();
+    auto sh_down_w = shared_down_proj_weight();
+    auto sh_gate_gate_w = shared_expert_gate_weight();
+
+    auto reshape_to_4d = [&](const Tensor& t) {
+        return t.unsqueeze(0).unsqueeze(2);
+    };
+
+    auto make_dummy = [&](int32_t dim_size, float val) {
+        auto shp = ops::const_vec(op_ctx, std::vector<int64_t>{1, dim_size, 1, 1});
+        auto scalar = ops::const_scalar(op_ctx, val);
+        auto bc = std::make_shared<ov::op::v3::Broadcast>(scalar.output(), shp.output());
+        return Tensor(bc, op_ctx);
+    };
+
+    auto sh_gate_4d = reshape_to_4d(sh_gate_w);
+    auto sh_up_4d = reshape_to_4d(sh_up_w);
+    auto sh_down_4d = reshape_to_4d(sh_down_w);
+    auto sh_gate_gate_1d = sh_gate_gate_w.reshape({-1});
+
+    auto sh_gate_s = make_dummy(shared_intermediate_size_, 1.0f);
+    auto sh_gate_z = make_dummy(shared_intermediate_size_, 0.0f);
+    auto sh_up_s = make_dummy(shared_intermediate_size_, 1.0f);
+    auto sh_up_z = make_dummy(shared_intermediate_size_, 0.0f);
+    auto sh_down_s = make_dummy(hidden_size_, 1.0f);
+    auto sh_down_z = make_dummy(hidden_size_, 0.0f);
+
     return ops::moe3gemm_fused_compressed(flat_f32,
                                           gate_weight(),
                                           gate_exps_w,
@@ -216,6 +245,16 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
                                           down_w,
                                           *down_scales_,
                                           *down_zps_,
+                                          sh_gate_4d,
+                                          sh_gate_s,
+                                          sh_gate_z,
+                                          sh_up_4d,
+                                          sh_up_s,
+                                          sh_up_z,
+                                          sh_down_4d,
+                                          sh_down_s,
+                                          sh_down_z,
+                                          sh_gate_gate_1d,
                                           hidden_size_,
                                           expert_intermediate_size_,
                                           num_experts_,
@@ -307,7 +346,13 @@ Tensor Qwen3_5SparseMoeBlock::forward(const Tensor& hidden_states) const {
     auto flat = hidden_states.reshape({-1, hidden_size_});
     auto flat_f32 = flat.to(ov::element::f32);
 
-    auto routed_out = can_use_fused_path() ? routed_fused(flat_f32) : routed_fallback(flat_f32);
+    if (can_use_fused_path()) {
+        auto fused_out = routed_fused(flat_f32);
+        auto restored = fused_out.reshape(shape::of(hidden_states), false);
+        return restored.to(input_dtype);
+    }
+
+    auto routed_out = routed_fallback(flat_f32);
 
     auto shared_gate = ops::linear(flat_f32, shared_gate_proj_weight().to(ov::element::f32));
     auto shared_up = ops::linear(flat_f32, shared_up_proj_weight().to(ov::element::f32));
