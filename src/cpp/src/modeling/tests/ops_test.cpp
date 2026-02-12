@@ -464,3 +464,168 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
     
     auto gate_inp_deq = test_utils::dequantize_q41(q_gate_inp, num_experts, 1, hidden_size);
 }
+
+TEST(Ops, Moe3GemmFusedCompressedWithSharedExperts) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    constexpr size_t batch = 1;
+    constexpr size_t seq_len = 16;
+    constexpr size_t hidden_size = 1024;
+    constexpr size_t inter_size = 2048;
+    constexpr size_t shared_inter_size = 1024;
+    constexpr size_t num_experts = 8;
+    constexpr size_t top_k = 4;
+    constexpr size_t group_size = 128;
+
+    static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
+    static_assert(inter_size % group_size == 0, "inter_size must be divisible by group_size");
+    static_assert(shared_inter_size % group_size == 0, "shared_inter_size must be divisible by group_size");
+
+    const size_t tokens = batch * seq_len;
+    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{tokens, hidden_size});
+
+    auto hidden_states = test_utils::random_f32(tokens * hidden_size, -0.5f, 0.5f, 11);
+    auto gate_inp = test_utils::random_f32(num_experts * hidden_size, -0.5f, 0.5f, 23);
+
+    auto gate_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 31);
+    auto up_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 37);
+    auto down_w_f32 = test_utils::random_f32(num_experts * hidden_size * inter_size, -0.5f, 0.5f, 41);
+
+    auto shared_gate_w_f32 = test_utils::random_f32(1 * shared_inter_size * hidden_size, -0.5f, 0.5f, 51);
+    auto shared_up_w_f32 = test_utils::random_f32(1 * shared_inter_size * hidden_size, -0.5f, 0.5f, 52);
+    auto shared_down_w_f32 = test_utils::random_f32(1 * hidden_size * shared_inter_size, -0.5f, 0.5f, 53);
+
+    auto q_gate = test_utils::quantize_q41(gate_w_f32, num_experts, inter_size, hidden_size, group_size);
+    auto q_up = test_utils::quantize_q41(up_w_f32, num_experts, inter_size, hidden_size, group_size);
+    auto q_down = test_utils::quantize_q41(down_w_f32, num_experts, hidden_size, inter_size, group_size);
+
+    auto q_shared_gate = test_utils::quantize_q41(shared_gate_w_f32, 1, shared_inter_size, hidden_size, group_size);
+    auto q_shared_up = test_utils::quantize_q41(shared_up_w_f32, 1, shared_inter_size, hidden_size, group_size);
+    auto q_shared_down = test_utils::quantize_q41(shared_down_w_f32, 1, hidden_size, shared_inter_size, group_size);
+
+    auto gate_w_deq = test_utils::dequantize_q41(q_gate, num_experts, inter_size, hidden_size);
+    auto up_w_deq = test_utils::dequantize_q41(q_up, num_experts, inter_size, hidden_size);
+    auto down_w_deq = test_utils::dequantize_q41(q_down, num_experts, hidden_size, inter_size);
+
+    auto shared_gate_w_deq = test_utils::dequantize_q41(q_shared_gate, 1, shared_inter_size, hidden_size);
+    auto shared_up_w_deq = test_utils::dequantize_q41(q_shared_up, 1, shared_inter_size, hidden_size);
+    auto shared_down_w_deq = test_utils::dequantize_q41(q_shared_down, 1, hidden_size, shared_inter_size);
+
+    auto* op_ctx = &ctx.op_context();
+    auto gate_inp_tensor = test_utils::make_tensor(gate_inp, {num_experts, hidden_size});
+
+    auto gate_inp_const = ov::genai::modeling::ops::constant(gate_inp_tensor, op_ctx);
+    auto gate_exps_weight = ov::genai::modeling::ops::constant(q_gate.weights_u4, op_ctx);
+    auto gate_exps_scales = ov::genai::modeling::ops::constant(q_gate.scales_f16, op_ctx);
+    auto gate_exps_zps = ov::genai::modeling::ops::constant(q_gate.zps_u4, op_ctx);
+    auto up_exps_weight = ov::genai::modeling::ops::constant(q_up.weights_u4, op_ctx);
+    auto up_exps_scales = ov::genai::modeling::ops::constant(q_up.scales_f16, op_ctx);
+    auto up_exps_zps = ov::genai::modeling::ops::constant(q_up.zps_u4, op_ctx);
+    auto down_exps_weight = ov::genai::modeling::ops::constant(q_down.weights_u4, op_ctx);
+    auto down_exps_scales = ov::genai::modeling::ops::constant(q_down.scales_f16, op_ctx);
+    auto down_exps_zps = ov::genai::modeling::ops::constant(q_down.zps_u4, op_ctx);
+
+    // Prepare Shared Tensors (Need to be unsqueezed/formatted for Op if necessary, but op takes what quantize gives usually)
+    // IMPORTANT: moe3gemm_fused_compressed expects explicit tensors for shared experts.
+    // Assuming 2D layout from quantize_q41 is acceptable or we need to reshape.
+    // In Qwen3_5 code, we saw `unsqueeze(0)` being applied to `scales`/`zps` to make them 3D [1, Group, Output] etc.
+    // But `constants` below will just wrap the shape from `quantize`.
+    // q_shared_gate.scales_f16 shape is [N, G] = [inter, G].
+    // If we want [1, N, G], we need reshape.
+    // However, `constant` op takes shape from tensor unless reshaped.
+    // Let's pass them as is. If the kernel implementation is robust, it might handle 2D. 
+    // If not, we might need explicitly reshape constants. 
+    // The previous code simplification for Qwen3.5 removed explicit Reshapes, relying on loader.
+    // Here we are creating constants directly.
+    // Let's wrap them in `unsqueeze` like Qwen3.5 code does, BUT we can't efficiently call `ops::unsqueeze` inside test setup easily without creating nodes.
+    // We can just reshape the `ov::Tensor` itself.
+    
+    // Actually, `ops::constant` copies data. We can reshape the passed tensor BEFORE creating constant.
+    // q_shared_gate.weights_u4 is [inter, hidden] (conceptually) or [inter, k_packed].
+    // We want [1, inter, k_packed].
+    
+    auto shared_gate_weight = ov::genai::modeling::ops::constant(q_shared_gate.weights_u4, op_ctx);
+    auto shared_gate_scales = ov::genai::modeling::ops::constant(q_shared_gate.scales_f16, op_ctx);
+    auto shared_gate_zps = ov::genai::modeling::ops::constant(q_shared_gate.zps_u4, op_ctx);
+    auto shared_up_weight = ov::genai::modeling::ops::constant(q_shared_up.weights_u4, op_ctx);
+    auto shared_up_scales = ov::genai::modeling::ops::constant(q_shared_up.scales_f16, op_ctx);
+    auto shared_up_zps = ov::genai::modeling::ops::constant(q_shared_up.zps_u4, op_ctx);
+    auto shared_down_weight = ov::genai::modeling::ops::constant(q_shared_down.weights_u4, op_ctx);
+    auto shared_down_scales = ov::genai::modeling::ops::constant(q_shared_down.scales_f16, op_ctx);
+    auto shared_down_zps = ov::genai::modeling::ops::constant(q_shared_down.zps_u4, op_ctx);
+
+    auto out = ov::genai::modeling::ops::moe3gemm_fused_compressed(
+        hidden_param,
+        gate_inp_const,
+        gate_exps_weight,
+        gate_exps_scales,
+        gate_exps_zps,
+        up_exps_weight,
+        up_exps_scales,
+        up_exps_zps,
+        down_exps_weight,
+        down_exps_scales,
+        down_exps_zps,
+        static_cast<int32_t>(hidden_size),
+        static_cast<int32_t>(inter_size),
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(top_k),
+        static_cast<int32_t>(group_size),
+        ov::element::f16,
+        shared_gate_weight,
+        shared_gate_scales,
+        shared_gate_zps,
+        shared_up_weight,
+        shared_up_scales,
+        shared_up_zps,
+        shared_down_weight,
+        shared_down_scales,
+        shared_down_zps,
+        ov::genai::modeling::Tensor{});
+
+    auto model = ctx.build_model({out.output()});
+
+    ov::Core core;
+    auto compiled = core.compile_model(model, "GPU");
+    auto request = compiled.create_infer_request();
+
+    auto hidden_tensor = test_utils::make_tensor(hidden_states, {tokens, hidden_size});
+    request.set_input_tensor(0, hidden_tensor);
+    request.infer();
+
+    auto expected_sparse = test_utils::moe_ref(hidden_states,
+                                        gate_inp,
+                                        gate_w_deq,
+                                        up_w_deq,
+                                        down_w_deq,
+                                        batch,
+                                        seq_len,
+                                        hidden_size,
+                                        inter_size,
+                                        num_experts,
+                                        top_k);
+    
+    std::vector<float> shared_gate_inp_dummy(1 * hidden_size, 0.0f); // all zeros will effectively be same as 1.0 (after softmax on 1 elem)? No exp(0)=1. 
+    // moe_ref computes logits = x @ gate_inp. 
+    // topk_softmax: max=log, sum=exp(log-max)=1. weights=1/1=1. 
+    // So gate weight is 1.0. Correct.
+
+    auto expected_shared = test_utils::moe_ref(hidden_states,
+                                        shared_gate_inp_dummy,
+                                        shared_gate_w_deq,
+                                        shared_up_w_deq,
+                                        shared_down_w_deq,
+                                        batch,
+                                        seq_len,
+                                        hidden_size,
+                                        shared_inter_size,
+                                        1, // num_experts
+                                        1); // top_k
+                                        
+    std::vector<float> expected(expected_sparse.size());
+    for(size_t i=0; i<expected.size(); ++i) {
+        expected[i] = expected_sparse[i] + expected_shared[i];
+    }
+                                        
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
+}

@@ -129,6 +129,12 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& down_exps_weight,
                                  const Tensor& down_exps_scales,
                                  const Tensor& down_exps_zps,
+                                 int32_t hidden_size,
+                                 int32_t inter_size,
+                                 int32_t num_experts,
+                                 int32_t top_k,
+                                 size_t group_size,
+                                 const ov::element::Type& out_type,
                                  const Tensor& shared_gate_weight,
                                  const Tensor& shared_gate_scales,
                                  const Tensor& shared_gate_zps,
@@ -138,13 +144,7 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& shared_down_weight,
                                  const Tensor& shared_down_scales,
                                  const Tensor& shared_down_zps,
-                                 const Tensor& shared_gate_gate_weight,
-                                 int32_t hidden_size,
-                                 int32_t inter_size,
-                                 int32_t num_experts,
-                                 int32_t top_k,
-                                 size_t group_size,
-                                 const ov::element::Type& out_type) {
+                                 const Tensor& shared_gate_gate_weight) {
     auto* ctx = input.context();
     auto router = matmul(input, gate_inp_weight, false, true);
     auto hidden_f16 = input.to(ov::element::f16);
