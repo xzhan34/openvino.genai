@@ -129,6 +129,16 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& down_exps_weight,
                                  const Tensor& down_exps_scales,
                                  const Tensor& down_exps_zps,
+                                 const Tensor& shared_gate_weight,
+                                 const Tensor& shared_gate_scales,
+                                 const Tensor& shared_gate_zps,
+                                 const Tensor& shared_up_weight,
+                                 const Tensor& shared_up_scales,
+                                 const Tensor& shared_up_zps,
+                                 const Tensor& shared_down_weight,
+                                 const Tensor& shared_down_scales,
+                                 const Tensor& shared_down_zps,
+                                 const Tensor& shared_gate_gate_weight,
                                  int32_t hidden_size,
                                  int32_t inter_size,
                                  int32_t num_experts,
@@ -160,6 +170,20 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
         down_exps_scales.output(),
         down_exps_zps.output()
     };
+
+    if (shared_gate_weight.context()) {
+        args.push_back(shared_gate_weight.output());
+        args.push_back(shared_gate_scales.output());
+        args.push_back(shared_gate_zps.output());
+        args.push_back(shared_up_weight.output());
+        args.push_back(shared_up_scales.output());
+        args.push_back(shared_up_zps.output());
+        args.push_back(shared_down_weight.output());
+        args.push_back(shared_down_scales.output());
+        args.push_back(shared_down_zps.output());
+        args.push_back(shared_gate_gate_weight.output());
+    }
+
     auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
     auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
     return Tensor(moe_f32, ctx);
