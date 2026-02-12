@@ -169,7 +169,8 @@ bool Qwen3_5SparseMoeBlock::can_use_fused_path() const {
     // Current gate_up split relies on StridedSlice over low-bit packed constants (u4/i4).
     // That path crashes during ConstantFolding on GPU in this branch.
     // Keep fused path disabled until packed split is implemented without low-bit StridedSlice.
-    return false;
+    // convert to u8 to split.
+    return true;
 }
 
 size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
@@ -184,13 +185,25 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
     auto gate_up_w = gate_up_expert_weights();
     auto down_w = down_expert_weights();
 
-    auto gate_exps_w = ops::slice(gate_up_w, 0, expert_intermediate_size_, 1, 1);
-    auto up_exps_w = ops::slice(gate_up_w, expert_intermediate_size_, 2 * expert_intermediate_size_, 1, 1);
+    auto gate_up_w_u8 = ops::convert(gate_up_w, ov::element::u8);
 
-    auto gate_exps_scales = ops::slice(*gate_up_scales_, 0, expert_intermediate_size_, 1, 2);
-    auto gate_exps_zps = ops::slice(*gate_up_zps_, 0, expert_intermediate_size_, 1, 2);
-    auto up_exps_scales = ops::slice(*gate_up_scales_, expert_intermediate_size_, 2 * expert_intermediate_size_, 1, 2);
-    auto up_exps_zps = ops::slice(*gate_up_zps_, expert_intermediate_size_, 2 * expert_intermediate_size_, 1, 2);
+    auto split = ops::split(gate_up_w_u8, 2, 1);
+    auto gate_exps_w_u8 = split.first;
+    auto up_exps_w_u8 = split.second;
+    auto gate_exps_w = ops::convert(gate_exps_w_u8, ov::element::u4);
+    auto up_exps_w = ops::convert(up_exps_w_u8, ov::element::u4);
+
+    // scale no need convert
+    auto split_scale = ops::split(*gate_up_scales_, 2, 2);
+    auto gate_exps_scales = split_scale.first;
+    auto up_exps_scales = split_scale.second;
+
+    auto split_zp_u8 = ops::convert(*gate_up_zps_, ov::element::u8);
+    auto split_zp = ops::split(split_zp_u8, 2, 2);
+    auto gate_exps_zps_u8 = split_zp.first;
+    auto up_exps_zps_u8 = split_zp.second;
+    auto gate_exps_zps = ops::convert(gate_exps_zps_u8, ov::element::u4);
+    auto up_exps_zps = ops::convert(up_exps_zps_u8, ov::element::u4);
 
     return ops::moe3gemm_fused_compressed(flat_f32,
                                           gate_weight(),

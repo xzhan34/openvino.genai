@@ -290,6 +290,23 @@ Tensor reduce_sum(const Tensor& x, const std::vector<int64_t>& axes, bool keepdi
     return Tensor(node, ctx);
 }
 
+std::pair<Tensor, Tensor> split(const Tensor& data, int64_t num_splits, int32_t axis) {
+    if (num_splits <= 0) {
+        OPENVINO_THROW("ops::split: num_splits must be > 0");
+    }
+    auto* ctx = data.context();
+    auto axis_node = const_scalar(ctx, static_cast<int32_t>(axis));
+    auto node = std::make_shared<ov::op::v1::Split>(data.output(), axis_node, static_cast<size_t>(num_splits));
+
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
+}
+
+Tensor convert(const Tensor& x, const ov::element::Type& dst_type) {
+    auto* ctx = x.context();
+    auto node = std::make_shared<ov::op::v0::Convert>(x.output(), dst_type);
+    return Tensor(node, ctx);
+}
+
 }  // namespace ops
 }  // namespace modeling
 }  // namespace genai

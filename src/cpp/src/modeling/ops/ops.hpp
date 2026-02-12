@@ -57,6 +57,8 @@ Tensor less_equal(const Tensor& a, const Tensor& b);
 Tensor where(const Tensor& cond, const Tensor& then_value, const Tensor& else_value);
 Tensor concat(const std::vector<Tensor>& xs, int64_t axis);
 Tensor rms(const Tensor& x, const Tensor& weight, float eps);
+std::pair<Tensor, Tensor> split(const Tensor& data, int64_t num_splits, int32_t axis);
+Tensor convert(const Tensor& x, const ov::element::Type& dst_type);
 
 // Trigonometric operations (for SnakeBeta activation)
 Tensor sin(const Tensor& x);
