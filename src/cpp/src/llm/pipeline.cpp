@@ -34,10 +34,10 @@ bool is_hybrid_attention_model(const std::filesystem::path& models_path) {
         // Check model_type field for known hybrid attention models
         if (config.contains("model_type")) {
             std::string model_type = config["model_type"].get<std::string>();
-            // qwen3_next uses hybrid attention (linear attention + full attention)
-            // These models have non-KV-cache states that use beam_idx for reordering,
+            // These models use hybrid attention (linear attention + full attention)
+            // and have non-KV-cache states that use beam_idx for reordering,
             // which SDPAToPagedAttention cannot handle.
-            if (model_type == "qwen3_next") {
+            if (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5") {
                 return true;
             }
         }

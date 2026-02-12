@@ -37,6 +37,8 @@
 #include "modeling/models/qwen3_next/modeling_qwen3_next.hpp"
 #include "modeling/models/smollm3/modeling_smollm3.hpp"
 #include "modeling/models/youtu/modeling_youtu.hpp"
+#include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
 #include "modeling/weights/quantization_config.hpp"
 
 using namespace ov;
@@ -543,7 +545,8 @@ std::map<std::string, GGUFMetaData> convert_config_to_gguf_format(const HFConfig
 std::shared_ptr<ov::Model> create_model_with_modeling_api(
     const HFConfig& hf_config,
     SafetensorsData& st_data,
-    const ov::genai::modeling::weights::QuantizationConfig& quant_config) {
+    const ov::genai::modeling::weights::QuantizationConfig& quant_config,
+    const std::filesystem::path& model_dir) {
     // Create weight source
     SafetensorsWeightSource source(st_data);
     SafetensorsWeightFinalizer finalizer(quant_config);
@@ -653,6 +656,12 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.mlp_bias = has_key("model.layers[0].mlp.gate_proj.bias");
         cfg.tie_word_embeddings = !has_key("lm_head.weight");
         ov_model = ov::genai::modeling::models::create_youtu_llm_model(cfg, source, finalizer);
+    } else if (hf_config.model_type == "qwen3_5_moe" || hf_config.model_type == "qwen3_5") {
+        // Parse Qwen3.5 config from the model directory
+        auto qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
+        // Create the text model (no visual inputs for greedy_causal_lm)
+        ov_model = ov::genai::modeling::models::create_qwen3_5_text_model(
+            qwen35_cfg, source, finalizer, false, false);
     } else {
         throw std::runtime_error("Unsupported model architecture '" + hf_config.model_type + "'");
     }
@@ -977,11 +986,13 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    const bool force_modeling_api = (model_type == "qwen3_next");
-    if (((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "qwen3_next" || model_type == "smollm3" || model_type == "youtu_llm") &&
+    const bool force_modeling_api = (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5");
+    if (((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "qwen3_next" || 
+          model_type == "qwen3_5_moe" || model_type == "qwen3_5" ||
+          model_type == "smollm3" || model_type == "youtu_llm") &&
          (use_modeling_api() || force_modeling_api))) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
-        model = create_model_with_modeling_api(config, st_data, final_quant_config);
+        model = create_model_with_modeling_api(config, st_data, final_quant_config, model_dir);
     } else if (model_type == "llama" || model_type == "qwen2" || model_type == "qwen3" || 
                model_type == "mistral" || model_type == "mixtral") {
         std::cout << "[Safetensors] Using legacy building_blocks" << std::endl;
