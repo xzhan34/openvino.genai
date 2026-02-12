@@ -577,21 +577,45 @@ int main(int argc, char* argv[]) try {
 
     ov::Tensor input_ids;
     ov::Tensor attention_mask;
+    bool use_dummy_tokenization = !tokenizer;
     if (tokenizer) {
-        std::string prompt;
-        if (use_vl) {
-            const int64_t image_tokens =
-                ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
-                    grid_thw,
-                    cfg.vision.spatial_merge_size);
-            prompt = build_vl_prompt(opts.user_prompt, image_tokens);
-        } else {
-            prompt = opts.user_prompt;
+        try {
+            std::string prompt;
+            if (use_vl) {
+                const int64_t image_tokens =
+                    ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+                        grid_thw,
+                        cfg.vision.spatial_merge_size);
+                prompt = build_vl_prompt(opts.user_prompt, image_tokens);
+            } else {
+                prompt = opts.user_prompt;
+            }
+            auto tokenized = tokenizer->encode(prompt, ov::genai::add_special_tokens(false));
+            input_ids = tokenized.input_ids;
+            attention_mask = tokenized.attention_mask;
+            
+            // For VL mode, verify token IDs match config - fall back to dummy if mismatch
+            if (use_vl) {
+                const int64_t* ids = input_ids.data<const int64_t>();
+                size_t img_tok_count = 0;
+                for (size_t i = 0; i < input_ids.get_shape()[1]; ++i) {
+                    if (ids[i] == cfg.image_token_id) img_tok_count++;
+                }
+                if (img_tok_count == 0) {
+                    std::cerr << "Tokenizer image_token_id mismatch (expected " << cfg.image_token_id 
+                              << " but none found in input_ids)" << std::endl;
+                    std::cerr << "Falling back to dummy tokenization for VL mode..." << std::endl;
+                    use_dummy_tokenization = true;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Tokenizer encode failed: " << e.what() << std::endl;
+            std::cerr << "Falling back to dummy tokenization..." << std::endl;
+            use_dummy_tokenization = true;
+            tokenizer.reset();
         }
-        auto tokenized = tokenizer->encode(prompt, ov::genai::add_special_tokens(false));
-        input_ids = tokenized.input_ids;
-        attention_mask = tokenized.attention_mask;
-    } else {
+    }
+    if (use_dummy_tokenization) {
         const int64_t image_tokens = use_vl
                                          ? ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
                                                grid_thw,
