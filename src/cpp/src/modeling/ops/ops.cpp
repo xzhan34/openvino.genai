@@ -113,7 +113,9 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
         }
     }
 
-    ov::OutputVector args = {q.output(), k.output(), v.output(), beta.output(), g.output(), initial_state.output()};
+    // Note: the OCL kernel expects input[3]=g, input[4]=beta (swapped relative to
+    // the C++ API parameter order), so we pass g before beta here.
+    ov::OutputVector args = {q.output(), k.output(), v.output(), g.output(), beta.output(), initial_state.output()};
     auto node = std::make_shared<ov::op::LinearAttention>(args);
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
