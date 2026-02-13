@@ -305,7 +305,7 @@ public:
 private:
     std::string layer_type_;
     std::unique_ptr<Qwen3NextAttention> self_attn_;
-    std::unique_ptr<Qwen3NextGatedDeltaNet> linear_attn_;
+    std::unique_ptr<Qwen3NextGatedDeltaNet2> linear_attn_;
     std::unique_ptr<Qwen3NextMLP> dense_mlp_;
     std::unique_ptr<Qwen3NextSparseMoeBlock> moe_mlp_;
     Qwen3NextRMSNorm input_layernorm_;
