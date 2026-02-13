@@ -608,34 +608,23 @@ Tensor Qwen3NextSparseMoeBlock::forward(const Tensor& hidden_states) const {
     auto sh_up_w = shared_up_proj_weight();
     auto sh_down_w = shared_down_proj_weight();
     auto sh_gate_gate_w = shared_expert_gate_weight();
+    auto sh_gate_scales = shared_gate_scales_.value();
+    auto sh_gate_zps = shared_gate_zps_.value();
+    auto sh_up_scales = shared_up_scales_.value();
+    auto sh_up_zps = shared_up_zps_.value();
+    auto sh_down_scales = shared_down_scales_.value();
+    auto sh_down_zps = shared_down_zps_.value();
 
-    auto reshape_to_4d = [&](const Tensor& t) {
-        return t.unsqueeze(0);
-    };
-
-    sh_gate_4d = reshape_to_4d(sh_gate_w);
-    sh_up_4d = reshape_to_4d(sh_up_w);
-    sh_down_4d = reshape_to_4d(sh_down_w);
-    sh_gate_gate_1d = sh_gate_gate_w.reshape({-1});
-
-    sh_gate_s = shared_gate_scales_->unsqueeze(0);
-    sh_gate_z = shared_gate_zps_->unsqueeze(0);
-    sh_up_s = shared_up_scales_->unsqueeze(0);
-    sh_up_z = shared_up_zps_->unsqueeze(0);
-    sh_down_s = shared_down_scales_->unsqueeze(0);
-    sh_down_z = shared_down_zps_->unsqueeze(0);
-
-    std::cout << "sh_gate_4d shape: " << sh_gate_4d.output().get_shape() << ", dtype: " << sh_gate_4d.dtype() << std::endl;
-    std::cout << "sh_gate_s shape: " << sh_gate_s.output().get_shape() << ", dtype: " << sh_gate_s.dtype() << std::endl;
-    std::cout << "sh_gate_z shape: " << sh_gate_z.output().get_shape() << ", dtype: " << sh_gate_z.dtype() << std::endl;
-    std::cout << "sh_up_4d shape: " << sh_up_4d.output().get_shape() << ", dtype: " << sh_up_4d.dtype() << std::endl;
-    std::cout << "sh_up_s shape: " << sh_up_s.output().get_shape() << ", dtype: " << sh_up_s.dtype() << std::endl;
-    std::cout << "sh_up_z shape: " << sh_up_z.output().get_shape() << ", dtype: " << sh_up_z.dtype() << std::endl;
-    std::cout << "sh_down_4d shape: " << sh_down_4d.output().get_shape() << ", dtype: " << sh_down_4d.dtype() << std::endl;
-    std::cout << "sh_down_s shape: " << sh_down_s.output().get_shape() << ", dtype: " << sh_down_s.dtype() << std::endl;
-    std::cout << "sh_down_z shape: " << sh_down_z.output().get_shape() << ", dtype: " << sh_down_z.dtype() << std::endl;
-    std::cout << "sh_gate_gate_1d shape: " << sh_gate_gate_1d.output().get_shape() << ", dtype: " << sh_gate_gate_1d.dtype() << std::endl;
-
+    std::cout << "sh_gate_w shape: " << sh_gate_w.output().get_shape() << ", dtype: " << sh_gate_w.dtype() << std::endl;
+    std::cout << "sh_gate_s shape: " << sh_gate_scales.output().get_shape() << ", dtype: " << sh_gate_scales.dtype() << std::endl;
+    std::cout << "sh_gate_z shape: " << sh_gate_zps.output().get_shape() << ", dtype: " << sh_gate_zps.dtype() << std::endl;
+    std::cout << "sh_up_w shape: " << sh_up_w.output().get_shape() << ", dtype: " << sh_up_w.dtype() << std::endl;
+    std::cout << "sh_up_s shape: " << sh_up_scales.output().get_shape() << ", dtype: " << sh_up_scales.dtype() << std::endl;
+    std::cout << "sh_up_z shape: " << sh_up_zps.output().get_shape() << ", dtype: " << sh_up_zps.dtype() << std::endl;
+    std::cout << "sh_down_w shape: " << sh_down_w.output().get_shape() << ", dtype: " << sh_down_w.dtype() << std::endl;
+    std::cout << "sh_down_s shape: " << sh_down_scales.output().get_shape() << ", dtype: " << sh_down_scales.dtype() << std::endl;
+    std::cout << "sh_down_z shape: " << sh_down_zps.output().get_shape() << ", dtype: " << sh_down_zps.dtype() << std::endl;
+    std::cout << "sh_gate_gate_w shape: " << sh_gate_gate_w.output().get_shape() << ", dtype: " << sh_gate_gate_w.dtype() << std::endl;
     // Use optimized MoE kernel for routed experts + shared experts
     auto combined = ops::moe3gemm_fused_compressed(flat_f32,
                                                    gate_weight(),
@@ -654,17 +643,16 @@ Tensor Qwen3NextSparseMoeBlock::forward(const Tensor& hidden_states) const {
                                                    top_k_,
                                                    group_size_,
                                                    ov::element::f16,
-                                                   sh_gate_4d,
-                                                   sh_gate_s,
-                                                   sh_gate_z,
-                                                   sh_up_4d,
-                                                   sh_up_s,
-                                                   sh_up_z,
-                                                   sh_down_4d,
-                                                   sh_down_s,
-                                                   sh_down_z,
-                                                   sh_gate_gate_1d);
-
+                                                   sh_gate_w,
+                                                   sh_gate_scales,
+                                                   sh_gate_zps,
+                                                   sh_up_w,
+                                                   sh_up_scales,
+                                                   sh_up_zps,
+                                                   sh_down_w,
+                                                   sh_down_scales,
+                                                   sh_down_zps,
+                                                   sh_gate_gate_w);
 
     auto restored = combined.reshape(shape::of(hidden_states), false);
     return restored.to(input_dtype);

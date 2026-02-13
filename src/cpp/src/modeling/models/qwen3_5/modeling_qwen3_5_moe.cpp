@@ -21,59 +21,6 @@ namespace models {
 
 namespace {
 
-Tensor slice_constant_or_fallback(const Tensor& input, int64_t start, int64_t stop, int64_t axis) {
-    auto node = input.output().get_node_shared_ptr();
-    if (auto constant = std::dynamic_pointer_cast<ov::op::v0::Constant>(node)) {
-        auto type = constant->get_element_type();
-        // Only apply manual slice for packed u4/i4 to avoid StridedSlice crash
-        if (type == ov::element::u4 || type == ov::element::i4) {
-            auto shape = constant->get_shape();
-            if (axis < 0)
-                axis += shape.size();
-
-            // Validate byte alignment for inner dims (must be multiple of 2 elements for u4/i4)
-            size_t inner_elements = 1;
-            for (size_t i = axis + 1; i < shape.size(); ++i)
-                inner_elements *= shape[i];
-
-            if (inner_elements > 0 && inner_elements % 2 == 0) {
-                size_t outer_elements = 1;
-                for (size_t i = 0; i < axis; ++i)
-                    outer_elements *= shape[i];
-
-                size_t axis_dim = shape[axis];
-                if (stop > axis_dim) {
-                    // Invalid slice range, fallback to ops::slice which might throw proper error or handle it
-                    return ops::slice(input, start, stop, 1, axis);
-                }
-
-                size_t split_dim = stop - start;
-
-                size_t inner_bytes = inner_elements / 2;
-                size_t axis_stride_bytes = axis_dim * inner_bytes;
-                size_t split_size_bytes = split_dim * inner_bytes;
-
-                ov::Shape new_shape = shape;
-                new_shape[axis] = split_dim;
-
-                std::vector<uint8_t> new_data(outer_elements * split_size_bytes);
-                const uint8_t* src_data = constant->get_data_ptr<uint8_t>();
-
-                for (size_t i = 0; i < outer_elements; ++i) {
-                    const uint8_t* src_ptr = src_data + i * axis_stride_bytes + start * inner_bytes;
-                    uint8_t* dst_ptr = new_data.data() + i * split_size_bytes;
-                    std::memcpy(dst_ptr, src_ptr, split_size_bytes);
-                }
-
-                auto new_const = std::make_shared<ov::op::v0::Constant>(type, new_shape, new_data.data());
-                return Tensor(new_const, input.context());
-            }
-        }
-    }
-    std::cout << "input.output().get_shape() = " << input.output().get_shape() << std::endl;
-    return ops::slice(input, start, stop, 1, axis);
-}
-
 Tensor dequantize_packed_moe_weight(const Tensor& packed_weight,
                                     const Tensor& scales_e_g_o,
                                     const Tensor& zps_e_g_o,
@@ -191,23 +138,8 @@ Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
         shared_gate_scales_.reset();
         shared_gate_zps_.reset();
         if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
-            auto scales = weight.auxiliary.at("scales");
-            auto scales_shape = scales.output().get_shape();
-            std::vector<int64_t> new_scales_shape = {1};
-            for (auto dim : scales_shape)
-                new_scales_shape.push_back(static_cast<int64_t>(dim));
-            shared_gate_scales_ = scales.reshape(new_scales_shape, false);
-
-            auto zps = weight.auxiliary.at("zps");
-            auto zps_shape = zps.output().get_shape();
-            std::vector<int64_t> new_zps_shape = {1};
-            for (auto dim : zps_shape)
-                new_zps_shape.push_back(static_cast<int64_t>(dim));
-            shared_gate_zps_ = zps.reshape(new_zps_shape, false);
-
-            // Update auxiliary in new_weight as well? param.bind takes FinalizedWeight.
-            // Actually param.bind binds the weight to the parameter.
-            // The member variables shared_gate_scales_ etc are used in calculation.
+            shared_gate_scales_ = weight.auxiliary.at("scales");
+            shared_gate_zps_ = weight.auxiliary.at("zps");
         }
     });
 
@@ -234,19 +166,8 @@ Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
         shared_up_scales_.reset();
         shared_up_zps_.reset();
         if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
-            auto scales = weight.auxiliary.at("scales");
-            auto scales_shape = scales.output().get_shape();
-            std::vector<int64_t> new_scales_shape = {1};
-            for (auto dim : scales_shape)
-                new_scales_shape.push_back(static_cast<int64_t>(dim));
-            shared_up_scales_ = scales.reshape(new_scales_shape, false);
-
-            auto zps = weight.auxiliary.at("zps");
-            auto zps_shape = zps.output().get_shape();
-            std::vector<int64_t> new_zps_shape = {1};
-            for (auto dim : zps_shape)
-                new_zps_shape.push_back(static_cast<int64_t>(dim));
-            shared_up_zps_ = zps.reshape(new_zps_shape, false);
+            shared_up_scales_ = weight.auxiliary.at("scales");
+            shared_up_zps_ = weight.auxiliary.at("zps");
         }
     });
 
@@ -273,19 +194,8 @@ Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
         shared_down_scales_.reset();
         shared_down_zps_.reset();
         if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
-            auto scales = weight.auxiliary.at("scales");
-            auto scales_shape = scales.output().get_shape();
-            std::vector<int64_t> new_scales_shape = {1};
-            for (auto dim : scales_shape)
-                new_scales_shape.push_back(static_cast<int64_t>(dim));
-            shared_down_scales_ = scales.reshape(new_scales_shape, false);
-
-            auto zps = weight.auxiliary.at("zps");
-            auto zps_shape = zps.output().get_shape();
-            std::vector<int64_t> new_zps_shape = {1};
-            for (auto dim : zps_shape)
-                new_zps_shape.push_back(static_cast<int64_t>(dim));
-            shared_down_zps_ = zps.reshape(new_zps_shape, false);
+            shared_down_scales_ = weight.auxiliary.at("scales");
+            shared_down_zps_ = weight.auxiliary.at("zps");
         }
     });
 }
@@ -358,41 +268,25 @@ size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
 Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
     auto gate_up_w = gate_up_expert_weights();
     auto down_w = down_expert_weights();
-    auto gate_exps_w = slice_constant_or_fallback(gate_up_w, 0, expert_intermediate_size_, 1);
-    auto up_exps_w = slice_constant_or_fallback(gate_up_w, expert_intermediate_size_, 2 * expert_intermediate_size_, 1);
+    auto gate_up_w_u8 = ops::convert(gate_up_w, ov::element::u8);
 
-    auto gate_exps_scales =
-        slice_constant_or_fallback(gate_up_scales_->unsqueeze(2), 0, expert_intermediate_size_, 2).unsqueeze(2);
-    auto gate_exps_zps =
-        slice_constant_or_fallback(gate_up_zps_->unsqueeze(2), 0, expert_intermediate_size_, 2).unsqueeze(2);
-    auto up_exps_scales = slice_constant_or_fallback(gate_up_scales_->unsqueeze(2),
-                                                     expert_intermediate_size_,
-                                                     2 * expert_intermediate_size_,
-                                                     2)
-                              .unsqueeze(2);
-    auto up_exps_zps = slice_constant_or_fallback(gate_up_zps_->unsqueeze(2),
-                                                  expert_intermediate_size_,
-                                                  2 * expert_intermediate_size_,
-                                                  2)
-                           .unsqueeze(2);
+    auto split = ops::split(gate_up_w_u8, 2, 1);
+    auto gate_exps_w_u8 = split.first;
+    auto up_exps_w_u8 = split.second;
+    auto gate_exps_w = ops::convert(gate_exps_w_u8, ov::element::u4);
+    auto up_exps_w = ops::convert(up_exps_w_u8, ov::element::u4);
 
-    std::cout << "[DEBUG] gate_up_w type: " << gate_up_w.output().get_element_type()
-              << ", shape: " << gate_up_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] down_w type: " << down_w.output().get_element_type()
-              << ", shape: " << down_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] gate_exps_w type: " << gate_exps_w.output().get_element_type()
-              << ", shape: " << gate_exps_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] up_exps_w type: " << up_exps_w.output().get_element_type()
-              << ", shape: " << up_exps_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] gate_exps_scales type: " << gate_exps_scales.output().get_element_type()
-              << ", shape: " << gate_exps_scales.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] gate_exps_zps type: " << gate_exps_zps.output().get_element_type()
-              << ", shape: " << gate_exps_zps.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] down_scales type: " << down_scales_->output().get_element_type()
-              << ", shape: " << down_scales_->output().get_shape() << std::endl;
-    std::cout << "[DEBUG] down_zps type: " << down_zps_->output().get_element_type()
-              << ", shape: " << down_zps_->output().get_shape() << std::endl
-              << std::endl;
+    // scale no need convert
+    auto split_scale = ops::split(*gate_up_scales_, 2, 2);
+    auto gate_exps_scales = split_scale.first;
+    auto up_exps_scales = split_scale.second;
+
+    auto split_zp_u8 = ops::convert(*gate_up_zps_, ov::element::u8);
+    auto split_zp = ops::split(split_zp_u8, 2, 2);
+    auto gate_exps_zps_u8 = split_zp.first;
+    auto up_exps_zps_u8 = split_zp.second;
+    auto gate_exps_zps = ops::convert(gate_exps_zps_u8, ov::element::u4);
+    auto up_exps_zps = ops::convert(up_exps_zps_u8, ov::element::u4);
 
     // Check if shared experts are fully quantized, otherwise we must fallback for shared part
     bool use_fused_shared = shared_gate_scales_.has_value() && shared_gate_zps_.has_value() &&
@@ -409,36 +303,34 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
     auto sh_down_w = shared_down_proj_weight();
     auto sh_gate_gate_w = shared_expert_gate_weight().to(ov::element::f16);
 
-    auto down_exps_scales = down_scales_->unsqueeze(2);
-    auto down_exps_zps = down_zps_->unsqueeze(2);
+    auto sh_gate_scales = shared_gate_scales_.value();
+    auto sh_gate_zps = shared_gate_zps_.value();
+    auto sh_up_scales = shared_up_scales_.value();
+    auto sh_up_zps = shared_up_zps_.value();
+    auto sh_down_scales = shared_down_scales_.value();
+    auto sh_down_zps = shared_down_zps_.value();
 
-    auto sh_gate_scales = shared_gate_scales_->unsqueeze(2);
-    auto sh_gate_zps = shared_gate_zps_->unsqueeze(2);
-    auto sh_up_scales = shared_up_scales_->unsqueeze(2);
-    auto sh_up_zps = shared_up_zps_->unsqueeze(2);
-    auto sh_down_scales = shared_down_scales_->unsqueeze(2);
-    auto sh_down_zps = shared_down_zps_->unsqueeze(2);
-
-    std::cout << "[DEBUG] sh_gate_w type: " << sh_gate_w.output().get_element_type()
-              << ", shape: " << sh_gate_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_up_w type: " << sh_up_w.output().get_element_type()
-              << ", shape: " << sh_up_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_down_w type: " << sh_down_w.output().get_element_type()
-              << ", shape: " << sh_down_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_gate_gate_w type: " << sh_gate_gate_w.output().get_element_type()
-              << ", shape: " << sh_gate_gate_w.output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_gate_scales: " << (sh_gate_scales).output().get_element_type()
-              << ", shape: " << (sh_gate_scales).output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_gate_zps: " << (sh_gate_zps).output().get_element_type()
-              << ", shape: " << (sh_gate_zps).output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_up_scales: " << (sh_up_scales).output().get_element_type()
-              << ", shape: " << (sh_up_scales).output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_up_zps: " << (sh_up_zps).output().get_element_type()
-              << ", shape: " << (sh_up_zps).output().get_shape() << std::endl;
-    std::cout << "[DEBUG] sh_down_scales: " << (sh_down_scales).output().get_element_type()
-              << ", shape: " << (sh_down_scales).output().get_element_type() << std::endl;
-    std::cout << "[DEBUG] sh_down_zps: " << (sh_down_zps).output().get_element_type()
-              << ", shape: " << (sh_down_zps).output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_gate_w type: " << sh_gate_w.output().get_element_type()
+    //           << ", shape: " << sh_gate_w.output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_up_w type: " << sh_up_w.output().get_element_type()
+    //           << ", shape: " << sh_up_w.output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_down_w type: " << sh_down_w.output().get_element_type()
+    //           << ", shape: " << sh_down_w.output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_gate_gate_w type: " << sh_gate_gate_w.output().get_element_type()
+    //           << ", shape: " << sh_gate_gate_w.output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_gate_scales: " << (sh_gate_scales).output().get_element_type()
+    //           << ", shape: " << (sh_gate_scales).output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_gate_zps: " << (sh_gate_zps).output().get_element_type()
+    //           << ", shape: " << (sh_gate_zps).output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_up_scales: " << (sh_up_scales).output().get_element_type()
+    //           << ", shape: " << (sh_up_scales).output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_up_zps: " << (sh_up_zps).output().get_element_type()
+    //           << ", shape: " << (sh_up_zps).output().get_element_type()
+    //           << ", shape: " << (sh_up_zps).output().get_shape() << std::endl;
+    // std::cout << "[DEBUG] sh_down_scales: " << (sh_down_scales).output().get_element_type()
+    //           << ", shape: " << (sh_down_scales).output().get_element_type() << std::endl;
+    // std::cout << "[DEBUG] sh_down_zps: " << (sh_down_zps).output().get_element_type()
+    //           << ", shape: " << (sh_down_zps).output().get_shape() << std::endl;
 
     auto result = ops::moe3gemm_fused_compressed(flat_f32,
                                                  gate_weight(),
@@ -449,8 +341,8 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
                                                  up_exps_scales,
                                                  up_exps_zps,
                                                  down_w,
-                                                 down_exps_scales,
-                                                 down_exps_zps,
+                                                 *down_scales_,
+                                                 *down_zps_,
                                                  hidden_size_,
                                                  expert_intermediate_size_,
                                                  num_experts_,

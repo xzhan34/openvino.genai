@@ -184,6 +184,35 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
         args.push_back(shared_gate_gate_weight.output());
     }
 
+    std::cout << "[DEBUG] input: " << (hidden_f16).output().get_element_type() << ", shape: " << (hidden_f16).output().get_partial_shape().to_string()
+              << std::endl;
+    std::cout << "[DEBUG] gate_inp_weight: " << (gate_inp_weight).output().get_element_type()
+              << ", shape: " << (gate_inp_weight).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] gate_exps_weight: " << (gate_exps_weight).output().get_element_type()
+              << ", shape: " << (gate_exps_weight).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] gate_exps_scales: " << (gate_exps_scales).output().get_element_type()
+              << ", shape: " << (gate_exps_scales).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] gate_exps_zps: " << (gate_exps_zps).output().get_element_type()
+              << ", shape: " << (gate_exps_zps).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] up_exps_weight: " << (up_exps_weight).output().get_element_type() << ", shape: " << (up_exps_weight).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] up_exps_scales: " << (up_exps_scales).output().get_element_type() << ", shape: " << (up_exps_scales).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] up_exps_zps: " << (up_exps_zps).output().get_element_type() << ", shape: " << (up_exps_zps).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] down_exps_weight: " << (down_exps_weight).output().get_element_type() << ", shape: " << (down_exps_weight).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] down_exps_scales: " << (down_exps_scales).output().get_element_type() << ", shape: " << (down_exps_scales).output().get_shape() << std::endl;
+    std::cout << "[DEBUG] down_exps_zps: " << (down_exps_zps).output().get_element_type() << ", shape: " << (down_exps_zps).output().get_shape() << std::endl;
+     if (shared_gate_weight.context()) {
+        std::cout << "[DEBUG] shared_gate_weight: " << (shared_gate_weight).output().get_element_type() << ", shape: " << (shared_gate_weight).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_gate_scales: " << (shared_gate_scales).output().get_element_type() << ", shape: " << (shared_gate_scales).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_gate_zps: " << (shared_gate_zps).output().get_element_type() << ", shape: " << (shared_gate_zps).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_up_weight: " << (shared_up_weight).output().get_element_type() << ", shape: " << (shared_up_weight).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_up_scales: " << (shared_up_scales).output().get_element_type() << ", shape: " << (shared_up_scales).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_up_zps: " << (shared_up_zps).output().get_element_type() << ", shape: " << (shared_up_zps).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_down_weight: " << (shared_down_weight).output().get_element_type() << ", shape: " << (shared_down_weight).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_down_scales: " << (shared_down_scales).output().get_element_type() << ", shape: " << (shared_down_scales).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_down_zps: " << (shared_down_zps).output().get_element_type() << ", shape: " << (shared_down_zps).output().get_shape() << std::endl;
+        std::cout << "[DEBUG] shared_gate_gate_weight: " << (shared_gate_gate_weight).output().get_element_type() << ", shape: " << (shared_gate_gate_weight).output().get_shape() << std::endl;
+    }
+
     auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
     auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
     return Tensor(moe_f32, ctx);
