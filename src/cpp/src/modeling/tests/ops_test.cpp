@@ -527,23 +527,6 @@ TEST(Ops, Moe3GemmFusedCompressedWithSharedExperts) {
 
     // Prepare Shared Tensors (Need to be unsqueezed/formatted for Op if necessary, but op takes what quantize gives usually)
     // IMPORTANT: moe3gemm_fused_compressed expects explicit tensors for shared experts.
-    // Assuming 2D layout from quantize_q41 is acceptable or we need to reshape.
-    // In Qwen3_5 code, we saw `unsqueeze(0)` being applied to `scales`/`zps` to make them 3D [1, Group, Output] etc.
-    // But `constants` below will just wrap the shape from `quantize`.
-    // q_shared_gate.scales_f16 shape is [N, G] = [inter, G].
-    // If we want [1, N, G], we need reshape.
-    // However, `constant` op takes shape from tensor unless reshaped.
-    // Let's pass them as is. If the kernel implementation is robust, it might handle 2D. 
-    // If not, we might need explicitly reshape constants. 
-    // The previous code simplification for Qwen3.5 removed explicit Reshapes, relying on loader.
-    // Here we are creating constants directly.
-    // Let's wrap them in `unsqueeze` like Qwen3.5 code does, BUT we can't efficiently call `ops::unsqueeze` inside test setup easily without creating nodes.
-    // We can just reshape the `ov::Tensor` itself.
-    
-    // Actually, `ops::constant` copies data. We can reshape the passed tensor BEFORE creating constant.
-    // q_shared_gate.weights_u4 is [inter, hidden] (conceptually) or [inter, k_packed].
-    // We want [1, inter, k_packed].
-    
     auto shared_gate_weight = ov::genai::modeling::ops::constant(q_shared_gate.weights_u4, op_ctx);
     auto shared_gate_scales = ov::genai::modeling::ops::constant(q_shared_gate.scales_f16, op_ctx);
     auto shared_gate_zps = ov::genai::modeling::ops::constant(q_shared_gate.zps_u4, op_ctx);
@@ -553,6 +536,11 @@ TEST(Ops, Moe3GemmFusedCompressedWithSharedExperts) {
     auto shared_down_weight = ov::genai::modeling::ops::constant(q_shared_down.weights_u4, op_ctx);
     auto shared_down_scales = ov::genai::modeling::ops::constant(q_shared_down.scales_f16, op_ctx);
     auto shared_down_zps = ov::genai::modeling::ops::constant(q_shared_down.zps_u4, op_ctx);
+
+    std::vector<float> shared_gate_inp_dummy = test_utils::random_f32(1 * hidden_size, 0.1f, 0.5f, 61);
+    auto shared_gate_inp_tensor = test_utils::make_tensor(shared_gate_inp_dummy, {1, hidden_size});
+    auto shared_gate_gate_f32 = ov::genai::modeling::ops::constant(shared_gate_inp_tensor, op_ctx);
+    auto shared_gate_gate = shared_gate_gate_f32.to(ov::element::f16);
 
     auto out = ov::genai::modeling::ops::moe3gemm_fused_compressed(
         hidden_param,
@@ -581,7 +569,7 @@ TEST(Ops, Moe3GemmFusedCompressedWithSharedExperts) {
         shared_down_weight,
         shared_down_scales,
         shared_down_zps,
-        ov::genai::modeling::Tensor{});
+        shared_gate_gate);
 
     auto model = ctx.build_model({out.output()});
 
@@ -604,11 +592,6 @@ TEST(Ops, Moe3GemmFusedCompressedWithSharedExperts) {
                                         inter_size,
                                         num_experts,
                                         top_k);
-    
-    std::vector<float> shared_gate_inp_dummy(1 * hidden_size, 0.0f); // all zeros will effectively be same as 1.0 (after softmax on 1 elem)? No exp(0)=1. 
-    // moe_ref computes logits = x @ gate_inp. 
-    // topk_softmax: max=log, sum=exp(log-max)=1. weights=1/1=1. 
-    // So gate weight is 1.0. Correct.
 
     auto expected_shared = test_utils::moe_ref(hidden_states,
                                         shared_gate_inp_dummy,
@@ -621,11 +604,24 @@ TEST(Ops, Moe3GemmFusedCompressedWithSharedExperts) {
                                         shared_inter_size,
                                         1, // num_experts
                                         1); // top_k
-                                        
-    std::vector<float> expected(expected_sparse.size());
-    for(size_t i=0; i<expected.size(); ++i) {
-        expected[i] = expected_sparse[i] + expected_shared[i];
+
+    // Compute Scalar Gate Sigmoid
+    std::vector<float> shared_gate_sigmoid(tokens, 0.0f);
+    for (size_t t = 0; t < tokens; ++t) {
+        float acc = 0.0f;
+        for (size_t h = 0; h < hidden_size; ++h) {
+            acc += hidden_states[t * hidden_size + h] * shared_gate_inp_dummy[h];
+        }
+        shared_gate_sigmoid[t] = 1.0f / (1.0f + std::exp(-acc));
     }
-                                        
+
+    std::vector<float> expected(expected_sparse.size());
+    for(size_t t=0; t < tokens; ++t) {
+        float scalar_scale = shared_gate_sigmoid[t];
+        for(size_t h=0; h < hidden_size; ++h) {
+            size_t idx = t * hidden_size + h;
+            expected[idx] = expected_sparse[idx] + expected_shared[idx] * scalar_scale;
+        }
+    }
     test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
 }

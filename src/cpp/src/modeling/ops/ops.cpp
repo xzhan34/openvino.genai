@@ -3,6 +3,7 @@
 
 #include "modeling/ops/ops.hpp"
 
+#include <iostream>
 #include <openvino/core/except.hpp>
 #include <openvino/op/linear_attn.hpp>
 #include <openvino/opsets/opset13.hpp>
@@ -186,6 +187,10 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
         args.push_back(shared_gate_gate_weight.output());
         config.num_shared_expert = 1;
     }
+
+    // for (size_t i = 0; i < args.size(); ++i) {
+    //     std::cout << "arg " << i << ": " << args[i].get_element_type() << " " << args[i].get_partial_shape() << std::endl;
+    // }
 
     auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
     auto moe_f32 = std::make_shared<ov::op::v0::Convert>(moe, ov::element::f32);
