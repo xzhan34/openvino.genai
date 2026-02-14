@@ -934,6 +934,17 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
 
     BuilderContext ctx;
     Qwen3_5ForCausalLM model(ctx, effective_cfg);
+    // HF Qwen3.5-MoE checkpoints store text weights under
+    // model.language_model.layers.N.*, while this model registers
+    // model.layers[N].* parameters.
+    // Add per-layer rules first so generic prefix rules don't consume them.
+    for (int32_t i = 0; i < effective_cfg.num_hidden_layers; ++i) {
+        const std::string idx = std::to_string(i);
+        model.packed_mapping().rules.push_back(
+            {"model.language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
+        model.packed_mapping().rules.push_back(
+            {"language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
+    }
     model.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
     model.packed_mapping().rules.push_back({"language_model.", "model.", 0});
 
