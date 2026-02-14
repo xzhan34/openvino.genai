@@ -443,33 +443,19 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
 
     auto projected_qkv = ops::linear(masked_hidden, in_proj_qkv_weight());
     auto projected_z = ops::linear(masked_hidden, in_proj_z_weight());
-    auto projected_qkvz = ops::concat({projected_qkv, projected_z}, 2);
     auto projected_b = ops::linear(masked_hidden, in_proj_b_weight());
     auto projected_a = ops::linear(masked_hidden, in_proj_a_weight());
-    auto projected_ba = ops::concat({projected_b, projected_a}, 2);
 
-    auto mixed_qkvz = projected_qkvz.reshape({0, 0, num_k_heads_, 2 * head_k_dim_ + 2 * ratio * head_v_dim_});
-    auto mixed_ba = projected_ba.reshape({0, 0, num_k_heads_, 2 * ratio});
+    // Split projected_qkv into flat Q, K, V using contiguous slicing
+    // (matches HF: torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1))
+    auto q_flat = ops::slice(projected_qkv, 0, key_dim_, 1, 2);
+    auto k_flat = ops::slice(projected_qkv, key_dim_, 2 * key_dim_, 1, 2);
+    auto v_flat = ops::slice(projected_qkv, 2 * key_dim_, 2 * key_dim_ + value_dim_, 1, 2);
 
-    auto q_pre = ops::slice(mixed_qkvz, 0, head_k_dim_, 1, 3);
-    auto k_pre = ops::slice(mixed_qkvz, head_k_dim_, 2 * head_k_dim_, 1, 3);
-    auto v_pre = ops::slice(mixed_qkvz, 2 * head_k_dim_, 2 * head_k_dim_ + ratio * head_v_dim_, 1, 3);
-    auto z = ops::slice(mixed_qkvz,
-                        2 * head_k_dim_ + ratio * head_v_dim_,
-                        2 * head_k_dim_ + 2 * ratio * head_v_dim_,
-                        1,
-                        3);
-    auto b = ops::slice(mixed_ba, 0, ratio, 1, 3);
-    auto a = ops::slice(mixed_ba, ratio, 2 * ratio, 1, 3);
-
-    auto value_pre = v_pre.reshape({0, 0, num_v_heads_, head_v_dim_});
-    z = z.reshape({0, 0, num_v_heads_, head_v_dim_});
-    b = b.reshape({0, 0, num_v_heads_});
-    a = a.reshape({0, 0, num_v_heads_});
-
-    auto q_flat = q_pre.reshape({0, 0, key_dim_});
-    auto k_flat = k_pre.reshape({0, 0, key_dim_});
-    auto v_flat = value_pre.reshape({0, 0, value_dim_});
+    // Reshape Z, b, a directly (they are already [B, S, value_dim] or [B, S, num_v_heads])
+    auto z = projected_z.reshape({0, 0, num_v_heads_, head_v_dim_});
+    auto b = projected_b.reshape({0, 0, num_v_heads_});
+    auto a = projected_a.reshape({0, 0, num_v_heads_});
 
     auto mixed_qkv = ops::concat({q_flat, k_flat, v_flat}, 2).permute({0, 2, 1});
 

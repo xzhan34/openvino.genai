@@ -83,9 +83,17 @@ void parse_text_config(const nlohmann::json& data, ov::genai::modeling::models::
 
     if (data.contains("rope_scaling")) {
         parse_rope_config(data.at("rope_scaling"), cfg.rope);
+        // Some configs nest rope_theta / partial_rotary_factor inside rope_scaling
+        // instead of at the text_config top level.  Pick them up if present.
+        read_json_param(data.at("rope_scaling"), "rope_theta", cfg.rope_theta);
+        read_json_param(data.at("rope_scaling"), "partial_rotary_factor", cfg.partial_rotary_factor);
     }
     if (data.contains("rope_parameters")) {
         parse_rope_config(data.at("rope_parameters"), cfg.rope);
+        // Same as above — Qwen3.5-MoE checkpoints store rope_theta and
+        // partial_rotary_factor inside rope_parameters.
+        read_json_param(data.at("rope_parameters"), "rope_theta", cfg.rope_theta);
+        read_json_param(data.at("rope_parameters"), "partial_rotary_factor", cfg.partial_rotary_factor);
     }
 
     cfg.finalize();
