@@ -184,6 +184,7 @@ Tensor moe3gemm_fused_compressed(const Tensor& input,
         args.push_back(shared_down_scales.output());
         args.push_back(shared_down_zps.output());
         args.push_back(shared_gate_gate_weight.output());
+        config.num_shared_expert = 1;
     }
 
     auto moe = std::make_shared<ov::op::internal::MOE3GemmFusedCompressed>(args, config);
