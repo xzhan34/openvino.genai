@@ -76,6 +76,24 @@ bool has_ir_model_pair(const std::filesystem::path& xml_path, const std::filesys
            std::filesystem::exists(bin_path) && std::filesystem::is_regular_file(bin_path);
 }
 
+bool has_model_input_name(const std::shared_ptr<ov::Model>& model, const std::string& input_name) {
+    if (!model) {
+        return false;
+    }
+    for (const auto& input : model->inputs()) {
+        const auto names = input.get_names();
+        if (names.find(input_name) != names.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_vl_text_ir_compatible(const std::shared_ptr<ov::Model>& model) {
+    return has_model_input_name(model, ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds) &&
+           has_model_input_name(model, ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask);
+}
+
 int parse_i32(const std::string& raw, const char* option_name) {
     try {
         return std::stoi(raw);
@@ -121,6 +139,7 @@ void print_usage(const char* argv0) {
         << "  --cache-model                   Enable model caching behavior.\n"
         << "                                  HF mode: load cached IR from --model dir if exists, else build+save there\n"
         << "                                  Dummy mode: save built IR to app executable folder\n"
+        << "                                  Text IR files are mode-specific: qwen3_5_text.xml (text), qwen3_5_text_vl.xml (vl)\n"
         << "  --vision-quant MODE             Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
         << "  --vision-gs N                   Real mode only. Vision quant group size, integer > 0 (default: 128)\n"
         << "  --text-quant MODE               Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
@@ -506,8 +525,8 @@ int main(int argc, char* argv[]) try {
         return std::filesystem::current_path();
     }();
     const std::filesystem::path ir_dir = use_dummy_mode_flag ? app_dir : model_dir;
-    const auto text_xml_path = ir_dir / "qwen3_5_text.xml";
-    const auto text_bin_path = ir_dir / "qwen3_5_text.bin";
+    const auto text_xml_path = ir_dir / (use_vl ? "qwen3_5_text_vl.xml" : "qwen3_5_text.xml");
+    const auto text_bin_path = ir_dir / (use_vl ? "qwen3_5_text_vl.bin" : "qwen3_5_text.bin");
     const auto vision_xml_path = ir_dir / "qwen3_5_vision.xml";
     const auto vision_bin_path = ir_dir / "qwen3_5_vision.bin";
 
@@ -555,7 +574,13 @@ int main(int argc, char* argv[]) try {
     if (load_text_from_ir) {
         std::cout << "[cache-model] Reusing cached text IR: " << text_xml_path << std::endl;
         text_model = core.read_model(text_xml_path.string(), text_bin_path.string());
-    } else {
+        if (use_vl && !is_vl_text_ir_compatible(text_model)) {
+            std::cout << "[cache-model] Cached text IR is not VL-compatible (missing visual inputs), rebuilding: "
+                      << text_xml_path << std::endl;
+            text_model.reset();
+        }
+    }
+    if (!text_model) {
         auto& weight_source = ensure_weight_source();
         ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
         text_model = ov::genai::modeling::models::create_qwen3_5_text_model(
