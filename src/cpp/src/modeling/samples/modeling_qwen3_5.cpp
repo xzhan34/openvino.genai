@@ -42,6 +42,7 @@ struct SampleOptions {
     std::string user_prompt;
     std::string device = "GPU";
     int max_new_tokens = 64;
+    bool cache_model = false;
 
     std::string vision_quant_mode;
     int vision_group_size = 128;
@@ -68,6 +69,11 @@ bool has_safetensors_file(const std::filesystem::path& model_dir) {
         }
     }
     return false;
+}
+
+bool has_ir_model_pair(const std::filesystem::path& xml_path, const std::filesystem::path& bin_path) {
+    return std::filesystem::exists(xml_path) && std::filesystem::is_regular_file(xml_path) &&
+           std::filesystem::exists(bin_path) && std::filesystem::is_regular_file(bin_path);
 }
 
 int parse_i32(const std::string& raw, const char* option_name) {
@@ -112,6 +118,9 @@ void print_usage(const char* argv0) {
         << "  --prompt TEXT                   User prompt\n"
         << "  --device NAME                   OpenVINO device name (default: GPU)\n"
         << "  --output-tokens N               Number of generated tokens (default: 64)\n"
+        << "  --cache-model                   Enable model caching behavior.\n"
+        << "                                  HF mode: load cached IR from --model dir if exists, else build+save there\n"
+        << "                                  Dummy mode: save built IR to app executable folder\n"
         << "  --vision-quant MODE             Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
         << "  --vision-gs N                   Real mode only. Vision quant group size, integer > 0 (default: 128)\n"
         << "  --text-quant MODE               Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
@@ -166,6 +175,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.device = take_value("--device");
         } else if (arg == "--output-tokens") {
             opts.max_new_tokens = parse_i32(take_value("--output-tokens"), "--output-tokens");
+        } else if (arg == "--cache-model") {
+            opts.cache_model = true;
         } else if (arg == "--vision-quant") {
             opts.vision_quant_mode = take_value("--vision-quant");
         } else if (arg == "--vision-gs") {
@@ -478,43 +489,85 @@ int main(int argc, char* argv[]) try {
         text_quant_config = create_quantization_config(opts.text_quant_mode, opts.text_group_size, "none");
     }
 
-    std::unique_ptr<ov::genai::modeling::weights::WeightSource> source;
-    if (use_dummy_mode_flag) {
-        constexpr uint32_t kDummySeed = 2026u;
-        constexpr float kDummyInitRange = 0.02f;
-        auto specs = use_vl ? ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg)
-                            : ov::genai::modeling::models::build_qwen3_5_text_weight_specs(cfg.text);
-        source = std::make_unique<ov::genai::modeling::weights::SyntheticWeightSource>(
-            std::move(specs),
-            kDummySeed,
-            -kDummyInitRange,
-            kDummyInitRange);
-    } else {
-        auto data = ov::genai::safetensors::load_safetensors(model_dir);
-        source = std::make_unique<ov::genai::safetensors::SafetensorsWeightSource>(std::move(data));
-    }
-
     ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig pre_cfg;
     const auto pre_cfg_path = model_dir / "preprocessor_config.json";
     if (!use_dummy_mode_flag && std::filesystem::exists(pre_cfg_path)) {
         pre_cfg = ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig::from_json_file(pre_cfg_path);
     }
 
+    const std::filesystem::path app_dir = [&]() {
+        std::filesystem::path exe_path = argv[0];
+        if (exe_path.is_relative()) {
+            exe_path = std::filesystem::absolute(exe_path);
+        }
+        if (exe_path.has_parent_path()) {
+            return exe_path.parent_path();
+        }
+        return std::filesystem::current_path();
+    }();
+    const std::filesystem::path ir_dir = use_dummy_mode_flag ? app_dir : model_dir;
+    const auto text_xml_path = ir_dir / "qwen3_5_text.xml";
+    const auto text_bin_path = ir_dir / "qwen3_5_text.bin";
+    const auto vision_xml_path = ir_dir / "qwen3_5_vision.xml";
+    const auto vision_bin_path = ir_dir / "qwen3_5_vision.bin";
+
+    const bool load_text_from_ir = opts.cache_model && !use_dummy_mode_flag && has_ir_model_pair(text_xml_path, text_bin_path);
+    const bool load_vision_from_ir =
+        opts.cache_model && !use_dummy_mode_flag && use_vl && has_ir_model_pair(vision_xml_path, vision_bin_path);
+
+    ov::Core core;
+    std::unique_ptr<ov::genai::modeling::weights::WeightSource> source;
+    auto ensure_weight_source = [&]() -> ov::genai::modeling::weights::WeightSource& {
+        if (!source) {
+            if (use_dummy_mode_flag) {
+                constexpr uint32_t kDummySeed = 2026u;
+                constexpr float kDummyInitRange = 0.02f;
+                auto specs = use_vl ? ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg)
+                                    : ov::genai::modeling::models::build_qwen3_5_text_weight_specs(cfg.text);
+                source = std::make_unique<ov::genai::modeling::weights::SyntheticWeightSource>(
+                    std::move(specs),
+                    kDummySeed,
+                    -kDummyInitRange,
+                    kDummyInitRange);
+            } else {
+                auto data = ov::genai::safetensors::load_safetensors(model_dir);
+                source = std::make_unique<ov::genai::safetensors::SafetensorsWeightSource>(std::move(data));
+            }
+        }
+        return *source;
+    };
+
     std::shared_ptr<ov::Model> vision_model;
-    if (use_vl) {
+    std::shared_ptr<ov::Model> text_model;
+    if (load_vision_from_ir) {
+        std::cout << "[cache-model] Reusing cached vision IR: " << vision_xml_path << std::endl;
+        vision_model = core.read_model(vision_xml_path.string(), vision_bin_path.string());
+    } else if (use_vl) {
+        auto& weight_source = ensure_weight_source();
         ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer(vision_quant_config);
-        vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(cfg, *source, vision_finalizer);
+        vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(cfg, weight_source, vision_finalizer);
+        if (opts.cache_model) {
+            ov::serialize(vision_model, vision_xml_path.string(), vision_bin_path.string());
+            std::cout << "[cache-model] Saved vision IR: " << vision_xml_path << std::endl;
+        }
     }
 
-    std::shared_ptr<ov::Model> text_model;
-    {
+    if (load_text_from_ir) {
+        std::cout << "[cache-model] Reusing cached text IR: " << text_xml_path << std::endl;
+        text_model = core.read_model(text_xml_path.string(), text_bin_path.string());
+    } else {
+        auto& weight_source = ensure_weight_source();
         ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
         text_model = ov::genai::modeling::models::create_qwen3_5_text_model(
             cfg,
-            *source,
+            weight_source,
             text_finalizer,
             false,
             use_vl);
+        if (opts.cache_model) {
+            ov::serialize(text_model, text_xml_path.string(), text_bin_path.string());
+            std::cout << "[cache-model] Saved text IR: " << text_xml_path << std::endl;
+        }
     }
 
     if (use_dummy_mode_flag && source) {
@@ -524,7 +577,6 @@ int main(int argc, char* argv[]) try {
         }
     }
 
-    ov::Core core;
     std::optional<ov::CompiledModel> compiled_vision;
     if (use_vl) {
         compiled_vision = core.compile_model(vision_model, opts.device);
@@ -534,9 +586,10 @@ int main(int argc, char* argv[]) try {
     ov::Tensor visual_embeds;
     ov::Tensor grid_thw;
     if (use_vl) {
+        auto& weight_source = ensure_weight_source();
         ov::Tensor image = opts.image_path.empty() ? make_dummy_image() : utils::load_image(opts.image_path);
-        const std::string pos_embed_name = resolve_pos_embed_name(*source);
-        const ov::Tensor pos_embed_weight = source->get_tensor(pos_embed_name);
+        const std::string pos_embed_name = resolve_pos_embed_name(weight_source);
+        const ov::Tensor pos_embed_weight = weight_source.get_tensor(pos_embed_name);
 
         ov::genai::modeling::models::Qwen3_5VisionPreprocessor preprocessor(cfg.vision, pre_cfg);
         const auto preprocess_start = std::chrono::steady_clock::now();
