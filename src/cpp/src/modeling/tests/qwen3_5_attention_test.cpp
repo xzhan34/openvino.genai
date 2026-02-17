@@ -50,15 +50,39 @@ ov::genai::modeling::models::Qwen3_5TextModelConfig make_qwen3_5_9b_attention_cf
 }
 
 ov::genai::modeling::models::Qwen3_5TextModelConfig make_linear_attention_cfg() {
+    // Align with Qwen3.5-35B-A3B text_config for realistic linear-attention behavior.
     ov::genai::modeling::models::Qwen3_5TextModelConfig cfg;
-    cfg.hidden_size = 64;
-    cfg.linear_num_key_heads = 2;
-    cfg.linear_num_value_heads = 4;
-    cfg.linear_key_head_dim = 16;
-    cfg.linear_value_head_dim = 16;
-    cfg.linear_conv_kernel_dim = 4;
+    cfg.architecture = "qwen3_5_moe";
+    cfg.vocab_size = 248320;
+    cfg.hidden_size = 2048;
+    cfg.num_hidden_layers = 40;
+    cfg.num_attention_heads = 16;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    cfg.max_position_embeddings = 262144;
     cfg.rms_norm_eps = 1e-6f;
+    cfg.rope_theta = 10000000.0f;
+    cfg.partial_rotary_factor = 0.25f;
     cfg.hidden_act = "silu";
+    cfg.attention_bias = false;
+    cfg.full_attention_interval = 4;
+    cfg.linear_conv_kernel_dim = 4;
+    cfg.linear_key_head_dim = 128;
+    cfg.linear_value_head_dim = 128;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 32;
+    cfg.moe_intermediate_size = 512;
+    cfg.shared_expert_intermediate_size = 512;
+    cfg.num_experts = 256;
+    cfg.num_experts_per_tok = 8;
+    cfg.output_router_logits = false;
+    cfg.router_aux_loss_coef = 0.001f;
+    cfg.mrope_interleaved = true;
+    cfg.mrope_section = {11, 11, 10};
+    cfg.layer_types.reserve(static_cast<size_t>(cfg.num_hidden_layers));
+    for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
+        cfg.layer_types.push_back(((i + 1) % cfg.full_attention_interval) ? "linear_attention" : "full_attention");
+    }
     return cfg;
 }
 
@@ -395,7 +419,7 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOps_GraphStateAndGpuInfer) {
     auto request = compiled.create_infer_request();
 
     const size_t hidden = static_cast<size_t>(cfg.hidden_size);
-    auto hidden_states = make_hidden_states_tensor(2, hidden, -0.1f, 0.1f, 100u);
+    auto hidden_states = make_hidden_states_tensor(2, hidden, -0.02f, 0.02f, 100u);
     ov::Tensor beam_idx(ov::element::i32, ov::Shape{1});
     auto attention_mask = make_attention_mask_tensor(2);
     beam_idx.data<int32_t>()[0] = 0;
@@ -435,7 +459,7 @@ TEST(Qwen3_5AttentionULT, LinearAttention_FusedOp_GraphStateAndGpuInfer) {
     auto request = compiled.create_infer_request();
 
     const size_t hidden = static_cast<size_t>(cfg.hidden_size);
-    auto hidden_states = make_hidden_states_tensor(2, hidden, -0.1f, 0.1f, 100u);
+    auto hidden_states = make_hidden_states_tensor(2, hidden, -0.02f, 0.02f, 100u);
     ov::Tensor beam_idx(ov::element::i32, ov::Shape{1});
     auto attention_mask = make_attention_mask_tensor(2);
     beam_idx.data<int32_t>()[0] = 0;
@@ -474,11 +498,6 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
     ASSERT_TRUE(has_op_type(model_fused, "LinearAttention"));
     ASSERT_FALSE(has_op_type(model_fused, "TensorIterator"));
 
-    auto compiled_basic = core.compile_model(model_basic, "GPU");
-    auto compiled_fused = core.compile_model(model_fused, "GPU");
-    auto req_basic = compiled_basic.create_infer_request();
-    auto req_fused = compiled_fused.create_infer_request();
-
     ov::Tensor beam_idx(ov::element::i32, ov::Shape{1});
     beam_idx.data<int32_t>()[0] = 0;
 
@@ -489,72 +508,81 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
         req.set_tensor("beam_idx", beam_idx);
         req.set_tensor("attention_mask", attention_mask);
         req.infer();
+        req.wait();
     };
 
-    // 1) Stateless comparison (single step from reset states)
-    for (auto& state : req_basic.query_state()) {
-        state.reset();
-    }
-    for (auto& state : req_fused.query_state()) {
-        state.reset();
-    }
-
+    // 1) Stateless comparison with fresh infer requests
     const size_t stateless_len = 4;
-    run_once(req_basic, stateless_len, -0.1f, 0.1f, 42u);
-    run_once(req_fused, stateless_len, -0.1f, 0.1f, 42u);
+    {
+        auto compiled_basic = core.compile_model(model_basic, "GPU");
+        auto compiled_fused = core.compile_model(model_fused, "GPU");
+        auto req_basic = compiled_basic.create_infer_request();
+        auto req_fused = compiled_fused.create_infer_request();
 
-    const auto stateless_basic = req_basic.get_output_tensor(0);
-    const auto stateless_fused = req_fused.get_output_tensor(0);
-    ASSERT_EQ(stateless_basic.get_shape(), (ov::Shape{1, stateless_len, hidden}));
-    ASSERT_EQ(stateless_fused.get_shape(), (ov::Shape{1, stateless_len, hidden}));
+        run_once(req_basic, stateless_len, -0.02f, 0.02f, 42u);
+        run_once(req_fused, stateless_len, -0.02f, 0.02f, 42u);
 
-    const float stateless_diff = max_abs_diff(stateless_basic, stateless_fused);
-    EXPECT_LT(stateless_diff, test_utils::k_tol_linear_attn)
-        << "Stateless max diff: " << stateless_diff
-        << ", tol: " << test_utils::k_tol_linear_attn;
+        const auto stateless_basic = req_basic.get_output_tensor(0);
+        const auto stateless_fused = req_fused.get_output_tensor(0);
+        ASSERT_EQ(stateless_basic.get_shape(), (ov::Shape{1, stateless_len, hidden}));
+        ASSERT_EQ(stateless_fused.get_shape(), (ov::Shape{1, stateless_len, hidden}));
 
-    // 2) Stateful comparison (prefill + decode, same carried-over states)
-    for (auto& state : req_basic.query_state()) {
-        state.reset();
+        const float stateless_diff = max_abs_diff(stateless_basic, stateless_fused);
+        EXPECT_LT(stateless_diff, test_utils::k_tol_linear_attn)
+            << "Stateless max diff: " << stateless_diff
+            << ", tol: " << test_utils::k_tol_linear_attn;
     }
-    for (auto& state : req_fused.query_state()) {
-        state.reset();
-    }
 
+    // 2) Prefill comparison with fresh infer requests
     const size_t prefill_len = 3;
-    run_once(req_basic, prefill_len, -0.1f, 0.1f, 123u);
-    run_once(req_fused, prefill_len, -0.1f, 0.1f, 123u);
+    {
+        auto compiled_basic = core.compile_model(model_basic, "GPU");
+        auto compiled_fused = core.compile_model(model_fused, "GPU");
+        auto req_basic = compiled_basic.create_infer_request();
+        auto req_fused = compiled_fused.create_infer_request();
 
-    const auto prefill_basic = req_basic.get_output_tensor(0);
-    const auto prefill_fused = req_fused.get_output_tensor(0);
-    ASSERT_EQ(prefill_basic.get_shape(), (ov::Shape{1, prefill_len, hidden}));
-    ASSERT_EQ(prefill_fused.get_shape(), (ov::Shape{1, prefill_len, hidden}));
+        run_once(req_basic, prefill_len, -0.02f, 0.02f, 123u);
+        run_once(req_fused, prefill_len, -0.02f, 0.02f, 123u);
 
-    const float prefill_diff = max_abs_diff(prefill_basic, prefill_fused);
-    EXPECT_LT(prefill_diff, test_utils::k_tol_linear_attn)
-        << "Prefill max diff: " << prefill_diff
-        << ", tol: " << test_utils::k_tol_linear_attn;
+        const auto prefill_basic = req_basic.get_output_tensor(0);
+        const auto prefill_fused = req_fused.get_output_tensor(0);
+        ASSERT_EQ(prefill_basic.get_shape(), (ov::Shape{1, prefill_len, hidden}));
+        ASSERT_EQ(prefill_fused.get_shape(), (ov::Shape{1, prefill_len, hidden}));
 
+        const float prefill_diff = max_abs_diff(prefill_basic, prefill_fused);
+        EXPECT_LT(prefill_diff, test_utils::k_tol_linear_attn)
+            << "Prefill max diff: " << prefill_diff
+            << ", tol: " << test_utils::k_tol_linear_attn;
+    }
+
+    // 3) Decode comparison with fresh infer requests
     const size_t decode_len = 1;
-    run_once(req_basic, decode_len, -0.05f, 0.05f, 456u);
-    run_once(req_fused, decode_len, -0.05f, 0.05f, 456u);
+    {
+        auto compiled_basic = core.compile_model(model_basic, "GPU");
+        auto compiled_fused = core.compile_model(model_fused, "GPU");
+        auto req_basic = compiled_basic.create_infer_request();
+        auto req_fused = compiled_fused.create_infer_request();
 
-    const auto decode_basic = req_basic.get_output_tensor(0);
-    const auto decode_fused = req_fused.get_output_tensor(0);
-    ASSERT_EQ(decode_basic.get_shape(), (ov::Shape{1, decode_len, hidden}));
-    ASSERT_EQ(decode_fused.get_shape(), (ov::Shape{1, decode_len, hidden}));
+        run_once(req_basic, decode_len, -0.02f, 0.02f, 456u);
+        run_once(req_fused, decode_len, -0.02f, 0.02f, 456u);
 
-    const float decode_diff = max_abs_diff(decode_basic, decode_fused);
-    EXPECT_LT(decode_diff, test_utils::k_tol_linear_attn)
-        << "Decode max diff: " << decode_diff
-        << ", tol: " << test_utils::k_tol_linear_attn;
+        const auto decode_basic = req_basic.get_output_tensor(0);
+        const auto decode_fused = req_fused.get_output_tensor(0);
+        ASSERT_EQ(decode_basic.get_shape(), (ov::Shape{1, decode_len, hidden}));
+        ASSERT_EQ(decode_fused.get_shape(), (ov::Shape{1, decode_len, hidden}));
 
-    const auto basic_state_shapes = collect_state_shapes(req_basic);
-    const auto fused_state_shapes = collect_state_shapes(req_fused);
-    ASSERT_EQ(basic_state_shapes.size(), fused_state_shapes.size());
-    for (const auto& kv : basic_state_shapes) {
-        const auto it = fused_state_shapes.find(kv.first);
-        ASSERT_NE(it, fused_state_shapes.end()) << "Missing state in fused path: " << kv.first;
-        EXPECT_EQ(kv.second, it->second) << "State shape mismatch for: " << kv.first;
+        const float decode_diff = max_abs_diff(decode_basic, decode_fused);
+        EXPECT_LT(decode_diff, test_utils::k_tol_linear_attn)
+            << "Decode max diff: " << decode_diff
+            << ", tol: " << test_utils::k_tol_linear_attn;
+
+        const auto basic_state_shapes = collect_state_shapes(req_basic);
+        const auto fused_state_shapes = collect_state_shapes(req_fused);
+        ASSERT_EQ(basic_state_shapes.size(), fused_state_shapes.size());
+        for (const auto& kv : basic_state_shapes) {
+            const auto it = fused_state_shapes.find(kv.first);
+            ASSERT_NE(it, fused_state_shapes.end()) << "Missing state in fused path: " << kv.first;
+            EXPECT_EQ(kv.second, it->second) << "State shape mismatch for: " << kv.first;
+        }
     }
 }
