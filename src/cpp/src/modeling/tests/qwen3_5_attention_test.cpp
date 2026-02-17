@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -124,6 +125,22 @@ ov::genai::modeling::weights::QuantizationConfig make_int4_quant_config(const st
         prefix + ".k_proj.weight",
         prefix + ".v_proj.weight",
         prefix + ".o_proj.weight"};
+    return quant_config;
+}
+
+ov::genai::modeling::weights::QuantizationConfig make_linear_attention_int4_quant_config(const std::string& prefix) {
+    ov::genai::modeling::weights::QuantizationConfig quant_config;
+    quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+    quant_config.group_size = 128;
+    quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
+    quant_config.selection.only_2d_weights = true;
+    quant_config.selection.include_weights = {
+        prefix + ".in_proj_qkv.weight",
+        prefix + ".in_proj_z.weight",
+        prefix + ".in_proj_b.weight",
+        prefix + ".in_proj_a.weight",
+        prefix + ".conv1d.weight",
+        prefix + ".out_proj.weight"};
     return quant_config;
 }
 
@@ -254,7 +271,8 @@ std::shared_ptr<ov::Model> build_linear_attention_model(
     ov::genai::modeling::models::Qwen3_5GatedDeltaNet linear_attn(ctx, "linear_attn", cfg, 0);
 
     test_utils::DummyWeightSource weights;
-    test_utils::DummyWeightFinalizer finalizer;
+    auto quant_config = make_linear_attention_int4_quant_config("linear_attn");
+    ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(quant_config);
     add_linear_attention_weights(weights, "linear_attn", cfg);
     ov::genai::modeling::weights::load_model(linear_attn, weights, finalizer);
 
@@ -315,6 +333,28 @@ ov::Tensor make_hidden_states_tensor(size_t seq_len, size_t hidden, float min_va
 ov::Tensor make_attention_mask_tensor(size_t seq_len) {
     ov::Tensor attention_mask(ov::element::i64, ov::Shape{1, seq_len});
     std::fill_n(attention_mask.data<int64_t>(), seq_len, 1);
+    return attention_mask;
+}
+
+ov::Tensor make_attention_mask_tensor_with_padding(size_t seq_len, uint32_t seed) {
+    ov::Tensor attention_mask(ov::element::i64, ov::Shape{1, seq_len});
+    auto* mask = attention_mask.data<int64_t>();
+    std::fill_n(mask, seq_len, 0);
+
+    if (seq_len == 0) {
+        return attention_mask;
+    }
+    if (seq_len == 1) {
+        mask[0] = 1;
+        return attention_mask;
+    }
+
+    const size_t min_valid = std::max<size_t>(1, (seq_len * 7) / 10);
+    const size_t max_valid = seq_len - 1;
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<size_t> dist(min_valid, max_valid);
+    const size_t valid_tokens = dist(rng);
+    std::fill_n(mask, valid_tokens, 1);
     return attention_mask;
 }
 
@@ -503,7 +543,7 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
 
     auto run_once = [&](ov::InferRequest& req, size_t seq_len, float min_value, float max_value, uint32_t seed) {
         auto hidden_states = make_hidden_states_tensor(seq_len, hidden, min_value, max_value, seed);
-        auto attention_mask = make_attention_mask_tensor(seq_len);
+        auto attention_mask = make_attention_mask_tensor_with_padding(seq_len, seed ^ 0x9e3779b9u);
         req.set_tensor("hidden_states", hidden_states);
         req.set_tensor("beam_idx", beam_idx);
         req.set_tensor("attention_mask", attention_mask);
@@ -511,30 +551,8 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
         req.wait();
     };
 
-    // 1) Stateless comparison with fresh infer requests
-    const size_t stateless_len = 4;
-    {
-        auto compiled_basic = core.compile_model(model_basic, "GPU");
-        auto compiled_fused = core.compile_model(model_fused, "GPU");
-        auto req_basic = compiled_basic.create_infer_request();
-        auto req_fused = compiled_fused.create_infer_request();
-
-        run_once(req_basic, stateless_len, -0.02f, 0.02f, 42u);
-        run_once(req_fused, stateless_len, -0.02f, 0.02f, 42u);
-
-        const auto stateless_basic = req_basic.get_output_tensor(0);
-        const auto stateless_fused = req_fused.get_output_tensor(0);
-        ASSERT_EQ(stateless_basic.get_shape(), (ov::Shape{1, stateless_len, hidden}));
-        ASSERT_EQ(stateless_fused.get_shape(), (ov::Shape{1, stateless_len, hidden}));
-
-        const float stateless_diff = max_abs_diff(stateless_basic, stateless_fused);
-        EXPECT_LT(stateless_diff, test_utils::k_tol_linear_attn)
-            << "Stateless max diff: " << stateless_diff
-            << ", tol: " << test_utils::k_tol_linear_attn;
-    }
-
-    // 2) Prefill comparison with fresh infer requests
-    const size_t prefill_len = 3;
+    // 1) Prefill comparison (long prompt with deterministic variable-length padding)
+    const size_t prefill_len = 1024;
     {
         auto compiled_basic = core.compile_model(model_basic, "GPU");
         auto compiled_fused = core.compile_model(model_fused, "GPU");
@@ -555,7 +573,7 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
             << ", tol: " << test_utils::k_tol_linear_attn;
     }
 
-    // 3) Decode comparison with fresh infer requests
+    // 2) Decode comparison (single token, fresh compile/request as requested)
     const size_t decode_len = 1;
     {
         auto compiled_basic = core.compile_model(model_basic, "GPU");
