@@ -300,6 +300,14 @@ bool has_op_type(const std::shared_ptr<ov::Model>& model, const std::string& typ
     return false;
 }
 
+void dump_ir_model(const std::shared_ptr<ov::Model>& model, const std::string& base_name) {
+    ov::serialize(model, base_name + ".xml");
+}
+
+void dump_ir_model(const ov::CompiledModel& compiled_model, const std::string& base_name) {
+    ov::serialize(compiled_model.get_runtime_model(), base_name + ".xml");
+}
+
 struct LinearStateSummary {
     bool has_conv = false;
     bool has_recurrent = false;
@@ -537,6 +545,8 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
     ASSERT_FALSE(has_op_type(model_basic, "LinearAttention"));
     ASSERT_TRUE(has_op_type(model_fused, "LinearAttention"));
     ASSERT_FALSE(has_op_type(model_fused, "TensorIterator"));
+    dump_ir_model(model_basic, "qwen3_5_linear_attention_basic_original");
+    dump_ir_model(model_fused, "qwen3_5_linear_attention_fused_original");
 
     ov::Tensor beam_idx(ov::element::i32, ov::Shape{1});
     beam_idx.data<int32_t>()[0] = 0;
@@ -556,6 +566,8 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
     {
         auto compiled_basic = core.compile_model(model_basic, "GPU");
         auto compiled_fused = core.compile_model(model_fused, "GPU");
+        dump_ir_model(compiled_basic, "qwen3_5_linear_attention_basic_prefill_compiled");
+        dump_ir_model(compiled_fused, "qwen3_5_linear_attention_fused_prefill_compiled");
         auto req_basic = compiled_basic.create_infer_request();
         auto req_fused = compiled_fused.create_infer_request();
 
@@ -578,6 +590,8 @@ TEST(Qwen3_5AttentionULT, LinearAttention_BasicOpsVsFused_OutputMatch_StatelessA
     {
         auto compiled_basic = core.compile_model(model_basic, "GPU");
         auto compiled_fused = core.compile_model(model_fused, "GPU");
+        dump_ir_model(compiled_basic, "qwen3_5_linear_attention_basic_decode_compiled");
+        dump_ir_model(compiled_fused, "qwen3_5_linear_attention_fused_decode_compiled");
         auto req_basic = compiled_basic.create_infer_request();
         auto req_fused = compiled_fused.create_infer_request();
 
