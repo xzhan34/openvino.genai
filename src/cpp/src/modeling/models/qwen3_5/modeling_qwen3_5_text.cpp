@@ -446,18 +446,12 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     auto projected_b = ops::linear(masked_hidden, in_proj_b_weight());
     auto projected_a = ops::linear(masked_hidden, in_proj_a_weight());
 
-    // Split projected_qkv into flat Q, K, V using contiguous slicing
-    // (matches HF: torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1))
-    auto q_flat = ops::slice(projected_qkv, 0, key_dim_, 1, 2);
-    auto k_flat = ops::slice(projected_qkv, key_dim_, 2 * key_dim_, 1, 2);
-    auto v_flat = ops::slice(projected_qkv, 2 * key_dim_, 2 * key_dim_ + value_dim_, 1, 2);
-
-    // Reshape Z, b, a directly (they are already [B, S, value_dim] or [B, S, num_v_heads])
+    // Keep Z in head layout; b/a are already [B, S, num_v_heads].
     auto z = projected_z.reshape({0, 0, num_v_heads_, head_v_dim_});
-    auto b = projected_b.reshape({0, 0, num_v_heads_});
-    auto a = projected_a.reshape({0, 0, num_v_heads_});
+    auto b = projected_b;
+    auto a = projected_a;
 
-    auto mixed_qkv = ops::concat({q_flat, k_flat, v_flat}, 2).permute({0, 2, 1});
+    auto mixed_qkv = projected_qkv.permute({0, 2, 1});
 
     auto batch = shape::dim(masked_hidden, 0);
     auto conv_shape = shape::make({batch,
@@ -597,10 +591,7 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
 
         core_attn_tensor = Tensor(core_attn, op_ctx);
     }
-    auto core_flat = core_attn_tensor.reshape({-1, head_v_dim_});
-    auto z_flat = z.reshape({-1, head_v_dim_});
-    auto gated = rms_norm_gated(core_flat, z_flat);
-    auto gated_4d = gated.reshape(shape::of(z), false);
+    auto gated_4d = rms_norm_gated(core_attn_tensor, z);
     auto merged = gated_4d.reshape({0, 0, value_dim_});
     return ops::linear(merged, out_proj_weight()).to(masked_hidden.dtype());
 }
