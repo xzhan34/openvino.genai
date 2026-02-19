@@ -10,6 +10,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -978,6 +979,7 @@ std::vector<float> attention_ref(const std::vector<float>& hidden,
 void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expected, float tol) {
     const float abs_tol = tol;
     const float rel_tol = tol;
+    constexpr size_t k_max_mismatch_logs = 100;
 
     ASSERT_EQ(output.get_size(), expected.size());
     const float* out_data = output.data<const float>();
@@ -991,6 +993,9 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
     float max_abs_error = 0.0f;
     float max_rel_error = 0.0f;
     float max_error = 0.0f;
+    std::vector<std::string> mismatch_logs;
+    mismatch_logs.reserve(k_max_mismatch_logs);
+
     for (size_t i = 0; i < expected.size(); ++i) {
         float actual = out_data[i];
         float expected_val = expected[i];
@@ -1007,20 +1012,66 @@ void expect_tensor_near(const ov::Tensor& output, const std::vector<float>& expe
             pass = (rel_error <= rel_tol);
 
             if (!pass) {
-                EXPECT_LE(rel_error, rel_tol)
-                    << "Element " << i << ": Relative error " << (rel_error * 100.0f) << "%"
-                    << " exceeds tolerance " << (rel_tol * 100.0f) << "%"
-                    << " (actual=" << actual << ", expected=" << expected_val << ", abs_diff=" << diff << ")";
+                if (mismatch_logs.size() < k_max_mismatch_logs) {
+                    std::ostringstream oss;
+                    oss << "Element " << i << ": Relative error " << (rel_error * 100.0f) << "%"
+                        << " exceeds tolerance " << (rel_tol * 100.0f) << "%"
+                        << " (actual=" << actual << ", expected=" << expected_val << ", abs_diff=" << diff << ")";
+                    mismatch_logs.push_back(oss.str());
+                }
             }
         } else {
             ++n_abs;
             pass = (diff <= abs_tol);
             if (!pass) {
-                EXPECT_LE(diff, abs_tol)
-                    << "Element " << i << ": Absolute error " << diff << " exceeds tolerance " << abs_tol
-                    << " (actual=" << actual << ", expected=" << expected_val << ")";
+                if (mismatch_logs.size() < k_max_mismatch_logs) {
+                    std::ostringstream oss;
+                    oss << "Element " << i << ": Absolute error " << diff << " exceeds tolerance " << abs_tol
+                        << " (actual=" << actual << ", expected=" << expected_val << ")";
+                    mismatch_logs.push_back(oss.str());
+                }
             }
         }
+
+        if (pass) {
+            ++pass_count;
+        } else {
+            ++fail_count;
+        }
+    }
+
+    if (fail_count > 0) {
+        const size_t total_count = expected.size();
+        const size_t match_percent = total_count == 0
+                                         ? 0
+                                         : static_cast<size_t>(std::round(100.0 * static_cast<double>(pass_count) /
+                                                                           static_cast<double>(total_count)));
+        const size_t mismatch_percent = total_count == 0
+                                            ? 0
+                                            : static_cast<size_t>(std::round(100.0 * static_cast<double>(fail_count) /
+                                                                              static_cast<double>(total_count)));
+
+        std::ostringstream oss;
+        oss << "Tensor compare failed.\n"
+            << "Stats: total=" << total_count
+            << ", match=" << pass_count << " (" << match_percent << "%)"
+            << ", mismatch=" << fail_count << " (" << mismatch_percent << "%)"
+            << ", abs_mode_count=" << n_abs
+            << ", rel_mode_count=" << n_rel
+            << ", max_abs_error=" << max_abs_error
+            << ", max_rel_error=" << max_rel_error
+            << ", max_error=" << max_error << "\n"
+            << "Showing first " << mismatch_logs.size() << " mismatch logs";
+        if (fail_count > mismatch_logs.size()) {
+            oss << " (remaining " << (fail_count - mismatch_logs.size()) << " omitted)";
+        }
+        oss << ":\n";
+
+        for (const auto& line : mismatch_logs) {
+            oss << line << '\n';
+        }
+
+        ADD_FAILURE() << oss.str();
     }
 }
 
