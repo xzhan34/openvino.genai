@@ -37,12 +37,15 @@ inline ov::genai::modeling::weights::QuantizationConfig create_quantization_conf
 
     config.group_size = group_size;
 
-    // Backup mode
-    if (backup_mode.find("int8") != std::string::npos) {
+    // Backup mode (supports INT4/INT8/NONE)
+    if (backup_mode == "int4_sym") {
+        config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
+    } else if (backup_mode == "int4_asym" || backup_mode == "int4") {
+        config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+    } else if (backup_mode == "int8_sym") {
+        config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
+    } else if (backup_mode == "int8_asym" || backup_mode == "int8") {
         config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
-        if (backup_mode.find("sym") != std::string::npos) {
-            config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
-        }
     } else if (backup_mode.empty() || backup_mode == "none") {
         config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
     }

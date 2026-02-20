@@ -22,7 +22,6 @@
 
 #include "load_image.hpp"
 #include "openvino/genai/tokenizer.hpp"
-#include "safetensors_utils/quantization_utils.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
@@ -31,6 +30,7 @@
 #include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
+#include "modeling/weights/quantization_config.hpp"
 #include "modeling/weights/synthetic_weight_source.hpp"
 
 namespace {
@@ -44,14 +44,7 @@ struct SampleOptions {
     int max_new_tokens = 64;
     bool cache_model = false;
 
-    std::string vision_quant_mode;
-    int vision_group_size = 128;
-    std::string text_quant_mode;
-    int text_group_size = 128;
-
     std::string dummy_model = "dense";
-    std::string dummy_weight_mode = "INT4_ASYM";
-    int dummy_group_size = 128;
 
     int dummy_num_layers = 0;
 };
@@ -139,28 +132,39 @@ void print_usage(const char* argv0) {
         << "  --cache-model                   Enable model caching behavior.\n"
         << "                                  HF mode: load cached IR from --model dir if exists, else build+save there\n"
         << "                                  Dummy mode: save built IR to app executable folder\n"
-        << "                                  Text IR files are mode-specific: qwen3_5_text.xml (text), qwen3_5_text_vl.xml (vl)\n"
-        << "  --vision-quant MODE             Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
-        << "  --vision-gs N                   Real mode only. Vision quant group size, integer > 0 (default: 128)\n"
-        << "  --text-quant MODE               Real mode only. MODE: none|int4_asym|int4_sym (default: none)\n"
-        << "  --text-gs N                     Real mode only. Text quant group size, integer > 0 (default: 128)\n"
+        << "                                  IR filename includes concise quant signature when quantization is enabled\n"
+        << "  Quantization for both real and dummy mode is controlled only by environment variables:\n"
+        << "    OV_GENAI_INFLIGHT_QUANT_MODE\n"
+        << "    OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE\n"
+        << "    OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE\n"
         << "  --dummy-model MODE              Dummy mode only: dense | moe (default: dense)\n"
-        << "  --dummy-weight-mode MODE        FP32 | INT4_ASYM | INT4_SYM (default: INT4_ASYM)\n"
-        << "  --dummy-group-size N            Dummy quant group size, integer > 0 (default: 128)\n"
         << "  --dummy-num-layers N            Override dummy text num_hidden_layers\n"
         << "  -h, --help                      Show this helper\n";
 }
 
-bool is_valid_quant_mode(std::string mode) {
-    mode = to_lower(std::move(mode));
-    return mode.empty() || mode == "none" || mode == "int4_asym" || mode == "int4_sym";
+std::string quant_mode_cache_token(ov::genai::modeling::weights::QuantizationConfig::Mode mode) {
+    using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
+    switch (mode) {
+        case Mode::INT4_SYM:
+            return "4s";
+        case Mode::INT4_ASYM:
+            return "4a";
+        case Mode::INT8_SYM:
+            return "8s";
+        case Mode::INT8_ASYM:
+            return "8a";
+        case Mode::NONE:
+        default:
+            return "n";
+    }
 }
 
-bool is_valid_dummy_weight_mode(std::string mode) {
-    for (auto& c : mode) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+std::string quant_cache_suffix(const ov::genai::modeling::weights::QuantizationConfig& cfg) {
+    if (!cfg.enabled()) {
+        return "";
     }
-    return mode == "FP32" || mode == "INT4_ASYM" || mode == "INT4_SYM" || mode == "INT4";
+    return "_q" + quant_mode_cache_token(cfg.mode) + "_b" + quant_mode_cache_token(cfg.backup_mode) +
+           "_g" + std::to_string(cfg.group_size);
 }
 
 SampleOptions parse_cli(int argc, char* argv[]) {
@@ -196,20 +200,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.max_new_tokens = parse_i32(take_value("--output-tokens"), "--output-tokens");
         } else if (arg == "--cache-model") {
             opts.cache_model = true;
-        } else if (arg == "--vision-quant") {
-            opts.vision_quant_mode = take_value("--vision-quant");
-        } else if (arg == "--vision-gs") {
-            opts.vision_group_size = parse_i32(take_value("--vision-gs"), "--vision-gs");
-        } else if (arg == "--text-quant") {
-            opts.text_quant_mode = take_value("--text-quant");
-        } else if (arg == "--text-gs") {
-            opts.text_group_size = parse_i32(take_value("--text-gs"), "--text-gs");
         } else if (arg == "--dummy-model") {
             opts.dummy_model = take_value("--dummy-model");
-        } else if (arg == "--dummy-weight-mode") {
-            opts.dummy_weight_mode = take_value("--dummy-weight-mode");
-        } else if (arg == "--dummy-group-size") {
-            opts.dummy_group_size = parse_i32(take_value("--dummy-group-size"), "--dummy-group-size");
         } else if (arg == "--dummy-num-layers") {
             opts.dummy_num_layers = parse_i32(take_value("--dummy-num-layers"), "--dummy-num-layers");
         } else {
@@ -234,24 +226,6 @@ SampleOptions parse_cli(int argc, char* argv[]) {
 
     if (opts.max_new_tokens <= 0) {
         throw std::runtime_error("max_new_tokens must be > 0");
-    }
-    if (opts.vision_group_size <= 0) {
-        throw std::runtime_error("vision-gs must be > 0");
-    }
-    if (opts.text_group_size <= 0) {
-        throw std::runtime_error("text-gs must be > 0");
-    }
-    if (opts.dummy_group_size <= 0) {
-        throw std::runtime_error("dummy-group-size must be > 0");
-    }
-    if (!is_valid_quant_mode(opts.vision_quant_mode)) {
-        throw std::runtime_error("vision-quant must be one of: none|int4_asym|int4_sym");
-    }
-    if (!is_valid_quant_mode(opts.text_quant_mode)) {
-        throw std::runtime_error("text-quant must be one of: none|int4_asym|int4_sym");
-    }
-    if (!is_valid_dummy_weight_mode(opts.dummy_weight_mode)) {
-        throw std::runtime_error("dummy-weight-mode must be one of: FP32|INT4_ASYM|INT4_SYM");
     }
     if (opts.user_prompt.empty()) {
         opts.user_prompt = (opts.mode == "vl") ? "Describe the image." : "Write one sentence about OpenVINO.";
@@ -415,29 +389,6 @@ ov::Tensor make_dummy_image() {
     return image;
 }
 
-ov::genai::modeling::weights::QuantizationConfig build_dummy_quant_config(const SampleOptions& opts) {
-    using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
-    ov::genai::modeling::weights::QuantizationConfig cfg;
-
-    std::string mode = opts.dummy_weight_mode;
-    for (auto& c : mode) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-
-    if (mode == "INT4_SYM") {
-        cfg.mode = Mode::INT4_SYM;
-    } else if (mode == "INT4_ASYM" || mode == "INT4") {
-        cfg.mode = Mode::INT4_ASYM;
-    } else {
-        cfg.mode = Mode::NONE;
-    }
-
-    cfg.group_size = opts.dummy_group_size;
-    cfg.backup_mode = cfg.mode;
-    cfg.selection.exclude_patterns.clear();
-    return cfg;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) try {
@@ -498,15 +449,16 @@ int main(int argc, char* argv[]) try {
 
     ov::genai::modeling::weights::QuantizationConfig vision_quant_config;
     ov::genai::modeling::weights::QuantizationConfig text_quant_config;
-    if (use_dummy_mode_flag) {
-        // Vision encoder: disable quantization by default (INT4 has severe perf regression on small batch)
-        // Text decoder: use configured quantization
-        vision_quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
-        text_quant_config = build_dummy_quant_config(opts);
-    } else {
-        vision_quant_config = create_quantization_config(opts.vision_quant_mode, opts.vision_group_size, "none");
-        text_quant_config = create_quantization_config(opts.text_quant_mode, opts.text_group_size, "none");
+    const auto shared_quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
+    if (shared_quant_config.enabled() && shared_quant_config.group_size <= 0) {
+        throw std::runtime_error(
+            "OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > 0 when OV_GENAI_INFLIGHT_QUANT_MODE is enabled");
     }
+    vision_quant_config = shared_quant_config;
+    text_quant_config = shared_quant_config;
+    std::cout << "[quant] env mode=" << quant_mode_cache_token(shared_quant_config.mode)
+              << ", backup=" << quant_mode_cache_token(shared_quant_config.backup_mode)
+              << ", group_size=" << shared_quant_config.group_size << std::endl;
 
     ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig pre_cfg;
     const auto pre_cfg_path = model_dir / "preprocessor_config.json";
@@ -525,10 +477,12 @@ int main(int argc, char* argv[]) try {
         return std::filesystem::current_path();
     }();
     const std::filesystem::path ir_dir = use_dummy_mode_flag ? app_dir : model_dir;
-    const auto text_xml_path = ir_dir / (use_vl ? "qwen3_5_text_vl.xml" : "qwen3_5_text.xml");
-    const auto text_bin_path = ir_dir / (use_vl ? "qwen3_5_text_vl.bin" : "qwen3_5_text.bin");
-    const auto vision_xml_path = ir_dir / "qwen3_5_vision.xml";
-    const auto vision_bin_path = ir_dir / "qwen3_5_vision.bin";
+    std::string text_ir_stem = (use_vl ? "qwen3_5_text_vl" : "qwen3_5_text") + quant_cache_suffix(text_quant_config);
+    std::string vision_ir_stem = "qwen3_5_vision" + quant_cache_suffix(vision_quant_config);
+    const auto text_xml_path = ir_dir / (text_ir_stem + ".xml");
+    const auto text_bin_path = ir_dir / (text_ir_stem + ".bin");
+    const auto vision_xml_path = ir_dir / (vision_ir_stem + ".xml");
+    const auto vision_bin_path = ir_dir / (vision_ir_stem + ".bin");
 
     const bool load_text_from_ir = opts.cache_model && !use_dummy_mode_flag && has_ir_model_pair(text_xml_path, text_bin_path);
     const bool load_vision_from_ir =
