@@ -8,7 +8,6 @@
 #include "safetensors_utils/safetensors_loader.hpp"
 
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
@@ -17,6 +16,7 @@
 #include <cstring>
 #include <chrono>
 #include <iomanip>
+#include <nlohmann/json.hpp>
 
 namespace ov {
 namespace genai {
@@ -132,34 +132,27 @@ std::vector<std::string> parse_index_json(const std::filesystem::path& index_pat
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open " + index_path.string());
     }
-    
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    std::string json = buffer.str();
-    
-    // Find weight_map section
-    size_t weight_map_pos = json.find("\"weight_map\"");
-    if (weight_map_pos == std::string::npos) {
-        throw std::runtime_error("weight_map not found in index.json");
+
+    nlohmann::json index_json;
+    try {
+        file >> index_json;
+    } catch (const nlohmann::json::exception& e) {
+        throw std::runtime_error("Failed to parse " + index_path.string() + ": " + e.what());
     }
-    
-    // Extract unique file names from weight_map values
+
+    if (!index_json.contains("weight_map") || !index_json["weight_map"].is_object()) {
+        throw std::runtime_error("weight_map not found or invalid in " + index_path.string());
+    }
+
+    // Extract unique file names from weight_map values.
     std::set<std::string> files;
-    size_t pos = weight_map_pos;
-    
-    // Simple extraction: find all .safetensors file references
-    while ((pos = json.find(".safetensors", pos)) != std::string::npos) {
-        // Find the start of the filename (after last quote before .safetensors)
-        size_t end = pos + 12;  // length of ".safetensors"
-        size_t start = json.rfind('"', pos);
-        if (start != std::string::npos && start < pos) {
-            start++;  // Skip the quote
-            std::string filename = json.substr(start, end - start);
-            files.insert(filename);
+    for (auto it = index_json["weight_map"].begin(); it != index_json["weight_map"].end(); ++it) {
+        if (!it.value().is_string()) {
+            throw std::runtime_error("Invalid weight_map entry for key '" + it.key() + "' in " + index_path.string());
         }
-        pos = end;
+        files.insert(it.value().get<std::string>());
     }
-    
+
     return std::vector<std::string>(files.begin(), files.end());
 }
 
