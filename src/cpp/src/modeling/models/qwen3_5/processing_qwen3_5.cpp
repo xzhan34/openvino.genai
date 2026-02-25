@@ -554,7 +554,7 @@ int32_t Qwen3_5TextConfig::resolved_head_dim() const {
     if (head_dim > 0) {
         return head_dim;
     }
-    if (hidden_size > 0 && num_attention_heads > 0) {
+    if (hidden_size > 0 && num_attention_heads > 0 && (hidden_size % num_attention_heads == 0)) {
         return hidden_size / num_attention_heads;
     }
     return 0;
@@ -623,6 +623,10 @@ void Qwen3_5TextConfig::validate() const {
         OPENVINO_THROW("Qwen3_5TextConfig.num_attention_heads must be divisible by num_key_value_heads");
     }
     if (resolved_head_dim() <= 0) {
+        if (hidden_size > 0 && num_attention_heads > 0 && (hidden_size % num_attention_heads != 0) && head_dim <= 0) {
+            OPENVINO_THROW("Qwen3_5TextConfig.hidden_size must be divisible by num_attention_heads "
+                           "when head_dim is not explicitly provided");
+        }
         OPENVINO_THROW("Qwen3_5TextConfig.head_dim must be > 0");
     }
     if (partial_rotary_factor <= 0.0f || partial_rotary_factor > 1.0f) {
@@ -640,9 +644,6 @@ void Qwen3_5TextConfig::validate() const {
                        head_dim,
                        ", partial_rotary_factor=",
                        partial_rotary_factor);
-    }
-    if (hidden_size % num_attention_heads != 0) {
-        OPENVINO_THROW("Qwen3_5TextConfig.hidden_size must be divisible by num_attention_heads");
     }
     if (rope.mrope_interleaved && rope.mrope_section.size() != 3) {
         OPENVINO_THROW("Qwen3_5TextConfig.mrope_section must have 3 elements");

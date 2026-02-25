@@ -66,6 +66,97 @@ TEST(Qwen3_5Config, DummyDense9bUsesUpdatedSpecialTokenIds) {
     EXPECT_EQ(cfg.vision_end_token_id, 248054);
 }
 
+TEST(Qwen3_5Config, AllowsExplicitHeadDimWhenHiddenSizeNotDivisibleByHeads) {
+    using ov::genai::modeling::models::Qwen3_5Config;
+
+    const nlohmann::json json = {
+        {"model_type", "qwen3_5"},
+        {"image_token_id", 7},
+        {"video_token_id", 8},
+        {"vision_start_token_id", 9},
+        {"vision_end_token_id", 10},
+        {"text_config",
+         {
+             {"model_type", "qwen3_5_text"},
+             {"vocab_size", 32000},
+             {"hidden_size", 26},
+             {"intermediate_size", 64},
+             {"num_hidden_layers", 2},
+             {"num_attention_heads", 8},
+             {"num_key_value_heads", 2},
+             {"head_dim", 4},
+             {"max_position_embeddings", 1024},
+             {"rms_norm_eps", 1e-6},
+         }},
+        {"vision_config",
+         {
+             {"model_type", "qwen3_5"},
+             {"depth", 1},
+             {"hidden_size", 8},
+             {"intermediate_size", 16},
+             {"num_heads", 2},
+             {"in_channels", 3},
+             {"patch_size", 2},
+             {"spatial_merge_size", 2},
+             {"temporal_patch_size", 1},
+             {"out_hidden_size", 26},
+             {"num_position_embeddings", 16},
+         }},
+    };
+
+    const auto cfg = Qwen3_5Config::from_json(json);
+    EXPECT_EQ(cfg.text.hidden_size, 26);
+    EXPECT_EQ(cfg.text.num_attention_heads, 8);
+    EXPECT_EQ(cfg.text.resolved_head_dim(), 4);
+}
+
+TEST(Qwen3_5Config, RejectsImplicitHeadDimWhenHiddenSizeNotDivisibleByHeads) {
+    using ov::genai::modeling::models::Qwen3_5Config;
+
+    nlohmann::json json = {
+        {"model_type", "qwen3_5"},
+        {"image_token_id", 7},
+        {"video_token_id", 8},
+        {"vision_start_token_id", 9},
+        {"vision_end_token_id", 10},
+        {"text_config",
+         {
+             {"model_type", "qwen3_5_text"},
+             {"vocab_size", 32000},
+             {"hidden_size", 26},
+             {"intermediate_size", 64},
+             {"num_hidden_layers", 2},
+             {"num_attention_heads", 8},
+             {"num_key_value_heads", 2},
+             {"max_position_embeddings", 1024},
+             {"rms_norm_eps", 1e-6},
+         }},
+        {"vision_config",
+         {
+             {"model_type", "qwen3_5"},
+             {"depth", 1},
+             {"hidden_size", 8},
+             {"intermediate_size", 16},
+             {"num_heads", 2},
+             {"in_channels", 3},
+             {"patch_size", 2},
+             {"spatial_merge_size", 2},
+             {"temporal_patch_size", 1},
+             {"out_hidden_size", 26},
+             {"num_position_embeddings", 16},
+         }},
+    };
+
+    try {
+        (void)Qwen3_5Config::from_json(json);
+        FAIL() << "Expected from_json to fail when head_dim is implicit and hidden_size is not divisible by num_attention_heads";
+    } catch (const ov::Exception& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("hidden_size must be divisible by num_attention_heads"), std::string::npos)
+            << "Unexpected error: " << msg;
+    }
+}
+
 TEST(Qwen3_5RopePlanner, BuildPlanProducesThreeChannelPositionIds) {
     const auto cfg = make_small_cfg();
     ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
