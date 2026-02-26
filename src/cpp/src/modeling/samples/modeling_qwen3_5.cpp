@@ -18,6 +18,7 @@
 
 #include <openvino/core/type/bfloat16.hpp>
 #include <openvino/core/type/float16.hpp>
+#include <openvino/op/constant.hpp>
 #include <openvino/openvino.hpp>
 
 #include "load_image.hpp"
@@ -360,6 +361,38 @@ std::string resolve_pos_embed_name(ov::genai::modeling::weights::WeightSource& s
     throw std::runtime_error("Failed to locate visual.pos_embed.weight");
 }
 
+// Name used for the extra pos_embed Result in cached vision IR
+static constexpr const char* kPosEmbedCacheResultName = "__pos_embed_cache__";
+
+// Embed pos_embed weight as a Constant->Result in the vision model so that
+// it is serialized into the .bin alongside other vision weights.
+void embed_pos_embed_in_vision_model(std::shared_ptr<ov::Model>& model,
+                                     const ov::Tensor& pos_embed) {
+    auto constant = std::make_shared<ov::op::v0::Constant>(pos_embed);
+    auto result = std::make_shared<ov::op::v0::Result>(constant);
+    result->set_friendly_name(kPosEmbedCacheResultName);
+    model->add_results({result});
+}
+
+// Extract the cached pos_embed Constant from a vision model loaded from IR,
+// then remove the extra Result so it doesn't affect inference.
+ov::Tensor extract_pos_embed_from_vision_model(std::shared_ptr<ov::Model>& model) {
+    for (const auto& result : model->get_results()) {
+        if (result->get_friendly_name() == kPosEmbedCacheResultName) {
+            auto const_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+                result->input_value(0).get_node_shared_ptr());
+            if (!const_node) {
+                throw std::runtime_error("pos_embed cache result is not a Constant");
+            }
+            ov::Tensor tensor(const_node->get_element_type(), const_node->get_shape());
+            std::memcpy(tensor.data(), const_node->get_data_ptr(), tensor.get_byte_size());
+            model->remove_result(result);
+            return tensor;
+        }
+    }
+    throw std::runtime_error("Cached vision IR does not contain pos_embed data");
+}
+
 double elapsed_ms(const std::chrono::steady_clock::time_point& start,
                   const std::chrono::steady_clock::time_point& end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
@@ -537,16 +570,31 @@ int main(int argc, char* argv[]) try {
 
     std::shared_ptr<ov::Model> vision_model;
     std::shared_ptr<ov::Model> text_model;
+    ov::Tensor cached_pos_embed;  // extracted from cached vision IR, or obtained from weight_source
     if (load_vision_from_ir) {
         std::cout << "[cache-model] Reusing cached vision IR: " << vision_xml_path << std::endl;
         vision_model = core.read_model(vision_xml_path.string(), vision_bin_path.string());
+        // Extract pos_embed from the cached vision IR and remove the extra Result
+        cached_pos_embed = extract_pos_embed_from_vision_model(vision_model);
+        std::cout << "[cache-model] Extracted pos_embed from vision IR" << std::endl;
     } else if (use_vl) {
         auto& weight_source = ensure_weight_source();
         ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer(vision_quant_config);
         vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(cfg, weight_source, vision_finalizer);
         if (opts.cache_model) {
+            // Embed pos_embed as a Constant->Result in the vision model so it's saved in the .bin
+            const std::string pe_name = resolve_pos_embed_name(weight_source);
+            cached_pos_embed = weight_source.get_tensor(pe_name);
+            embed_pos_embed_in_vision_model(vision_model, cached_pos_embed);
             ov::serialize(vision_model, vision_xml_path.string(), vision_bin_path.string());
-            std::cout << "[cache-model] Saved vision IR: " << vision_xml_path << std::endl;
+            std::cout << "[cache-model] Saved vision IR (with pos_embed): " << vision_xml_path << std::endl;
+            // Remove the extra Result before compile_model
+            for (const auto& result : vision_model->get_results()) {
+                if (result->get_friendly_name() == kPosEmbedCacheResultName) {
+                    vision_model->remove_result(result);
+                    break;
+                }
+            }
         }
     }
 
@@ -595,10 +643,15 @@ int main(int argc, char* argv[]) try {
     ov::Tensor visual_embeds;
     ov::Tensor grid_thw;
     if (use_vl) {
-        auto& weight_source = ensure_weight_source();
         ov::Tensor image = opts.image_path.empty() ? make_dummy_image() : utils::load_image(opts.image_path);
-        const std::string pos_embed_name = resolve_pos_embed_name(weight_source);
-        const ov::Tensor pos_embed_weight = weight_source.get_tensor(pos_embed_name);
+        ov::Tensor pos_embed_weight;
+        if (cached_pos_embed) {
+            pos_embed_weight = cached_pos_embed;
+        } else {
+            auto& weight_source = ensure_weight_source();
+            const std::string pos_embed_name = resolve_pos_embed_name(weight_source);
+            pos_embed_weight = weight_source.get_tensor(pos_embed_name);
+        }
 
         ov::genai::modeling::models::Qwen3_5VisionPreprocessor preprocessor(cfg.vision, pre_cfg);
         const auto preprocess_start = std::chrono::steady_clock::now();
