@@ -46,7 +46,7 @@ struct SampleOptions {
 
     std::string dummy_model = "dense";
 
-    int dummy_num_layers = 0;
+    std::optional<int> num_layers;
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -138,7 +138,7 @@ void print_usage(const char* argv0) {
         << "    OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE\n"
         << "    OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE\n"
         << "  --dummy-model MODE              Dummy mode only: dense | moe (default: dense)\n"
-        << "  --dummy-num-layers N            Override dummy text num_hidden_layers\n"
+        << "  --num-layers N                  Run only the first N text transformer layers (dummy + real model)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -202,8 +202,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.cache_model = true;
         } else if (arg == "--dummy-model") {
             opts.dummy_model = take_value("--dummy-model");
-        } else if (arg == "--dummy-num-layers") {
-            opts.dummy_num_layers = parse_i32(take_value("--dummy-num-layers"), "--dummy-num-layers");
+        } else if (arg == "--num-layers") {
+            opts.num_layers = parse_i32(take_value("--num-layers"), "--num-layers");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -234,15 +234,29 @@ SampleOptions parse_cli(int argc, char* argv[]) {
     return opts;
 }
 
-void apply_dummy_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cfg, const SampleOptions& opts) {
-    bool layer_schedule_needs_refresh = false;
-    if (opts.dummy_num_layers > 0) {
-        cfg.text.num_hidden_layers = opts.dummy_num_layers;
-        layer_schedule_needs_refresh = true;
+void apply_text_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cfg, const SampleOptions& opts) {
+    if (!opts.num_layers.has_value()) {
+        return;
     }
-    if (layer_schedule_needs_refresh) {
-        cfg.text.layer_types.clear();
+    if (*opts.num_layers <= 0) {
+        throw std::runtime_error("--num-layers must be > 0");
     }
+
+    if (*opts.num_layers > cfg.text.num_hidden_layers) {
+        throw std::runtime_error("--num-layers must be <= model num_hidden_layers (" +
+                                 std::to_string(cfg.text.num_hidden_layers) + "), got: " +
+                                 std::to_string(*opts.num_layers));
+    }
+
+    cfg.text.num_hidden_layers = *opts.num_layers;
+    if (!cfg.text.layer_types.empty()) {
+        if (cfg.text.layer_types.size() >= static_cast<size_t>(*opts.num_layers)) {
+            cfg.text.layer_types.resize(static_cast<size_t>(*opts.num_layers));
+        } else {
+            cfg.text.layer_types.clear();
+        }
+    }
+
     cfg.finalize();
     cfg.validate();
 }
@@ -443,9 +457,7 @@ int main(int argc, char* argv[]) try {
     } else {
         cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(model_dir);
     }
-    if (use_dummy_mode_flag) {
-        apply_dummy_config_overrides(cfg, opts);
-    }
+    apply_text_config_overrides(cfg, opts);
 
     ov::genai::modeling::weights::QuantizationConfig vision_quant_config;
     ov::genai::modeling::weights::QuantizationConfig text_quant_config;
@@ -478,6 +490,9 @@ int main(int argc, char* argv[]) try {
     }();
     const std::filesystem::path ir_dir = use_dummy_mode_flag ? app_dir : model_dir;
     std::string text_ir_stem = (use_vl ? "qwen3_5_text_vl" : "qwen3_5_text") + quant_cache_suffix(text_quant_config);
+    if (opts.num_layers.has_value()) {
+        text_ir_stem += "_l" + std::to_string(*opts.num_layers);
+    }
     std::string vision_ir_stem = "qwen3_5_vision" + quant_cache_suffix(vision_quant_config);
     const auto text_xml_path = ir_dir / (text_ir_stem + ".xml");
     const auto text_bin_path = ir_dir / (text_ir_stem + ".bin");
