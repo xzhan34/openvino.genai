@@ -466,7 +466,7 @@ int main(int argc, char* argv[]) try {
         throw std::runtime_error(
             "OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > 0 when OV_GENAI_INFLIGHT_QUANT_MODE is enabled");
     }
-    vision_quant_config = shared_quant_config;
+    // vision_quant_config = shared_quant_config;  // disabled: GPU compile_model hangs with many INT4 dequant subgraphs in vision encoder
     text_quant_config = shared_quant_config;
     std::cout << "[quant] env mode=" << quant_mode_cache_token(shared_quant_config.mode)
               << ", backup=" << quant_mode_cache_token(shared_quant_config.backup_mode)
