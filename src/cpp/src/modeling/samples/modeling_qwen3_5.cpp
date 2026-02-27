@@ -583,7 +583,12 @@ int main(int argc, char* argv[]) try {
 
     std::optional<ov::CompiledModel> compiled_vision;
     if (use_vl) {
-        compiled_vision = core.compile_model(vision_model, opts.device);
+        std::string vision_device = opts.device;
+        if (const char* env_vision_dev = std::getenv("OV_GENAI_VISION_DEVICE")) {
+            vision_device = env_vision_dev;
+        }
+        std::cout << "[vision] Compiling vision model on device: " << vision_device << std::endl;
+        compiled_vision = core.compile_model(vision_model, vision_device);
     }
     auto compiled_text = core.compile_model(text_model, opts.device);
 
