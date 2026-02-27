@@ -47,6 +47,7 @@ struct SampleOptions {
     std::string dummy_model = "dense";
 
     std::optional<int> num_layers;
+    int max_pixels = 0;
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -138,7 +139,9 @@ void print_usage(const char* argv0) {
         << "    OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE\n"
         << "    OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE\n"
         << "  --dummy-model MODE              Dummy mode only: dense | moe (default: dense)\n"
-        << "  --num-layers N                  Run only the first N text transformer layers (dummy + real model)\n"
+    << "  --num-layers N                  Run only the first N text transformer layers (dummy + real model)\n"
+    << "  --max-pixels N                  Limit vision input to N pixels (default: from preprocessor_config.json)\n"
+    << "                                  Recommended: 602112 (3072 tokens * 14^2 patch) for ARL-H GPU\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -204,6 +207,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.dummy_model = take_value("--dummy-model");
         } else if (arg == "--num-layers") {
             opts.num_layers = parse_i32(take_value("--num-layers"), "--num-layers");
+        } else if (arg == "--max-pixels") {
+            opts.max_pixels = parse_i32(take_value("--max-pixels"), "--max-pixels");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -476,6 +481,11 @@ int main(int argc, char* argv[]) try {
     const auto pre_cfg_path = model_dir / "preprocessor_config.json";
     if (!use_dummy_mode_flag && std::filesystem::exists(pre_cfg_path)) {
         pre_cfg = ov::genai::modeling::models::Qwen3_5VisionPreprocessConfig::from_json_file(pre_cfg_path);
+    }
+    if (opts.max_pixels > 0) {
+        std::cout << "[max-pixels] Overriding pre_cfg.max_pixels: " << pre_cfg.max_pixels
+                  << " -> " << opts.max_pixels << std::endl;
+        pre_cfg.max_pixels = static_cast<int64_t>(opts.max_pixels);
     }
 
     const std::filesystem::path app_dir = [&]() {
