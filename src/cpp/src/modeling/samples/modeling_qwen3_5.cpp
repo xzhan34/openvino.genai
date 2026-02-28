@@ -849,6 +849,12 @@ int main(int argc, char* argv[]) try {
 
                 if (first_active_tokens < 0) {
                     first_active_tokens = active_tokens;
+                } else if (first_active_tokens != active_tokens) {
+                    OPENVINO_THROW("Batch decode with different active prompt lengths is not supported in this sample: first=",
+                                   first_active_tokens,
+                                   ", current=",
+                                   active_tokens,
+                                   ".");
                 }
             }
 
