@@ -366,3 +366,61 @@ TEST(Qwen3_5RopePlanner, BuildPlanClampsNegativeRopeDeltaToZero) {
     const int64_t* rope_delta = plan.rope_deltas.data<const int64_t>();
     EXPECT_EQ(rope_delta[0], 0);
 }
+
+TEST(Qwen3_5RopePlanner, BuildPlanKeepsTextOffsetAroundVisionSpan) {
+    const auto cfg = make_small_cfg();
+    ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
+
+    // Sequence layout:
+    // text(1), <vision_start>, image_tokens(4), text(1)
+    ov::Tensor input_ids(ov::element::i64, {1, 7});
+    auto* ids = input_ids.data<int64_t>();
+    ids[0] = 101;
+    ids[1] = cfg.vision_start_token_id;
+    ids[2] = cfg.image_token_id;
+    ids[3] = cfg.image_token_id;
+    ids[4] = cfg.image_token_id;
+    ids[5] = cfg.image_token_id;
+    ids[6] = 102;
+
+    ov::Tensor attention_mask(ov::element::i64, {1, 7});
+    auto* mask = attention_mask.data<int64_t>();
+    for (size_t i = 0; i < 7; ++i) {
+        mask[i] = 1;
+    }
+
+    ov::Tensor image_grid_thw(ov::element::i64, {1, 3});
+    auto* grid = image_grid_thw.data<int64_t>();
+    grid[0] = 1;
+    grid[1] = 4;
+    grid[2] = 4;
+
+    auto plan = planner.build_plan(input_ids, &attention_mask, &image_grid_thw);
+
+    const int64_t* pos = plan.position_ids.data<const int64_t>();
+    constexpr size_t seq_len = 7;
+
+    // Plane 0 (temporal)
+    EXPECT_EQ(pos[0 * seq_len + 0], 0);
+    EXPECT_EQ(pos[0 * seq_len + 1], 1);
+    EXPECT_EQ(pos[0 * seq_len + 2], 2);
+    EXPECT_EQ(pos[0 * seq_len + 3], 2);
+    EXPECT_EQ(pos[0 * seq_len + 4], 2);
+    EXPECT_EQ(pos[0 * seq_len + 5], 2);
+    EXPECT_EQ(pos[0 * seq_len + 6], 4);
+
+    // Plane 1 (height)
+    EXPECT_EQ(pos[1 * seq_len + 2], 2);
+    EXPECT_EQ(pos[1 * seq_len + 3], 2);
+    EXPECT_EQ(pos[1 * seq_len + 4], 3);
+    EXPECT_EQ(pos[1 * seq_len + 5], 3);
+
+    // Plane 2 (width)
+    EXPECT_EQ(pos[2 * seq_len + 2], 2);
+    EXPECT_EQ(pos[2 * seq_len + 3], 3);
+    EXPECT_EQ(pos[2 * seq_len + 4], 2);
+    EXPECT_EQ(pos[2 * seq_len + 5], 3);
+
+    const int64_t* rope_delta = plan.rope_deltas.data<const int64_t>();
+    EXPECT_EQ(rope_delta[0], 0);
+}
