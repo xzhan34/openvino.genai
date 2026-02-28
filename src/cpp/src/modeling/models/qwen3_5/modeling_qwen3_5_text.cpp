@@ -734,6 +734,44 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                   const Tensor* visual_pos_mask) {
     OPENVINO_ASSERT((input_ids != nullptr) || (inputs_embeds != nullptr),
                     "Either input_ids or inputs_embeds must be provided");
+    OPENVINO_ASSERT(!(input_ids != nullptr && inputs_embeds != nullptr),
+                    "input_ids and inputs_embeds are mutually exclusive");
+    OPENVINO_ASSERT((visual_embeds == nullptr) == (visual_pos_mask == nullptr),
+                    "visual_embeds and visual_pos_mask must be provided together");
+
+    const auto source_ps = (inputs_embeds ? inputs_embeds->output() : input_ids->output()).get_partial_shape();
+    const auto source_rank = source_ps.rank();
+    OPENVINO_ASSERT(!source_rank.is_static() || source_rank.get_length() >= 2,
+                    "input source must have rank >= 2");
+
+    const auto position_ps = position_ids.output().get_partial_shape();
+    const auto position_rank = position_ps.rank();
+    OPENVINO_ASSERT(!position_rank.is_static() || position_rank.get_length() == 3,
+                    "position_ids must have rank 3 [3, B, S]");
+
+    if (source_rank.is_static() && source_rank.get_length() >= 2 && position_rank.is_static() &&
+        position_rank.get_length() == 3 && source_ps[0].is_static() && source_ps[1].is_static() &&
+        position_ps[1].is_static() && position_ps[2].is_static()) {
+        OPENVINO_ASSERT(position_ps[1].get_length() == source_ps[0].get_length() &&
+                        position_ps[2].get_length() == source_ps[1].get_length(),
+                        "position_ids shape mismatch with input source");
+    }
+
+    const auto full_mask_ps = full_attention_mask.output().get_partial_shape();
+    const auto full_mask_rank = full_mask_ps.rank();
+    OPENVINO_ASSERT(!full_mask_rank.is_static() || full_mask_rank.get_length() >= 2,
+                    "full_attention_mask must have rank >= 2");
+
+    if (source_rank.is_static() && source_rank.get_length() >= 2 && full_mask_rank.is_static() &&
+        full_mask_rank.get_length() >= 2 && source_ps[0].is_static() && source_ps[1].is_static() &&
+        full_mask_ps[full_mask_rank.get_length() - 2].is_static() &&
+        full_mask_ps[full_mask_rank.get_length() - 1].is_static()) {
+        OPENVINO_ASSERT(full_mask_ps[full_mask_rank.get_length() - 2].get_length() == source_ps[0].get_length(),
+                        "full_attention_mask batch dimension mismatch");
+        OPENVINO_ASSERT(full_mask_ps[full_mask_rank.get_length() - 1].get_length() == source_ps[1].get_length(),
+                        "full_attention_mask sequence dimension mismatch");
+    }
+
     Tensor hidden_states = inputs_embeds ? *inputs_embeds : embed_tokens_.forward(*input_ids);
     if (visual_embeds && visual_pos_mask) {
         hidden_states = embedding_injector_.forward(hidden_states, *visual_embeds, *visual_pos_mask);
