@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -22,6 +23,7 @@
 #include <openvino/openvino.hpp>
 
 #include "openvino/genai/chat_history.hpp"
+#include "openvino/genai/generation_config.hpp"
 #include "load_image.hpp"
 #include "openvino/genai/tokenizer.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
@@ -278,6 +280,33 @@ std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens
     prompt += user_prompt;
     prompt += "<|im_end|>\n<|im_start|>assistant\n";
     return prompt;
+}
+
+std::set<int64_t> resolve_stop_token_ids(const std::filesystem::path& model_dir,
+                                         const ov::genai::Tokenizer* tokenizer) {
+    std::set<int64_t> stop_token_ids;
+
+    if (!model_dir.empty()) {
+        const auto generation_config_path = model_dir / "generation_config.json";
+        if (std::filesystem::exists(generation_config_path) && std::filesystem::is_regular_file(generation_config_path)) {
+            try {
+                ov::genai::GenerationConfig generation_config(generation_config_path);
+                stop_token_ids = generation_config.stop_token_ids;
+            } catch (const std::exception& e) {
+                std::cerr << "Failed to load generation_config.json: " << e.what() << std::endl;
+                std::cerr << "Falling back to tokenizer eos_token_id..." << std::endl;
+            }
+        }
+    }
+
+    if (stop_token_ids.empty() && tokenizer) {
+        const int64_t eos_token_id = tokenizer->get_eos_token_id();
+        if (eos_token_id >= 0) {
+            stop_token_ids.insert(eos_token_id);
+        }
+    }
+
+    return stop_token_ids;
 }
 
 int64_t argmax_last_token(const ov::Tensor& logits) {
@@ -786,10 +815,8 @@ int main(int argc, char* argv[]) try {
     generated.reserve(static_cast<size_t>(opts.max_new_tokens));
     generated.push_back(next_id);
 
-    int64_t eos_token_id = -1;
-    if (tokenizer) {
-        eos_token_id = tokenizer->get_eos_token_id();
-    }
+    const auto stop_token_ids = resolve_stop_token_ids(use_dummy_mode_flag ? std::filesystem::path{} : model_dir,
+                                                       tokenizer.get());
 
     ov::Tensor step_ids(ov::element::i64, {batch, 1});
     ov::Tensor step_mask(ov::element::i64, {batch, 1});
@@ -809,7 +836,7 @@ int main(int argc, char* argv[]) try {
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
     for (int step = 1; step < opts.max_new_tokens; ++step) {
-        if (eos_token_id >= 0 && next_id == eos_token_id) {
+        if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) {
             break;
         }
         auto* step_data = step_ids.data<int64_t>();
