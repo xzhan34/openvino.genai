@@ -1230,13 +1230,14 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
                 if (mask_value(*attention_mask, idx)) {
                     continue;
                 }
-                pos_data[0 * batch * seq_len + idx] = 1;
-                pos_data[1 * batch * seq_len + idx] = 1;
-                pos_data[2 * batch * seq_len + idx] = 1;
+                pos_data[0 * batch * seq_len + idx] = 0;
+                pos_data[1 * batch * seq_len + idx] = 0;
+                pos_data[2 * batch * seq_len + idx] = 0;
             }
         }
 
-        delta_data[b] = max_pos + 1 - static_cast<int64_t>(seq_len);
+        const int64_t raw_delta = max_pos + 1 - static_cast<int64_t>(tokens.size());
+        delta_data[b] = std::max<int64_t>(raw_delta, 0);
         image_grid_index = local_image_grid_index;
         video_grid_index = local_video_grid_index;
     }

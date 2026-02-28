@@ -304,3 +304,65 @@ TEST(Qwen3_5RopePlanner, DecodePositionIdsApplyRopeDeltas) {
     EXPECT_EQ(data[4], 13);
     EXPECT_EQ(data[5], 14);
 }
+
+TEST(Qwen3_5RopePlanner, BuildPlanUsesActiveTokensForRopeDeltaAndZeroPadsMaskedPositions) {
+    const auto cfg = make_small_cfg();
+    ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
+
+    ov::Tensor input_ids(ov::element::i64, {1, 5});
+    auto* ids = input_ids.data<int64_t>();
+    ids[0] = 11;
+    ids[1] = 12;
+    ids[2] = 13;
+    ids[3] = 14;
+    ids[4] = 15;
+
+    ov::Tensor attention_mask(ov::element::i64, {1, 5});
+    auto* mask = attention_mask.data<int64_t>();
+    mask[0] = 1;
+    mask[1] = 1;
+    mask[2] = 1;
+    mask[3] = 0;
+    mask[4] = 0;
+
+    auto plan = planner.build_plan(input_ids, &attention_mask);
+
+    const auto* pos = plan.position_ids.data<const int64_t>();
+    EXPECT_EQ(pos[0], 0);
+    EXPECT_EQ(pos[1], 1);
+    EXPECT_EQ(pos[2], 2);
+    EXPECT_EQ(pos[3], 0);
+    EXPECT_EQ(pos[4], 0);
+
+    const int64_t* rope_delta = plan.rope_deltas.data<const int64_t>();
+    EXPECT_EQ(rope_delta[0], 0);
+}
+
+TEST(Qwen3_5RopePlanner, BuildPlanClampsNegativeRopeDeltaToZero) {
+    const auto cfg = make_small_cfg();
+    ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
+
+    ov::Tensor input_ids(ov::element::i64, {1, 5});
+    auto* ids = input_ids.data<int64_t>();
+    ids[0] = cfg.vision_start_token_id;
+    ids[1] = cfg.image_token_id;
+    ids[2] = cfg.image_token_id;
+    ids[3] = cfg.image_token_id;
+    ids[4] = cfg.image_token_id;
+
+    ov::Tensor attention_mask(ov::element::i64, {1, 5});
+    auto* mask = attention_mask.data<int64_t>();
+    for (size_t i = 0; i < 5; ++i) {
+        mask[i] = 1;
+    }
+
+    ov::Tensor image_grid_thw(ov::element::i64, {1, 3});
+    auto* grid = image_grid_thw.data<int64_t>();
+    grid[0] = 1;
+    grid[1] = 4;
+    grid[2] = 4;
+
+    auto plan = planner.build_plan(input_ids, &attention_mask, &image_grid_thw);
+    const int64_t* rope_delta = plan.rope_deltas.data<const int64_t>();
+    EXPECT_EQ(rope_delta[0], 0);
+}
