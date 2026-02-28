@@ -833,6 +833,30 @@ int main(int argc, char* argv[]) try {
     }
 
     int64_t past_len = prompt_len;
+    if (attention_mask.get_element_type() == ov::element::i64) {
+        const int64_t* mask_data = attention_mask.data<const int64_t>();
+        const size_t mask_batch = attention_mask.get_shape().at(0);
+        const size_t mask_seq = attention_mask.get_shape().at(1);
+        if (mask_batch > 0 && mask_seq > 0) {
+            int64_t first_active_tokens = -1;
+            for (size_t b = 0; b < mask_batch; ++b) {
+                int64_t active_tokens = 0;
+                for (size_t s = 0; s < mask_seq; ++s) {
+                    if (mask_data[b * mask_seq + s] != 0) {
+                        active_tokens += 1;
+                    }
+                }
+
+                if (first_active_tokens < 0) {
+                    first_active_tokens = active_tokens;
+                }
+            }
+
+            if (first_active_tokens >= 0) {
+                past_len = first_active_tokens;
+            }
+        }
+    }
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
     for (int step = 1; step < opts.max_new_tokens; ++step) {
