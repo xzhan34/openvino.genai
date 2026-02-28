@@ -21,6 +21,7 @@
 #include <openvino/op/constant.hpp>
 #include <openvino/openvino.hpp>
 
+#include "openvino/genai/chat_history.hpp"
 #include "load_image.hpp"
 #include "openvino/genai/tokenizer.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
@@ -696,16 +697,24 @@ int main(int argc, char* argv[]) try {
     if (tokenizer) {
         try {
             std::string prompt;
+            bool add_special_tokens = true;
             if (use_vl) {
                 const int64_t image_tokens =
                     ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
                         grid_thw,
                         cfg.vision.spatial_merge_size);
                 prompt = build_vl_prompt(opts.user_prompt, image_tokens);
+                add_special_tokens = false;
             } else {
                 prompt = opts.user_prompt;
+                if (!tokenizer->get_chat_template().empty()) {
+                    ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
+                    constexpr bool add_generation_prompt = true;
+                    prompt = tokenizer->apply_chat_template(history, add_generation_prompt);
+                    add_special_tokens = false;
+                }
             }
-            auto tokenized = tokenizer->encode(prompt, ov::genai::add_special_tokens(false));
+            auto tokenized = tokenizer->encode(prompt, ov::genai::add_special_tokens(add_special_tokens));
             input_ids = tokenized.input_ids;
             attention_mask = tokenized.attention_mask;
             
