@@ -3,9 +3,12 @@
 
 #include "modeling/models/qwen3_5/modeling_qwen3_5_moe.hpp"
 
+#include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include <openvino/core/except.hpp>
+#include <openvino/op/constant.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
@@ -13,6 +16,7 @@
 #include "modeling/ops/shape.hpp"
 #include "modeling/ops/tensor_ops.hpp"
 #include "modeling/weights/weight_loader.hpp"
+#include "modeling/weights/weight_source.hpp"
 
 namespace ov {
 namespace genai {
@@ -20,6 +24,76 @@ namespace modeling {
 namespace models {
 
 namespace {
+
+/// Lightweight in-memory WeightSource wrapping a single pre-split tensor.
+/// Used to call finalizer.finalize() for gate/up halves independently.
+class InMemoryWeightSource : public weights::WeightSource {
+public:
+    void add(const std::string& name, ov::Tensor tensor) {
+        tensors_[name] = std::move(tensor);
+    }
+
+    std::vector<std::string> keys() const override {
+        std::vector<std::string> k;
+        k.reserve(tensors_.size());
+        for (const auto& p : tensors_)
+            k.push_back(p.first);
+        return k;
+    }
+
+    bool has(const std::string& name) const override {
+        return tensors_.count(name) > 0;
+    }
+
+    const ov::Tensor& get_tensor(const std::string& name) const override {
+        auto it = tensors_.find(name);
+        OPENVINO_ASSERT(it != tensors_.end(), "InMemoryWeightSource: tensor not found: ", name);
+        return it->second;
+    }
+
+private:
+    std::unordered_map<std::string, ov::Tensor> tensors_;
+};
+
+/// Split an ov::Tensor in half along the given dimension (CPU memcpy).
+/// Requires element type with bitwidth >= 8.
+std::pair<ov::Tensor, ov::Tensor> split_tensor_on_dim(const ov::Tensor& tensor, size_t dim) {
+    auto shape = tensor.get_shape();
+    auto elem_type = tensor.get_element_type();
+
+    OPENVINO_ASSERT(elem_type.bitwidth() >= 8, "split_tensor_on_dim requires element bitwidth >= 8");
+    OPENVINO_ASSERT(dim < shape.size(), "split_tensor_on_dim: dim out of range");
+    OPENVINO_ASSERT(shape[dim] % 2 == 0, "split_tensor_on_dim: dim size must be even, got ", shape[dim]);
+
+    size_t outer = 1;
+    for (size_t i = 0; i < dim; ++i)
+        outer *= shape[i];
+    size_t mid = shape[dim] / 2;
+    size_t inner = 1;
+    for (size_t i = dim + 1; i < shape.size(); ++i)
+        inner *= shape[i];
+
+    ov::Shape half_shape = shape;
+    half_shape[dim] = mid;
+
+    ov::Tensor first(elem_type, half_shape);
+    ov::Tensor second(elem_type, half_shape);
+
+    size_t elem_size = elem_type.size();
+    size_t half_bytes = mid * inner * elem_size;
+    size_t full_bytes = 2 * half_bytes;
+
+    const uint8_t* src = static_cast<const uint8_t*>(tensor.data());
+    uint8_t* dst1 = static_cast<uint8_t*>(first.data());
+    uint8_t* dst2 = static_cast<uint8_t*>(second.data());
+
+    for (size_t o = 0; o < outer; ++o) {
+        std::memcpy(dst1 + o * half_bytes, src + o * full_bytes, half_bytes);
+        std::memcpy(dst2 + o * half_bytes, src + o * full_bytes + half_bytes, half_bytes);
+    }
+
+    return {first, second};
+}
 
 Tensor dequantize_packed_moe_weight(const Tensor& packed_weight,
                                     const Tensor& scales_e_g_o,
@@ -83,15 +157,43 @@ Qwen3_5SparseMoeBlock::Qwen3_5SparseMoeBlock(BuilderContext& ctx,
         if (!param.context()) {
             OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
         }
-        auto weight = finalizer.finalize(weight_name, source, *param.context());
-        param.bind(weight);
 
-        gate_up_scales_.reset();
-        gate_up_zps_.reset();
-        if (weight.get_auxiliary("scales") != std::nullopt && weight.get_auxiliary("zps") != std::nullopt) {
-            gate_up_scales_ = weight.auxiliary.at("scales");
-            gate_up_zps_ = weight.auxiliary.at("zps");
+        // Split fused gate_up_proj [E, 2*I, H] before quantization so gate/up
+        // get independent scales and zero points.
+        const ov::Tensor& fused_tensor = source.get_tensor(weight_name);
+        auto [gate_tensor, up_tensor] = split_tensor_on_dim(fused_tensor, 1);
+
+        std::string gate_name = weight_name;
+        {
+            auto pos = gate_name.find("gate_up_proj");
+            OPENVINO_ASSERT(pos != std::string::npos, "Expected 'gate_up_proj' in weight name: ", weight_name);
+            gate_name.replace(pos, std::string("gate_up_proj").length(), "gate_proj.weight");
         }
+        std::string up_name = weight_name;
+        {
+            auto pos = up_name.find("gate_up_proj");
+            OPENVINO_ASSERT(pos != std::string::npos, "Expected 'gate_up_proj' in weight name: ", weight_name);
+            up_name.replace(pos, std::string("gate_up_proj").length(), "up_proj.weight");
+        }
+
+        InMemoryWeightSource gate_source;
+        gate_source.add(gate_name, gate_tensor);
+        auto gate_result = finalizer.finalize(gate_name, gate_source, *param.context());
+
+        InMemoryWeightSource up_source;
+        up_source.add(up_name, up_tensor);
+        auto up_result = finalizer.finalize(up_name, up_source, *param.context());
+
+        gate_weight_ = gate_result.primary;
+        gate_scales_ = gate_result.get_auxiliary("scales");
+        gate_zps_ = gate_result.get_auxiliary("zps");
+
+        up_weight_ = up_result.primary;
+        up_scales_ = up_result.get_auxiliary("scales");
+        up_zps_ = up_result.get_auxiliary("zps");
+
+        // Keep original parameter marked as loaded.
+        param.bind(gate_result.primary);
     });
 
     experts_down_param_->set_weight_loader([this](WeightParameter& param,
@@ -120,13 +222,6 @@ const Tensor& Qwen3_5SparseMoeBlock::gate_weight() const {
         OPENVINO_THROW("Qwen3_5SparseMoeBlock gate parameter is not registered");
     }
     return gate_param_->value();
-}
-
-const Tensor& Qwen3_5SparseMoeBlock::gate_up_expert_weights() const {
-    if (!experts_gate_up_param_) {
-        OPENVINO_THROW("Qwen3_5SparseMoeBlock experts.gate_up_proj parameter is not registered");
-    }
-    return experts_gate_up_param_->value();
 }
 
 const Tensor& Qwen3_5SparseMoeBlock::down_expert_weights() const {
@@ -165,73 +260,47 @@ const Tensor& Qwen3_5SparseMoeBlock::shared_down_proj_weight() const {
 }
 
 bool Qwen3_5SparseMoeBlock::can_use_fused_path() const {
-    // NOTE:
-    // Current gate_up split relies on StridedSlice over low-bit packed constants (u4/i4).
-    // That path crashes during ConstantFolding on GPU in this branch.
-    // Keep fused path disabled until packed split is implemented without low-bit StridedSlice.
-    // open as split on u4 is supported now
-    return true;
+    const bool has_gate_quant = gate_weight_.has_value() && gate_scales_.has_value() && gate_zps_.has_value();
+    const bool has_up_quant = up_weight_.has_value() && up_scales_.has_value() && up_zps_.has_value();
+    const bool has_down_quant = down_scales_.has_value() && down_zps_.has_value();
+    if (!(has_gate_quant && has_up_quant && has_down_quant)) {
+        return false;
+    }
+
+    // Fused compressed MoE kernel expects packed expert weights.
+    const auto gate_rank = gate_weight_->output().get_shape().size();
+    const auto up_rank = up_weight_->output().get_shape().size();
+    const auto down_rank = down_expert_weights().output().get_shape().size();
+    return gate_rank == 4 && up_rank == 4 && down_rank == 4;
 }
 
 size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
-    const auto gate_up_shape = gate_up_expert_weights().output().get_shape();
-    if (gate_up_shape.size() == 4 && gate_up_shape[3] > 0) {
-        return gate_up_shape[3];
+    if (gate_weight_.has_value()) {
+        const auto shape = gate_weight_->output().get_shape();
+        if (shape.size() == 4 && shape[3] > 0) {
+            return shape[3];
+        }
     }
     return 128;
 }
 
-// default split on u4 directly to save used memory and reduce compile time, could fallback to u8 as ref
-#define EXPERTS_GATE_UP_SPLIT_ON_U4
-
 Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
-    auto gate_up_w = gate_up_expert_weights();
-    auto down_w = down_expert_weights();
-
-#ifdef EXPERTS_GATE_UP_SPLIT_ON_U4
-    auto split_wei = ops::split(gate_up_w, 2, 1);
-    auto gate_exps_w = split_wei.first;
-    auto up_exps_w = split_wei.second;
-
-    auto split_scale = ops::split(*gate_up_scales_, 2, 2);
-    auto gate_exps_scales = split_scale.first;
-    auto up_exps_scales = split_scale.second;
-
-    auto split_zp = ops::split(*gate_up_zps_, 2, 2);
-    auto gate_exps_zps = split_zp.first;
-    auto up_exps_zps = split_zp.second;
-#else
-    auto gate_up_w_u8 = ops::convert(gate_up_w, ov::element::u8);
-
-    auto split = ops::split(gate_up_w_u8, 2, 1);
-    auto gate_exps_w_u8 = split.first;
-    auto up_exps_w_u8 = split.second;
-    auto gate_exps_w = ops::convert(gate_exps_w_u8, ov::element::u4);
-    auto up_exps_w = ops::convert(up_exps_w_u8, ov::element::u4);
-
-    // scale no need convert
-    auto split_scale = ops::split(*gate_up_scales_, 2, 2);
-    auto gate_exps_scales = split_scale.first;
-    auto up_exps_scales = split_scale.second;
-
-    auto split_zp_u8 = ops::convert(*gate_up_zps_, ov::element::u8);
-    auto split_zp = ops::split(split_zp_u8, 2, 2);
-    auto gate_exps_zps_u8 = split_zp.first;
-    auto up_exps_zps_u8 = split_zp.second;
-    auto gate_exps_zps = ops::convert(gate_exps_zps_u8, ov::element::u4);
-    auto up_exps_zps = ops::convert(up_exps_zps_u8, ov::element::u4);
-<<<<<<< ours
-#endif
+    OPENVINO_ASSERT(gate_weight_.has_value() && gate_scales_.has_value() && gate_zps_.has_value(),
+                    "Gate expert weights not loaded (split-before-quantize)");
+    OPENVINO_ASSERT(up_weight_.has_value() && up_scales_.has_value() && up_zps_.has_value(),
+                    "Up expert weights not loaded (split-before-quantize)");
+    OPENVINO_ASSERT(down_scales_.has_value() && down_zps_.has_value(),
+                    "Down expert scales/zps not loaded");
 
     return ops::moe3gemm_fused_compressed(flat_f32,
                                           gate_weight(),
-                                          gate_exps_w,
-                                          gate_exps_scales,
-                                          gate_exps_zps,
-                                          up_exps_w,
-                                          up_exps_scales,
-                                          up_exps_zps,
-                                          down_w,
+                                          *gate_weight_,
+                                          *gate_scales_,
+                                          *gate_zps_,
+                                          *up_weight_,
+                                          *up_scales_,
+                                          *up_zps_,
+                                          down_expert_weights(),
                                           *down_scales_,
                                           *down_zps_,
                                           hidden_size_,
@@ -240,60 +309,6 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
                                           top_k_,
                                           infer_group_size(),
                                           ov::element::f16);
-=======
-
-    // Check if shared experts are fully quantized, otherwise we must fallback for shared part
-    bool use_fused_shared = shared_gate_scales_.has_value() && shared_gate_zps_.has_value() &&
-                            shared_up_scales_.has_value() && shared_up_zps_.has_value() &&
-                            shared_down_scales_.has_value() && shared_down_zps_.has_value();
-
-    if (!use_fused_shared) {
-        std::cout << "[ERROR] Cannot get shared experts" << std::endl;
-        exit(0);
-    }
-
-    auto sh_gate_w = shared_gate_proj_weight();
-    auto sh_up_w = shared_up_proj_weight();
-    auto sh_down_w = shared_down_proj_weight();
-    auto sh_gate_gate_w = shared_expert_gate_weight().to(ov::element::f16);
-
-    auto sh_gate_scales = shared_gate_scales_.value();
-    auto sh_gate_zps = shared_gate_zps_.value();
-    auto sh_up_scales = shared_up_scales_.value();
-    auto sh_up_zps = shared_up_zps_.value();
-    auto sh_down_scales = shared_down_scales_.value();
-    auto sh_down_zps = shared_down_zps_.value();
-
-    auto result = ops::moe3gemm_fused_compressed(flat_f32,
-                                                 gate_weight(),
-                                                 gate_exps_w,
-                                                 gate_exps_scales,
-                                                 gate_exps_zps,
-                                                 up_exps_w,
-                                                 up_exps_scales,
-                                                 up_exps_zps,
-                                                 down_w,
-                                                 *down_scales_,
-                                                 *down_zps_,
-                                                 hidden_size_,
-                                                 expert_intermediate_size_,
-                                                 num_experts_,
-                                                 top_k_,
-                                                 infer_group_size(),
-                                                 ov::element::f16,
-                                                 sh_gate_w,
-                                                 sh_gate_scales,
-                                                 sh_gate_zps,
-                                                 sh_up_w,
-                                                 sh_up_scales,
-                                                 sh_up_zps,
-                                                 sh_down_w,
-                                                 sh_down_scales,
-                                                 sh_down_zps,
-                                                 sh_gate_gate_w);
-
-    return result;
->>>>>>> theirs
 }
 
 Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
@@ -332,21 +347,23 @@ Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
     auto flat_3d = flat_f32.unsqueeze(0);
     auto tiled = ops::tensor::tile(flat_3d, {num_experts_, 1, 1});  // [E, T, H]
 
-    Tensor gate_up;
-    Tensor down_exps_w;
-    const bool has_quant_aux = gate_up_scales_.has_value() && gate_up_zps_.has_value() &&
-                               down_scales_.has_value() && down_zps_.has_value();
+    const bool has_gate_quant = gate_weight_.has_value() && gate_scales_.has_value() && gate_zps_.has_value();
+    const bool has_down_quant = down_scales_.has_value() && down_zps_.has_value();
 
-    if (has_quant_aux &&
-        gate_up_expert_weights().output().get_shape().size() == 4 &&
-        down_expert_weights().output().get_shape().size() == 4) {
-        // Quantized packed MoE weights: dequantize explicitly for fallback path.
-        gate_up = dequantize_packed_moe_weight(gate_up_expert_weights(),
-                                               *gate_up_scales_,
-                                               *gate_up_zps_,
-                                               num_experts_,
-                                               2 * expert_intermediate_size_,
-                                               hidden_size_);
+    Tensor gate_exps_w, up_exps_w, down_exps_w;
+    if (has_gate_quant && gate_weight_->output().get_shape().size() == 4) {
+        gate_exps_w = dequantize_packed_moe_weight(*gate_weight_, *gate_scales_, *gate_zps_,
+                                                   num_experts_, expert_intermediate_size_, hidden_size_);
+        up_exps_w = dequantize_packed_moe_weight(*up_weight_, *up_scales_, *up_zps_,
+                                                 num_experts_, expert_intermediate_size_, hidden_size_);
+    } else if (gate_weight_.has_value()) {
+        gate_exps_w = gate_weight_->to(ov::element::f32);
+        up_exps_w = up_weight_->to(ov::element::f32);
+    } else {
+        OPENVINO_THROW("Gate/up expert weights not loaded for fallback path");
+    }
+
+    if (has_down_quant && down_expert_weights().output().get_shape().size() == 4) {
         down_exps_w = dequantize_packed_moe_weight(down_expert_weights(),
                                                    *down_scales_,
                                                    *down_zps_,
@@ -354,12 +371,8 @@ Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
                                                    hidden_size_,
                                                    expert_intermediate_size_);
     } else {
-        gate_up = gate_up_expert_weights().to(ov::element::f32);
         down_exps_w = down_expert_weights().to(ov::element::f32);
     }
-
-    auto gate_exps_w = ops::slice(gate_up, 0, expert_intermediate_size_, 1, 1);
-    auto up_exps_w = ops::slice(gate_up, expert_intermediate_size_, 2 * expert_intermediate_size_, 1, 1);
 
     auto gate_bmm = ops::matmul(tiled, gate_exps_w, false, true);
     auto up_bmm = ops::matmul(tiled, up_exps_w, false, true);

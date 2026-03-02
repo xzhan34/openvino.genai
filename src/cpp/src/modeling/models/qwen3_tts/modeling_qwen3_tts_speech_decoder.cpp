@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-/**
+/*
  * @file modeling_qwen3_tts_speech_decoder.cpp
  * @brief Qwen3-TTS Speech Decoder implementation using Modeling API
  *

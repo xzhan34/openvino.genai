@@ -39,6 +39,7 @@
 #include "modeling/models/youtu/modeling_youtu.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
+#include "modeling/models/qwen3_omni/modeling_qwen3_omni.hpp"
 #include "modeling/weights/quantization_config.hpp"
 
 using namespace ov;
@@ -662,6 +663,10 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         // Create the text model (no visual inputs for greedy_causal_lm)
         ov_model = ov::genai::modeling::models::create_qwen3_5_text_model(
             qwen35_cfg, source, finalizer, false, false);
+    } else if (hf_config.model_type == "qwen3_omni") {
+        auto qwen3_omni_cfg = ov::genai::modeling::models::Qwen3OmniConfig::from_json_file(model_dir);
+        ov_model = ov::genai::modeling::models::create_qwen3_omni_text_model(
+            qwen3_omni_cfg, source, finalizer, false, false);
     } else {
         throw std::runtime_error("Unsupported model architecture '" + hf_config.model_type + "'");
     }
@@ -986,9 +991,9 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    const bool force_modeling_api = (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5");
+        const bool force_modeling_api = (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5" || model_type == "qwen3_omni");
     if (((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "qwen3_next" || 
-          model_type == "qwen3_5_moe" || model_type == "qwen3_5" ||
+            model_type == "qwen3_5_moe" || model_type == "qwen3_5" || model_type == "qwen3_omni" ||
           model_type == "smollm3" || model_type == "youtu_llm") &&
          (use_modeling_api() || force_modeling_api))) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;

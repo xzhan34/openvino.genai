@@ -564,7 +564,8 @@ Tensor DeepseekSamAttention::forward(const Tensor& hidden_states) const {
     }
 
     auto* policy = &this->ctx().op_policy();
-    auto context = ops::llm::sdpa(q, k, v, 1.0f, 3, use_rel_pos_ ? &attn_bias : nullptr, false, policy);
+    const float scaling = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    auto context = ops::llm::sdpa(q, k, v, scaling, 3, use_rel_pos_ ? &attn_bias : nullptr, false, policy);
     auto merged = context.permute({0, 2, 1, 3});
     auto h = Tensor(shape::dim(hidden_states, 1), ctx).squeeze(0);
     auto w = Tensor(shape::dim(hidden_states, 2), ctx).squeeze(0);

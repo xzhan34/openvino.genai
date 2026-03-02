@@ -704,7 +704,7 @@ int main(int argc, char* argv[]) try {
         const auto kv_pos = ov::genai::utils::get_kv_axes_pos(compiled_target.get_runtime_model());
         target_kv_state.seq_length_axis = kv_pos.seq_len;
         const auto beam_idx = make_beam_idx(1);
-
+        std::cout << "---------------START INFERENCE --------------------" << std::endl;
         // Prefill: run target on prompt to get first token.
         auto prefill_start = Clock::now();
         target_request.set_tensor("input_ids", make_ids_tensor(output_ids));
@@ -739,7 +739,7 @@ int main(int argc, char* argv[]) try {
         std::cout << "\n[Streaming Output]\n";
         auto prompt_text = tokenizer.decode(prompt_ids, {ov::genai::skip_special_tokens(true)});
         std::cout << prompt_text;
-        auto first_token_text = tokenizer.decode(std::vector<int64_t>{next_token}, {ov::genai::skip_special_tokens(true)});
+        auto first_token_text = tokenizer.decode(std::vector<int64_t>{next_token}, ov::genai::skip_special_tokens(true));
         std::cout << first_token_text << std::flush;
 
         const auto generation_start = Clock::now();
@@ -854,9 +854,10 @@ int main(int argc, char* argv[]) try {
             block_output_ids.insert(block_output_ids.end(), draft_tokens.begin(), draft_tokens.end());
 
             const size_t verify_len = block_output_ids.size();
+            const size_t kv_len = target_hidden_len + verify_len;
             auto verify_start = Clock::now();
             target_request.set_tensor("input_ids", make_ids_tensor(block_output_ids));
-            target_request.set_tensor("attention_mask", make_attention_mask(verify_len));
+            target_request.set_tensor("attention_mask", make_attention_mask(kv_len));
             target_request.set_tensor("position_ids", make_position_ids_range(target_hidden_len, verify_len));
             target_request.set_tensor("beam_idx", beam_idx);
             target_request.infer();
@@ -971,7 +972,7 @@ int main(int argc, char* argv[]) try {
             next_token = posterior_next;
             output_ids.push_back(next_token);
             // Stream print posterior token
-            auto posterior_text = tokenizer.decode(std::vector<int64_t>{posterior_next}, {ov::genai::skip_special_tokens(true)});
+            auto posterior_text = tokenizer.decode(std::vector<int64_t>{posterior_next}, ov::genai::skip_special_tokens(true));
             std::cout << posterior_text << std::flush;
             
             // Check if posterior token is EOS

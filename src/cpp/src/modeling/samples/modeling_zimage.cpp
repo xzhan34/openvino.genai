@@ -859,9 +859,26 @@ PromptContext build_prompt_context(const std::string& prompt,
     const size_t seq_len = input_shape[1];
     ov::Tensor position_ids = make_position_ids(1, seq_len);
 
+    // Ensure attention_mask has shape [1, seq_len] to match input_ids/position_ids for text encoder
+    ov::Tensor attention_mask_for_text(ov::element::i64, {1, seq_len});
+    {
+        const auto am_shape = tokenized.attention_mask.get_shape();
+        const size_t am_len = (am_shape.size() == 2 && am_shape[0] == 1) ? am_shape[1] : 0;
+        int64_t* out = attention_mask_for_text.data<int64_t>();
+        if (am_len == seq_len && tokenized.attention_mask.get_element_type() == ov::element::i64) {
+            std::memcpy(out, tokenized.attention_mask.data<const int64_t>(), seq_len * sizeof(int64_t));
+        } else if (am_len == seq_len && tokenized.attention_mask.get_element_type() == ov::element::i32) {
+            const int32_t* src = tokenized.attention_mask.data<const int32_t>();
+            for (size_t i = 0; i < seq_len; ++i)
+                out[i] = static_cast<int64_t>(src[i]);
+        } else {
+            std::fill(out, out + seq_len, 1);
+        }
+    }
+
     auto request = text_compiled.create_infer_request();
     request.set_tensor("input_ids", tokenized.input_ids);
-    request.set_tensor("attention_mask", tokenized.attention_mask);
+    request.set_tensor("attention_mask", attention_mask_for_text);
     request.set_tensor("position_ids", position_ids);
     request.infer();
 
@@ -1043,25 +1060,22 @@ int main(int argc, char* argv[]) try {
 
     std::shared_ptr<ov::Model> text_model;
     {
-        // create text_encoder model
         auto text_data = ov::genai::safetensors::load_safetensors(text_dir);
         ov::genai::safetensors::SafetensorsWeightSource text_source(std::move(text_data));
         ov::genai::safetensors::SafetensorsWeightFinalizer text_finalizer(text_quant_config);
         text_model = ov::genai::modeling::models::create_qwen3_text_encoder_model(text_cfg, text_source, text_finalizer);
     }
-    
+
     std::shared_ptr<ov::Model> dit_model;
     {
-        // create DiT model
         auto dit_data = ov::genai::safetensors::load_safetensors(dit_dir);
         ov::genai::safetensors::SafetensorsWeightSource dit_source(std::move(dit_data));
         ov::genai::safetensors::SafetensorsWeightFinalizer dit_finalizer(dit_quant_config);
         dit_model = create_zimage_dit_model(dit_cfg, dit_source, dit_finalizer);
     }
-    
+
     std::shared_ptr<ov::Model> vae_model;
     {
-        // create VAE decoder model
         auto vae_data = ov::genai::safetensors::load_safetensors(vae_dir);
         ov::genai::safetensors::SafetensorsWeightSource vae_source(std::move(vae_data));
         ov::genai::safetensors::SafetensorsWeightFinalizer vae_finalizer(vae_quant_config);

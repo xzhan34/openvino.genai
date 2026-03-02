@@ -64,7 +64,7 @@ public:
     Tensor forward_no_cache(const Tensor& hidden_states,
                             const Tensor& rope_cos,
                             const Tensor& rope_sin,
-                            const Tensor& causal_mask) const;
+                            const Tensor& attention_mask) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -126,7 +126,7 @@ public:
     std::pair<Tensor, Tensor> forward_no_cache(const Tensor& hidden_states,
                                                const Tensor& rope_cos,
                                                const Tensor& rope_sin,
-                                               const Tensor& causal_mask,
+                                               const Tensor& attention_mask,
                                                const std::optional<Tensor>& residual) const;
 
 private:
@@ -149,15 +149,20 @@ public:
     std::pair<Tensor, Tensor> forward_with_selected_layers(const Tensor& input_ids,
                                                            const Tensor& position_ids,
                                                            const Tensor& beam_idx,
+                                                           const Tensor& attention_mask,
                                                            const std::vector<int32_t>& layer_ids);
     Tensor forward_no_cache(const Tensor& input_ids,
-                            const Tensor& position_ids);
+                            const Tensor& position_ids,
+                            const Tensor& attention_mask);
     std::pair<Tensor, Tensor> forward_with_penultimate_no_cache(const Tensor& input_ids,
-                                                                const Tensor& position_ids);
+                                                                const Tensor& position_ids,
+                                                                const Tensor& attention_mask);
     std::pair<Tensor, Tensor> forward_with_pre_norm_no_cache(const Tensor& input_ids,
-                                                             const Tensor& position_ids);
+                                                             const Tensor& position_ids,
+                                                             const Tensor& attention_mask);
     std::pair<Tensor, Tensor> forward_with_selected_layers_no_cache(const Tensor& input_ids,
                                                                     const Tensor& position_ids,
+                                                                    const Tensor& attention_mask,
                                                                     const std::vector<int32_t>& layer_ids);
 
     VocabEmbedding& embed_tokens();
@@ -197,6 +202,29 @@ std::shared_ptr<ov::Model> create_qwen3_text_encoder_model(
     const Qwen3DenseConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_dflash_target_model(
+    const Qwen3DenseConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_dflash_target_model_no_cache(
+    const Qwen3DenseConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_embedding_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+std::shared_ptr<ov::Model> create_qwen3_lm_head_model(
+    const Qwen3DenseConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    const ov::element::Type& input_type);
 
 std::shared_ptr<ov::Model> create_qwen3_dflash_target_model(
     const Qwen3DenseConfig& cfg,
