@@ -88,7 +88,16 @@ void ImagePreprocessModule::run() {
     prepare_inputs();
     VLMModelType model_type = to_vlm_model_type(module_desc->model_type);
 
-    if (exists_input("images")) {
+    // When running in text-only mode, neither image nor images data is provided.
+    // Skip preprocessing entirely - downstream modules will detect the absence.
+    const bool has_images = exists_input("images") && !inputs["images"].data.empty();
+    const bool has_image  = exists_input("image")  && !inputs["image"].data.empty();
+    if (!has_images && !has_image) {
+        GENAI_INFO("ImagePreprocessModule[" + module_desc->name + "]: no image input - skipping (text-only mode)");
+        return;
+    }
+
+    if (has_images) {
         auto images_data = get_input("images").as<std::vector<ov::Tensor>>();
         if (model_type == VLMModelType::QWEN2_VL || model_type == VLMModelType::QWEN2_5_VL) {
             std::vector<ov::Tensor> output_tensors;
@@ -113,7 +122,7 @@ void ImagePreprocessModule::run() {
             this->outputs["rotary_cos"].data = output.rotary_cos;
             this->outputs["rotary_sin"].data = output.rotary_sin;
         }
-    } else {
+    } else if (has_image) {
         auto image1_data = get_input("image").as<ov::Tensor>();
         if (model_type == VLMModelType::QWEN2_VL || model_type == VLMModelType::QWEN2_5_VL) {
             auto encoded_img = std::get<std::shared_ptr<VisionEncoderQwen2VL>>(encoder_ptr)->encode(image1_data, ov::AnyMap{});

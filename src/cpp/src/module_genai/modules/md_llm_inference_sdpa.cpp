@@ -458,10 +458,16 @@ void LLMInferenceSDPAModule::run() {
     ov::Tensor attention_mask(ov::element::i64, {batch, seq_len});
     std::fill_n(attention_mask.data<int64_t>(), batch * seq_len, int64_t{1});
 
-    // Determine VL mode: all three additional inputs must be present
-    const bool is_vl = (this->inputs.find("visual_embeds") != this->inputs.end() &&
-                        this->inputs.find("visual_pos_mask") != this->inputs.end() &&
-                        this->inputs.find("grid_thw") != this->inputs.end());
+    // Determine VL mode: all three additional inputs must be present AND have valid data.
+    // In text-only mode, the keys exist in the inputs map (from YAML) but data is empty
+    // because ImagePreprocessModule and VisionEncoderModule skipped execution.
+    auto has_valid_input = [this](const std::string& name) {
+        auto it = this->inputs.find(name);
+        return it != this->inputs.end() && !it->second.data.empty();
+    };
+    const bool is_vl = has_valid_input("visual_embeds") &&
+                       has_valid_input("visual_pos_mask") &&
+                       has_valid_input("grid_thw");
 
     ov::genai::modeling::models::Qwen3_5InputPlanner planner(m_model_config);
 

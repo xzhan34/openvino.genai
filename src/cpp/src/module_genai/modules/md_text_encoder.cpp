@@ -150,7 +150,7 @@ void TextEncoderModule::run() {
         }
     } else if (model_type == VLMModelType::QWEN3_5) {
         std::optional<ov::Tensor> grid_thw = std::nullopt;
-        if (exists_input("grid_thw")) {
+        if (exists_input("grid_thw") && !inputs["grid_thw"].data.empty()) {
             grid_thw = get_input("grid_thw").as<ov::Tensor>();
         }
 

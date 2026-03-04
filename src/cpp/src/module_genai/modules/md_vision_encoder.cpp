@@ -111,6 +111,12 @@ bool VisionEncoderModule::initialize() {
 
     std::filesystem::path model_path = it_path->second;
 
+    // Determine the default vision model filename based on model type
+    auto model_type_for_path = to_vlm_model_type(module_desc->model_type);
+    std::string vision_model_filename = (model_type_for_path == VLMModelType::QWEN3_5)
+        ? "qwen3_5_vision.xml"
+        : "openvino_vision_embeddings_merger_model.xml";
+
     std::shared_ptr<ov::Model> model;
     if (model_path.extension() == ".xml") {
         if (!std::filesystem::exists(model_path)) {
@@ -121,13 +127,13 @@ bool VisionEncoderModule::initialize() {
         model = utils::singleton_core().read_model(model_path);
         model_path = model_path.parent_path();
     } else {
-        if (!std::filesystem::exists(model_path / "openvino_vision_embeddings_merger_model.xml")) {
+        if (!std::filesystem::exists(model_path / vision_model_filename)) {
             GENAI_ERR("VisionEncoderModule[" + module_desc->name + "]: model file not found at " + 
-                (model_path / "openvino_vision_embeddings_merger_model.xml").string());
+                (model_path / vision_model_filename).string());
             return false;
         }
         model = utils::singleton_core().read_model(
-            model_path / "openvino_vision_embeddings_merger_model.xml");
+            model_path / vision_model_filename);
     }
 
     auto model_type = to_vlm_model_type(module_desc->model_type);
@@ -219,8 +225,8 @@ void VisionEncoderModule::run() {
             this->outputs["rope_delta"].data = position_ids_max_element + 1 - static_cast<int>(input_ids.get_shape().at(1));
         }
     } else if (model_type == VLMModelType::QWEN3_5) {
-        if (!exists_input("preprocessed_image")) {
-            GENAI_ERR("VisionEncoderModule[" + module_desc->name + "]: 'preprocessed_image' input not found");
+        if (!exists_input("preprocessed_image") || inputs["preprocessed_image"].data.empty()) {
+            GENAI_INFO("VisionEncoderModule[" + module_desc->name + "]: no preprocessed_image - skipping (text-only mode)");
             return;
         }
         ov::Tensor preprocessed_image = get_input("preprocessed_image").as<ov::Tensor>();
@@ -523,31 +529,15 @@ Qwen3_5VisionEmbeddingResult VisionEncoderModule::embed(
         image_grid_index = local_grid_index;
     }
 
-    const auto &embeds_shape = vision_embeds.get_shape();
-    const size_t hidden     = embeds_shape[1];
-    const size_t elem_size  = vision_embeds.get_element_type().size();
-    const size_t row_bytes  = hidden * elem_size;
+    // Return raw (compact) vision embeddings [V, H] instead of scattered [B, S, H].
+    // The downstream LLM module handles scattering via
+    // Qwen3_5InputPlanner::scatter_visual_embeds(), matching the reference
+    // flow in md_qwen3_5_modeling.cpp.
+    // Deep-copy so the tensor outlives the infer-request circular buffer guard.
+    ov::Tensor raw_embeds(vision_embeds.get_element_type(), vision_embeds.get_shape());
+    std::memcpy(raw_embeds.data(), vision_embeds.data(), vision_embeds.get_byte_size());
 
-    ov::Tensor visual_embeds_scattered(vision_embeds.get_element_type(), {batch, seq_len, hidden});
-    std::memset(visual_embeds_scattered.data(), 0, visual_embeds_scattered.get_byte_size());
-
-    const char* src = static_cast<const char*>(vision_embeds.data());
-    char*       dst = static_cast<char*>(visual_embeds_scattered.data());
-    const bool* mask_ptr = static_cast<const bool*>(visual_pos_mask.data());
-
-    size_t visual_idx = 0;
-    const size_t total = batch * seq_len;
-    for (size_t idx = 0; idx < total; ++idx) {
-        if (!mask_ptr[idx]) continue;
-        OPENVINO_ASSERT(visual_idx < embeds_shape[0],
-            "VisionEncoderModule::embed: visual_embeds shorter than visual_pos_mask count");
-        std::memcpy(dst + idx * row_bytes, src + visual_idx * row_bytes, row_bytes);
-        visual_idx++;
-    }
-    OPENVINO_ASSERT(visual_idx == embeds_shape[0],
-        "VisionEncoderModule::embed: visual_embeds length does not match visual_pos_mask count");
-
-    return {position_ids, visual_pos_mask, rope_deltas, visual_embeds_scattered};
+    return {position_ids, visual_pos_mask, rope_deltas, raw_embeds};
 }
 
 ov::Tensor VisionEncoderModule::get_rotary_pos_emb(const std::vector<std::array<size_t, 3>>& grids_thw) {

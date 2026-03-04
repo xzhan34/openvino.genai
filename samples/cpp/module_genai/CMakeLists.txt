@@ -36,7 +36,8 @@ endfunction()
 set (SAMPLE_LIST
     md_image_generation
     md_video_generation
-    md_visual_language_chat)
+    md_visual_language_chat
+    md_llm_chat)
 
 foreach(sample IN LISTS SAMPLE_LIST)
     add_sample_executable(${sample})
