@@ -13,6 +13,7 @@
 #include <openvino/op/tensor_iterator.hpp>
 #include <openvino/op/util/variable.hpp>
 #include <openvino/opsets/opset13.hpp>
+#include <ov_ops/rms.hpp>
 
 #include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/llm.hpp"
@@ -115,10 +116,11 @@ const Tensor& Qwen3_5RMSNorm::weight() const {
 
 Tensor Qwen3_5RMSNorm::forward(const Tensor& x) const {
     auto x_f32 = x.to(ov::element::f32);
-    auto var = x_f32.pow(2.0f).mean(-1, true);
-    auto norm = x_f32 * (var + eps_).rsqrt();
-    auto scaled = norm * (1.0f + weight().to(ov::element::f32));
-    return scaled.to(x.dtype());
+    // Qwen3.5 uses (1 + weight) as the RMS scale factor.
+    auto gamma = 1.0f + weight().to(ov::element::f32);
+    auto rms_node = std::make_shared<ov::op::internal::RMS>(
+        x_f32.output(), gamma.output(), static_cast<double>(eps_), x.dtype());
+    return Tensor(rms_node->output(0), x.context());
 }
 
 std::pair<Tensor, Tensor> Qwen3_5RMSNorm::forward(const Tensor& x, const Tensor& residual) const {
