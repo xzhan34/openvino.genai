@@ -913,6 +913,12 @@ int main(int argc, char* argv[]) try {
             }
         }
     }
+    // Pre-allocate USM-host tensor for decode position_ids - reuse across steps
+    // to avoid per-step create_host_tensor() + memcpy overhead.
+    // Shape: [3, batch, 1] (3 planes of identical position values per batch element)
+    ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, 1});
+    const int64_t* rope_deltas_data = plan.rope_deltas.data<const int64_t>();
+
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
     for (int step = 1; step < opts.max_new_tokens; ++step) {
@@ -924,11 +930,14 @@ int main(int argc, char* argv[]) try {
             step_data[b] = next_id;
         }
 
-        auto position_ids = ov::genai::modeling::models::Qwen3_5InputPlanner::build_decode_position_ids(
-            plan.rope_deltas,
-            past_len,
-            1);
-        auto usm_decode_pos = clone_as_usm_host(gpu_ctx, position_ids);
+        // Fill position_ids in-place: all 3 planes get the same value per batch element
+        auto* pos_data = usm_decode_pos.data<int64_t>();
+        for (size_t b = 0; b < batch; ++b) {
+            const int64_t value = past_len + rope_deltas_data[b];
+            pos_data[b] = value;             // plane 0
+            pos_data[batch + b] = value;     // plane 1
+            pos_data[2 * batch + b] = value; // plane 2
+        }
 
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
