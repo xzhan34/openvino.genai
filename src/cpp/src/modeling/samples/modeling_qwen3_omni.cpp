@@ -547,10 +547,11 @@ ov::genai::modeling::weights::QuantizationConfig quant_config_for_mode(Precision
 int main(int argc, char* argv[]) try {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] [DUMP_DIR] [PY_REF_DUMP_DIR] [PRECISION_MODE]\n"
+                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] [DUMP_DIR] [PY_REF_DUMP_DIR] [PRECISION_MODE] [DUMP_IR_DIR]\n"
                   << "  PRECISION_MODE: mixed | default | fp32 | inf_fp32_kv_int8 | inf_fp32_kv_int4 | inf_fp16_kv_int8 | inf_fp16_kv_int4\n"
                   << "                | inf_fp32_kv_fp32_w_int8 | inf_fp32_kv_fp32_w_int4_asym | inf_fp32_kv_int8_w_int4_asym | inf_fp16_kv_int8_w_int4_asym\n"
-                  << "  aliases: fp32_kv8/fp32_kv4/fp16_kv8/fp16_kv4 ; legacy 0/1 also supported\n";
+                  << "  aliases: fp32_kv8/fp32_kv4/fp16_kv8/fp16_kv4 ; legacy 0/1 also supported\n"
+                  << "  DUMP_IR_DIR: if set, save text model IR (xml+bin) to this directory\n";
         return 1;
     }
 
@@ -563,6 +564,7 @@ int main(int argc, char* argv[]) try {
     const std::filesystem::path py_ref_dump_dir =
         (argc > 7) ? std::filesystem::path(argv[7]) : std::filesystem::path();
     const PrecisionMode precision_mode = (argc > 8) ? parse_precision_mode(argv[8]) : PrecisionMode::kMixed;
+    const std::filesystem::path dump_ir_dir = (argc > 9) ? std::filesystem::path(argv[9]) : std::filesystem::path();
 
     auto omni_cfg = ov::genai::modeling::models::Qwen3OmniConfig::from_json_file(model_dir);
     auto vl_cfg = ov::genai::modeling::models::to_qwen3_omni_vl_cfg(omni_cfg);
@@ -584,6 +586,18 @@ int main(int argc, char* argv[]) try {
         finalizer,
         false,
         true);
+
+    // Save text model IR for debugging (only when DUMP_IR_DIR is provided)
+    if (!dump_ir_dir.empty()) {
+        std::filesystem::create_directories(dump_ir_dir);
+        const std::string ir_stem = "text_model_" + precision_mode_to_string(precision_mode);
+        const auto ir_path = dump_ir_dir / (ir_stem + ".xml");
+        const auto bin_path = dump_ir_dir / (ir_stem + ".bin");
+        std::cout << "[DEBUG] Saving text model IR to " << ir_path << std::endl;
+        ov::serialize(text_model, ir_path.string(), bin_path.string());
+        std::cout << "[DEBUG] Text model IR saved successfully" << std::endl;
+    }
+
     auto vision_model = ov::genai::modeling::models::create_qwen3_omni_vision_model(omni_cfg, source, finalizer);
 
     if (precision_mode == PrecisionMode::kFP32 ||
