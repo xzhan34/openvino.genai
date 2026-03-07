@@ -20,6 +20,19 @@ std::filesystem::path make_temp_path(const std::string& stem) {
 }
 
 std::string shell_quote(const std::string& value) {
+#ifdef _WIN32
+    // Windows CMD uses double quotes for quoting
+    std::string out = "\"";
+    for (char c : value) {
+        if (c == '"') {
+            out += "\\\"";
+        } else {
+            out += c;
+        }
+    }
+    out += "\"";
+    return out;
+#else
     std::string out = "'";
     for (char c : value) {
         if (c == '\'') {
@@ -30,6 +43,7 @@ std::string shell_quote(const std::string& value) {
     }
     out += "'";
     return out;
+#endif
 }
 
 }  // namespace

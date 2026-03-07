@@ -20,14 +20,41 @@ def _load_module(module_name: str, file_path: Path):
     return module
 
 
-def _default_utils_dir() -> Path:
-    return Path(
-        "/home/wanglei/model/Qwen3_omni/qwen3_omni_4B_final_release/qwen_omni_utils/v2_5"
+_LINUX_RELEASE_BASE = Path("/home/wanglei/model/Qwen3_omni/qwen3_omni_4B_final_release")
+_RELEASE_DIR_NAME = "qwen3_omni_4B_final_release"
+
+
+def _find_release_base(model_dir: str = "") -> Path:
+    """Locate the qwen3_omni_4B_final_release directory.
+
+    Search order:
+      1. QWEN3_OMNI_RELEASE_BASE env var
+      2. Sibling of model_dir  (e.g. .../wangleis/qwen3_omni_4B_final_release)
+      3. Hard-coded Linux fallback
+    """
+    env_base = os.environ.get("QWEN3_OMNI_RELEASE_BASE", "")
+    if env_base:
+        p = Path(env_base)
+        if p.exists():
+            return p
+    if model_dir:
+        candidate = Path(model_dir).parent / _RELEASE_DIR_NAME
+        if candidate.exists():
+            return candidate
+    if _LINUX_RELEASE_BASE.exists():
+        return _LINUX_RELEASE_BASE
+    raise FileNotFoundError(
+        f"Cannot find {_RELEASE_DIR_NAME}. Set QWEN3_OMNI_RELEASE_BASE or "
+        f"place it as a sibling of your model directory."
     )
 
 
-def _default_internal_src() -> Path:
-    base = Path("/home/wanglei/model/Qwen3_omni/qwen3_omni_4B_final_release")
+def _default_utils_dir(model_dir: str = "") -> Path:
+    return _find_release_base(model_dir) / "qwen_omni_utils" / "v2_5"
+
+
+def _default_internal_src(model_dir: str = "") -> Path:
+    base = _find_release_base(model_dir)
     matches = glob.glob(str(base / "transformers-internal-q3o-dense-*" / "src"))
     if not matches:
         raise FileNotFoundError("Cannot locate internal transformers source for qwen3_omni")
@@ -57,8 +84,9 @@ def _compute_audio_features(conversations, model_dir: str, use_audio_in_video: b
 
     import torch
 
-    base = Path("/home/wanglei/model/Qwen3_omni/qwen3_omni_4B_final_release")
-    internal_src = _default_internal_src()
+    use_model_dir = model_dir if model_dir else str(_default_model_dir())
+    base = _find_release_base(use_model_dir)
+    internal_src = _default_internal_src(use_model_dir)
     if str(internal_src) not in sys.path:
         sys.path.insert(0, str(internal_src))
     if str(base) not in sys.path:
@@ -264,7 +292,7 @@ def main():
     parser.add_argument("--utils-dir", default=os.environ.get("QWEN3_OMNI_UTILS_PATH", ""))
     args = parser.parse_args()
 
-    utils_dir = Path(args.utils_dir) if args.utils_dir else _default_utils_dir()
+    utils_dir = Path(args.utils_dir) if args.utils_dir else _default_utils_dir(args.model_dir)
     audio_py = utils_dir / "audio_process.py"
     vision_py = utils_dir / "vision_process.py"
 

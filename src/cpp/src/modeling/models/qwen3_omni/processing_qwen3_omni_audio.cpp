@@ -23,6 +23,19 @@ std::filesystem::path make_temp_path(const std::string& stem) {
 }
 
 std::string shell_quote(const std::string& value) {
+#ifdef _WIN32
+    // Windows CMD uses double quotes for quoting
+    std::string out = "\"";
+    for (char c : value) {
+        if (c == '"') {
+            out += "\\\"";
+        } else {
+            out += c;
+        }
+    }
+    out += "\"";
+    return out;
+#else
     std::string out = "'";
     for (char c : value) {
         if (c == '\'') {
@@ -33,6 +46,60 @@ std::string shell_quote(const std::string& value) {
     }
     out += "'";
     return out;
+#endif
+}
+
+/**
+ * Locate the bridge Python script.
+ *
+ * __FILE__ may be a relative path (MSVC) so we first try it as-is, then
+ * canonicalize via std::filesystem::absolute().  As a last resort the
+ * QWEN3_OMNI_BRIDGE_DIR env var can point to the directory containing the
+ * script.
+ */
+std::filesystem::path locate_bridge_script() {
+    constexpr const char* kName = "processing_qwen3_omni_bridge.py";
+
+    // 1. __FILE__ (relative or absolute)
+    std::filesystem::path candidate =
+        std::filesystem::path(__FILE__).parent_path() / kName;
+    if (std::filesystem::exists(candidate))
+        return candidate;
+
+    // 2. Absolutized __FILE__
+    try {
+        candidate = std::filesystem::absolute(
+            std::filesystem::path(__FILE__).parent_path()) / kName;
+        if (std::filesystem::exists(candidate))
+            return candidate;
+    } catch (...) {}
+
+    // 3. Env-var override
+    const char* env = std::getenv("QWEN3_OMNI_BRIDGE_DIR");
+    if (env && std::strlen(env) > 0) {
+        candidate = std::filesystem::path(env) / kName;
+        if (std::filesystem::exists(candidate))
+            return candidate;
+    }
+
+    OPENVINO_THROW("Bridge script not found.  Set QWEN3_OMNI_BRIDGE_DIR to "
+                   "the directory containing ", kName,
+                   " (tried: ", std::filesystem::path(__FILE__).parent_path().string(), ")");
+}
+
+/**
+ * Run a shell command via std::system(), working around the Windows cmd.exe
+ * quoting quirk: when the command string starts with '"', cmd.exe /c strips
+ * the first and last '"' characters, mangling the paths.  Wrapping the entire
+ * command in an extra pair of quotes prevents this.
+ */
+int run_shell_command(const std::string& cmd) {
+#ifdef _WIN32
+    std::string wrapped = "\"" + cmd + "\"";
+    return std::system(wrapped.c_str());
+#else
+    return std::system(cmd.c_str());
+#endif
 }
 
 }  // namespace
@@ -123,10 +190,7 @@ nlohmann::json Qwen3OmniAudioProcess::process_audio_info_via_python(
     const nlohmann::json& conversations,
     bool use_audio_in_video,
     const std::string& python_executable) {
-    const auto bridge_script = std::filesystem::path(__FILE__).parent_path() / "processing_qwen3_omni_bridge.py";
-    if (!std::filesystem::exists(bridge_script)) {
-        OPENVINO_THROW("Bridge script not found: ", bridge_script.string());
-    }
+    const auto bridge_script = locate_bridge_script();
 
     const auto input_path = make_temp_path("qwen3_omni_audio_in");
     const auto output_path = make_temp_path("qwen3_omni_audio_out");
@@ -147,7 +211,7 @@ nlohmann::json Qwen3OmniAudioProcess::process_audio_info_via_python(
         cmd += " --use-audio-in-video";
     }
 
-    int ret = std::system(cmd.c_str());
+    int ret = run_shell_command(cmd);
     if (ret != 0) {
         std::filesystem::remove(input_path);
         std::filesystem::remove(output_path);
@@ -175,10 +239,7 @@ nlohmann::json Qwen3OmniAudioProcess::process_audio_features_via_python(
     const std::string& model_dir,
     bool use_audio_in_video,
     const std::string& python_executable) {
-    const auto bridge_script = std::filesystem::path(__FILE__).parent_path() / "processing_qwen3_omni_bridge.py";
-    if (!std::filesystem::exists(bridge_script)) {
-        OPENVINO_THROW("Bridge script not found: ", bridge_script.string());
-    }
+    const auto bridge_script = locate_bridge_script();
 
     const auto input_path = make_temp_path("qwen3_omni_audio_features_in");
     const auto output_path = make_temp_path("qwen3_omni_audio_features_out");
@@ -202,11 +263,12 @@ nlohmann::json Qwen3OmniAudioProcess::process_audio_features_via_python(
         cmd += " --model-dir " + shell_quote(model_dir);
     }
 
-    int ret = std::system(cmd.c_str());
+    int ret = run_shell_command(cmd);
     if (ret != 0) {
         std::filesystem::remove(input_path);
         std::filesystem::remove(output_path);
-        OPENVINO_THROW("Python bridge audio feature process failed with code: ", ret);
+        OPENVINO_THROW("Python bridge audio feature process failed with code: ", ret,
+                       "\n  Command was: ", cmd);
     }
 
     nlohmann::json result;
