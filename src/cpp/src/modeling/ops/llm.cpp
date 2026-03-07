@@ -174,7 +174,9 @@ Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32
     auto hdim = const_vec(ctx, std::vector<int64_t>{static_cast<int64_t>(head_dim)});
 
     auto target = shape::make({batch, kv_heads, rep, seq, hdim});
-    auto broadcast = shape::broadcast_to(unsq, target);
+    // Use BIDIRECTIONAL broadcast to match GPU's Unsqueeze+Broadcast+Reshape+SDPA fusion pattern.
+    auto broadcast = Tensor(
+        std::make_shared<ov::op::v3::Broadcast>(unsq.output(), target, ov::op::BroadcastType::BIDIRECTIONAL), ctx);
 
     auto heads = const_vec(ctx, std::vector<int64_t>{static_cast<int64_t>(num_heads)});
     auto reshape_shape = shape::make({batch, heads, seq, hdim});
