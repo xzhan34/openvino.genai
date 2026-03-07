@@ -55,6 +55,7 @@ public:
         const size_t dim = static_cast<size_t>(cfg.latent_dim);
         constexpr float mean_scale = 1.0f / 16.0f;
 
+        // Synthetic identity weights — keys use model-parameter naming (with "decoder." prefix)
         synthetic_["decoder.quantizer.rvq_first.output_proj.weight"] =
             make_conv1d_identity_weight(dim, dim, 1, mean_scale);
         synthetic_["decoder.quantizer.rvq_rest.output_proj.weight"] =
@@ -69,53 +70,114 @@ public:
         synthetic_["decoder.pre_transformer.output_proj.bias"] = make_zero_tensor(ov::Shape{dim});
     }
 
+    // Return keys using model-parameter naming so load_model() can match them.
+    // Source keys get "decoder." prefix prepended, and layers.N → layers[N].
     std::vector<std::string> keys() const override {
-        auto names = source_.keys();
-        names.push_back("code_embedding.weight");
-        names.push_back("decoder.quantizer.rvq_first.output_proj.weight");
-        names.push_back("decoder.quantizer.rvq_rest.output_proj.weight");
-        names.push_back("decoder.pre_conv.conv.weight");
-        names.push_back("decoder.pre_conv.conv.bias");
-        names.push_back("decoder.pre_transformer.input_proj.weight");
-        names.push_back("decoder.pre_transformer.input_proj.bias");
-        names.push_back("decoder.pre_transformer.output_proj.weight");
-        names.push_back("decoder.pre_transformer.output_proj.bias");
+        auto src_keys = source_.keys();
+        std::vector<std::string> names;
+        names.reserve(src_keys.size() + 28);
+        for (const auto& k : src_keys) {
+            names.push_back(to_model_name(k));
+        }
+        // Codebook entries (model parameter names)
+        names.push_back("decoder.quantizer.rvq_first.vq.layers[0]._codebook.embed");
+        for (int i = 0; i < 15; ++i) {
+            names.push_back("decoder.quantizer.rvq_rest.vq.layers[" + std::to_string(i) + "]._codebook.embed");
+        }
+        // Synthetic entries
+        for (const auto& kv : synthetic_) {
+            names.push_back(kv.first);
+        }
         return names;
     }
 
     bool has(const std::string& name) const override {
-        if (source_.has(name)) {
+        if (synthetic_.find(name) != synthetic_.end()) {
             return true;
         }
         if (is_quantizer_codebook(name) && source_.has("code_embedding.weight")) {
             return true;
         }
-        return synthetic_.find(name) != synthetic_.end();
+        return source_.has(to_source_name(name));
     }
 
     const ov::Tensor& get_tensor(const std::string& name) const override {
-        if (source_.has(name)) {
-            return source_.get_tensor(name);
+        auto it = synthetic_.find(name);
+        if (it != synthetic_.end()) {
+            return it->second;
         }
         if (is_quantizer_codebook(name) && source_.has("code_embedding.weight")) {
             return source_.get_tensor("code_embedding.weight");
         }
-        auto it = synthetic_.find(name);
-        OPENVINO_ASSERT(it != synthetic_.end(), "Missing mapped code2wav tensor: ", name);
-        return it->second;
+        std::string src = to_source_name(name);
+        OPENVINO_ASSERT(source_.has(src), "Missing mapped code2wav tensor: ", name, " (source: ", src, ")");
+        return source_.get_tensor(src);
     }
 
     void release_tensor(const std::string& name) override {
-        if (source_.has(name)) {
-            source_.release_tensor(name);
+        if (synthetic_.find(name) != synthetic_.end()) {
             return;
         }
         if (is_quantizer_codebook(name) && source_.has("code_embedding.weight")) {
             source_.release_tensor("code_embedding.weight");
+            return;
+        }
+        std::string src = to_source_name(name);
+        if (source_.has(src)) {
+            source_.release_tensor(src);
         }
     }
 
 private:
+    // Model param name → source key name.
+    // Strip "decoder." prefix added by SpeechDecoderModel module name,
+    // and convert brackets to dots: layers[0] → layers.0
+    static std::string to_source_name(const std::string& model_name) {
+        std::string s = model_name;
+        // Strip "decoder." prefix
+        if (s.rfind("decoder.", 0) == 0) {
+            s = s.substr(8);
+        }
+        // Convert brackets to dots: layers[0] → layers.0
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '[') {
+                out.push_back('.');
+            } else if (s[i] == ']') {
+                // skip closing bracket
+            } else {
+                out.push_back(s[i]);
+            }
+        }
+        return out;
+    }
+
+    // Source key name → model param name.
+    // Prepend "decoder." and convert layers.N → layers[N]
+    static std::string to_model_name(const std::string& src_name) {
+        std::string s = "decoder." + src_name;
+        // Convert "layers." followed by digits then "." → "layers[digits]."
+        std::string result;
+        result.reserve(s.size() + 8);
+        size_t i = 0;
+        while (i < s.size()) {
+            if (i + 7 <= s.size() && s.substr(i, 7) == "layers.") {
+                result += "layers[";
+                i += 7;
+                // Copy digits
+                while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+                    result += s[i++];
+                }
+                result += ']';
+                // The next char (dot or end) is preserved naturally
+            } else {
+                result += s[i++];
+            }
+        }
+        return result;
+    }
+
     static bool is_quantizer_codebook(const std::string& name) {
         return name.find("decoder.quantizer.rvq_first.vq.layers[0]._codebook.embed") == 0 ||
                name.find("decoder.quantizer.rvq_rest.vq.layers[") == 0;
