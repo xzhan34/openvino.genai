@@ -59,12 +59,14 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error(std::string{"Usage: "} + argv[0] +
                                      "\n"
                                      "  -cfg config.yaml \n"
+                                     "  -cache_dir: [Optional] string path, default empty\n"
                                      "  -prompt: input prompt\n"
                                      "  -img: [Optional] image path\n"
                                      "  -video: [Optional] video path\n");
         }
 
         std::filesystem::path config_path = utils::get_input_arg(argc, argv, "-cfg", std::string{});
+        std::string cache_dir = utils::get_input_arg(argc, argv, "-cache_dir", std::string{});
         std::string prompt = utils::get_input_arg(argc, argv, "-prompt", std::string{});
         std::string img_path = utils::get_input_arg(argc, argv, "-img", std::string{});
         std::string video_path = utils::get_input_arg(argc, argv, "-video", std::string{});
@@ -75,7 +77,12 @@ int main(int argc, char* argv[]) {
             std::cout << "[Input] " << key << ": " << value.as<std::string>() << std::endl;
         }
 
-        ov::genai::module::ModulePipeline pipe(config_path);
+        ov::AnyMap properties{};
+        if (!cache_dir.empty()) {
+            properties.insert({ov::cache_dir(cache_dir)});
+        }
+
+        ov::genai::module::ModulePipeline pipe(config_path, properties);
 
         pipe.generate(inputs);
 
