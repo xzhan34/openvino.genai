@@ -671,6 +671,7 @@ int main(int argc, char* argv[]) try {
     const int max_new_tokens = opts.max_new_tokens.value_or(64);
     const std::filesystem::path dump_dir = opts.dump_dir;
     const std::filesystem::path py_ref_dump_dir = opts.py_ref_dump_dir;
+    const std::filesystem::path dump_ir_dir = opts.dump_ir_dir;
     const PrecisionMode precision_mode = opts.precision_mode.value_or(PrecisionMode::kMixed);
 
     auto omni_cfg = ov::genai::modeling::models::Qwen3OmniConfig::from_json_file(model_dir);
