@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -542,29 +543,132 @@ ov::genai::modeling::weights::QuantizationConfig quant_config_for_mode(Precision
     return config;
 }
 
+std::string quant_mode_cache_token(ov::genai::modeling::weights::QuantizationConfig::Mode mode) {
+    using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
+    switch (mode) {
+    case Mode::INT4_SYM:
+        return "int4_sym";
+    case Mode::INT4_ASYM:
+        return "int4_asym";
+    case Mode::INT8_SYM:
+        return "int8_sym";
+    case Mode::INT8_ASYM:
+        return "int8_asym";
+    case Mode::NONE:
+    default:
+        return "none";
+    }
+}
+
+std::string quant_cache_suffix(const ov::genai::modeling::weights::QuantizationConfig& cfg) {
+    using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
+    if (cfg.mode == Mode::NONE && cfg.backup_mode == Mode::NONE) {
+        return "";
+    }
+    return "_q" + quant_mode_cache_token(cfg.mode) + "_b" + quant_mode_cache_token(cfg.backup_mode) + "_g" +
+           std::to_string(cfg.group_size);
+}
+
+struct SampleOptions {
+    std::optional<std::filesystem::path> model_dir;
+    std::optional<std::filesystem::path> image_path;
+    std::optional<std::string> user_prompt;
+    std::optional<std::string> device;
+    std::optional<int> max_new_tokens;
+    std::filesystem::path dump_dir;
+    std::filesystem::path py_ref_dump_dir;
+    std::optional<PrecisionMode> precision_mode;
+    std::filesystem::path dump_ir_dir;
+};
+
+int parse_i32(const std::string& raw, const char* option_name) {
+    try {
+        return std::stoi(raw);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid integer for ") + option_name + ": " + raw);
+    }
+}
+
+void print_usage(const char* argv0) {
+    std::cerr
+        << "Qwen3-Omni Modeling Sample\n"
+        << "========================\n\n"
+    << "Named options:\n"
+        << "  " << argv0 << " --model-dir PATH --image PATH [--prompt TEXT] [--device NAME] [--output-tokens N]\n"
+        << "      [--dump-dir PATH] [--py-ref-dump-dir PATH] [--precision MODE] [--dump-ir-dir PATH]\n\n"
+        << "  --dump-ir-dir (IR dump directory)\n\n"
+        << "PRECISION_MODE / --precision:\n"
+        << "  mixed | default | fp32 | inf_fp32_kv_int8 | inf_fp32_kv_int4 | inf_fp16_kv_int8 | inf_fp16_kv_int4\n"
+        << "  | inf_fp32_kv_fp32_w_int8 | inf_fp32_kv_fp32_w_int4_asym | inf_fp32_kv_int8_w_int4_asym | inf_fp16_kv_int8_w_int4_asym\n"
+        << "  aliases: fp32_kv8/fp32_kv4/fp16_kv8/fp16_kv4 ; legacy 0/1 also supported\n";
+}
+
+SampleOptions parse_cli(int argc, char* argv[]) {
+    SampleOptions opts;
+    if (argc <= 1) {
+        print_usage(argv[0]);
+        std::exit(1);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        }
+        if (arg.rfind("--", 0) != 0) {
+            throw std::runtime_error("Positional arguments are not supported. Use --help and pass named options.");
+        }
+
+        auto take_value = [&](const char* option_name) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(std::string("Missing value for ") + option_name);
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--model-dir") {
+            opts.model_dir = std::filesystem::path(take_value("--model-dir"));
+        } else if (arg == "--image") {
+            opts.image_path = std::filesystem::path(take_value("--image"));
+        } else if (arg == "--prompt") {
+            opts.user_prompt = take_value("--prompt");
+        } else if (arg == "--device") {
+            opts.device = take_value("--device");
+        } else if (arg == "--output-tokens") {
+            opts.max_new_tokens = parse_i32(take_value("--output-tokens"), "--output-tokens");
+        } else if (arg == "--dump-dir") {
+            opts.dump_dir = std::filesystem::path(take_value("--dump-dir"));
+        } else if (arg == "--py-ref-dump-dir") {
+            opts.py_ref_dump_dir = std::filesystem::path(take_value("--py-ref-dump-dir"));
+        } else if (arg == "--precision") {
+            opts.precision_mode = parse_precision_mode(take_value("--precision"));
+        } else if (arg == "--dump-ir-dir") {
+            opts.dump_ir_dir = std::filesystem::path(take_value("--dump-ir-dir"));
+        } else {
+            throw std::runtime_error("Unknown option: " + arg);
+        }
+    }
+
+    if (!opts.model_dir.has_value() || !opts.image_path.has_value()) {
+        print_usage(argv[0]);
+        throw std::runtime_error("--model-dir and --image are required");
+    }
+    return opts;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) try {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] [DUMP_DIR] [PY_REF_DUMP_DIR] [PRECISION_MODE] [DUMP_IR_DIR]\n"
-                  << "  PRECISION_MODE: mixed | default | fp32 | inf_fp32_kv_int8 | inf_fp32_kv_int4 | inf_fp16_kv_int8 | inf_fp16_kv_int4\n"
-                  << "                | inf_fp32_kv_fp32_w_int8 | inf_fp32_kv_fp32_w_int4_asym | inf_fp32_kv_int8_w_int4_asym | inf_fp16_kv_int8_w_int4_asym\n"
-                  << "  aliases: fp32_kv8/fp32_kv4/fp16_kv8/fp16_kv4 ; legacy 0/1 also supported\n"
-                  << "  DUMP_IR_DIR: if set, save text model IR (xml+bin) to this directory\n";
-        return 1;
-    }
-
-    const std::filesystem::path model_dir = argv[1];
-    const std::filesystem::path image_path = argv[2];
-    const std::string user_prompt = (argc > 3) ? argv[3] : "What can you see";
-    const std::string device = (argc > 4) ? argv[4] : "CPU";
-    const int max_new_tokens = (argc > 5) ? std::stoi(argv[5]) : 64;
-    const std::filesystem::path dump_dir = (argc > 6) ? std::filesystem::path(argv[6]) : std::filesystem::path();
-    const std::filesystem::path py_ref_dump_dir =
-        (argc > 7) ? std::filesystem::path(argv[7]) : std::filesystem::path();
-    const PrecisionMode precision_mode = (argc > 8) ? parse_precision_mode(argv[8]) : PrecisionMode::kMixed;
-    const std::filesystem::path dump_ir_dir = (argc > 9) ? std::filesystem::path(argv[9]) : std::filesystem::path();
+    const SampleOptions opts = parse_cli(argc, argv);
+    const std::filesystem::path model_dir = *opts.model_dir;
+    const std::filesystem::path image_path = *opts.image_path;
+    const std::string user_prompt = opts.user_prompt.value_or("What can you see");
+    const std::string device = opts.device.value_or("CPU");
+    const int max_new_tokens = opts.max_new_tokens.value_or(64);
+    const std::filesystem::path dump_dir = opts.dump_dir;
+    const std::filesystem::path py_ref_dump_dir = opts.py_ref_dump_dir;
+    const PrecisionMode precision_mode = opts.precision_mode.value_or(PrecisionMode::kMixed);
 
     auto omni_cfg = ov::genai::modeling::models::Qwen3OmniConfig::from_json_file(model_dir);
     auto vl_cfg = ov::genai::modeling::models::to_qwen3_omni_vl_cfg(omni_cfg);
@@ -629,6 +733,7 @@ int main(int argc, char* argv[]) try {
 
     ov::Core core;
     ov::AnyMap compile_properties;
+
     if (precision_mode == PrecisionMode::kFP32 ||
         precision_mode == PrecisionMode::kInfFp32KvInt8 ||
         precision_mode == PrecisionMode::kInfFp32KvInt4 ||
@@ -650,6 +755,15 @@ int main(int argc, char* argv[]) try {
         precision_mode == PrecisionMode::kInfFp16KvInt8WInt4Asym) {
         compile_properties.emplace(ov::hint::kv_cache_precision.name(), ov::element::u8);
     }
+
+    if (!opts.dump_ir_dir.empty()) {
+        std::filesystem::create_directories(opts.dump_ir_dir);
+        std::string text_ir_stem = "qwen3_omni_text" + quant_cache_suffix(quant_config);
+        ov::serialize(text_model, (opts.dump_ir_dir / (text_ir_stem + ".xml")).string());
+        std::string vision_ir_stem = "qwen3_omni_vision" + quant_cache_suffix(quant_config);
+        ov::serialize(vision_model, (opts.dump_ir_dir / (vision_ir_stem + ".xml")).string());
+    }
+
     auto compiled_vision = core.compile_model(vision_model, device, compile_properties);
     auto compiled_text = core.compile_model(text_model, device, compile_properties);
 
