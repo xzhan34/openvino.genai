@@ -691,17 +691,6 @@ int main(int argc, char* argv[]) try {
         false,
         true);
 
-    // Save text model IR for debugging (only when DUMP_IR_DIR is provided)
-    if (!dump_ir_dir.empty()) {
-        std::filesystem::create_directories(dump_ir_dir);
-        const std::string ir_stem = "text_model_" + precision_mode_to_string(precision_mode);
-        const auto ir_path = dump_ir_dir / (ir_stem + ".xml");
-        const auto bin_path = dump_ir_dir / (ir_stem + ".bin");
-        std::cout << "[DEBUG] Saving text model IR to " << ir_path << std::endl;
-        ov::serialize(text_model, ir_path.string(), bin_path.string());
-        std::cout << "[DEBUG] Text model IR saved successfully" << std::endl;
-    }
-
     auto vision_model = ov::genai::modeling::models::create_qwen3_omni_vision_model(omni_cfg, source, finalizer);
 
     if (precision_mode == PrecisionMode::kFP32 ||
@@ -759,9 +748,15 @@ int main(int argc, char* argv[]) try {
     if (!opts.dump_ir_dir.empty()) {
         std::filesystem::create_directories(opts.dump_ir_dir);
         std::string text_ir_stem = "qwen3_omni_text" + quant_cache_suffix(quant_config);
-        ov::serialize(text_model, (opts.dump_ir_dir / (text_ir_stem + ".xml")).string());
         std::string vision_ir_stem = "qwen3_omni_vision" + quant_cache_suffix(quant_config);
-        ov::serialize(vision_model, (opts.dump_ir_dir / (vision_ir_stem + ".xml")).string());
+        const std::string full_text_ir_path = (opts.dump_ir_dir / (text_ir_stem + ".xml")).string();
+        const std::string full_vision_ir_path = (opts.dump_ir_dir / (vision_ir_stem + ".xml")).string();
+
+        ov::serialize(text_model, full_text_ir_path);
+        ov::serialize(vision_model, full_vision_ir_path);
+
+        std::cout << "[DEBUG] Saved text model IR to " << full_text_ir_path << std::endl;
+        std::cout << "[DEBUG] Saved vision model IR to " << full_vision_ir_path << std::endl;
     }
 
     auto compiled_vision = core.compile_model(vision_model, device, compile_properties);
