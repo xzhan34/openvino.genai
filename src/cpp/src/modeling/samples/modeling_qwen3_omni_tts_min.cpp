@@ -256,9 +256,120 @@ std::string find_python_executable() {
 #endif
 }
 
+// --- Precision mode support (aligned with modeling_qwen3_omni.cpp) ---
+
+enum class PrecisionMode {
+    kMixed,
+    kDefault,
+    kFP32,
+    kInfFp16KvInt8,
+    kInfFp16KvInt4,
+    kInfFp32KvFp32WInt4Asym,
+    kInfFp16KvInt8WInt4Asym,
+};
+
+static std::string to_lower_copy(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static PrecisionMode parse_precision_mode(const std::string& value) {
+    const auto m = to_lower_copy(value);
+    if (m == "mixed" || m == "0" || m == "false" || m == "off") return PrecisionMode::kMixed;
+    if (m == "default")                                          return PrecisionMode::kDefault;
+    if (m == "fp32" || m == "1" || m == "true" || m == "on")     return PrecisionMode::kFP32;
+    if (m == "inf_fp16_kv_int8" || m == "fp16_kv8")              return PrecisionMode::kInfFp16KvInt8;
+    if (m == "inf_fp16_kv_int4" || m == "fp16_kv4")              return PrecisionMode::kInfFp16KvInt4;
+    if (m == "inf_fp32_kv_fp32_w_int4_asym")                     return PrecisionMode::kInfFp32KvFp32WInt4Asym;
+    if (m == "inf_fp16_kv_int8_w_int4_asym")                     return PrecisionMode::kInfFp16KvInt8WInt4Asym;
+    throw std::runtime_error("Invalid PRECISION_MODE: " + value);
+}
+
+static std::string precision_mode_to_string(PrecisionMode mode) {
+    switch (mode) {
+    case PrecisionMode::kMixed:                     return "mixed";
+    case PrecisionMode::kDefault:                   return "default";
+    case PrecisionMode::kFP32:                      return "fp32";
+    case PrecisionMode::kInfFp16KvInt8:             return "inf_fp16_kv_int8";
+    case PrecisionMode::kInfFp16KvInt4:             return "inf_fp16_kv_int4";
+    case PrecisionMode::kInfFp32KvFp32WInt4Asym:    return "inf_fp32_kv_fp32_w_int4_asym";
+    case PrecisionMode::kInfFp16KvInt8WInt4Asym:    return "inf_fp16_kv_int8_w_int4_asym";
+    }
+    return "unknown";
+}
+
+/// Build ov::AnyMap compile properties based on precision mode.
+static ov::AnyMap compile_props_for_precision(PrecisionMode mode) {
+    ov::AnyMap props;
+    switch (mode) {
+    case PrecisionMode::kFP32:
+    case PrecisionMode::kInfFp32KvFp32WInt4Asym:
+        props.emplace(ov::hint::inference_precision.name(), ov::element::f32);
+        break;
+    case PrecisionMode::kDefault:
+        props.emplace(ov::hint::inference_precision.name(), ov::element::bf16);
+        break;
+    case PrecisionMode::kInfFp16KvInt8:
+    case PrecisionMode::kInfFp16KvInt4:
+    case PrecisionMode::kInfFp16KvInt8WInt4Asym:
+        props.emplace(ov::hint::inference_precision.name(), ov::element::f16);
+        break;
+    default:
+        break;
+    }
+    // KV cache precision
+    if (mode == PrecisionMode::kInfFp16KvInt8 || mode == PrecisionMode::kInfFp16KvInt8WInt4Asym) {
+        props.emplace(ov::hint::kv_cache_precision.name(), ov::element::u8);
+    }
+    return props;
+}
+
+/// Set runtime_options on the text model according to precision mode.
+static void set_text_model_precision(std::shared_ptr<ov::Model>& text_model, PrecisionMode mode) {
+    switch (mode) {
+    case PrecisionMode::kFP32:
+    case PrecisionMode::kInfFp32KvFp32WInt4Asym:
+        text_model->set_rt_info(ov::element::f32, {"runtime_options", ov::hint::kv_cache_precision.name()});
+        break;
+    case PrecisionMode::kDefault:
+        text_model->set_rt_info(ov::element::bf16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+        break;
+    case PrecisionMode::kInfFp16KvInt8:
+    case PrecisionMode::kInfFp16KvInt4:
+    case PrecisionMode::kInfFp16KvInt8WInt4Asym:
+        text_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+        break;
+    default:
+        break;
+    }
+    if (mode == PrecisionMode::kInfFp16KvInt8 || mode == PrecisionMode::kInfFp16KvInt8WInt4Asym) {
+        text_model->set_rt_info(ov::element::u8, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    }
+}
+
 // --- Text generation with optional vision / audio ---
 
-std::string run_text_generation(const std::filesystem::path& model_dir,
+struct TextGenResult {
+    std::string text;
+    int64_t prompt_tokens = 0;
+    int64_t output_tokens = 0;
+    double model_load_ms = 0.0;
+    double audio_encode_ms = 0.0;
+    double vision_encode_ms = 0.0;
+    double preprocess_ms = 0.0;   // tokenization + scatter + plan
+    double ttft_ms = 0.0;         // time to first token (prefill infer)
+    double decode_ms = 0.0;       // all decode steps
+    double tpot_ms = 0.0;         // time per output token
+    double throughput = 0.0;      // tokens/s
+    double text_gen_total_ms = 0.0;
+};
+
+static double elapsed_ms(const std::chrono::steady_clock::time_point& a,
+                          const std::chrono::steady_clock::time_point& b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+TextGenResult run_text_generation(const std::filesystem::path& model_dir,
                                 ov::Core& core,
                                 ov::genai::modeling::weights::WeightSource& source,
                                 ov::genai::modeling::weights::WeightFinalizer& finalizer,
@@ -267,15 +378,20 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
                                 const std::filesystem::path& image_path,
                                 const std::filesystem::path& audio_path,
                                 int max_new_tokens,
-                                const std::string& device) {
+                                const std::string& device,
+                                PrecisionMode precision_mode = PrecisionMode::kFP32) {
+    TextGenResult perf;
+    const auto t_start = std::chrono::steady_clock::now();
+
     const bool has_image = !image_path.empty() && std::filesystem::exists(image_path);
     const bool has_audio = !audio_path.empty() && std::filesystem::exists(audio_path);
     auto vl_cfg = to_qwen3_omni_vl_cfg(cfg);
-    ov::AnyMap props = {{ov::hint::inference_precision.name(), ov::element::f32}};
+    ov::AnyMap props = compile_props_for_precision(precision_mode);
+    std::cout << "[TextGen] precision_mode: " << precision_mode_to_string(precision_mode) << std::endl;
 
     const bool has_multimodal = has_image || has_audio;
     auto text_model = create_qwen3_omni_text_model(cfg, source, finalizer, false, has_multimodal);
-    text_model->set_rt_info(ov::element::f32, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    set_text_model_precision(text_model, precision_mode);
 
     ov::genai::Tokenizer tokenizer(model_dir);
 
@@ -290,11 +406,14 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
     }
 
     auto compiled_text = core.compile_model(text_model, device, props);
+    const auto t_model_load = std::chrono::steady_clock::now();
+    perf.model_load_ms = elapsed_ms(t_start, t_model_load);
 
     if (has_audio) {
         // ==========================================
         // Native C++ audio path (no Python bridge)
         // ==========================================
+        const auto t_audio_start = std::chrono::steady_clock::now();
         // Step 1: Read WAV → mel spectrogram
         std::cout << "[Audio] Reading WAV: " << audio_path.string() << std::endl;
         auto waveform = read_wav_to_float32(audio_path.string());
@@ -355,6 +474,8 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
         waveform.clear();
         waveform.shrink_to_fit();
         std::cout << "[Audio] Audio encoder resources released." << std::endl;
+        const auto t_audio_end = std::chrono::steady_clock::now();
+        perf.audio_encode_ms = elapsed_ms(t_audio_start, t_audio_end);
 
         // Step 3: Compute expected token count & build prompt
         const int64_t expected_tokens = get_audio_token_count(T_frames);
@@ -373,6 +494,7 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
         int64_t img_tok = 0;
         Qwen3OmniVisionInputs vis_in;
         if (has_image) {
+            const auto t_vis_start = std::chrono::steady_clock::now();
             std::cout << "[Audio+Vision] Also processing image: " << image_path.string() << std::endl;
             auto compiled_vision = core.compile_model(vision_model, device, props);
 
@@ -402,6 +524,7 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
             img_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
                 vis_in.grid_thw, vl_cfg.vision.spatial_merge_size);
             std::cout << "[Audio+Vision]   visual tokens: " << img_tok << std::endl;
+            perf.vision_encode_ms = elapsed_ms(t_vis_start, std::chrono::steady_clock::now());
         }
 
         auto prompt_str = build_audio_prompt(user_prompt, num_audio_tokens, img_tok);
@@ -476,6 +599,7 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
         std::cout << "[Audio]   input_ids shape: [" << batch << ", " << seq_len << "]" << std::endl;
         std::cout << "[Audio]   position_ids shape: " << position_ids.get_shape() << std::endl;
     } else if (has_image) {
+        const auto t_vis_start = std::chrono::steady_clock::now();
         auto compiled_vision = core.compile_model(vision_model, device, props);
 
         // Load & preprocess image
@@ -497,6 +621,7 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
         vreq.set_tensor(Qwen3VLVisionIO::kRotarySin, vis_in.rotary_sin);
         vreq.set_tensor("attention_mask", build_vision_attention_mask(vis_in.grid_thw));
         vreq.infer();
+        perf.vision_encode_ms = elapsed_ms(t_vis_start, std::chrono::steady_clock::now());
 
         ov::Tensor visual_embeds = vreq.get_tensor(Qwen3VLVisionIO::kVisualEmbeds);
         std::vector<ov::Tensor> ds_embeds;
@@ -568,7 +693,11 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
         }
     }
 
+    const auto t_prefill_start = std::chrono::steady_clock::now();
     treq.infer();
+    const auto t_prefill_end = std::chrono::steady_clock::now();
+    perf.ttft_ms = elapsed_ms(t_prefill_start, t_prefill_end);
+
     int64_t next_id = argmax_last_token(treq.get_tensor(Qwen3OmniTextIO::kLogits));
     std::vector<int64_t> generated;
     generated.reserve(static_cast<size_t>(max_new_tokens));
@@ -596,6 +725,7 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
 
     int64_t past_len = prompt_len;
     const int64_t eos_id = tokenizer.get_eos_token_id();
+    const auto t_decode_start = std::chrono::steady_clock::now();
     for (int step = 1; step < max_new_tokens; ++step) {
         if (eos_id >= 0 && next_id == eos_id) break;
         {
@@ -627,8 +757,20 @@ std::string run_text_generation(const std::filesystem::path& model_dir,
         generated.push_back(next_id);
         past_len += 1;
     }
+    const auto t_decode_end = std::chrono::steady_clock::now();
 
-    return tokenizer.decode(generated, ov::genai::skip_special_tokens(true));
+    const int64_t decode_steps = static_cast<int64_t>(generated.size()) - 1;  // excluding prefill token
+    perf.prompt_tokens = prompt_len;
+    perf.output_tokens = static_cast<int64_t>(generated.size());
+    perf.decode_ms = elapsed_ms(t_decode_start, t_decode_end);
+    perf.tpot_ms = decode_steps > 0 ? (perf.decode_ms / static_cast<double>(decode_steps)) : 0.0;
+    perf.throughput = (decode_steps > 0 && perf.decode_ms > 0.0)
+                          ? (static_cast<double>(decode_steps) * 1000.0 / perf.decode_ms)
+                          : 0.0;
+    perf.text_gen_total_ms = elapsed_ms(t_start, t_decode_end);
+
+    perf.text = tokenizer.decode(generated, ov::genai::skip_special_tokens(true));
+    return perf;
 }
 
 struct TtsRunResult {
@@ -793,9 +935,16 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
                          const Qwen3OmniConfig& cfg,
                          const std::string& text,
                          const std::filesystem::path& wav_out,
-                         const std::string& device) {
+                         const std::string& device,
+                         PrecisionMode precision_mode = PrecisionMode::kFP32) {
     try {
-        ov::AnyMap props = {{ov::hint::inference_precision.name(), ov::element::f32}};
+        // TTS models (talker, code predictor, speech decoder) always use fp32
+        // regardless of the user-specified precision, which only applies to the
+        // text generation (thinker) model.  Using reduced precision (e.g. int8 KV)
+        // in the talker degrades codec generation quality and produces distorted audio.
+        ov::AnyMap tts_props = {{ov::hint::inference_precision.name(), ov::element::f32}};
+        std::cerr << "[TTS] precision_mode (text model): " << precision_mode_to_string(precision_mode)
+                  << " | TTS models: fp32\n";
         auto talker_cfg = to_qwen3_omni_talker_config(cfg);
         auto cp_cfg = to_qwen3_omni_code_predictor_config(cfg);
 
@@ -810,22 +959,22 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         // --- Create and compile all models ---
         std::cerr << "[TTS] Creating talker embedding model...\n";
         auto embed_model = create_qwen3_omni_talker_embedding_model(cfg, talker_source, finalizer);
-        auto embed_compiled = core.compile_model(embed_model, device, props);
+        auto embed_compiled = core.compile_model(embed_model, device, tts_props);
         auto embed_infer = embed_compiled.create_infer_request();
 
         std::cerr << "[TTS] Creating talker prefill model...\n";
         auto prefill_model = create_qwen3_omni_talker_prefill_model(cfg, talker_source, finalizer);
-        auto prefill_compiled = core.compile_model(prefill_model, device, props);
+        auto prefill_compiled = core.compile_model(prefill_model, device, tts_props);
         auto prefill_infer = prefill_compiled.create_infer_request();
 
         std::cerr << "[TTS] Creating talker decode model...\n";
         auto decode_model = create_qwen3_omni_talker_decode_model(cfg, talker_source, finalizer);
-        auto decode_compiled = core.compile_model(decode_model, device, props);
+        auto decode_compiled = core.compile_model(decode_model, device, tts_props);
         auto decode_infer = decode_compiled.create_infer_request();
 
         std::cerr << "[TTS] Creating talker codec embedding model...\n";
         auto codec_embed_model = create_qwen3_omni_talker_codec_embedding_model(cfg, talker_source, finalizer);
-        auto codec_embed_compiled = core.compile_model(codec_embed_model, device, props);
+        auto codec_embed_compiled = core.compile_model(codec_embed_model, device, tts_props);
         auto codec_embed_infer = codec_embed_compiled.create_infer_request();
 
         // Code predictor AR models (15 steps) and single codec embed models
@@ -837,22 +986,22 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         for (int step = 0; step < cp_steps; ++step) {
             std::cerr << "[TTS] Creating code predictor AR step " << step << "...\n";
             auto ar_model = create_qwen3_omni_code_predictor_ar_model(cfg, step, talker_source, finalizer);
-            auto ar_c = core.compile_model(ar_model, device, props);
+            auto ar_c = core.compile_model(ar_model, device, tts_props);
             cp_ar_infer.push_back(ar_c.create_infer_request());
 
             auto se_model = create_qwen3_omni_code_predictor_single_codec_embed_model(cfg, step, talker_source, finalizer);
-            auto se_c = core.compile_model(se_model, device, props);
+            auto se_c = core.compile_model(se_model, device, tts_props);
             cp_embed_infer.push_back(se_c.create_infer_request());
         }
 
         std::cerr << "[TTS] Creating code predictor codec embedding model...\n";
         auto cp_codec_model = create_qwen3_omni_code_predictor_codec_embed_model(cfg, talker_source, finalizer);
-        auto cp_codec_compiled = core.compile_model(cp_codec_model, device, props);
+        auto cp_codec_compiled = core.compile_model(cp_codec_model, device, tts_props);
         auto cp_codec_infer = cp_codec_compiled.create_infer_request();
 
         std::cerr << "[TTS] Creating speech decoder model...\n";
         auto decoder_model = create_qwen3_omni_speech_decoder_model(cfg, source, finalizer);
-        auto decoder_compiled = core.compile_model(decoder_model, device, props);
+        auto decoder_compiled = core.compile_model(decoder_model, device, tts_props);
         auto decoder_infer = decoder_compiled.create_infer_request();
 
         // --- Tokenize text ---
@@ -1236,7 +1385,7 @@ int main(int argc, char* argv[]) try {
 #endif
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <CASE_ID> <TEXT_PROMPT> <WAV_OUT> [IMAGE_PATH] [AUDIO_PATH] [DEVICE] [MAX_NEW_TOKENS]\n";
+                  << " <MODEL_DIR> <CASE_ID> <TEXT_PROMPT> <WAV_OUT> [IMAGE_PATH] [AUDIO_PATH] [DEVICE] [MAX_NEW_TOKENS] [PRECISION]\n";
         return 1;
     }
 
@@ -1248,6 +1397,7 @@ int main(int argc, char* argv[]) try {
     const std::filesystem::path audio_path = (argc > 6) ? std::filesystem::path(argv[6]) : std::filesystem::path();
     const std::string device = (argc > 7) ? argv[7] : "CPU";
     const int max_new_tokens = (argc > 8) ? std::stoi(argv[8]) : 64;
+    const PrecisionMode precision = (argc > 9) ? parse_precision_mode(argv[9]) : PrecisionMode::kFP32;
 
     auto st_data = ov::genai::safetensors::load_safetensors(model_dir);
     ov::genai::safetensors::SafetensorsWeightSource source(std::move(st_data));
@@ -1257,7 +1407,7 @@ int main(int argc, char* argv[]) try {
     ov::Core core;
 
     const auto start = std::chrono::high_resolution_clock::now();
-    std::string response_text = run_text_generation(model_dir,
+    auto text_gen = run_text_generation(model_dir,
                                                     core,
                                                     source,
                                                     finalizer,
@@ -1266,33 +1416,51 @@ int main(int argc, char* argv[]) try {
                                                     image_path,
                                                     audio_path,
                                                     max_new_tokens,
-                                                    device);
-
+                                                    device,
+                                                    precision);
+    const auto t_tts_start = std::chrono::high_resolution_clock::now();
     TtsRunResult tts = run_min_tts(model_dir,
                                    core,
                                    source,
                                    finalizer,
                                    cfg,
-                                   response_text.empty() ? text_prompt : response_text,
+                                   text_gen.text.empty() ? text_prompt : text_gen.text,
                                    wav_out,
-                                   device);
+                                   device,
+                                   precision);
     const auto end = std::chrono::high_resolution_clock::now();
     const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    const auto tts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - t_tts_start).count();
 
     // Escape newlines so parse_kv_stdout sees TEXT_OUTPUT as a single line
-    std::string escaped_text = response_text;
+    std::string escaped_text = text_gen.text;
     for (size_t pos = 0; (pos = escaped_text.find('\n', pos)) != std::string::npos; ) {
         escaped_text.replace(pos, 1, "\\n");
         pos += 2;
     }
 
+    std::cout << std::fixed << std::setprecision(2);
     std::cout << "CASE_ID: " << case_id << "\n";
+    std::cout << "DEVICE: " << device << "\n";
+    std::cout << "PRECISION_MODE: " << precision_mode_to_string(precision) << "\n";
     std::cout << "TEXT_OUTPUT: " << escaped_text << "\n";
     std::cout << "WAV_OUTPUT: " << wav_out.string() << "\n";
     std::cout << "AUDIO_SAMPLES: " << tts.samples << "\n";
     std::cout << "AUDIO_SAMPLE_RATE: " << tts.sample_rate << "\n";
     std::cout << "TTS_BACKEND: " << tts.backend << "\n";
     std::cout << "TTS_NOTE: " << tts.note << "\n";
+    // Performance metrics
+    std::cout << "PROMPT_TOKENS: " << text_gen.prompt_tokens << "\n";
+    std::cout << "OUTPUT_TOKENS: " << text_gen.output_tokens << "\n";
+    std::cout << "MODEL_LOAD_MS: " << text_gen.model_load_ms << "\n";
+    std::cout << "AUDIO_ENCODE_MS: " << text_gen.audio_encode_ms << "\n";
+    std::cout << "VISION_ENCODE_MS: " << text_gen.vision_encode_ms << "\n";
+    std::cout << "TTFT_MS: " << text_gen.ttft_ms << "\n";
+    std::cout << "DECODE_MS: " << text_gen.decode_ms << "\n";
+    std::cout << "TPOT_MS: " << text_gen.tpot_ms << "\n";
+    std::cout << "THROUGHPUT: " << text_gen.throughput << "\n";
+    std::cout << "TEXT_GEN_MS: " << text_gen.text_gen_total_ms << "\n";
+    std::cout << "TTS_MS: " << tts_ms << "\n";
     std::cout << "TOTAL_MS: " << total_ms << "\n";
     return 0;
 } catch (const std::exception& ex) {
