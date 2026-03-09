@@ -999,9 +999,12 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         auto cp_codec_compiled = core.compile_model(cp_codec_model, device, tts_props);
         auto cp_codec_infer = cp_codec_compiled.create_infer_request();
 
-        std::cerr << "[TTS] Creating speech decoder model...\n";
+        // Speech decoder (BigVGAN) always runs on CPU: GPU f16 accumulation in
+        // SnakeBeta activations (exp/sin²) across 4 upsample stages causes
+        // systematic ~10x amplitude loss, producing noise-like audio.
+        std::cerr << "[TTS] Creating speech decoder model (always CPU)...\n";
         auto decoder_model = create_qwen3_omni_speech_decoder_model(cfg, source, finalizer);
-        auto decoder_compiled = core.compile_model(decoder_model, device, tts_props);
+        auto decoder_compiled = core.compile_model(decoder_model, "CPU", tts_props);
         auto decoder_infer = decoder_compiled.create_infer_request();
 
         // --- Tokenize text ---
