@@ -721,6 +721,13 @@ struct TtsRunResult {
     int sample_rate = 24000;
     std::string backend = "speech_decoder";
     std::string note;
+    // Sub-component timing (ms)
+    double model_compile_ms = 0.0;     // all model creation + compile
+    double talker_prefill_ms = 0.0;    // embedding + prefill infer
+    double talker_decode_ms = 0.0;     // AR generation loop (talker decode steps only)
+    double code_predictor_ms = 0.0;    // AR generation loop (code predictor steps only)
+    double speech_decoder_ms = 0.0;    // speech decoder infer
+    int codec_frames = 0;             // number of codec frames generated
 };
 
 TtsRunResult synthesize_fallback_tone(const std::filesystem::path& wav_out, const std::string& text) {
@@ -899,6 +906,7 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
                   << " text_hidden=" << talker_cfg.text_hidden_size << "\n";
 
         // --- Create and compile all models ---
+        const auto t_compile_start = std::chrono::steady_clock::now();
         std::cerr << "[TTS] Creating talker embedding model...\n";
         auto embed_model = create_qwen3_omni_talker_embedding_model(cfg, talker_source, finalizer);
         auto embed_compiled = core.compile_model(embed_model, device, tts_props);
@@ -948,6 +956,7 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         auto decoder_model = create_qwen3_omni_speech_decoder_model(cfg, source, finalizer);
         auto decoder_compiled = core.compile_model(decoder_model, "CPU", tts_props);
         auto decoder_infer = decoder_compiled.create_infer_request();
+        const auto t_compile_end = std::chrono::steady_clock::now();
 
         // --- Tokenize text ---
         ov::genai::Tokenizer tokenizer(model_dir);
@@ -1060,6 +1069,7 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         std::cerr << "[TTS] Pre-computed " << trailing_text_embeds.size() << " trailing text embeddings\n";
 
         // --- Get prefill embeddings ---
+        const auto t_prefill_start = std::chrono::steady_clock::now();
         {
             ov::Tensor tt(ov::element::i64, {batch, prefill_len}, full_text_ids.data());
             ov::Tensor ct(ov::element::i64, {batch, prefill_len}, full_codec_ids.data());
@@ -1092,6 +1102,7 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         }
         std::cerr << "[TTS] Running talker prefill...\n";
         prefill_infer.infer();
+        const auto t_prefill_end = std::chrono::steady_clock::now();
 
         auto logits_tensor = prefill_infer.get_tensor("logits");
         auto hidden_tensor = prefill_infer.get_tensor("hidden_states");
@@ -1144,10 +1155,13 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
                                          l0_embed_out.data<float>() + hidden_size);
 
         size_t current_seq_len = prefill_len;
+        double talker_decode_accum_ms = 0.0;
+        double code_predictor_accum_ms = 0.0;
 
         // Process frames
         for (int frame = 0; frame < max_frames && layer0_token != codec_eos; ++frame) {
             // --- Code predictor: generate layers 1-15 for this frame ---
+            const auto t_cp_start = std::chrono::steady_clock::now();
             std::vector<float> ar_seq;
             ar_seq.insert(ar_seq.end(), past_hidden.begin(), past_hidden.end());
             ar_seq.insert(ar_seq.end(), layer0_embed.begin(), layer0_embed.end());
@@ -1195,8 +1209,12 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
             const float* sum_ptr = codec_embeds_sum.data<float>();
             for (size_t i = 0; i < hidden_size; ++i) codec_sum[i] += sum_ptr[i];
 
+            const auto t_cp_end = std::chrono::steady_clock::now();
+            code_predictor_accum_ms += elapsed_ms(t_cp_start, t_cp_end);
+
             // inputs_embeds = codec_sum + text_conditioning
             // Python streams text tokens: text₁,text₂,...,textₙ,tts_eos, then tts_pad when exhausted
+            const auto t_td_start = std::chrono::steady_clock::now();
             const auto& text_cond = (static_cast<size_t>(frame) < trailing_text_embeds.size())
                 ? trailing_text_embeds[frame] : tts_pad_embed;
             std::vector<float> step_embed_data(hidden_size);
@@ -1244,6 +1262,8 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
             }
 
             current_seq_len++;
+            const auto t_td_end = std::chrono::steady_clock::now();
+            talker_decode_accum_ms += elapsed_ms(t_td_start, t_td_end);
 
             if (frame % 20 == 0 || layer0_token == codec_eos) {
                 std::string text_info = (static_cast<size_t>(frame) < trailing_text_embeds.size())
@@ -1301,8 +1321,10 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
 
         // --- Run speech decoder ---
         std::cerr << "[TTS] Running speech decoder on " << num_frames << " frames...\n";
+        const auto t_decoder_start = std::chrono::steady_clock::now();
         decoder_infer.set_tensor("codes", codes);
         decoder_infer.infer();
+        const auto t_decoder_end = std::chrono::steady_clock::now();
         ov::Tensor audio = decoder_infer.get_tensor("audio");
 
         const float* audio_ptr = audio.data<const float>();
@@ -1314,6 +1336,12 @@ TtsRunResult run_min_tts(const std::filesystem::path& model_dir,
         result.wav_path = wav_out;
         result.samples = sample_count;
         result.sample_rate = 24000;
+        result.model_compile_ms = elapsed_ms(t_compile_start, t_compile_end);
+        result.talker_prefill_ms = elapsed_ms(t_prefill_start, t_prefill_end);
+        result.talker_decode_ms = talker_decode_accum_ms;
+        result.code_predictor_ms = code_predictor_accum_ms;
+        result.speech_decoder_ms = elapsed_ms(t_decoder_start, t_decoder_end);
+        result.codec_frames = static_cast<int>(num_frames);
         return result;
     } catch (const std::exception& ex) {
         std::cerr << "[TTS] Speech decoder failed: " << ex.what() << "\n";
@@ -1406,6 +1434,13 @@ int main(int argc, char* argv[]) try {
     std::cout << "THROUGHPUT: " << text_gen.throughput << "\n";
     std::cout << "TEXT_GEN_MS: " << text_gen.text_gen_total_ms << "\n";
     std::cout << "TTS_MS: " << tts_ms << "\n";
+    // TTS sub-component timing
+    std::cout << "TTS_MODEL_COMPILE_MS: " << tts.model_compile_ms << "\n";
+    std::cout << "TTS_TALKER_PREFILL_MS: " << tts.talker_prefill_ms << "\n";
+    std::cout << "TTS_TALKER_DECODE_MS: " << tts.talker_decode_ms << "\n";
+    std::cout << "TTS_CODE_PREDICTOR_MS: " << tts.code_predictor_ms << "\n";
+    std::cout << "TTS_SPEECH_DECODER_MS: " << tts.speech_decoder_ms << "\n";
+    std::cout << "TTS_CODEC_FRAMES: " << tts.codec_frames << "\n";
     std::cout << "TOTAL_MS: " << total_ms << "\n";
     return 0;
 } catch (const std::exception& ex) {

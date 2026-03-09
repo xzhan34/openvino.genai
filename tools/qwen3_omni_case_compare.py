@@ -5,10 +5,8 @@ import glob
 import json
 import math
 import os
-import signal
 import subprocess
 import sys
-import threading
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -56,25 +54,77 @@ def parse_cpp_text(stdout: str) -> str:
     return text
 
 
-def run_cpp_case(cpp_bin: Path, model_dir: Path, image_path: Path, prompt: str, max_new_tokens: int, precision: str = "fp32") -> dict:
+def parse_perf_from_base_stdout(stdout: str) -> dict:
+    """Extract performance metrics from base C++ binary (modeling_qwen3_omni) stdout.
+
+    The base binary prints lines like:
+        Prompt token size: 726
+        Output token size: 53
+        Preprocess time: 123.45 ms
+        Vision encode time: 456.78 ms
+        TTFT: 789.01 ms
+        Decode time: 2345.67 ms
+        TPOT: 45.07 ms/token
+        Throughput: 22.19 tokens/s
+    """
+    perf = {}
+    kv = parse_kv_stdout(stdout)
+    def _float(key: str) -> float:
+        val = kv.get(key, "0")
+        # strip units like " ms", " ms/token", " tokens/s"
+        for unit in (" ms/token", " tokens/s", " ms"):
+            if val.endswith(unit):
+                val = val[:-len(unit)]
+                break
+        try:
+            return float(val)
+        except ValueError:
+            return 0.0
+
+    perf["prompt_tokens"] = int(_float("Prompt token size"))
+    perf["output_tokens"] = int(_float("Output token size"))
+    perf["vision_encode_ms"] = _float("Vision encode time")
+    perf["preprocess_ms"] = _float("Preprocess time")
+    perf["ttft_ms"] = _float("TTFT")
+    perf["decode_ms"] = _float("Decode time")
+    perf["tpot_ms"] = _float("TPOT")
+    perf["throughput"] = _float("Throughput")
+    # Base binary doesn't output total_ms; compute from available stages
+    perf["total_ms"] = perf["preprocess_ms"] + perf["vision_encode_ms"] + perf["ttft_ms"] + perf["decode_ms"]
+    return perf
+
+
+def run_cpp_case(cpp_bin: Path, model_dir: Path, image_path: Path, prompt: str, max_new_tokens: int, precision: str = "fp32", device: str = "CPU", timeout: int = 0) -> dict:
     cmd = [
         str(cpp_bin),
-        str(model_dir),
-        str(image_path),
-        prompt,
-        "CPU",
-        str(max_new_tokens),
-        "",
-        "",
-        precision,
+        "--model-dir", str(model_dir),
+        "--image", str(image_path),
+        "--prompt", prompt,
+        "--device", device,
+        "--output-tokens", str(max_new_tokens),
+        "--precision", precision,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout if timeout > 0 else None)
+    except subprocess.TimeoutExpired:
+        return {
+            "supported": True,
+            "return_code": -999,
+            "stdout": "",
+            "stderr": f"TIMEOUT after {timeout}s",
+            "text_output": "",
+            "perf": {},
+            "timeout": True,
+        }
+    perf = parse_perf_from_base_stdout(proc.stdout) if proc.returncode == 0 else {}
     result = {
         "supported": True,
         "return_code": proc.returncode,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
         "text_output": parse_cpp_text(proc.stdout) if proc.returncode == 0 else "",
+        "perf": perf,
     }
     return result
 
@@ -99,6 +149,9 @@ def run_cpp_tts_case(
     max_new_tokens: int,
     image_path: Path = None,
     audio_path: Path = None,
+    device: str = "CPU",
+    precision: str = "fp32",
+    timeout: int = 0,
 ) -> dict:
     cmd = [
         str(cpp_tts_bin),
@@ -108,11 +161,58 @@ def run_cpp_tts_case(
         str(wav_out),
         str(image_path) if image_path else "none",
         str(audio_path) if audio_path else "none",
-        "CPU",
+        device,
         str(max_new_tokens),
+        precision,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout if timeout > 0 else None)
+    except subprocess.TimeoutExpired:
+        return {
+            "supported": True,
+            "return_code": -999,
+            "stdout": "",
+            "stderr": f"TIMEOUT after {timeout}s",
+            "text_output": "",
+            "wav_output": "",
+            "audio_samples": 0,
+            "audio_sample_rate": 0,
+            "tts_backend": "",
+            "tts_note": "",
+            "perf": {},
+            "timeout": True,
+        }
     parsed = parse_kv_stdout(proc.stdout) if proc.returncode == 0 else {}
+    def _pf(key: str) -> float:
+        try:
+            return float(parsed.get(key, "0"))
+        except ValueError:
+            return 0.0
+
+    perf = {}
+    if proc.returncode == 0:
+        perf = {
+            "prompt_tokens": int(_pf("PROMPT_TOKENS")),
+            "output_tokens": int(_pf("OUTPUT_TOKENS")),
+            "model_load_ms": _pf("MODEL_LOAD_MS"),
+            "audio_encode_ms": _pf("AUDIO_ENCODE_MS"),
+            "vision_encode_ms": _pf("VISION_ENCODE_MS"),
+            "ttft_ms": _pf("TTFT_MS"),
+            "decode_ms": _pf("DECODE_MS"),
+            "tpot_ms": _pf("TPOT_MS"),
+            "throughput": _pf("THROUGHPUT"),
+            "text_gen_ms": _pf("TEXT_GEN_MS"),
+            "tts_ms": _pf("TTS_MS"),
+            # TTS sub-component timing
+            "tts_model_compile_ms": _pf("TTS_MODEL_COMPILE_MS"),
+            "tts_talker_prefill_ms": _pf("TTS_TALKER_PREFILL_MS"),
+            "tts_talker_decode_ms": _pf("TTS_TALKER_DECODE_MS"),
+            "tts_code_predictor_ms": _pf("TTS_CODE_PREDICTOR_MS"),
+            "tts_speech_decoder_ms": _pf("TTS_SPEECH_DECODER_MS"),
+            "tts_codec_frames": int(_pf("TTS_CODEC_FRAMES")),
+            "total_ms": _pf("TOTAL_MS"),
+        }
     return {
         "supported": True,
         "return_code": proc.returncode,
@@ -124,6 +224,7 @@ def run_cpp_tts_case(
         "audio_sample_rate": int(parsed.get("AUDIO_SAMPLE_RATE", "0")) if proc.returncode == 0 else 0,
         "tts_backend": parsed.get("TTS_BACKEND", "") if proc.returncode == 0 else "",
         "tts_note": parsed.get("TTS_NOTE", "") if proc.returncode == 0 else "",
+        "perf": perf,
     }
 
 
@@ -170,21 +271,39 @@ def main() -> int:
     parser.add_argument("--cpp-tts-bin", required=False, default="")
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument("--cpp-precision", type=str, default="fp32",
-                        help="Precision mode for C++ binary (fp32/inf_fp32_kv_fp32_w_int4_asym/etc.)")
+    parser.add_argument("--cpp-precision", type=str, default="",
+                        help="(Deprecated) Single precision mode. Use --precisions instead.")
+    parser.add_argument("--precisions", type=str, default="",
+                        help="Comma-separated precision modes (e.g. 'fp32,fp16_kv8,inf_fp32_kv_fp32_w_int4_asym'). Default: fp32")
     parser.add_argument("--test-audio", type=str, default="",
                         help="Path to a real speech WAV file for case 3 (default: auto-generated 440Hz test tone)")
-    parser.add_argument("--py-max-new-tokens", type=int, default=0,
-                        help="Max new tokens for Python inference (default: same as --max-new-tokens, "
-                             "set lower to avoid slow CPU inference)")
-    parser.add_argument("--py-timeout", type=int, default=600,
-                        help="Timeout in seconds for each Python case (default: 600). 0=no timeout.")
     parser.add_argument("--cpp-only", action="store_true",
                         help="Skip Python model loading and inference, only run C++ cases")
     parser.add_argument("--cases", type=str, default="",
                         help="Comma-separated list of case IDs to run (e.g. '4' or '3,4'). Empty = all.")
+    parser.add_argument("--device", type=str, default="",
+                        help="(Deprecated) Single device. Use --devices instead.")
+    parser.add_argument("--devices", type=str, default="",
+                        help="Comma-separated devices (e.g. 'CPU,GPU'). Default: CPU")
+    parser.add_argument("--timeout", type=int, default=600,
+                        help="Timeout in seconds per C++ subprocess. 0=no timeout. Default: 600")
     args = parser.parse_args()
-    py_max_new_tokens = args.py_max_new_tokens if args.py_max_new_tokens > 0 else args.max_new_tokens
+
+    # Resolve devices list (--devices takes precedence over deprecated --device)
+    if args.devices:
+        devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+    elif args.device:
+        devices = [args.device.strip()]
+    else:
+        devices = ["CPU"]
+
+    # Resolve precisions list (--precisions takes precedence over deprecated --cpp-precision)
+    if args.precisions:
+        precisions = [p.strip() for p in args.precisions.split(",") if p.strip()]
+    elif args.cpp_precision:
+        precisions = [args.cpp_precision.strip()]
+    else:
+        precisions = ["fp32"]
 
     model_dir = Path(args.model_dir)
     image_path = Path(args.image)
@@ -193,13 +312,12 @@ def main() -> int:
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
 
+    test_audio = out_json.parent / "qwen3_omni_test_tone.wav"
+    ensure_test_wav(test_audio)
     if args.test_audio:
         test_audio = Path(args.test_audio)
         if not test_audio.exists():
             raise FileNotFoundError(f"Test audio not found: {test_audio}")
-    else:
-        test_audio = out_json.parent / "qwen3_omni_test_tone.wav"
-        ensure_test_wav(test_audio)
 
     case_filter = set(int(x) for x in args.cases.split(",") if x.strip()) if args.cases else set()
 
@@ -305,177 +423,239 @@ def main() -> int:
         "model_dir": str(model_dir),
         "image": str(image_path),
         "audio": str(test_audio),
-        "compare_target": f"C++ {args.cpp_precision} vs Python default(dtype=auto)",
-        "cases": [],
+        "devices": devices,
+        "precisions": precisions,
+        "results": [],
     }
 
-    for case in cases:
-        if case_filter and case["id"] not in case_filter:
-            continue
+    total_combos = len(devices) * len(precisions) * (len([c for c in cases if not case_filter or c["id"] in case_filter]))
+    combo_idx = 0
 
-        # Extract the user text prompt from conversation
-        user_text_prompt = ""
-        for msg in case["conversation"]:
-            if isinstance(msg.get("content"), list):
-                for c in msg["content"]:
-                    if c.get("type") == "text":
-                        user_text_prompt = c.get("text", "")
-        cpp_prompt = case.get("cpp_prompt", user_text_prompt)
+    for prec in precisions:
+        for device in devices:
+            for case in cases:
+                if case_filter and case["id"] not in case_filter:
+                    continue
 
-        case_result = {
-            "id": case["id"],
-            "name": case["name"],
-            "expect_tts": case["expect_tts"],
-            "python_prompt": user_text_prompt,
-            "cpp_prompt": cpp_prompt,
-            "cpp": {"supported": case["cpp_supported"]},
-            "python": {},
-        }
+                combo_idx += 1
+                combo_label = f"[{combo_idx}/{total_combos}] precision={prec} device={device} case={case['id']}"
+                print(f"\n>>> {combo_label} <<<")
+                print(f"  [{case['id']}] {case['name']}")
+                # Extract the text prompt from conversation
+                conv_text = ""
+                for msg in case["conversation"]:
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for item in content:
+                            if item.get("type") == "text":
+                                conv_text = item.get("text", "")
+                print(f"  Prompt: text=\"{conv_text}\"")
+                if case.get("cpp_prompt"):
+                    print(f"  C++ Prompt: cpp_prompt=\"{case['cpp_prompt']}\"")
 
-        if not args.cpp_only and processor is not None:
-            text = processor.apply_chat_template(case["conversation"], add_generation_prompt=True, tokenize=False)
-            audios, images, videos = process_mm_info(case["conversation"], use_audio_in_video=True)
-
-            py_result_container = {}
-            def _run_py_case():
-                try:
-                    inputs = processor(
-                        text=text,
-                        audio=audios,
-                        images=images,
-                        videos=videos,
-                        return_tensors="pt",
-                        padding=True,
-                        use_audio_in_video=True,
-                    )
-                    inputs = inputs.to(model.device).to(model.dtype)
-                    print(f"  [Python] Starting generate (max_new_tokens={py_max_new_tokens}, "
-                          f"return_audio={case['expect_tts']})...", flush=True)
-                    generation = model.generate(
-                        **inputs,
-                        do_sample=False,
-                        max_new_tokens=py_max_new_tokens,
-                        speaker="f245",
-                        return_audio=case["expect_tts"],
-                        use_audio_in_video=True,
-                        thinker_return_dict_in_generate=True,
-                    )
-
-                    py_has_audio = False
-                    generation_for_decode = generation
-                    if isinstance(generation, tuple):
-                        generation_for_decode = generation[0]
-                        py_has_audio = generation[1] is not None
-
-                    py_text, py_has_audio_from_decode = decode_python_generation(
-                        generation_for_decode,
-                        processor.tokenizer,
-                        int(inputs["input_ids"].shape[1]),
-                    )
-                    py_has_audio = py_has_audio or py_has_audio_from_decode
-                    py_result_container["result"] = {
-                        "ok": True,
-                        "text_output": py_text,
-                        "has_tts_audio": py_has_audio,
-                    }
-                except Exception as error:
-                    py_result_container["result"] = {
-                        "ok": False,
-                        "error": str(error),
-                    }
-
-            timeout = args.py_timeout if args.py_timeout > 0 else None
-            py_thread = threading.Thread(target=_run_py_case, daemon=True)
-            py_thread.start()
-            py_thread.join(timeout=timeout)
-            if py_thread.is_alive():
-                print(f"  [Python] TIMEOUT after {timeout}s - skipping", flush=True)
-                case_result["python"] = {
-                    "ok": False,
-                    "error": f"timeout ({timeout}s)",
+                case_result = {
+                    "id": case["id"],
+                    "name": case["name"],
+                    "device": device,
+                    "precision": prec,
+                    "expect_tts": case["expect_tts"],
+                    "cpp": {"supported": case["cpp_supported"]},
+                    "python": {},
                 }
-            elif "result" in py_result_container:
-                case_result["python"] = py_result_container["result"]
-            else:
-                case_result["python"] = {
-                    "ok": False,
-                    "error": "unknown error (no result)",
-                }
-        else:
-            case_result["python"] = {"ok": False, "error": "skipped (--cpp-only)"}
 
-        if case["cpp_supported"]:
-            if case.get("cpp_mode") == "tts_min":
-                wav_out = out_json.parent / f"case{case['id']}_cpp_tts.wav"
-                # Only pass image_path / audio_path when the case conversation actually uses them
-                case_has_image = any(
-                    c.get("type") == "image"
-                    for msg in case["conversation"]
-                    for c in (msg.get("content") if isinstance(msg.get("content"), list) else [])
-                )
-                case_has_audio = any(
-                    c.get("type") == "audio"
-                    for msg in case["conversation"]
-                    for c in (msg.get("content") if isinstance(msg.get("content"), list) else [])
-                )
-                case_result["cpp"] = run_cpp_tts_case(
-                    cpp_tts_bin,
-                    model_dir,
-                    case["id"],
-                    case.get("cpp_prompt", ""),
-                    wav_out,
-                    args.max_new_tokens,
-                    image_path=image_path if case_has_image else None,
-                    audio_path=test_audio if case_has_audio else None,
-                )
-            else:
-                cpp_prompt = "Describe this image in detail."
-                case_result["cpp"] = run_cpp_case(cpp_bin, model_dir, image_path, cpp_prompt, args.max_new_tokens, args.cpp_precision)
-        else:
-            case_result["cpp"] = {
-                "supported": False,
-                "reason": "C++ tts sample binary is not provided. Pass --cpp-tts-bin to enable case2/3/4.",
-            }
+                if not args.cpp_only and processor is not None:
+                    text = processor.apply_chat_template(case["conversation"], add_generation_prompt=True, tokenize=False)
+                    audios, images, videos = process_mm_info(case["conversation"], use_audio_in_video=True)
 
-        report["cases"].append(case_result)
+                    try:
+                        inputs = processor(
+                            text=text,
+                            audio=audios,
+                            images=images,
+                            videos=videos,
+                            return_tensors="pt",
+                            padding=True,
+                            use_audio_in_video=True,
+                        )
+                        inputs = inputs.to(model.device).to(model.dtype)
+                        generation = model.generate(
+                            **inputs,
+                            do_sample=False,
+                            max_new_tokens=args.max_new_tokens,
+                            speaker="f245",
+                            return_audio=case["expect_tts"],
+                            use_audio_in_video=True,
+                            thinker_return_dict_in_generate=True,
+                        )
+
+                        py_has_audio = False
+                        generation_for_decode = generation
+                        if isinstance(generation, tuple):
+                            generation_for_decode = generation[0]
+                            py_has_audio = generation[1] is not None
+
+                        py_text, py_has_audio_from_decode = decode_python_generation(
+                            generation_for_decode,
+                            processor.tokenizer,
+                            int(inputs["input_ids"].shape[1]),
+                        )
+                        py_has_audio = py_has_audio or py_has_audio_from_decode
+                        case_result["python"] = {
+                            "ok": True,
+                            "text_output": py_text,
+                            "has_tts_audio": py_has_audio,
+                        }
+                    except Exception as error:
+                        case_result["python"] = {
+                            "ok": False,
+                            "error": str(error),
+                        }
+                else:
+                    case_result["python"] = {"ok": False, "error": "skipped (--cpp-only)"}
+
+                if case["cpp_supported"]:
+                    if case.get("cpp_mode") == "tts_min":
+                        wav_out = out_json.parent / f"case{case['id']}_{device}_{prec}_cpp_tts.wav"
+                        # Only pass image_path / audio_path when the case conversation actually uses them
+                        case_has_image = any(
+                            c.get("type") == "image"
+                            for msg in case["conversation"]
+                            for c in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+                        )
+                        case_has_audio = any(
+                            c.get("type") == "audio"
+                            for msg in case["conversation"]
+                            for c in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+                        )
+                        case_result["cpp"] = run_cpp_tts_case(
+                            cpp_tts_bin,
+                            model_dir,
+                            case["id"],
+                            case.get("cpp_prompt", ""),
+                            wav_out,
+                            args.max_new_tokens,
+                            image_path=image_path if case_has_image else None,
+                            audio_path=test_audio if case_has_audio else None,
+                            device=device,
+                            precision=prec,
+                            timeout=args.timeout,
+                        )
+                    else:
+                        cpp_prompt = "Describe this image in detail."
+                        case_result["cpp"] = run_cpp_case(cpp_bin, model_dir, image_path, cpp_prompt, args.max_new_tokens, prec, device=device, timeout=args.timeout)
+                else:
+                    case_result["cpp"] = {
+                        "supported": False,
+                        "reason": "C++ tts sample binary is not provided. Pass --cpp-tts-bin to enable case2/3/4.",
+                    }
+
+                # Print quick status line
+                cpp = case_result["cpp"]
+                if cpp.get("timeout"):
+                    print(f"  C++: TIMEOUT (>{args.timeout}s) � skipped")
+                elif cpp.get("return_code") == 0:
+                    print(f"  C++: OK")
+                    cpp_text = cpp.get("text_output", "")
+                    if len(cpp_text) > 200:
+                        cpp_text = cpp_text[:200] + "..."
+                    if cpp_text:
+                        print(f"  C++ text: {cpp_text}")
+                    if cpp.get("wav_output"):
+                        print(f"  C++ wav: {cpp['wav_output']}")
+                    if cpp.get("audio_samples"):
+                        print(f"  C++ audio_samples: {cpp['audio_samples']}")
+                    if cpp.get("tts_backend"):
+                        print(f"  C++ tts_backend: {cpp['tts_backend']}")
+                    # Performance metrics
+                    perf = cpp.get("perf", {})
+                    if perf:
+                        parts = []
+                        if perf.get("output_tokens"):
+                            parts.append(f"tokens={perf['output_tokens']}")
+                        if perf.get("ttft_ms"):
+                            parts.append(f"TTFT={perf['ttft_ms']:.0f}ms")
+                        if perf.get("tpot_ms"):
+                            parts.append(f"TPOT={perf['tpot_ms']:.1f}ms")
+                        if perf.get("throughput"):
+                            parts.append(f"throughput={perf['throughput']:.1f}t/s")
+                        if perf.get("total_ms"):
+                            parts.append(f"total={perf['total_ms']:.0f}ms")
+                        elif perf.get("text_gen_ms"):
+                            parts.append(f"total={perf.get('text_gen_ms',0)+perf.get('tts_ms',0):.0f}ms")
+                        if parts:
+                            print(f"  Perf: {', '.join(parts)}")
+                elif cpp.get("supported"):
+                    print(f"  C++: FAIL (rc={cpp.get('return_code')})")
+
+                report["results"].append(case_result)
+
+        # --- Per-precision summary after all devicesxcases for this precision ---
+        prec_rows = [(r["device"], r["id"], r["name"], r["cpp"].get("perf", {}))
+                     for r in report["results"]
+                     if r["precision"] == prec
+                     and r["cpp"].get("supported") and r["cpp"].get("return_code") == 0
+                     and r["cpp"].get("perf")]
+        if prec_rows:
+            print(f"\n{'='*110}")
+            print(f" Precision Summary: {prec}")
+            print(f"{'='*110}")
+            header = f"{'Device':<6} {'Case':<35} {'Tokens':>7} {'TTFT':>9} {'Decode':>9} {'TPOT':>9} {'Thru':>9} {'Total':>10}"
+            print(header)
+            print("-" * len(header))
+            for dev, cid, cname, perf in prec_rows:
+                tokens = f"{perf.get('output_tokens', 0)}"
+                ttft = f"{perf['ttft_ms']:.0f}ms" if perf.get("ttft_ms") else "N/A"
+                decode = f"{perf['decode_ms']:.0f}ms" if perf.get("decode_ms") else "N/A"
+                tpot = f"{perf['tpot_ms']:.1f}ms" if perf.get("tpot_ms") else "N/A"
+                thru = f"{perf['throughput']:.1f}t/s" if perf.get("throughput") else "N/A"
+                total = f"{perf['total_ms']:.0f}ms" if perf.get("total_ms") else (
+                    f"{perf.get('text_gen_ms', 0) + perf.get('tts_ms', 0):.0f}ms" if perf.get("text_gen_ms") else "N/A"
+                )
+                name_short = cname[:32] if len(cname) > 32 else cname
+                print(f"{dev:<6} [{cid}] {name_short:<32} {tokens:>7} {ttft:>9} {decode:>9} {tpot:>9} {thru:>9} {total:>10}")
+            print(f"{'='*110}")
 
     out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"=== Qwen3 Omni Case Compare (C++ {args.cpp_precision} vs Python default) ===")
-    for case in report["cases"]:
-        py = case["python"]
-        cpp = case["cpp"]
-        py_status = "OK" if py.get("ok") else f"FAIL: {py.get('error', '')}"
-        if cpp.get("supported"):
-            cpp_status = "OK" if cpp.get("return_code") == 0 else f"FAIL(rc={cpp.get('return_code')})"
-        else:
-            cpp_status = f"UNSUPPORTED ({cpp.get('reason')})"
-        print(f"[{case['id']}] {case['name']}")
-        # Show input modalities
-        modalities = []
-        if case.get('python_prompt'):
-            modalities.append(f"text=\"{case['python_prompt']}\"")
-        if case.get('cpp_prompt') and case.get('cpp_prompt') != case.get('python_prompt'):
-            modalities.append(f"cpp_prompt=\"{case['cpp_prompt']}\"")
-        print(f"  Prompt: {modalities[0] if modalities else '(none)'}")
-        if len(modalities) > 1:
-            print(f"  C++ Prompt: {modalities[1]}")
-        print(f"  Python: {py_status}")
-        if py.get("ok"):
-            py_text = py.get('text_output', '')
-            py_text_display = (py_text[:200] + '...') if len(py_text) > 200 else py_text
-            print(f"  Python text: {py_text_display}")
-            print(f"  Python has_tts_audio: {py.get('has_tts_audio')}")
-        print(f"  C++: {cpp_status}")
-        if cpp.get("supported") and cpp.get("return_code") == 0:
-            cpp_text = cpp.get('text_output', '')
-            cpp_text_display = (cpp_text[:200] + '...') if len(cpp_text) > 200 else cpp_text
-            print(f"  C++ text: {cpp_text_display}")
-            if cpp.get("wav_output"):
-                print(f"  C++ wav: {cpp.get('wav_output')}")
-                print(f"  C++ audio_samples: {cpp.get('audio_samples')}")
-                if cpp.get("tts_backend"):
-                    print(f"  C++ tts_backend: {cpp.get('tts_backend')}")
+    # ============================================================
+    # Grand Summary: all precisions x devices x cases in one table
+    # ============================================================
+    all_perf = [(r["precision"], r["device"], r["id"], r["name"], r["cpp"].get("perf", {}))
+                for r in report["results"]
+                if r["cpp"].get("supported") and r["cpp"].get("return_code") == 0
+                and r["cpp"].get("perf")]
+    if all_perf:
+        print(f"\n{'#'*130}")
+        print(f"  GRAND PERFORMANCE SUMMARY  ({len(all_perf)} runs)")
+        print(f"{'#'*130}")
+        header = f"{'Precision':<32} {'Device':<6} {'Case':<35} {'Tokens':>7} {'TTFT':>9} {'Decode':>9} {'TPOT':>9} {'Thru':>9} {'Total':>10}"
+        print(header)
+        print("-" * len(header))
+        prev_prec = None
+        for prec, dev, cid, cname, perf in all_perf:
+            if prev_prec is not None and prec != prev_prec:
+                print()  # blank line between precision groups
+            prev_prec = prec
+            tokens = f"{perf.get('output_tokens', 0)}"
+            ttft = f"{perf['ttft_ms']:.0f}ms" if perf.get("ttft_ms") else "N/A"
+            decode = f"{perf['decode_ms']:.0f}ms" if perf.get("decode_ms") else "N/A"
+            tpot = f"{perf['tpot_ms']:.1f}ms" if perf.get("tpot_ms") else "N/A"
+            thru = f"{perf['throughput']:.1f}t/s" if perf.get("throughput") else "N/A"
+            total = f"{perf['total_ms']:.0f}ms" if perf.get("total_ms") else (
+                f"{perf.get('text_gen_ms', 0) + perf.get('tts_ms', 0):.0f}ms" if perf.get("text_gen_ms") else "N/A"
+            )
+            name_short = cname[:32] if len(cname) > 32 else cname
+            print(f"{prec:<32} {dev:<6} [{cid}] {name_short:<32} {tokens:>7} {ttft:>9} {decode:>9} {tpot:>9} {thru:>9} {total:>10}")
+        print(f"{'#'*130}")
+
+    # Also list any failures / timeouts
+    fails = [r for r in report["results"]
+             if r["cpp"].get("supported") and r["cpp"].get("return_code", -1) != 0]
+    if fails:
+        print(f"\n  FAILED / TIMED-OUT RUNS ({len(fails)}):")
+        for r in fails:
+            reason = "TIMEOUT" if r["cpp"].get("timeout") else f"rc={r['cpp'].get('return_code')}"
+            print(f"    precision={r['precision']}  device={r['device']}  case={r['id']}  {reason}")
 
     print(f"\nSaved report: {out_json}")
     return 0
