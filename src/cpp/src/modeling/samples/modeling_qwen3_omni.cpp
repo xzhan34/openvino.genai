@@ -637,6 +637,9 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.device = take_value("--device");
         } else if (arg == "--output-tokens") {
             opts.max_new_tokens = parse_i32(take_value("--output-tokens"), "--output-tokens");
+            if (opts.max_new_tokens <= 0) {
+                throw std::runtime_error("--output-tokens must be a positive integer");
+            }
         } else if (arg == "--dump-dir") {
             opts.dump_dir = std::filesystem::path(take_value("--dump-dir"));
         } else if (arg == "--py-ref-dump-dir") {
