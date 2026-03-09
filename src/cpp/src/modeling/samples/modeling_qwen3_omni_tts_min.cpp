@@ -29,8 +29,6 @@ extern "C" __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned int);
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include "load_image.hpp"
 #include "modeling/models/qwen3_omni/modeling_qwen3_omni.hpp"
 #include "modeling/models/qwen3_omni/modeling_qwen3_omni_audio.hpp"
@@ -199,62 +197,6 @@ std::string resolve_pos_embed_name(ov::genai::modeling::weights::WeightSource& s
     throw std::runtime_error("Cannot find visual pos_embed.weight in safetensors");
 }
 
-// --- JSON tensor helpers (for Python bridge) ---
-
-template <typename T>
-void flatten_json_values(const nlohmann::json& data, std::vector<T>& out) {
-    if (data.is_array()) {
-        for (const auto& item : data) flatten_json_values(item, out);
-        return;
-    }
-    out.push_back(data.get<T>());
-}
-
-ov::Tensor tensor_from_bridge_json(const nlohmann::json& node) {
-    if (!node.is_object()) throw std::runtime_error("Bridge tensor node must be an object");
-    const std::string dtype = node.value("dtype", "");
-    const auto& shape_json = node.at("shape");
-    ov::Shape shape;
-    shape.reserve(shape_json.size());
-    for (const auto& d : shape_json) shape.push_back(static_cast<size_t>(d.get<int64_t>()));
-
-    if (dtype == "float32" || dtype == "f32") {
-        std::vector<float> values;
-        values.reserve(ov::shape_size(shape));
-        flatten_json_values(node.at("data"), values);
-        ov::Tensor t(ov::element::f32, shape);
-        std::memcpy(t.data(), values.data(), values.size() * sizeof(float));
-        return t;
-    }
-    if (dtype == "int64" || dtype == "i64") {
-        std::vector<int64_t> values;
-        values.reserve(ov::shape_size(shape));
-        flatten_json_values(node.at("data"), values);
-        ov::Tensor t(ov::element::i64, shape);
-        std::memcpy(t.data(), values.data(), values.size() * sizeof(int64_t));
-        return t;
-    }
-    if (dtype == "bool") {
-        std::vector<uint8_t> values;
-        values.reserve(ov::shape_size(shape));
-        flatten_json_values(node.at("data"), values);
-        ov::Tensor t(ov::element::boolean, shape);
-        std::memcpy(t.data(), values.data(), values.size() * sizeof(uint8_t));
-        return t;
-    }
-    throw std::runtime_error("Unsupported bridge tensor dtype: " + dtype);
-}
-
-std::string find_python_executable() {
-    // Check PYTHON_EXECUTABLE env var first
-    const char* env = std::getenv("PYTHON_EXECUTABLE");
-    if (env && std::strlen(env) > 0) return std::string(env);
-#ifdef _WIN32
-    return "python";
-#else
-    return "python3";
-#endif
-}
 
 // --- Precision mode support (aligned with modeling_qwen3_omni.cpp) ---
 

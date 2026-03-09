@@ -111,15 +111,7 @@ def run_cpp_tts_case(
         "CPU",
         str(max_new_tokens),
     ]
-    # Set env vars for the C++ binary to find the bridge script and Python executable
-    env = dict(os.environ)
-    # This script lives at <repo>/tools/qwen3_omni_case_compare.py
-    # Bridge script is at  <repo>/src/cpp/src/modeling/models/qwen3_omni/
-    bridge_dir = Path(__file__).resolve().parent.parent / "src" / "cpp" / "src" / "modeling" / "models" / "qwen3_omni"
-    if bridge_dir.exists():
-        env["QWEN3_OMNI_BRIDGE_DIR"] = str(bridge_dir)
-    env.setdefault("PYTHON_EXECUTABLE", sys.executable)
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     parsed = parse_kv_stdout(proc.stdout) if proc.returncode == 0 else {}
     return {
         "supported": True,
