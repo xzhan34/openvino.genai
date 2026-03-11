@@ -36,6 +36,12 @@ public:
     Qwen3OmniVisionInputs preprocess(const ov::Tensor& images,
                                      const ov::Tensor& pos_embed_weight) const;
 
+    /// Preprocess video frames (each [1, H, W, 3] u8) for the vision encoder.
+    Qwen3OmniVisionInputs preprocess_video(const std::vector<ov::Tensor>& frames,
+                                           const ov::Tensor& pos_embed_weight,
+                                           size_t video_min_pixels = 128 * 28 * 28,
+                                           size_t video_max_pixels = 768 * 28 * 28) const;
+
     static int64_t count_visual_tokens(const ov::Tensor& grid_thw,
                                        int32_t spatial_merge_size);
 

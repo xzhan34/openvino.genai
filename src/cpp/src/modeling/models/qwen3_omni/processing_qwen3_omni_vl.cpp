@@ -20,6 +20,14 @@ Qwen3OmniVisionInputs Qwen3OmniVisionPreprocessor::preprocess(const ov::Tensor& 
     return preprocessor_.preprocess(images, pos_embed_weight);
 }
 
+Qwen3OmniVisionInputs Qwen3OmniVisionPreprocessor::preprocess_video(
+    const std::vector<ov::Tensor>& frames,
+    const ov::Tensor& pos_embed_weight,
+    size_t video_min_pixels,
+    size_t video_max_pixels) const {
+    return preprocessor_.preprocess_video(frames, pos_embed_weight, video_min_pixels, video_max_pixels);
+}
+
 int64_t Qwen3OmniVisionPreprocessor::count_visual_tokens(const ov::Tensor& grid_thw,
                                                          int32_t spatial_merge_size) {
     return Qwen3VLVisionPreprocessor::count_visual_tokens(grid_thw, spatial_merge_size);
