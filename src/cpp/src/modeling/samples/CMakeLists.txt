@@ -312,8 +312,10 @@ set_target_properties(modeling_qwen3_omni_tts_min PROPERTIES
 find_package(OpenCV QUIET COMPONENTS videoio imgcodecs imgproc core)
 if(OpenCV_FOUND)
     add_executable(extract_video_frames extract_video_frames.cpp)
+    target_include_directories(extract_video_frames PRIVATE
+        ${OpenCV_INCLUDE_DIRS})
     target_link_libraries(extract_video_frames PRIVATE
-        opencv_videoio opencv_imgcodecs opencv_imgproc opencv_core)
+        ${OpenCV_LIBS})
     set_target_properties(extract_video_frames PROPERTIES
         INSTALL_RPATH_USE_LINK_PATH ON)
     if(WIN32)
