@@ -201,39 +201,6 @@ std::vector<ov::Tensor> load_video_frames(const std::filesystem::path& frames_di
     return frames;
 }
 
-/**
- * Compute the number of frames to sample from a video.
- * Mirrors Python smart_nframes() with default fps=2, min_frames=4, max_frames=768.
- */
-size_t smart_nframes(size_t total_frames, double video_fps,
-                     double target_fps = 2.0,
-                     size_t min_frames = 4,
-                     size_t max_frames = 768,
-                     size_t frame_factor = 2) {
-    double nframes_d = static_cast<double>(total_frames) / video_fps * target_fps;
-    min_frames = ((min_frames + frame_factor - 1) / frame_factor) * frame_factor; // ceil
-    max_frames = (std::min(max_frames, total_frames) / frame_factor) * frame_factor; // floor
-    size_t nframes = static_cast<size_t>(nframes_d);
-    nframes = std::max(min_frames, std::min(nframes, max_frames));
-    nframes = std::min(nframes, total_frames);
-    nframes = (nframes / frame_factor) * frame_factor; // floor to factor
-    if (nframes < frame_factor) nframes = frame_factor;
-    return nframes;
-}
-
-/**
- * Sample frame indices uniformly from [0, total-1], returning `count` indices.
- */
-std::vector<size_t> linspace_indices(size_t total, size_t count) {
-    std::vector<size_t> indices(count);
-    if (count == 1) { indices[0] = 0; return indices; }
-    for (size_t i = 0; i < count; ++i) {
-        double val = static_cast<double>(i) * static_cast<double>(total - 1) / static_cast<double>(count - 1);
-        indices[i] = static_cast<size_t>(std::round(val));
-    }
-    return indices;
-}
-
 ov::Tensor make_zero_tensor(const ov::element::Type& type, const ov::Shape& shape) {
     ov::Tensor t(type, shape);
     std::memset(t.data(), 0, t.get_byte_size());
