@@ -307,3 +307,27 @@ add_custom_command(TARGET modeling_qwen3_omni_tts_min POST_BUILD
 set_target_properties(modeling_qwen3_omni_tts_min PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+# Standalone video frame extraction tool (replaces Python extract_video_frames.py)
+find_package(OpenCV QUIET COMPONENTS videoio imgcodecs imgproc core)
+if(OpenCV_FOUND)
+    add_executable(extract_video_frames extract_video_frames.cpp)
+    target_link_libraries(extract_video_frames PRIVATE
+        opencv_videoio opencv_imgcodecs opencv_imgproc opencv_core)
+    set_target_properties(extract_video_frames PROPERTIES
+        INSTALL_RPATH_USE_LINK_PATH ON)
+    if(WIN32)
+        # Copy OpenCV DLLs next to the executable
+        foreach(_opencv_target opencv_videoio opencv_imgcodecs opencv_imgproc opencv_core)
+            if(TARGET ${_opencv_target})
+                add_custom_command(TARGET extract_video_frames POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "$<TARGET_FILE:${_opencv_target}>"
+                            "$<TARGET_FILE_DIR:extract_video_frames>"
+                    VERBATIM)
+            endif()
+        endforeach()
+    endif()
+else()
+    message(STATUS "OpenCV not found -- extract_video_frames tool will not be built")
+endif()

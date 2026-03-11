@@ -450,11 +450,21 @@ def main() -> int:
     case5_video_frames_dir = None
     if case5_video and case5_video.exists() and cpp_tts_bin is not None:
         case5_video_frames_dir = out_json.parent / "case5_video_frames"
-        extract_script = Path(__file__).resolve().parent / "extract_video_frames.py"
-        if extract_script.exists():
-            print(f"[Case5] Extracting video frames from {case5_video} ...")
+
+        # Prefer C++ extract_video_frames binary (no Python deps needed)
+        cpp_bin_dir = Path(cpp_tts_bin).resolve().parent if cpp_tts_bin else None
+        extract_cpp_bin = None
+        if cpp_bin_dir:
+            for name in ("extract_video_frames.exe", "extract_video_frames"):
+                candidate = cpp_bin_dir / name
+                if candidate.exists():
+                    extract_cpp_bin = candidate
+                    break
+
+        if extract_cpp_bin:
+            print(f"[Case5] Extracting video frames from {case5_video} (C++ backend) ...")
             extract_cmd = [
-                sys.executable, str(extract_script),
+                str(extract_cpp_bin),
                 "--video", str(case5_video),
                 "--output-dir", str(case5_video_frames_dir),
             ]
@@ -462,13 +472,31 @@ def main() -> int:
                 extract_cmd += ["--max-frames", str(args.max_video_frames)]
             rc = subprocess.run(extract_cmd, capture_output=True, text=True)
             if rc.returncode != 0:
-                print(f"[Case5] WARNING: frame extraction failed: {rc.stderr}")
+                print(f"[Case5] WARNING: C++ frame extraction failed: {rc.stderr}")
                 case5_video_frames_dir = None
             else:
                 print(f"[Case5] Frames saved to {case5_video_frames_dir}")
         else:
-            print(f"[Case5] WARNING: extract_video_frames.py not found at {extract_script}")
-            case5_video_frames_dir = None
+            # Fallback to Python script
+            extract_script = Path(__file__).resolve().parent / "extract_video_frames.py"
+            if extract_script.exists():
+                print(f"[Case5] Extracting video frames from {case5_video} (Python fallback) ...")
+                extract_cmd = [
+                    sys.executable, str(extract_script),
+                    "--video", str(case5_video),
+                    "--output-dir", str(case5_video_frames_dir),
+                ]
+                if args.max_video_frames:
+                    extract_cmd += ["--max-frames", str(args.max_video_frames)]
+                rc = subprocess.run(extract_cmd, capture_output=True, text=True)
+                if rc.returncode != 0:
+                    print(f"[Case5] WARNING: frame extraction failed: {rc.stderr}")
+                    case5_video_frames_dir = None
+                else:
+                    print(f"[Case5] Frames saved to {case5_video_frames_dir}")
+            else:
+                print(f"[Case5] WARNING: no frame extraction tool found (neither C++ nor Python)")
+                case5_video_frames_dir = None
 
     case5_content = [{"type": "image", "image": str(case5_image)}]
     if case5_video and case5_video.exists():
