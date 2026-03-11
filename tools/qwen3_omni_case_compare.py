@@ -152,6 +152,7 @@ def run_cpp_tts_case(
     device: str = "CPU",
     precision: str = "fp32",
     timeout: int = 0,
+    video_frames_dir: Path = None,
 ) -> dict:
     cmd = [
         str(cpp_tts_bin),
@@ -164,6 +165,7 @@ def run_cpp_tts_case(
         device,
         str(max_new_tokens),
         precision,
+        str(video_frames_dir) if video_frames_dir else "none",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -277,6 +279,17 @@ def main() -> int:
                         help="Comma-separated precision modes (e.g. 'fp32,fp16_kv8,inf_fp32_kv_fp32_w_int4_asym'). Default: fp32")
     parser.add_argument("--test-audio", type=str, default="",
                         help="Path to a real speech WAV file for case 3 (default: auto-generated 440Hz test tone)")
+    parser.add_argument("--video", type=str, default="",
+                        help="Path to video file for case 5 (e.g. rainning.mp4)")
+    parser.add_argument("--case5-audio", type=str, default="",
+                        help="Path to audio file for case 5 (e.g. thunder-and-rain-sounds.mp3). Falls back to --test-audio if not set.")
+    parser.add_argument("--case5-image", type=str, default="",
+                        help="Path to image file for case 5 (e.g. london.jpg). Falls back to --image if not set.")
+    parser.add_argument("--case5-prompt-file", type=str, default="",
+                        help="Path to text file containing the Case 5 prompt. If not set, uses a built-in default.")
+    parser.add_argument("--max-video-frames", type=int, default=8,
+                        help="Max video frames to extract for C++ binary (default: 8). "
+                             "Higher values use more memory; 30 frames at 720p needs ~76GB for attention on CPU fp32.")
     parser.add_argument("--cpp-only", action="store_true",
                         help="Skip Python model loading and inference, only run C++ cases")
     parser.add_argument("--cases", type=str, default="",
@@ -318,6 +331,20 @@ def main() -> int:
         test_audio = Path(args.test_audio)
         if not test_audio.exists():
             raise FileNotFoundError(f"Test audio not found: {test_audio}")
+
+    # --- Case 5 resources ---
+    case5_image = Path(args.case5_image) if args.case5_image else image_path
+    case5_audio = Path(args.case5_audio) if args.case5_audio else test_audio
+    case5_video = Path(args.video) if args.video else None
+    case5_prompt = (
+        "You are a weather bot. I'm showing you my current location and a forecast report. "
+        "Look at the window (video) and listen to the environment. "
+        "Is the forecast accurate? Respond with a summary and a voice alert."
+    )
+    if args.case5_prompt_file:
+        pf = Path(args.case5_prompt_file)
+        if pf.exists():
+            case5_prompt = pf.read_text(encoding="utf-8").strip()
 
     case_filter = set(int(x) for x in args.cases.split(",") if x.strip()) if args.cases else set()
 
@@ -418,11 +445,58 @@ def main() -> int:
         },
     ]
 
+    # --- Case 5: text + image + video + audio -> text + tts ---
+    # Auto-extract video frames for C++ binary when video is available
+    case5_video_frames_dir = None
+    if case5_video and case5_video.exists() and cpp_tts_bin is not None:
+        case5_video_frames_dir = out_json.parent / "case5_video_frames"
+        extract_script = Path(__file__).resolve().parent / "extract_video_frames.py"
+        if extract_script.exists():
+            print(f"[Case5] Extracting video frames from {case5_video} ...")
+            extract_cmd = [
+                sys.executable, str(extract_script),
+                "--video", str(case5_video),
+                "--output-dir", str(case5_video_frames_dir),
+            ]
+            if args.max_video_frames:
+                extract_cmd += ["--max-frames", str(args.max_video_frames)]
+            rc = subprocess.run(extract_cmd, capture_output=True, text=True)
+            if rc.returncode != 0:
+                print(f"[Case5] WARNING: frame extraction failed: {rc.stderr}")
+                case5_video_frames_dir = None
+            else:
+                print(f"[Case5] Frames saved to {case5_video_frames_dir}")
+        else:
+            print(f"[Case5] WARNING: extract_video_frames.py not found at {extract_script}")
+            case5_video_frames_dir = None
+
+    case5_content = [{"type": "image", "image": str(case5_image)}]
+    if case5_video and case5_video.exists():
+        case5_content.append({"type": "video", "video": str(case5_video)})
+    case5_content.append({"type": "audio", "audio": str(case5_audio)})
+    case5_content.append({"type": "text", "text": case5_prompt})
+    cases.append({
+        "id": 5,
+        "name": "image+video+audio+text -> text+tts",
+        "conversation": [{"role": "user", "content": case5_content}],
+        "cpp_supported": cpp_tts_bin is not None,
+        "cpp_mode": "tts_min",
+        "cpp_prompt": case5_prompt,
+        "expect_tts": True,
+        "use_audio_in_video": False,
+        "cpp_image": case5_image,   # may differ from the global --image
+        "cpp_audio": case5_audio,   # may differ from --test-audio
+        "cpp_video_frames_dir": case5_video_frames_dir,
+    })
+
     report = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "model_dir": str(model_dir),
         "image": str(image_path),
         "audio": str(test_audio),
+        "case5_image": str(case5_image),
+        "case5_video": str(case5_video) if case5_video else "",
+        "case5_audio": str(case5_audio),
         "devices": devices,
         "precisions": precisions,
         "results": [],
@@ -464,8 +538,9 @@ def main() -> int:
                 }
 
                 if not args.cpp_only and processor is not None:
+                    use_audio_in_video = case.get("use_audio_in_video", True)
                     text = processor.apply_chat_template(case["conversation"], add_generation_prompt=True, tokenize=False)
-                    audios, images, videos = process_mm_info(case["conversation"], use_audio_in_video=True)
+                    audios, images, videos = process_mm_info(case["conversation"], use_audio_in_video=use_audio_in_video)
 
                     try:
                         inputs = processor(
@@ -475,7 +550,7 @@ def main() -> int:
                             videos=videos,
                             return_tensors="pt",
                             padding=True,
-                            use_audio_in_video=True,
+                            use_audio_in_video=use_audio_in_video,
                         )
                         inputs = inputs.to(model.device).to(model.dtype)
                         generation = model.generate(
@@ -484,7 +559,7 @@ def main() -> int:
                             max_new_tokens=args.max_new_tokens,
                             speaker="f245",
                             return_audio=case["expect_tts"],
-                            use_audio_in_video=True,
+                            use_audio_in_video=use_audio_in_video,
                             thinker_return_dict_in_generate=True,
                         )
 
@@ -527,6 +602,10 @@ def main() -> int:
                             for msg in case["conversation"]
                             for c in (msg.get("content") if isinstance(msg.get("content"), list) else [])
                         )
+                        # Case 5 may use its own image / audio files
+                        eff_image = case.get("cpp_image", image_path) if case_has_image else None
+                        eff_audio = case.get("cpp_audio", test_audio) if case_has_audio else None
+                        eff_video = case.get("cpp_video_frames_dir")
                         case_result["cpp"] = run_cpp_tts_case(
                             cpp_tts_bin,
                             model_dir,
@@ -534,11 +613,12 @@ def main() -> int:
                             case.get("cpp_prompt", ""),
                             wav_out,
                             args.max_new_tokens,
-                            image_path=image_path if case_has_image else None,
-                            audio_path=test_audio if case_has_audio else None,
+                            image_path=eff_image,
+                            audio_path=eff_audio,
                             device=device,
                             precision=prec,
                             timeout=args.timeout,
+                            video_frames_dir=eff_video,
                         )
                     else:
                         cpp_prompt = "Describe this image in detail."
@@ -552,7 +632,7 @@ def main() -> int:
                 # Print quick status line
                 cpp = case_result["cpp"]
                 if cpp.get("timeout"):
-                    print(f"  C++: TIMEOUT (>{args.timeout}s) � skipped")
+                    print(f"  C++: TIMEOUT (>{args.timeout}s)  --  skipped")
                 elif cpp.get("return_code") == 0:
                     print(f"  C++: OK")
                     cpp_text = cpp.get("text_output", "")
@@ -585,7 +665,18 @@ def main() -> int:
                         if parts:
                             print(f"  Perf: {', '.join(parts)}")
                 elif cpp.get("supported"):
-                    print(f"  C++: FAIL (rc={cpp.get('return_code')})")
+                    stderr_text = cpp.get('stderr', '')
+                    if 'Exceeded max size of memory' in stderr_text or 'out of memory' in stderr_text.lower():
+                        print(f"  C++: OOM (GPU memory allocation exceeded)")
+                        cpp['oom'] = True
+                    else:
+                        print(f"  C++: FAIL (rc={cpp.get('return_code')})")
+                    if stderr_text:
+                        # Show first meaningful line of stderr
+                        for line in stderr_text.splitlines():
+                            if line.strip() and ('Error' in line or 'Exceeded' in line or 'failed' in line.lower()):
+                                print(f"  C++ stderr: {line.strip()[:150]}")
+                                break
 
                 report["results"].append(case_result)
 
@@ -618,7 +709,7 @@ def main() -> int:
     out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # ============================================================
-    # Grand Summary: all precisions x devices x cases in one table
+    # Grand Summary  --  all precisions x devices x cases in one table
     # ============================================================
     all_perf = [(r["precision"], r["device"], r["id"], r["name"], r["cpp"].get("perf", {}))
                 for r in report["results"]
@@ -652,9 +743,21 @@ def main() -> int:
     fails = [r for r in report["results"]
              if r["cpp"].get("supported") and r["cpp"].get("return_code", -1) != 0]
     if fails:
-        print(f"\n  FAILED / TIMED-OUT RUNS ({len(fails)}):")
+        oom_count = sum(1 for r in fails if r["cpp"].get("oom"))
+        other_count = len(fails) - oom_count
+        label_parts = []
+        if oom_count: label_parts.append(f"{oom_count} OOM")
+        if other_count: label_parts.append(f"{other_count} FAIL")
+        timeout_count = sum(1 for r in fails if r["cpp"].get("timeout"))
+        if timeout_count: label_parts.append(f"{timeout_count} TIMEOUT")
+        print(f"\n  FAILED / TIMED-OUT RUNS ({len(fails)}: {', '.join(label_parts)}):")
         for r in fails:
-            reason = "TIMEOUT" if r["cpp"].get("timeout") else f"rc={r['cpp'].get('return_code')}"
+            if r["cpp"].get("timeout"):
+                reason = "TIMEOUT"
+            elif r["cpp"].get("oom"):
+                reason = "OOM  --  GPU memory allocation exceeded max single alloc size"
+            else:
+                reason = f"rc={r['cpp'].get('return_code')}"
             print(f"    precision={r['precision']}  device={r['device']}  case={r['id']}  {reason}")
 
     print(f"\nSaved report: {out_json}")
