@@ -139,11 +139,17 @@ std::string build_prompt(const std::string& user_prompt, int64_t image_tokens) {
  */
 std::string build_audio_prompt(const std::string& user_prompt,
                                int64_t audio_tokens,
-                               int64_t image_tokens = 0) {
+                               int64_t image_tokens = 0,
+                               int64_t video_tokens = 0) {
     std::string prompt = "<|im_start|>user\n";
     if (image_tokens > 0) {
         prompt += "<|vision_start|>";
         for (int64_t i = 0; i < image_tokens; ++i) prompt += "<|image_pad|>";
+        prompt += "<|vision_end|>";
+    }
+    if (video_tokens > 0) {
+        prompt += "<|vision_start|>";
+        for (int64_t i = 0; i < video_tokens; ++i) prompt += "<|video_pad|>";
         prompt += "<|vision_end|>";
     }
     prompt += "<|audio_start|>";
@@ -154,10 +160,99 @@ std::string build_audio_prompt(const std::string& user_prompt,
     return prompt;
 }
 
+/**
+ * Build a prompt containing video placeholders (no audio).
+ */
+std::string build_video_prompt(const std::string& user_prompt, int64_t video_tokens) {
+    std::string prompt = "<|im_start|>user\n<|vision_start|>";
+    for (int64_t i = 0; i < video_tokens; ++i) prompt += "<|video_pad|>";
+    prompt += "<|vision_end|>";
+    prompt += user_prompt;
+    prompt += "<|im_end|>\n<|im_start|>assistant\n";
+    return prompt;
+}
+
+/**
+ * Load video frames from a directory of image files using stb_image (via load_image).
+ * Files are sorted lexicographically. Returns a vector of [1,H,W,3] u8 tensors.
+ */
+std::vector<ov::Tensor> load_video_frames(const std::filesystem::path& frames_dir) {
+    if (!std::filesystem::is_directory(frames_dir)) {
+        throw std::runtime_error("Video frames path is not a directory: " + frames_dir.string());
+    }
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(frames_dir)) {
+        if (!entry.is_regular_file()) continue;
+        auto ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
+            paths.push_back(entry.path());
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+    if (paths.empty()) {
+        throw std::runtime_error("No image files (jpg/png/bmp) found in: " + frames_dir.string());
+    }
+    std::vector<ov::Tensor> frames;
+    frames.reserve(paths.size());
+    for (const auto& p : paths) {
+        frames.push_back(utils::load_image(p));
+    }
+    return frames;
+}
+
+/**
+ * Compute the number of frames to sample from a video.
+ * Mirrors Python smart_nframes() with default fps=2, min_frames=4, max_frames=768.
+ */
+size_t smart_nframes(size_t total_frames, double video_fps,
+                     double target_fps = 2.0,
+                     size_t min_frames = 4,
+                     size_t max_frames = 768,
+                     size_t frame_factor = 2) {
+    double nframes_d = static_cast<double>(total_frames) / video_fps * target_fps;
+    min_frames = ((min_frames + frame_factor - 1) / frame_factor) * frame_factor; // ceil
+    max_frames = (std::min(max_frames, total_frames) / frame_factor) * frame_factor; // floor
+    size_t nframes = static_cast<size_t>(nframes_d);
+    nframes = std::max(min_frames, std::min(nframes, max_frames));
+    nframes = std::min(nframes, total_frames);
+    nframes = (nframes / frame_factor) * frame_factor; // floor to factor
+    if (nframes < frame_factor) nframes = frame_factor;
+    return nframes;
+}
+
+/**
+ * Sample frame indices uniformly from [0, total-1], returning `count` indices.
+ */
+std::vector<size_t> linspace_indices(size_t total, size_t count) {
+    std::vector<size_t> indices(count);
+    if (count == 1) { indices[0] = 0; return indices; }
+    for (size_t i = 0; i < count; ++i) {
+        double val = static_cast<double>(i) * static_cast<double>(total - 1) / static_cast<double>(count - 1);
+        indices[i] = static_cast<size_t>(std::round(val));
+    }
+    return indices;
+}
+
 ov::Tensor make_zero_tensor(const ov::element::Type& type, const ov::Shape& shape) {
     ov::Tensor t(type, shape);
     std::memset(t.data(), 0, t.get_byte_size());
     return t;
+}
+
+/// Concatenate two tensors along dimension 0 (must have same rank and matching other dims).
+ov::Tensor concat_tensors_dim0(const ov::Tensor& a, const ov::Tensor& b) {
+    auto sa = a.get_shape();
+    auto sb = b.get_shape();
+    OPENVINO_ASSERT(sa.size() == sb.size(), "concat_tensors_dim0: rank mismatch");
+    auto out_shape = sa;
+    out_shape[0] = sa[0] + sb[0];
+    ov::Tensor out(a.get_element_type(), out_shape);
+    const size_t a_bytes = a.get_byte_size();
+    const size_t b_bytes = b.get_byte_size();
+    std::memcpy(out.data(), a.data(), a_bytes);
+    std::memcpy(static_cast<uint8_t*>(out.data()) + a_bytes, b.data(), b_bytes);
+    return out;
 }
 
 ov::Tensor build_vision_attention_mask(const ov::Tensor& grid_thw) {
@@ -319,6 +414,7 @@ TextGenResult run_text_generation(const std::filesystem::path& model_dir,
                                 const std::string& user_prompt,
                                 const std::filesystem::path& image_path,
                                 const std::filesystem::path& audio_path,
+                                const std::filesystem::path& video_path,
                                 int max_new_tokens,
                                 const std::string& device,
                                 PrecisionMode precision_mode = PrecisionMode::kFP32) {
@@ -327,11 +423,12 @@ TextGenResult run_text_generation(const std::filesystem::path& model_dir,
 
     const bool has_image = !image_path.empty() && std::filesystem::exists(image_path);
     const bool has_audio = !audio_path.empty() && std::filesystem::exists(audio_path);
+    const bool has_video = !video_path.empty() && std::filesystem::exists(video_path) && std::filesystem::is_directory(video_path);
     auto vl_cfg = to_qwen3_omni_vl_cfg(cfg);
     ov::AnyMap props = compile_props_for_precision(precision_mode);
     std::cout << "[TextGen] precision_mode: " << precision_mode_to_string(precision_mode) << std::endl;
 
-    const bool has_multimodal = has_image || has_audio;
+    const bool has_multimodal = has_image || has_audio || has_video;
     auto text_model = create_qwen3_omni_text_model(cfg, source, finalizer, false, has_multimodal);
     set_text_model_precision(text_model, precision_mode);
 
@@ -342,8 +439,8 @@ TextGenResult run_text_generation(const std::filesystem::path& model_dir,
     std::vector<ov::Tensor> deepstack_padded;
 
     std::shared_ptr<ov::Model> vision_model;
-    if (has_image) {
-        // Build vision model whenever image is present (audio+image or image-only)
+    if (has_image || has_video) {
+        // Build vision model whenever image or video is present
         vision_model = create_qwen3_omni_vision_model(cfg, source, finalizer);
     }
 
@@ -429,50 +526,104 @@ TextGenResult run_text_generation(const std::filesystem::path& model_dir,
         }
 
         // ==========================================
-        // If image is also present, run vision encoder first
+        // If image and/or video is also present, run vision encoder
         // ==========================================
         ov::Tensor visual_embeds;
         std::vector<ov::Tensor> ds_embeds;
         int64_t img_tok = 0;
-        Qwen3OmniVisionInputs vis_in;
-        if (has_image) {
+        int64_t vid_tok = 0;
+        ov::Tensor combined_grid_thw;
+        if (has_image || has_video) {
             const auto t_vis_start = std::chrono::steady_clock::now();
-            std::cout << "[Audio+Vision] Also processing image: " << image_path.string() << std::endl;
             auto compiled_vision = core.compile_model(vision_model, device, props);
-
-            ov::Tensor image = utils::load_image(image_path);
             const ov::Tensor pos_embed = source.get_tensor(resolve_pos_embed_name(source));
             Qwen3OmniVisionPreprocessConfig pre_cfg;
             const auto pre_cfg_path = model_dir / "preprocessor_config.json";
             if (std::filesystem::exists(pre_cfg_path))
                 pre_cfg = Qwen3OmniVisionPreprocessConfig::from_json_file(pre_cfg_path);
             Qwen3OmniVisionPreprocessor preprocessor(cfg, pre_cfg);
-            vis_in = preprocessor.preprocess(image, pos_embed);
 
-            auto vreq = compiled_vision.create_infer_request();
-            vreq.set_tensor(Qwen3VLVisionIO::kPixelValues, vis_in.pixel_values);
-            vreq.set_tensor(Qwen3VLVisionIO::kGridThw, vis_in.grid_thw);
-            vreq.set_tensor(Qwen3VLVisionIO::kPosEmbeds, vis_in.pos_embeds);
-            vreq.set_tensor(Qwen3VLVisionIO::kRotaryCos, vis_in.rotary_cos);
-            vreq.set_tensor(Qwen3VLVisionIO::kRotarySin, vis_in.rotary_sin);
-            vreq.set_tensor("attention_mask", build_vision_attention_mask(vis_in.grid_thw));
-            vreq.infer();
+            // Lambda: run vision encoder on preprocessed inputs
+            struct VisionOut { ov::Tensor embeds; std::vector<ov::Tensor> ds; };
+            auto run_vision_encoder = [&](const Qwen3OmniVisionInputs& vis) -> VisionOut {
+                auto vreq = compiled_vision.create_infer_request();
+                vreq.set_tensor(Qwen3VLVisionIO::kPixelValues, vis.pixel_values);
+                vreq.set_tensor(Qwen3VLVisionIO::kGridThw, vis.grid_thw);
+                vreq.set_tensor(Qwen3VLVisionIO::kPosEmbeds, vis.pos_embeds);
+                vreq.set_tensor(Qwen3VLVisionIO::kRotaryCos, vis.rotary_cos);
+                vreq.set_tensor(Qwen3VLVisionIO::kRotarySin, vis.rotary_sin);
+                vreq.set_tensor("attention_mask", build_vision_attention_mask(vis.grid_thw));
+                vreq.infer();
+                VisionOut out;
+                out.embeds = vreq.get_tensor(Qwen3VLVisionIO::kVisualEmbeds);
+                for (size_t i = 0; i < vl_cfg.vision.deepstack_visual_indexes.size(); ++i)
+                    out.ds.push_back(vreq.get_tensor(
+                        std::string(Qwen3VLVisionIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i)));
+                return out;
+            };
 
-            visual_embeds = vreq.get_tensor(Qwen3VLVisionIO::kVisualEmbeds);
-            for (size_t i = 0; i < vl_cfg.vision.deepstack_visual_indexes.size(); ++i) {
-                ds_embeds.push_back(vreq.get_tensor(
-                    std::string(Qwen3VLVisionIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i)));
+            ov::Tensor img_embeds, vid_embeds;
+            std::vector<ov::Tensor> img_ds, vid_ds;
+            ov::Tensor img_grid, vid_grid;
+
+            if (has_image) {
+                std::cout << "[Audio+Vision] Processing image: " << image_path.string() << std::endl;
+                ov::Tensor image = utils::load_image(image_path);
+                auto vis_in_img = preprocessor.preprocess(image, pos_embed);
+                auto out = run_vision_encoder(vis_in_img);
+                img_embeds = out.embeds;
+                img_ds = out.ds;
+                img_grid = vis_in_img.grid_thw;
+                img_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
+                    img_grid, vl_cfg.vision.spatial_merge_size);
+                std::cout << "[Audio+Vision]   image visual tokens: " << img_tok << std::endl;
             }
-            img_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
-                vis_in.grid_thw, vl_cfg.vision.spatial_merge_size);
-            std::cout << "[Audio+Vision]   visual tokens: " << img_tok << std::endl;
+            if (has_video) {
+                std::cout << "[Audio+Video] Processing video frames: " << video_path.string() << std::endl;
+                auto frames = load_video_frames(video_path);
+                std::cout << "[Audio+Video]   loaded " << frames.size() << " frames" << std::endl;
+                auto vis_in_vid = preprocessor.preprocess_video(frames, pos_embed);
+                auto out = run_vision_encoder(vis_in_vid);
+                vid_embeds = out.embeds;
+                vid_ds = out.ds;
+                vid_grid = vis_in_vid.grid_thw;
+                vid_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
+                    vid_grid, vl_cfg.vision.spatial_merge_size);
+                std::cout << "[Audio+Video]   video visual tokens: " << vid_tok << std::endl;
+            }
+
+            // Combine visual outputs (image first, then video — matching prompt order)
+            if (has_image && has_video) {
+                visual_embeds = concat_tensors_dim0(img_embeds, vid_embeds);
+                for (size_t i = 0; i < img_ds.size(); ++i)
+                    ds_embeds.push_back(concat_tensors_dim0(img_ds[i], vid_ds[i]));
+                combined_grid_thw = concat_tensors_dim0(img_grid, vid_grid);
+            } else if (has_image) {
+                visual_embeds = img_embeds;
+                ds_embeds = img_ds;
+                combined_grid_thw = img_grid;
+            } else {
+                visual_embeds = vid_embeds;
+                ds_embeds = vid_ds;
+                combined_grid_thw = vid_grid;
+            }
             perf.vision_encode_ms = elapsed_ms(t_vis_start, std::chrono::steady_clock::now());
         }
 
-        auto prompt_str = build_audio_prompt(user_prompt, num_audio_tokens, img_tok);
+        auto prompt_str = build_audio_prompt(user_prompt, num_audio_tokens, img_tok, vid_tok);
         auto tokenized = tokenizer.encode(prompt_str, ov::genai::add_special_tokens(false));
         input_ids = tokenized.input_ids;
         attention_mask = tokenized.attention_mask;
+
+        // Replace video_token_id with image_token_id so the planner recognizes them
+        if (has_video) {
+            auto* ids = input_ids.data<int64_t>();
+            const size_t n = input_ids.get_size();
+            for (size_t i = 0; i < n; ++i) {
+                if (ids[i] == static_cast<int64_t>(cfg.video_token_id))
+                    ids[i] = static_cast<int64_t>(cfg.image_token_id);
+            }
+        }
 
         const size_t batch = input_ids.get_shape()[0];
         const size_t seq_len = input_ids.get_shape()[1];
@@ -511,9 +662,9 @@ TextGenResult run_text_generation(const std::filesystem::path& model_dir,
 
         // Step 6: Build position_ids using Qwen3VLInputPlanner
         Qwen3VLInputPlanner planner(vl_cfg);
-        if (has_image) {
-            // Audio+Image: use grid_thw for mRoPE spatial positions
-            auto plan = planner.build_plan(input_ids, &attention_mask, &vis_in.grid_thw);
+        if (has_image || has_video) {
+            // Audio+Vision: use grid_thw for mRoPE spatial positions
+            auto plan = planner.build_plan(input_ids, &attention_mask, &combined_grid_thw);
             position_ids = plan.position_ids;
             visual_pos_mask = plan.visual_pos_mask;
             rope_deltas = plan.rope_deltas;
@@ -540,49 +691,120 @@ TextGenResult run_text_generation(const std::filesystem::path& model_dir,
         std::cout << "[Audio] Native C++ audio pipeline complete." << std::endl;
         std::cout << "[Audio]   input_ids shape: [" << batch << ", " << seq_len << "]" << std::endl;
         std::cout << "[Audio]   position_ids shape: " << position_ids.get_shape() << std::endl;
-    } else if (has_image) {
+    } else if (has_image || has_video) {
+        // ==========================================
+        // Vision-only path (image and/or video, no audio)
+        // ==========================================
         const auto t_vis_start = std::chrono::steady_clock::now();
         auto compiled_vision = core.compile_model(vision_model, device, props);
-
-        // Load & preprocess image
-        ov::Tensor image = utils::load_image(image_path);
         const ov::Tensor pos_embed = source.get_tensor(resolve_pos_embed_name(source));
         Qwen3OmniVisionPreprocessConfig pre_cfg;
         const auto pre_cfg_path = model_dir / "preprocessor_config.json";
         if (std::filesystem::exists(pre_cfg_path))
             pre_cfg = Qwen3OmniVisionPreprocessConfig::from_json_file(pre_cfg_path);
         Qwen3OmniVisionPreprocessor preprocessor(cfg, pre_cfg);
-        auto vis_in = preprocessor.preprocess(image, pos_embed);
 
-        // Run vision encoder
-        auto vreq = compiled_vision.create_infer_request();
-        vreq.set_tensor(Qwen3VLVisionIO::kPixelValues, vis_in.pixel_values);
-        vreq.set_tensor(Qwen3VLVisionIO::kGridThw, vis_in.grid_thw);
-        vreq.set_tensor(Qwen3VLVisionIO::kPosEmbeds, vis_in.pos_embeds);
-        vreq.set_tensor(Qwen3VLVisionIO::kRotaryCos, vis_in.rotary_cos);
-        vreq.set_tensor(Qwen3VLVisionIO::kRotarySin, vis_in.rotary_sin);
-        vreq.set_tensor("attention_mask", build_vision_attention_mask(vis_in.grid_thw));
-        vreq.infer();
+        struct VisionOut { ov::Tensor embeds; std::vector<ov::Tensor> ds; };
+        auto run_vision_encoder = [&](const Qwen3OmniVisionInputs& vis) -> VisionOut {
+            auto vreq = compiled_vision.create_infer_request();
+            vreq.set_tensor(Qwen3VLVisionIO::kPixelValues, vis.pixel_values);
+            vreq.set_tensor(Qwen3VLVisionIO::kGridThw, vis.grid_thw);
+            vreq.set_tensor(Qwen3VLVisionIO::kPosEmbeds, vis.pos_embeds);
+            vreq.set_tensor(Qwen3VLVisionIO::kRotaryCos, vis.rotary_cos);
+            vreq.set_tensor(Qwen3VLVisionIO::kRotarySin, vis.rotary_sin);
+            vreq.set_tensor("attention_mask", build_vision_attention_mask(vis.grid_thw));
+            vreq.infer();
+            VisionOut out;
+            out.embeds = vreq.get_tensor(Qwen3VLVisionIO::kVisualEmbeds);
+            for (size_t i = 0; i < vl_cfg.vision.deepstack_visual_indexes.size(); ++i)
+                out.ds.push_back(vreq.get_tensor(
+                    std::string(Qwen3VLVisionIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i)));
+            return out;
+        };
+
+        ov::Tensor img_embeds, vid_embeds;
+        std::vector<ov::Tensor> img_ds, vid_ds;
+        ov::Tensor img_grid, vid_grid;
+        int64_t img_tok = 0, vid_tok = 0;
+
+        if (has_image) {
+            std::cout << "[Vision] Processing image: " << image_path.string() << std::endl;
+            ov::Tensor image = utils::load_image(image_path);
+            auto vis_in_img = preprocessor.preprocess(image, pos_embed);
+            auto out = run_vision_encoder(vis_in_img);
+            img_embeds = out.embeds;
+            img_ds = out.ds;
+            img_grid = vis_in_img.grid_thw;
+            img_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
+                img_grid, vl_cfg.vision.spatial_merge_size);
+            std::cout << "[Vision]   image visual tokens: " << img_tok << std::endl;
+        }
+        if (has_video) {
+            std::cout << "[Vision] Processing video frames: " << video_path.string() << std::endl;
+            auto frames = load_video_frames(video_path);
+            std::cout << "[Vision]   loaded " << frames.size() << " frames" << std::endl;
+            auto vis_in_vid = preprocessor.preprocess_video(frames, pos_embed);
+            auto out = run_vision_encoder(vis_in_vid);
+            vid_embeds = out.embeds;
+            vid_ds = out.ds;
+            vid_grid = vis_in_vid.grid_thw;
+            vid_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
+                vid_grid, vl_cfg.vision.spatial_merge_size);
+            std::cout << "[Vision]   video visual tokens: " << vid_tok << std::endl;
+        }
         perf.vision_encode_ms = elapsed_ms(t_vis_start, std::chrono::steady_clock::now());
 
-        ov::Tensor visual_embeds = vreq.get_tensor(Qwen3VLVisionIO::kVisualEmbeds);
+        // Combine visual outputs
+        ov::Tensor visual_embeds, combined_grid_thw;
         std::vector<ov::Tensor> ds_embeds;
-        for (size_t i = 0; i < vl_cfg.vision.deepstack_visual_indexes.size(); ++i) {
-            ds_embeds.push_back(vreq.get_tensor(
-                std::string(Qwen3VLVisionIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i)));
+        if (has_image && has_video) {
+            visual_embeds = concat_tensors_dim0(img_embeds, vid_embeds);
+            for (size_t i = 0; i < img_ds.size(); ++i)
+                ds_embeds.push_back(concat_tensors_dim0(img_ds[i], vid_ds[i]));
+            combined_grid_thw = concat_tensors_dim0(img_grid, vid_grid);
+        } else if (has_image) {
+            visual_embeds = img_embeds;
+            ds_embeds = img_ds;
+            combined_grid_thw = img_grid;
+        } else {
+            visual_embeds = vid_embeds;
+            ds_embeds = vid_ds;
+            combined_grid_thw = vid_grid;
         }
 
-        // Build prompt with image tokens & tokenize
-        const int64_t img_tok = Qwen3OmniVisionPreprocessor::count_visual_tokens(
-            vis_in.grid_thw, vl_cfg.vision.spatial_merge_size);
-        auto tokenized = tokenizer.encode(build_prompt(user_prompt, img_tok),
-                                          ov::genai::add_special_tokens(false));
+        // Build prompt & tokenize
+        std::string prompt_str;
+        if (has_image && !has_video) {
+            prompt_str = build_prompt(user_prompt, img_tok);
+        } else if (!has_image && has_video) {
+            prompt_str = build_video_prompt(user_prompt, vid_tok);
+        } else {
+            // Image + Video (no audio): image first, then video
+            prompt_str = "<|im_start|>user\n<|vision_start|>";
+            for (int64_t i = 0; i < img_tok; ++i) prompt_str += "<|image_pad|>";
+            prompt_str += "<|vision_end|><|vision_start|>";
+            for (int64_t i = 0; i < vid_tok; ++i) prompt_str += "<|video_pad|>";
+            prompt_str += "<|vision_end|>";
+            prompt_str += user_prompt;
+            prompt_str += "<|im_end|>\n<|im_start|>assistant\n";
+        }
+        auto tokenized = tokenizer.encode(prompt_str, ov::genai::add_special_tokens(false));
         input_ids = tokenized.input_ids;
         attention_mask = tokenized.attention_mask;
 
+        // Replace video_token_id with image_token_id so the planner recognizes them
+        if (has_video) {
+            auto* ids = input_ids.data<int64_t>();
+            const size_t n = input_ids.get_size();
+            for (size_t i = 0; i < n; ++i) {
+                if (ids[i] == static_cast<int64_t>(cfg.video_token_id))
+                    ids[i] = static_cast<int64_t>(cfg.image_token_id);
+            }
+        }
+
         // Plan positions with mRoPE offsets
         Qwen3VLInputPlanner planner(vl_cfg);
-        auto plan = planner.build_plan(input_ids, &attention_mask, &vis_in.grid_thw);
+        auto plan = planner.build_plan(input_ids, &attention_mask, &combined_grid_thw);
         position_ids = plan.position_ids;
         visual_pos_mask = plan.visual_pos_mask;
         rope_deltas = plan.rope_deltas;
@@ -1358,7 +1580,7 @@ int main(int argc, char* argv[]) try {
 #endif
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <CASE_ID> <TEXT_PROMPT> <WAV_OUT> [IMAGE_PATH] [AUDIO_PATH] [DEVICE] [MAX_NEW_TOKENS] [PRECISION]\n";
+                  << " <MODEL_DIR> <CASE_ID> <TEXT_PROMPT> <WAV_OUT> [IMAGE_PATH] [AUDIO_PATH] [DEVICE] [MAX_NEW_TOKENS] [PRECISION] [VIDEO_FRAMES_DIR]\n";
         return 1;
     }
 
@@ -1371,6 +1593,7 @@ int main(int argc, char* argv[]) try {
     const std::string device = (argc > 7) ? argv[7] : "CPU";
     const int max_new_tokens = (argc > 8) ? std::stoi(argv[8]) : 64;
     const PrecisionMode precision = (argc > 9) ? parse_precision_mode(argv[9]) : PrecisionMode::kFP32;
+    const std::filesystem::path video_path = (argc > 10) ? std::filesystem::path(argv[10]) : std::filesystem::path();
 
     auto st_data = ov::genai::safetensors::load_safetensors(model_dir);
     ov::genai::safetensors::SafetensorsWeightSource source(std::move(st_data));
@@ -1388,6 +1611,7 @@ int main(int argc, char* argv[]) try {
                                                     text_prompt,
                                                     image_path,
                                                     audio_path,
+                                                    video_path,
                                                     max_new_tokens,
                                                     device,
                                                     precision);
