@@ -40,7 +40,7 @@ static int smart_nframes(int total_frames,
     nframes = std::max(FRAME_FACTOR, nframes);
     nframes = std::min(nframes, total_frames);
 
-    min_frames = (min_frames / FRAME_FACTOR) * FRAME_FACTOR;
+    min_frames = ((min_frames + FRAME_FACTOR - 1) / FRAME_FACTOR) * FRAME_FACTOR;
     if (min_frames < FRAME_FACTOR) min_frames = FRAME_FACTOR;
 
     max_frames = std::min(max_frames, total_frames);
