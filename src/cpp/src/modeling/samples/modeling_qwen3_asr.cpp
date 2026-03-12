@@ -610,11 +610,6 @@ bool is_language_tag_token(const std::string& token) {
     return true;
 }
 
-bool is_text_stop_token(const std::string& token) {
-    // Common end markers used by Qwen-family chat/tokenizers.
-    return token == "<|endoftext|>" || token == "<|im_end|>" || token == "<|eot_id|>";
-}
-
 std::string detect_language_from_tokens(ov::genai::Tokenizer& tokenizer, const std::vector<int64_t>& generated_ids) {
     for (size_t i = 0; i < generated_ids.size() && i < 8; ++i) {
         const std::string token = tokenizer.decode({generated_ids[i]}, {ov::genai::skip_special_tokens(false)});
@@ -1047,6 +1042,11 @@ int main(int argc, char* argv[]) try {
     const int64_t excl_token_id = find_token_id(vocab, {"!"}, -1);
     const int64_t qmark_token_id = find_token_id(vocab, {"?"}, -1);
 
+    std::unordered_set<int64_t> stop_token_ids;
+    add_token_if_found(vocab, "<|endoftext|>", stop_token_ids);
+    add_token_if_found(vocab, "<|im_end|>", stop_token_ids);
+    add_token_if_found(vocab, "<|eot_id|>", stop_token_ids);
+
     ov::Shape logits_shape;
     double ttft_ms = 0.0;
     double decode_ms = 0.0;
@@ -1095,15 +1095,27 @@ int main(int argc, char* argv[]) try {
     };
 
     text_request.reset_state();
+    ov::Tensor beam_idx = make_i32({batch}, 0);
     text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx,
-                            make_i32({batch}, 0));
+                            beam_idx);
+
+    const size_t max_total_seq_len = prompt_token_size + static_cast<size_t>(max_new_tokens);
+    std::vector<int64_t> attention_mask_storage(max_total_seq_len, 1);
+    auto make_attention_mask_view = [&](size_t seq_len) -> ov::Tensor {
+        if (seq_len == 0 || seq_len > max_total_seq_len) {
+            throw std::runtime_error("Invalid seq_len for attention mask view");
+        }
+        return ov::Tensor(ov::element::i64,
+                          ov::Shape{batch, seq_len},
+                          attention_mask_storage.data());
+    };
 
     // Prefill: run full prompt once to initialize KV cache.
     const size_t prompt_seq_len = input_ids.size();
     text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
                             make_i64_from_vector(input_ids));
     text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                            make_i64({batch, prompt_seq_len}, 1));
+                            make_attention_mask_view(prompt_seq_len));
     text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
                             make_position_ids_3d(batch, prompt_seq_len));
     if (!text_only) {
@@ -1123,8 +1135,8 @@ int main(int argc, char* argv[]) try {
     auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
         logits_shape = logits.get_shape();
         const int64_t next_token_id = argmax_last_token_id_excluding(logits, excluded_decode_ids);
-        const std::string next_token_text = tokenizer.decode({next_token_id}, {ov::genai::skip_special_tokens(false)});
-        if ((eos_token_id >= 0 && next_token_id == eos_token_id) || is_text_stop_token(next_token_text)) {
+        if ((eos_token_id >= 0 && next_token_id == eos_token_id) ||
+            (stop_token_ids.find(next_token_id) != stop_token_ids.end())) {
             return true;
         }
         generated_ids.push_back(next_token_id);
@@ -1154,7 +1166,7 @@ int main(int argc, char* argv[]) try {
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
                                 one_token_ids);
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                                make_i64({batch, total_seq_len}, 1));
+                                make_attention_mask_view(total_seq_len));
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
                                 one_token_pos_ids);
         if (!text_only) {
