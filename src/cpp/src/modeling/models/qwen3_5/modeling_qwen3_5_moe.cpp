@@ -220,6 +220,7 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
     auto up_exps_zps_u8 = split_zp.second;
     auto gate_exps_zps = ops::convert(gate_exps_zps_u8, ov::element::u4);
     auto up_exps_zps = ops::convert(up_exps_zps_u8, ov::element::u4);
+<<<<<<< ours
 #endif
 
     return ops::moe3gemm_fused_compressed(flat_f32,
@@ -239,6 +240,60 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
                                           top_k_,
                                           infer_group_size(),
                                           ov::element::f16);
+=======
+
+    // Check if shared experts are fully quantized, otherwise we must fallback for shared part
+    bool use_fused_shared = shared_gate_scales_.has_value() && shared_gate_zps_.has_value() &&
+                            shared_up_scales_.has_value() && shared_up_zps_.has_value() &&
+                            shared_down_scales_.has_value() && shared_down_zps_.has_value();
+
+    if (!use_fused_shared) {
+        std::cout << "[ERROR] Cannot get shared experts" << std::endl;
+        exit(0);
+    }
+
+    auto sh_gate_w = shared_gate_proj_weight();
+    auto sh_up_w = shared_up_proj_weight();
+    auto sh_down_w = shared_down_proj_weight();
+    auto sh_gate_gate_w = shared_expert_gate_weight().to(ov::element::f16);
+
+    auto sh_gate_scales = shared_gate_scales_.value();
+    auto sh_gate_zps = shared_gate_zps_.value();
+    auto sh_up_scales = shared_up_scales_.value();
+    auto sh_up_zps = shared_up_zps_.value();
+    auto sh_down_scales = shared_down_scales_.value();
+    auto sh_down_zps = shared_down_zps_.value();
+
+    auto result = ops::moe3gemm_fused_compressed(flat_f32,
+                                                 gate_weight(),
+                                                 gate_exps_w,
+                                                 gate_exps_scales,
+                                                 gate_exps_zps,
+                                                 up_exps_w,
+                                                 up_exps_scales,
+                                                 up_exps_zps,
+                                                 down_w,
+                                                 *down_scales_,
+                                                 *down_zps_,
+                                                 hidden_size_,
+                                                 expert_intermediate_size_,
+                                                 num_experts_,
+                                                 top_k_,
+                                                 infer_group_size(),
+                                                 ov::element::f16,
+                                                 sh_gate_w,
+                                                 sh_gate_scales,
+                                                 sh_gate_zps,
+                                                 sh_up_w,
+                                                 sh_up_scales,
+                                                 sh_up_zps,
+                                                 sh_down_w,
+                                                 sh_down_scales,
+                                                 sh_down_zps,
+                                                 sh_gate_gate_w);
+
+    return result;
+>>>>>>> theirs
 }
 
 Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
