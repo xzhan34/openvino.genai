@@ -66,6 +66,7 @@ struct SampleOptions {
     float frequency_penalty = 0.0f;
     float presence_penalty = 1.5f;
     size_t rng_seed = 0;  // 0 = use random_device
+    bool enable_thinking = true;  // --think 0/1
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -184,6 +185,7 @@ void print_usage(const char* argv0) {
     << "  --frequency-penalty FLOAT       Subtract penalty * token_count from logit (default: 0.0)\n"
     << "  --presence-penalty FLOAT        Subtract penalty if token appeared (default: 1.5)\n"
     << "  --rng-seed INT                  Random seed for sampling (default: 0 = random)\n"
+    << "  --think 0|1                     Enable/disable thinking mode (default: 1 = enabled)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -267,6 +269,9 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.presence_penalty = parse_float(take_value("--presence-penalty"), "--presence-penalty");
         } else if (arg == "--rng-seed") {
             opts.rng_seed = static_cast<size_t>(parse_i32(take_value("--rng-seed"), "--rng-seed"));
+        } else if (arg == "--think") {
+            int val = parse_i32(take_value("--think"), "--think");
+            opts.enable_thinking = (val != 0);
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -837,7 +842,8 @@ int main(int argc, char* argv[]) try {
                 if (!tokenizer->get_chat_template().empty()) {
                     ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
                     constexpr bool add_generation_prompt = true;
-                    prompt = tokenizer->apply_chat_template(history, add_generation_prompt);
+                    ov::genai::JsonContainer extra({{"enable_thinking", opts.enable_thinking}});
+                    prompt = tokenizer->apply_chat_template(history, add_generation_prompt, {}, std::nullopt, extra);
                     add_special_tokens = false;
                 }
             }
