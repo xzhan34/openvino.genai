@@ -37,6 +37,7 @@
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
 #include "modeling/weights/quantization_config.hpp"
 #include "modeling/weights/synthetic_weight_source.hpp"
+#include "sampling/logit_processor.hpp"
 
 namespace {
 
@@ -54,6 +55,10 @@ struct SampleOptions {
 
     std::optional<int> num_layers;
     int max_pixels = 0;
+
+    float repetition_penalty = 1.1f;
+    float frequency_penalty = 0.1f;
+    float presence_penalty = 0.0f;
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -99,6 +104,14 @@ int parse_i32(const std::string& raw, const char* option_name) {
         return std::stoi(raw);
     } catch (const std::exception&) {
         throw std::runtime_error(std::string("Invalid integer for ") + option_name + ": " + raw);
+    }
+}
+
+float parse_float(const std::string& raw, const char* option_name) {
+    try {
+        return std::stof(raw);
+    } catch (const std::exception&) {
+        throw std::runtime_error(std::string("Invalid float for ") + option_name + ": " + raw);
     }
 }
 
@@ -157,6 +170,9 @@ void print_usage(const char* argv0) {
     << "  --num-layers N                  Run only the first N text transformer layers (dummy + real model)\n"
     << "  --max-pixels N                  Limit vision input to N pixels (default: from preprocessor_config.json)\n"
     << "                                  Recommended: 602112 (3072 tokens * 14^2 patch) for ARL-H GPU\n"
+    << "  --repetition-penalty FLOAT      Penalty for repeating tokens (default: 1.0, >1 discourages repetition)\n"
+    << "  --frequency-penalty FLOAT       Subtract penalty * token_count from logit each step (default: 0.0)\n"
+    << "  --presence-penalty FLOAT        Subtract penalty from logit if token appeared at all (default: 0.0)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -226,6 +242,12 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.num_layers = parse_i32(take_value("--num-layers"), "--num-layers");
         } else if (arg == "--max-pixels") {
             opts.max_pixels = parse_i32(take_value("--max-pixels"), "--max-pixels");
+        } else if (arg == "--repetition-penalty") {
+            opts.repetition_penalty = parse_float(take_value("--repetition-penalty"), "--repetition-penalty");
+        } else if (arg == "--frequency-penalty") {
+            opts.frequency_penalty = parse_float(take_value("--frequency-penalty"), "--frequency-penalty");
+        } else if (arg == "--presence-penalty") {
+            opts.presence_penalty = parse_float(take_value("--presence-penalty"), "--presence-penalty");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -329,52 +351,32 @@ std::set<int64_t> resolve_stop_token_ids(const std::filesystem::path& model_dir,
     return stop_token_ids;
 }
 
-int64_t argmax_last_token(const ov::Tensor& logits) {
+
+// Extract the last token's logits from [1, S, V] into a float32 scratch buffer.
+// Handles f32, f16, and bf16 logit tensors.
+void extract_last_logits_f32(const ov::Tensor& logits, std::vector<float>& out) {
     const auto shape = logits.get_shape();
-    if (shape.size() != 3 || shape[0] != 1) {
-        throw std::runtime_error("logits must have shape [1, S, V]");
-    }
     const size_t seq_len = shape[1];
     const size_t vocab = shape[2];
     const size_t offset = (seq_len - 1) * vocab;
+    out.resize(vocab);
+    if (logits.get_element_type() == ov::element::f32) {
+        std::memcpy(out.data(), logits.data<const float>() + offset, vocab * sizeof(float));
+    } else if (logits.get_element_type() == ov::element::f16) {
+        const auto* src = logits.data<const ov::float16>() + offset;
+        for (size_t i = 0; i < vocab; ++i)
+            out[i] = static_cast<float>(src[i]);
+    } else if (logits.get_element_type() == ov::element::bf16) {
+        const auto* src = logits.data<const ov::bfloat16>() + offset;
+        for (size_t i = 0; i < vocab; ++i)
+            out[i] = static_cast<float>(src[i]);
+    } else {
+        throw std::runtime_error("Unsupported logits dtype for logit processing");
+    }
+}
 
-    if (logits.get_element_type() == ov::element::f16) {
-        const auto* data = logits.data<const ov::float16>() + offset;
-        ov::float16 max_val = data[0];
-        size_t max_idx = 0;
-        for (size_t i = 1; i < vocab; ++i) {
-            if (data[i] > max_val) {
-                max_val = data[i];
-                max_idx = i;
-            }
-        }
-        return static_cast<int64_t>(max_idx);
-    }
-    if (logits.get_element_type() == ov::element::bf16) {
-        const auto* data = logits.data<const ov::bfloat16>() + offset;
-        ov::bfloat16 max_val = data[0];
-        size_t max_idx = 0;
-        for (size_t i = 1; i < vocab; ++i) {
-            if (data[i] > max_val) {
-                max_val = data[i];
-                max_idx = i;
-            }
-        }
-        return static_cast<int64_t>(max_idx);
-    }
-    if (logits.get_element_type() != ov::element::f32) {
-        throw std::runtime_error("Unsupported logits dtype");
-    }
-    const auto* data = logits.data<const float>() + offset;
-    float max_val = data[0];
-    size_t max_idx = 0;
-    for (size_t i = 1; i < vocab; ++i) {
-        if (data[i] > max_val) {
-            max_val = data[i];
-            max_idx = i;
-        }
-    }
-    return static_cast<int64_t>(max_idx);
+int64_t argmax_f32(const std::vector<float>& data) {
+    return static_cast<int64_t>(std::max_element(data.begin(), data.end()) - data.begin());
 }
 
 ov::Tensor make_beam_idx(size_t batch) {
@@ -839,6 +841,11 @@ int main(int argc, char* argv[]) try {
     const size_t batch = input_ids.get_shape().at(0);
     const int64_t prompt_len = static_cast<int64_t>(input_ids.get_shape().at(1));
 
+    // Collect all prompt token IDs (flat, for LogitProcessor repetition tracking).
+    std::vector<int64_t> prompt_token_ids(
+        input_ids.data<const int64_t>(),
+        input_ids.data<const int64_t>() + input_ids.get_size());
+
     ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
     auto plan = planner.build_plan(input_ids, &attention_mask, use_vl ? &grid_thw : nullptr);
 
@@ -873,11 +880,31 @@ int main(int argc, char* argv[]) try {
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, usm_visual_pos_mask);
     }
 
+    // Build GenerationConfig for LogitProcessor from CLI options.
+    ov::genai::GenerationConfig gen_config;
+    gen_config.do_sample = false;
+    gen_config.repetition_penalty = opts.repetition_penalty;
+    gen_config.frequency_penalty = opts.frequency_penalty;
+    gen_config.presence_penalty = opts.presence_penalty;
+    ov::genai::LogitProcessor logit_processor(gen_config, prompt_token_ids);
+
+    // Reusable float32 scratch buffer for logit processing across all decode steps.
+    std::vector<float> logit_buf;
+
     const auto prefill_start = std::chrono::steady_clock::now();
     text_request.infer();
     ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
-    int64_t next_id = argmax_last_token(logits);
     const auto prefill_end = std::chrono::steady_clock::now();
+
+    // Process prefill logits and select first token.
+    extract_last_logits_f32(logits, logit_buf);
+    {
+        ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+        logit_processor.apply(lw);
+    }
+    int64_t next_id = argmax_f32(logit_buf);
+    logit_processor.register_new_generated_token(next_id);
+    logit_processor.update_generated_len(1);
 
     std::vector<int64_t> generated;
     generated.reserve(static_cast<size_t>(opts.max_new_tokens));
@@ -970,8 +997,15 @@ int main(int argc, char* argv[]) try {
 
         text_request.infer();
         logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
-        next_id = argmax_last_token(logits);
+        extract_last_logits_f32(logits, logit_buf);
+        {
+            ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+            logit_processor.apply(lw);
+        }
+        next_id = argmax_f32(logit_buf);
+        logit_processor.register_new_generated_token(next_id);
         generated.push_back(next_id);
+        logit_processor.update_generated_len(generated.size());
         decode_steps += 1;
         past_len += 1;
     }
