@@ -418,7 +418,8 @@ int64_t argmax_f32(const std::vector<float>& data) {
 
 struct SamplingContext {
     // Scratch buffers reused across decode steps.
-    std::vector<std::pair<float, int64_t>> candidates;  // (logit, token_id)
+    std::vector<std::pair<float, int64_t>> ranked;  // top-K candidates (logit, token_id), size K
+    std::vector<std::pair<float, int64_t>> candidates;  // full-vocab buffer (only for Case 3: top-P without top-K)
     std::vector<float> probs;                            // softmax probs of selected candidates
 };
 
@@ -469,40 +470,63 @@ int64_t sample_fast(const float* logits,
     }
 
     // --- Case 2: top-K (with optional top-P) — the common path ---
+    // Uses a single sequential read pass over logits (same cache pattern as argmax)
+    // with a tiny K-element buffer that stays in L1 cache.
+    // Memory: reads 600KB (logit_buf), writes ~240 bytes (K=20 buffer).
     if (use_top_k) {
         size_t k = std::min(top_k, vocab_size);
+        ctx.ranked.resize(k);
 
-        // Build candidate list (reuse buffer)
-        ctx.candidates.resize(vocab_size);
-        for (size_t i = 0; i < vocab_size; ++i) {
-            ctx.candidates[i] = {logits[i], static_cast<int64_t>(i)};
+        // Initialize with first K logits
+        for (size_t i = 0; i < k; ++i) {
+            ctx.ranked[i] = {logits[i], static_cast<int64_t>(i)};
         }
 
-        // nth_element partitions so that the top-K are in [0, k) — O(V) average
-        std::nth_element(ctx.candidates.begin(),
-                         ctx.candidates.begin() + static_cast<ptrdiff_t>(k),
-                         ctx.candidates.end(),
-                         [](const auto& a, const auto& b) { return a.first > b.first; });
+        // Find current minimum in the K-element buffer
+        size_t min_pos = 0;
+        float min_val = ctx.ranked[0].first;
+        for (size_t i = 1; i < k; ++i) {
+            if (ctx.ranked[i].first < min_val) {
+                min_val = ctx.ranked[i].first;
+                min_pos = i;
+            }
+        }
 
-        // Sort only the top-K candidates descending — O(K log K)
-        std::sort(ctx.candidates.begin(),
-                  ctx.candidates.begin() + static_cast<ptrdiff_t>(k),
+        // Single sequential scan over remaining logits — O(V) read-only
+        // Only touches the K-element buffer when a new top-K candidate is found.
+        for (size_t i = k; i < vocab_size; ++i) {
+            if (logits[i] > min_val) {
+                ctx.ranked[min_pos] = {logits[i], static_cast<int64_t>(i)};
+                // Rescan tiny buffer for new minimum (~20 comparisons, L1-resident)
+                min_val = ctx.ranked[0].first;
+                min_pos = 0;
+                for (size_t j = 1; j < k; ++j) {
+                    if (ctx.ranked[j].first < min_val) {
+                        min_val = ctx.ranked[j].first;
+                        min_pos = j;
+                    }
+                }
+            }
+        }
+
+        // Sort only K elements descending — O(K log K), trivial for K=20
+        std::sort(ctx.ranked.begin(), ctx.ranked.end(),
                   [](const auto& a, const auto& b) { return a.first > b.first; });
 
         // Apply temperature + softmax on K candidates only
-        float max_logit = ctx.candidates[0].first;
+        float max_logit = ctx.ranked[0].first;
         float inv_temp = 1.0f / temperature;
         ctx.probs.resize(k);
         float total = 0.0f;
         for (size_t i = 0; i < k; ++i) {
-            float val = std::exp((ctx.candidates[i].first - max_logit) * inv_temp);
+            float val = std::exp((ctx.ranked[i].first - max_logit) * inv_temp);
             ctx.probs[i] = val;
             total += val;
         }
 
         // Guard against degenerate distributions (NaN/Inf/zero)
         if (!(total > 0.0f) || !std::isfinite(total)) {
-            return ctx.candidates[0].second;  // fallback to highest logit
+            return ctx.ranked[0].second;  // fallback to highest logit
         }
 
         // Apply top-P cutoff if needed (ensure at least 1 candidate survives)
@@ -528,10 +552,10 @@ int64_t sample_fast(const float* logits,
         for (size_t i = 0; i < num_candidates; ++i) {
             cumsum += ctx.probs[i];
             if (cumsum >= dart) {
-                return ctx.candidates[i].second;
+                return ctx.ranked[i].second;
             }
         }
-        return ctx.candidates[num_candidates - 1].second;
+        return ctx.ranked[num_candidates - 1].second;
     }
 
     // --- Case 3: top-P only (no top-K) ---
