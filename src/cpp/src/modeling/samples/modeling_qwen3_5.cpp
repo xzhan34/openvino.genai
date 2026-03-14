@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -403,25 +404,234 @@ int64_t argmax_f32(const std::vector<float>& data) {
     return static_cast<int64_t>(std::max_element(data.begin(), data.end()) - data.begin());
 }
 
-// Multinomial sampling from processed logits.
-// After LogitProcessor::apply(), if temperature > 0, the Logits object contains
-// softmax probabilities (from TemperatureLogitTransform) and may have been filtered
-// by TopP/TopK (stored in lw.m_vector).  We sample from that distribution.
-int64_t sample_multinomial(ov::genai::Logits& lw, std::mt19937& rng) {
-    if (lw.is_vector_initialized()) {
-        // TopP / TopK was applied – m_vector holds the filtered (prob, index) pairs.
-        std::vector<float> weights;
-        weights.reserve(lw.m_vector.size());
-        for (size_t i = 0; i < lw.m_size; ++i) {
-            weights.push_back(std::max(lw.m_vector[i].m_log_prob, 0.0f));
+// ---------------------------------------------------------------------------
+// Fast multinomial sampling — avoids full-vocab softmax and sort.
+//
+// Strategy (for the common case: temperature>0, top_k>0, top_p<1):
+//   1. nth_element to partition top-K logits            — O(V) avg
+//   2. Sort only the K candidates                       — O(K log K)
+//   3. Apply temperature + softmax on K candidates only — O(K)
+//   4. Apply top-P cutoff on K candidates               — O(K)
+//   5. Direct CDF sampling                              — O(K)
+// Total: O(V) + O(K log K), vs original O(5V + V log V).
+// ---------------------------------------------------------------------------
+
+struct SamplingContext {
+    // Scratch buffers reused across decode steps.
+    std::vector<std::pair<float, int64_t>> ranked;  // top-K candidates (logit, token_id), size K
+    std::vector<std::pair<float, int64_t>> candidates;  // full-vocab buffer (only for Case 3: top-P without top-K)
+    std::vector<float> probs;                            // softmax probs of selected candidates
+};
+
+int64_t sample_fast(const float* logits,
+                    size_t vocab_size,
+                    float temperature,
+                    float top_p,
+                    size_t top_k,
+                    std::mt19937& rng,
+                    SamplingContext& ctx) {
+    OPENVINO_ASSERT(vocab_size > 0, "logits must not be empty");
+    OPENVINO_ASSERT(temperature > 0.0f, "temperature must be positive for sampling");
+
+    const bool use_top_k = (top_k > 0 && top_k < vocab_size);
+    const bool use_top_p = (top_p > 0.0f && top_p < 1.0f);
+
+    // --- Case 1: No top-K, no top-P — full-vocab softmax + CDF sampling (single pass) ---
+    if (!use_top_k && !use_top_p) {
+        // Find max for numerical stability
+        float max_logit = *std::max_element(logits, logits + vocab_size);
+        float inv_temp = 1.0f / temperature;
+
+        // Compute exp and accumulate sum in one pass
+        ctx.probs.resize(vocab_size);
+        float total = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            float val = std::exp((logits[i] - max_logit) * inv_temp);
+            ctx.probs[i] = val;
+            total += val;
         }
-        std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
-        size_t picked = dist(rng);
-        return lw.m_vector[picked].m_index;
+
+        // Guard against degenerate distributions (NaN/Inf/zero)
+        if (!(total > 0.0f) || !std::isfinite(total)) {
+            return static_cast<int64_t>(std::max_element(logits, logits + vocab_size) - logits);
+        }
+
+        // Sample via CDF
+        std::uniform_real_distribution<float> udist(0.0f, total);
+        float dart = udist(rng);
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            cumsum += ctx.probs[i];
+            if (cumsum >= dart) {
+                return static_cast<int64_t>(i);
+            }
+        }
+        return static_cast<int64_t>(vocab_size - 1);
     }
-    // No TopP/TopK – m_data holds full vocab probabilities.
-    std::discrete_distribution<size_t> dist(lw.m_data, lw.m_data + lw.m_size);
-    return static_cast<int64_t>(dist(rng));
+
+    // --- Case 2: top-K (with optional top-P) — the common path ---
+    // Uses a single sequential read pass over logits (same cache pattern as argmax)
+    // with a tiny K-element buffer that stays in L1 cache.
+    // Memory: reads 600KB (logit_buf), writes ~240 bytes (K=20 buffer).
+    if (use_top_k) {
+        size_t k = std::min(top_k, vocab_size);
+        ctx.ranked.resize(k);
+
+        // Initialize with first K logits
+        for (size_t i = 0; i < k; ++i) {
+            ctx.ranked[i] = {logits[i], static_cast<int64_t>(i)};
+        }
+
+        // Find current minimum in the K-element buffer
+        size_t min_pos = 0;
+        float min_val = ctx.ranked[0].first;
+        for (size_t i = 1; i < k; ++i) {
+            if (ctx.ranked[i].first < min_val) {
+                min_val = ctx.ranked[i].first;
+                min_pos = i;
+            }
+        }
+
+        // Single sequential scan over remaining logits — O(V) read-only
+        // Only touches the K-element buffer when a new top-K candidate is found.
+        for (size_t i = k; i < vocab_size; ++i) {
+            if (logits[i] > min_val) {
+                ctx.ranked[min_pos] = {logits[i], static_cast<int64_t>(i)};
+                // Rescan tiny buffer for new minimum (~20 comparisons, L1-resident)
+                min_val = ctx.ranked[0].first;
+                min_pos = 0;
+                for (size_t j = 1; j < k; ++j) {
+                    if (ctx.ranked[j].first < min_val) {
+                        min_val = ctx.ranked[j].first;
+                        min_pos = j;
+                    }
+                }
+            }
+        }
+
+        // Sort only K elements descending — O(K log K), trivial for K=20
+        std::sort(ctx.ranked.begin(), ctx.ranked.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        // Apply temperature + softmax on K candidates only
+        float max_logit = ctx.ranked[0].first;
+        float inv_temp = 1.0f / temperature;
+        ctx.probs.resize(k);
+        float total = 0.0f;
+        for (size_t i = 0; i < k; ++i) {
+            float val = std::exp((ctx.ranked[i].first - max_logit) * inv_temp);
+            ctx.probs[i] = val;
+            total += val;
+        }
+
+        // Guard against degenerate distributions (NaN/Inf/zero)
+        if (!(total > 0.0f) || !std::isfinite(total)) {
+            return ctx.ranked[0].second;  // fallback to highest logit
+        }
+
+        // Apply top-P cutoff if needed (ensure at least 1 candidate survives)
+        size_t num_candidates = k;
+        if (use_top_p) {
+            float threshold = top_p * total;
+            float cumsum = 0.0f;
+            for (size_t i = 0; i < k; ++i) {
+                cumsum += ctx.probs[i];
+                if (cumsum >= threshold) {
+                    num_candidates = i + 1;
+                    total = cumsum;
+                    break;
+                }
+            }
+        }
+        num_candidates = std::max<size_t>(1, num_candidates);
+
+        // Direct CDF sampling from the surviving candidates
+        std::uniform_real_distribution<float> udist(0.0f, total);
+        float dart = udist(rng);
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < num_candidates; ++i) {
+            cumsum += ctx.probs[i];
+            if (cumsum >= dart) {
+                return ctx.ranked[i].second;
+            }
+        }
+        return ctx.ranked[num_candidates - 1].second;
+    }
+
+    // --- Case 3: top-P only (no top-K) ---
+    // Use partial sort with adaptive step, similar to original TopPFilter.
+    ctx.candidates.resize(vocab_size);
+    for (size_t i = 0; i < vocab_size; ++i) {
+        ctx.candidates[i] = {logits[i], static_cast<int64_t>(i)};
+    }
+
+    // Apply temperature + softmax on full vocab to get probabilities
+    float max_logit = std::max_element(ctx.candidates.begin(), ctx.candidates.end(),
+                                       [](const auto& a, const auto& b) { return a.first < b.first; })->first;
+    float inv_temp = 1.0f / temperature;
+    float total = 0.0f;
+    for (size_t i = 0; i < vocab_size; ++i) {
+        ctx.candidates[i].first = std::exp((ctx.candidates[i].first - max_logit) * inv_temp);
+        total += ctx.candidates[i].first;
+    }
+
+    // Guard against degenerate distributions (NaN/Inf/zero)
+    if (!(total > 0.0f) || !std::isfinite(total)) {
+        // Find the candidate with the highest original logit (max_logit)
+        for (size_t i = 0; i < vocab_size; ++i) {
+            if (logits[i] == max_logit) return static_cast<int64_t>(i);
+        }
+        return static_cast<int64_t>(0);
+    }
+
+    float threshold = top_p * total;
+
+    // Try partial sort with increasing step sizes to find top-P nucleus
+    size_t num_candidates = vocab_size;
+    for (size_t step = 16; step <= 1024; step *= 2) {
+        if (vocab_size <= step) break;
+        std::partial_sort(ctx.candidates.begin(),
+                          ctx.candidates.begin() + static_cast<ptrdiff_t>(step),
+                          ctx.candidates.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < step; ++i) {
+            cumsum += ctx.candidates[i].first;
+            if (cumsum >= threshold) {
+                num_candidates = i + 1;
+                total = cumsum;
+                goto nucleus_found;
+            }
+        }
+    }
+    // Fallback: full sort
+    std::sort(ctx.candidates.begin(), ctx.candidates.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    {
+        float cumsum = 0.0f;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            cumsum += ctx.candidates[i].first;
+            if (cumsum >= threshold) {
+                num_candidates = i + 1;
+                total = cumsum;
+                break;
+            }
+        }
+    }
+
+nucleus_found:
+    num_candidates = std::max<size_t>(1, num_candidates);
+    // Direct CDF sampling
+    std::uniform_real_distribution<float> udist(0.0f, total);
+    float dart = udist(rng);
+    float cumsum = 0.0f;
+    for (size_t i = 0; i < num_candidates; ++i) {
+        cumsum += ctx.candidates[i].first;
+        if (cumsum >= dart) {
+            return ctx.candidates[i].second;
+        }
+    }
+    return ctx.candidates[num_candidates - 1].second;
 }
 
 ov::Tensor make_beam_idx(size_t batch) {
@@ -926,17 +1136,16 @@ int main(int argc, char* argv[]) try {
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, usm_visual_pos_mask);
     }
 
-    // Build GenerationConfig for LogitProcessor from CLI options.
+    // Build GenerationConfig for penalty-only LogitProcessor.
+    // Temperature / TopP / TopK are handled by sample_fast() to avoid
+    // O(V log V) full-vocab softmax+sort on every decode step.
     const bool use_sampling = opts.temperature > 0.0f;
-    ov::genai::GenerationConfig gen_config;
-    gen_config.do_sample = use_sampling;
-    gen_config.temperature = opts.temperature;
-    gen_config.top_p = opts.top_p;
-    gen_config.top_k = opts.top_k;
-    gen_config.repetition_penalty = opts.repetition_penalty;
-    gen_config.frequency_penalty = opts.frequency_penalty;
-    gen_config.presence_penalty = opts.presence_penalty;
-    ov::genai::LogitProcessor logit_processor(gen_config, prompt_token_ids);
+    ov::genai::GenerationConfig penalty_config;
+    penalty_config.do_sample = false;  // penalties only — no Temperature/TopP/TopK transforms
+    penalty_config.repetition_penalty = opts.repetition_penalty;
+    penalty_config.frequency_penalty = opts.frequency_penalty;
+    penalty_config.presence_penalty = opts.presence_penalty;
+    ov::genai::LogitProcessor penalty_processor(penalty_config, prompt_token_ids);
 
     // RNG for multinomial sampling.
     std::mt19937 rng(opts.rng_seed != 0
@@ -945,6 +1154,9 @@ int main(int argc, char* argv[]) try {
 
     // Reusable float32 scratch buffer for logit processing across all decode steps.
     std::vector<float> logit_buf;
+
+    // Pre-allocated scratch buffers for fast sampling (reused across decode steps).
+    SamplingContext sampling_ctx;
 
     const auto prefill_start = std::chrono::steady_clock::now();
     text_request.infer();
@@ -956,11 +1168,14 @@ int main(int argc, char* argv[]) try {
     int64_t next_id;
     {
         ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
-        logit_processor.apply(lw);
-        next_id = use_sampling ? sample_multinomial(lw, rng) : argmax_f32(logit_buf);
+        penalty_processor.apply(lw);  // penalties only — O(|generated|)
+        next_id = use_sampling
+                      ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                    opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                      : argmax_f32(logit_buf);
     }
-    logit_processor.register_new_generated_token(next_id);
-    logit_processor.update_generated_len(1);
+    penalty_processor.register_new_generated_token(next_id);
+    penalty_processor.update_generated_len(1);
 
     std::vector<int64_t> generated;
     generated.reserve(static_cast<size_t>(opts.max_new_tokens));
@@ -1056,12 +1271,15 @@ int main(int argc, char* argv[]) try {
         extract_last_logits_f32(logits, logit_buf);
         {
             ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
-            logit_processor.apply(lw);
-            next_id = use_sampling ? sample_multinomial(lw, rng) : argmax_f32(logit_buf);
+            penalty_processor.apply(lw);  // penalties only — O(|generated|)
+            next_id = use_sampling
+                          ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                        opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                          : argmax_f32(logit_buf);
         }
-        logit_processor.register_new_generated_token(next_id);
+        penalty_processor.register_new_generated_token(next_id);
         generated.push_back(next_id);
-        logit_processor.update_generated_len(generated.size());
+        penalty_processor.update_generated_len(generated.size());
         decode_steps += 1;
         past_len += 1;
     }
