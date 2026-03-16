@@ -23,8 +23,6 @@ modeling/
 │   ├── modeling_qwen3_omni_tts_min.cpp  # Cases 2–5: multimodal → text + TTS
 │   ├── extract_video_frames.cpp         # Video frame extraction tool
 │   └── tools/                           # Dev-only Python utilities (see tools/README.md)
-│       └── qwen3_omni_case_compare.py   # Automated test harness (all cases × devices × precisions)
-│       └── hf_tokenizer_to_ov.py        # Convert a HuggingFace tokenizer to OpenVINO IR format.
 ```
 
 ## Prerequisites
