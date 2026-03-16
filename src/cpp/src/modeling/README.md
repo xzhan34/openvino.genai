@@ -21,8 +21,10 @@ modeling/
 ├── samples/              # Sample executables
 │   ├── modeling_qwen3_omni.cpp          # Case 1: image+text → text
 │   ├── modeling_qwen3_omni_tts_min.cpp  # Cases 2–5: multimodal → text + TTS
-│   └── extract_video_frames.cpp         # Video frame extraction tool
-└── qwen3_omni_case_compare.py           # Automated test harness (all cases × devices × precisions)
+│   ├── extract_video_frames.cpp         # Video frame extraction tool
+│   └── tools/                           # Dev-only Python utilities (see tools/README.md)
+│       └── qwen3_omni_case_compare.py   # Automated test harness (all cases × devices × precisions)
+│       └── hf_tokenizer_to_ov.py        # Convert a HuggingFace tokenizer to OpenVINO IR format.
 ```
 
 ## Prerequisites
@@ -199,13 +201,13 @@ Control inference precision and KV-cache compression via the `--precision` argum
 
 Aliases: `fp32_kv8` → `inf_fp32_kv_int8`, `fp16_kv8` → `inf_fp16_kv_int8`, etc.
 
-## Automated Case Comparison (`qwen3_omni_case_compare.py`)
+## Automated Case Comparison (`tools/qwen3_omni_case_compare.py`)
 
 Runs all cases across multiple devices and precision modes, generating a JSON report
 with performance metrics and text outputs for comparison.
 
 ```bat
-python qwen3_omni_case_compare.py ^
+python tools/qwen3_omni_case_compare.py ^
     --model-dir     D:\models\Qwen3-Omni-4B-Instruct-multilingual ^
     --image         path\to\image.jpg ^
     --test-audio    path\to\audio.wav ^
