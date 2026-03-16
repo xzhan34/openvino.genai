@@ -11,6 +11,7 @@ from pathlib import Path
 
 from openvino import save_model
 from openvino_tokenizers import convert_tokenizer
+from transformers import AutoTokenizer
 
 
 def convert(
@@ -20,11 +21,6 @@ def convert(
     trust_remote_code: bool = False,
     padding_side: str | None = None,
 ):
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        sys.exit("ERROR: 'transformers' is required. Install: pip install -r requirements.txt")
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
