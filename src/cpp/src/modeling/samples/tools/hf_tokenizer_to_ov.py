@@ -9,6 +9,9 @@ import argparse
 import sys
 from pathlib import Path
 
+from openvino import save_model
+from openvino_tokenizers import convert_tokenizer
+
 
 def convert(
     model_id: str,
@@ -21,13 +24,6 @@ def convert(
         from transformers import AutoTokenizer
     except ImportError:
         sys.exit("ERROR: 'transformers' is required. Install: pip install -r requirements.txt")
-
-    try:
-        from openvino_tokenizers import convert_tokenizer
-    except ImportError:
-        sys.exit("ERROR: 'openvino-tokenizers' is required. Install: pip install -r requirements.txt")
-
-    from openvino import save_model
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
