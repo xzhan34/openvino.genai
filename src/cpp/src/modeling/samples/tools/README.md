@@ -20,7 +20,7 @@ Dependencies: `requirements_hf_tokenizer_to_ov.txt`
 
 ```bash
 # Basic usage — output defaults to model_id directory
-python hf_tokenizer_to_ov.py <model_id_or_path>
+python hf_tokenizer_to_ov.py --help
 
 # Specify output directory
 python hf_tokenizer_to_ov.py Qwen/Qwen3-0.6B -o ./qwen3_tokenizer_ir
