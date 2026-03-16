@@ -4,7 +4,7 @@ This directory contains the C++ modeling API for running **Qwen3-Omni-4B** infer
 with OpenVINO, including text generation, vision understanding, audio understanding,
 and text-to-speech (TTS) synthesis.
 
-## Directory Structure
+├── models/    # Model implementations
 
 ```
 modeling/
