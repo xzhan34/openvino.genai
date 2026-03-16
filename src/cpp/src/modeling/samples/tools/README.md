@@ -26,13 +26,6 @@ python hf_tokenizer_to_ov.py --help
 python hf_tokenizer_to_ov.py Qwen/Qwen3-0.6B -o ./qwen3_tokenizer_ir
 ```
 
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `-o, --output-dir` | Output directory (default: model_id directory) |
-
----
 
 ### qwen3_omni_case_compare.py
 
