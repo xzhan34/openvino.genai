@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -11,21 +14,49 @@
 #include "openvino/genai/llm_pipeline.hpp"
 #include "../../../src/cpp/src/modeling/weights/quantization_config.hpp"
 
+namespace {
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream ifs(path, std::ios::in | std::ios::binary);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open prompt file: " + path.string());
+    }
+
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    return oss.str();
+}
+
+}  // namespace
+
 int main(int argc, char* argv[]) try {
     if (3 > argc)
-        throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> \"<PROMPT>\" [DEVICE] [NUM_WARMUP] [NUM_ITER] [MAX_NEW_TOKENS] [COMPRESSION_MODE] [GROUP_SIZE] [BACKUP_MODE]");
+        throw std::runtime_error(std::string{"Usage: "} + argv[0] +
+                                 " <MODEL_DIR> <PROMPT | --prompt-file <PATH.txt>> [DEVICE] [NUM_WARMUP] [NUM_ITER] [MAX_NEW_TOKENS] [COMPRESSION_MODE] [GROUP_SIZE] [BACKUP_MODE]");
 
     std::string models_path = argv[1];
-    std::string prompt = argv[2];
-    std::string device = argc > 3 ? argv[3] : "GPU";  // GPU can be used as well
-    std::size_t num_warmup = argc > 4 ? std::stoul(argv[4]) : 1;
-    std::size_t num_iter = argc > 5 ? std::stoul(argv[5]) : 3;
-    std::size_t max_new_tokens = argc > 6 ? std::stoul(argv[6]) : 100;
+
+    std::string prompt;
+    int optional_arg_start = 3;
+    if (std::string(argv[2]) == "--prompt-file") {
+        if (argc <= 3) {
+            throw std::runtime_error("Missing value for --prompt-file");
+        }
+        prompt = read_text_file(std::filesystem::path(argv[3]));
+        optional_arg_start = 4;
+    } else {
+        prompt = argv[2];
+    }
+
+    std::string device = argc > optional_arg_start ? argv[optional_arg_start] : "GPU";  // GPU can be used as well
+    std::size_t num_warmup = argc > optional_arg_start + 1 ? std::stoul(argv[optional_arg_start + 1]) : 1;
+    std::size_t num_iter = argc > optional_arg_start + 2 ? std::stoul(argv[optional_arg_start + 2]) : 3;
+    std::size_t max_new_tokens = argc > optional_arg_start + 3 ? std::stoul(argv[optional_arg_start + 3]) : 100;
 
     // Parse compression config
     ov::genai::modeling::weights::QuantizationConfig quant_config;
-    if (argc > 7) {
-        std::string mode_str = argv[7];
+    if (argc > optional_arg_start + 4) {
+        std::string mode_str = argv[optional_arg_start + 4];
         if (mode_str == "int4_sym") quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
         else if (mode_str == "int4_asym") quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
         else if (mode_str == "int8_sym") quant_config.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
@@ -33,12 +64,12 @@ int main(int argc, char* argv[]) try {
         else if (mode_str != "none") throw std::runtime_error("Unknown compression mode: " + mode_str);
     }
 
-    if (argc > 8) {
-        quant_config.group_size = std::stoi(argv[8]);
+    if (argc > optional_arg_start + 5) {
+        quant_config.group_size = std::stoi(argv[optional_arg_start + 5]);
     }
 
-    if (argc > 9) {
-        std::string mode_str = argv[9];
+    if (argc > optional_arg_start + 6) {
+        std::string mode_str = argv[optional_arg_start + 6];
         if (mode_str == "int4_sym") quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
         else if (mode_str == "int4_asym") quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
         else if (mode_str == "int8_sym") quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
