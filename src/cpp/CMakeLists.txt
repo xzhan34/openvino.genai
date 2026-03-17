@@ -6,6 +6,9 @@ file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_
 file(GLOB modeling_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/samples/*.cpp")
 list(REMOVE_ITEM SOURCE_FILES ${modeling_samples_src})
 list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/safetensors_utils/.*")
+if(NOT ENABLE_MODELING_PRIVATE)
+    list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/modeling_private/.*")
+endif()
 list(APPEND SOURCE_FILES "${CMAKE_CURRENT_BINARY_DIR}/version.cpp")
 
 # Dependencies
@@ -105,6 +108,9 @@ FetchContent_Declare(safetensors.h
 FetchContent_MakeAvailable(safetensors.h)
 
 add_subdirectory(src/modeling)
+if(ENABLE_MODELING_PRIVATE)
+    add_subdirectory(src/modeling_private)
+endif()
 
 if(ENABLE_GGUF)
     FetchContent_Declare(
