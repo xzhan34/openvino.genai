@@ -44,6 +44,10 @@ from .py_openvino_genai import (
     VLMPipeline,
 )
 
+from .py_openvino_genai import (
+    ModulePipeline,
+)
+
 # LLM pipeline
 from .py_openvino_genai import (
     LLMPipeline,

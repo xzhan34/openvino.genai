@@ -1,0 +1,125 @@
+# OpenVINO™ Modular GenAI
+
+OpenVINO™ Modular GenAI is POC. It redefines GenAI application development by decomposing complex workflows into independent, reusable modules. By orchestrating these modules through a Directed Acyclic Graph (DAG), developers can build sophisticated AI pipelines with unprecedented flexibility and efficiency.
+
+## Getting Started
+
+<details>
+<summary>ENV</summary>
+
+```
+python -m venv python-env
+source python-env/bin/activate
+pip install numpy
+```
+</details>
+
+
+<details>
+<summary>Prepare OpenVINO</summary>
+
+```
+git clone https://github.com/openvinotoolkit/openvino.git
+cd openvino && mkdir build && cd build
+git submodule update --init
+cmake -DCMAKE_INSTALL_PREFIX=install ..
+make -j20 && make install
+```
+</details>
+
+<details>
+<summary>Build GenAI</summary>
+
+```
+sudo apt-get install libyaml-cpp-dev
+
+source ./python-env/bin/activate
+source ./openvino/build/install/setupvars.sh
+
+git clone https://github.com/xipingyan/openvino.genai.git --branch master_tr_module_genai
+cd openvino.genai
+git submodule update --init
+
+cmake -DCMAKE_BUILD_TYPE=Release -S ./ -B ./build/
+cmake --build ./build/ --config Release -j 20
+cmake --install ./build/ --config Release --prefix ./install
+```
+</details>
+
+<details>
+<summary>Build Python Wheel</summary>
+
+**Linux:**
+```bash
+source ./python-env/bin/activate
+source /opt/intel/openvino/setupvars.sh  # or your OpenVINO installation path
+
+cd openvino.genai
+
+# Upgrade pip to ensure you have the latest version
+python -m pip install --upgrade pip
+
+# Build the wheel
+python -m pip wheel . -w dist/ --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
+
+# Install the built wheel
+pip install dist/openvino_genai-*.whl
+```
+
+**Windows:**
+```powershell
+.\python-env\Scripts\activate
+"C:\Program Files (x86)\Intel\openvino\setupvars.bat"  # or your OpenVINO installation path
+
+cd openvino.genai
+
+# Upgrade pip to ensure you have the latest version
+python -m pip install --upgrade pip
+
+# Build the wheel
+python -m pip wheel . -w dist/ --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
+
+# Install the built wheel
+pip install (Get-ChildItem dist\openvino_genai-*.whl).FullName
+```
+
+> **NOTE**: You would need to build ABI compatible OpenVINO and OpenVINO Tokenizers for Ubuntu instead of downloading them from PyPI. See [BUILD.md](src/docs/BUILD.md) for more details.
+
+</details>
+
+## Samples
+
+[CPP Samples](../../../../samples/cpp/module_genai/README.md)   <br>
+[CPP ComfyUI Sample](../../../../samples/cpp/module_genai/comfyui/README.md) <br>
+[Python Sample](../../../../samples/python/module_genai/README.md) <br>
+
+<details>
+<summary>Qwen2.5-VL</summary>
+
+```
+<!-- Convert model -->
+python -m venv pyenv_cvt_model
+source pyenv_cvt_model/bin/activate
+pip install openvino-tokenizers openvino nncf optimum[intel]
+pip install -U huggingface_hub
+
+model_id='Qwen/Qwen2.5-VL-3B-Instruct'
+optimum-cli export openvino --model $model_id --task image-text-to-text $model_id/INT4 --weight-format int4 --trust-remote-code
+```
+
+```
+<!-- Python example -->
+import openvino_genai
+
+config_file="./config.yaml"
+
+pipe = openvino_genai.ModulePipeline(config_file)
+
+pipe.generate(img1=ov::Tensor, prompt_data="Describle the image")
+output = pipe.get_output("generated_text")
+
+print("output = ", output)
+```
+``Note:`` Reference [config.yaml](../../../../samples/cpp/module_genai/config_yaml/Qwen2.5-VL-3B-Instruct/config.yaml). Please update the `model_path` of config.yaml with your local path.
+
+</details>

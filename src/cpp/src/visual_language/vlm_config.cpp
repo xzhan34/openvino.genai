@@ -8,8 +8,6 @@
 
 namespace ov::genai {
 
-namespace {
-
 VLMModelType to_vlm_model_type(const std::string& value) {
     static const std::unordered_map<std::string, VLMModelType> model_types_map = {
         {"minicpmv", VLMModelType::MINICPM},
@@ -24,7 +22,10 @@ VLMModelType to_vlm_model_type(const std::string& value) {
         {"qwen2_vl", VLMModelType::QWEN2_VL},
         {"qwen2_5_vl", VLMModelType::QWEN2_5_VL},
         {"qwen3_vl", VLMModelType::QWEN3_VL},
+        {"qwen3_omni", VLMModelType::QWEN3_OMNI},
         {"gemma3", VLMModelType::GEMMA3},
+        {"qwen3_5", VLMModelType::QWEN3_5},
+        {"qwen3_5_moe", VLMModelType::QWEN3_5_MOE},
     };
 
     auto it = model_types_map.find(value);
@@ -33,6 +34,8 @@ VLMModelType to_vlm_model_type(const std::string& value) {
     }
     OPENVINO_THROW("Unsupported '", value, "' VLM model type");
 }
+
+namespace {
 
 void assert_size(size_t size, VLMModelType model_type) {
     if (model_type == VLMModelType::PHI3_V) {

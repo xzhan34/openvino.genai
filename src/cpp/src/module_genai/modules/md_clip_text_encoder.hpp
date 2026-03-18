@@ -1,0 +1,77 @@
+// Copyright (C) 2023-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <yaml-cpp/yaml.h>
+#include <fstream>
+#include <filesystem>
+
+#include "module_genai/pipeline/module.hpp"
+#include "module_genai/pipeline/module_type.hpp"
+#include "module_genai/pipeline/transformer_config.hpp"
+#include "openvino/genai/image_generation/generation_config.hpp"
+#include "openvino/genai/tokenizer.hpp"
+#include "tokenizer/tokenizer_impl.hpp"
+
+
+namespace ov {
+namespace genai {
+namespace module {
+
+// Shared resources for ClipTextEncoderModule with the same model_path
+struct ClipTextEncoderSharedResources {
+    ov::CompiledModel compiled_model;
+    std::shared_ptr<Tokenizer::TokenizerImpl> tokenizer_impl;
+    std::shared_ptr<minja::chat_template> minja_template;
+    TransformerConfig encoder_config;
+    DiffusionModelType model_type;
+};
+
+// Compute cache key hash from model XML file content and device
+inline std::size_t compute_cache_key(const std::filesystem::path& model_xml_path, const std::string& device) {
+    // Read model XML file content
+    std::ifstream file(model_xml_path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        // Fallback to path-based hash if file cannot be read
+        std::string fallback = model_xml_path.string() + device;
+        return std::hash<std::string_view>{}(std::string_view(fallback.data(), fallback.size()));
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::string content(size, '\0');
+    file.read(content.data(), size);
+    content += device;  // Append device to ensure different devices have different keys
+
+    return std::hash<std::string_view>{}(std::string_view(content.data(), content.size()));
+}
+
+class ClipTextEncoderModule : public IBaseModule {
+    DeclareModuleConstructor(ClipTextEncoderModule);
+
+private:
+    bool initialize();
+    bool do_classifier_free_guidance(float guidance_scale);
+
+    // Shared resources (shared across modules with same model_path within the same pipeline)
+    std::shared_ptr<ClipTextEncoderSharedResources> m_shared_resources;
+
+    // Per-instance infer request (each module has its own)
+    ov::InferRequest m_request;
+
+    std::pair<ov::Tensor, ov::Tensor> run(
+        const std::vector<std::string>& prompts,
+        const std::vector<std::string>& negative_prompts,
+        const ImageGenerationConfig &generation_config);
+    ov::Tensor encode_prompt(const std::vector<std::string>& prompts, const ImageGenerationConfig &generation_config);
+
+    ov::AnyMap m_compile_properties;
+};
+
+REGISTER_MODULE_CONFIG(ClipTextEncoderModule);
+
+}  // namespace module
+}  // namespace genai
+}  // namespace ov

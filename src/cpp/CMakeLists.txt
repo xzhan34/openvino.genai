@@ -3,9 +3,9 @@
 #
 
 file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
-file(GLOB modeling_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/samples/*.cpp")
+file(GLOB_RECURSE modeling_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/samples/*.cpp")
 list(REMOVE_ITEM SOURCE_FILES ${modeling_samples_src})
-file(GLOB modeling_private_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling_private/samples/*.cpp")
+file(GLOB_RECURSE modeling_private_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling_private/samples/*.cpp")
 list(REMOVE_ITEM SOURCE_FILES ${modeling_private_samples_src})
 list(FILTER SOURCE_FILES EXCLUDE REGEX ".*[/\\]safetensors_utils[/\\].*")
 if(NOT ENABLE_MODELING_PRIVATE)
@@ -84,6 +84,9 @@ if(NOT TARGET nlohmann_json)
         URL_HASH SHA256=0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406)
     FetchContent_MakeAvailable(nlohmann_json)
 endif()
+
+# yaml-cpp dependency (use centralized cmake module)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/yaml-cpp.cmake)
 
 if(NOT TARGET minja)
     FetchContent_Declare(
@@ -177,7 +180,8 @@ if(ENABLE_XGRAMMAR)
         add_subdirectory("${xgrammar_SOURCE_DIR}" "${xgrammar_BINARY_DIR}" EXCLUDE_FROM_ALL)
         if(MSVC)
             # Suppress C4146 warning for MSVC compiler
-            target_compile_options(xgrammar PRIVATE "/wd4146")
+            # Add /utf-8 to fix encoding issues with non-ASCII characters in xgrammar source files
+            target_compile_options(xgrammar PRIVATE "/wd4146" "/utf-8")
         endif()
     endif()
 else()
@@ -226,10 +230,15 @@ set(TARGET_NAME_OBJ ${TARGET_NAME}_obj)
 
 add_library(${TARGET_NAME_OBJ} OBJECT ${SOURCE_FILES})
 
+if(ENABLE_OPENVINO_NEW_ARCH)
+    target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_OPENVINO_NEW_ARCH=1)
+endif()
+
 target_include_directories(${TARGET_NAME_OBJ}
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>"
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${YAML_CPP_INCLUDE_DIRS}")
 
 if(ENABLE_XGRAMMAR)
     target_link_libraries(${TARGET_NAME_OBJ} PRIVATE xgrammar)
@@ -295,7 +304,7 @@ target_include_directories(${TARGET_NAME} INTERFACE "$<INSTALL_INTERFACE:runtime
                                                     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                                                     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>")
 
-target_link_libraries(${TARGET_NAME} PUBLIC openvino::runtime PRIVATE openvino::threading nlohmann_json::nlohmann_json minja ${CMAKE_DL_LIBS})
+target_link_libraries(${TARGET_NAME} PUBLIC openvino::runtime PRIVATE openvino::threading nlohmann_json::nlohmann_json ${YAML_CPP_TARGET} minja ${CMAKE_DL_LIBS})
 
 # Add OpenCL support if enabled via OpenVINO configuration
 if(ENABLE_SYSTEM_OPENCL AND TARGET OpenCL::OpenCL)

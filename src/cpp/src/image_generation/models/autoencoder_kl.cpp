@@ -130,7 +130,14 @@ AutoencoderKL::AutoencoderKL(const std::filesystem::path& vae_decoder_path,
                              const ov::AnyMap& properties)
     : m_config(vae_decoder_path / "config.json") {
 
-    const auto [properties_without_blob, blob_path] = utils::extract_export_properties(properties);
+    auto properties_copy = properties;
+    bool enable_postprocess = true;
+    if (auto it = properties_copy.find("enable_postprocess"); it != properties_copy.end()) {
+        enable_postprocess = it->second.as<bool>();
+        properties_copy.erase(it);
+    }
+
+    const auto [properties_without_blob, blob_path] = utils::extract_export_properties(properties_copy);
 
     if (blob_path.has_value()) {
         import_model(*blob_path, device, properties_without_blob);
@@ -139,7 +146,7 @@ AutoencoderKL::AutoencoderKL(const std::filesystem::path& vae_decoder_path,
 
     m_decoder_model = utils::singleton_core().read_model(vae_decoder_path / "openvino_model.xml");
     // apply VaeImageProcessor postprocessing steps by merging them into the VAE decoder model
-    merge_vae_image_post_processing();
+    merge_vae_image_post_processing(enable_postprocess);
     compile(device, *extract_adapters_from_properties(properties_without_blob));
 }
 
@@ -316,7 +323,7 @@ size_t AutoencoderKL::get_vae_scale_factor() const {
     return std::pow(2, m_config.block_out_channels.size() - 1);
 }
 
-void AutoencoderKL::merge_vae_image_post_processing() const {
+void AutoencoderKL::merge_vae_image_post_processing(const bool& enable_postprocess) const {
     ov::preprocess::PrePostProcessor ppp(m_decoder_model);
 
     // scale and shift input before VAE decoder
@@ -325,21 +332,23 @@ void AutoencoderKL::merge_vae_image_post_processing() const {
     if (m_config.shift_factor != 0.0f)
         ppp.input().preprocess().mean(-m_config.shift_factor);
 
-    // apply VaeImageProcessor normalization steps
-    // https://github.com/huggingface/diffusers/blob/v0.30.1/src/diffusers/image_processor.py#L159
-    ppp.output().postprocess().custom([](const ov::Output<ov::Node>& port) {
-        auto constant_0_5 = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1}, 0.5f);
-        auto constant_255 = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1}, 255.0f);
-        auto scaled_0_5 = std::make_shared<ov::op::v1::Multiply>(port, constant_0_5);
-        auto added_0_5 = std::make_shared<ov::op::v1::Add>(scaled_0_5, constant_0_5);
-        auto clamped = std::make_shared<ov::op::v0::Clamp>(added_0_5, 0.0f, 1.0f);
-        return std::make_shared<ov::op::v1::Multiply>(clamped, constant_255);
-    });
-    ppp.output().postprocess().convert_element_type(ov::element::u8);
-    // layout conversion
-    // https://github.com/huggingface/diffusers/blob/v0.30.1/src/diffusers/image_processor.py#L144
-    ppp.output().model().set_layout("NCHW");
-    ppp.output().tensor().set_layout("NHWC");
+    if (enable_postprocess) {
+        // apply VaeImageProcessor normalization steps
+        // https://github.com/huggingface/diffusers/blob/v0.30.1/src/diffusers/image_processor.py#L159
+        ppp.output().postprocess().custom([](const ov::Output<ov::Node>& port) {
+            auto constant_0_5 = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1}, 0.5f);
+            auto constant_255 = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1}, 255.0f);
+            auto scaled_0_5 = std::make_shared<ov::op::v1::Multiply>(port, constant_0_5);
+            auto added_0_5 = std::make_shared<ov::op::v1::Add>(scaled_0_5, constant_0_5);
+            auto clamped = std::make_shared<ov::op::v0::Clamp>(added_0_5, 0.0f, 1.0f);
+            return std::make_shared<ov::op::v1::Multiply>(clamped, constant_255);
+        });
+        ppp.output().postprocess().convert_element_type(ov::element::u8);
+        // layout conversion
+        // https://github.com/huggingface/diffusers/blob/v0.30.1/src/diffusers/image_processor.py#L144
+        ppp.output().model().set_layout("NCHW");
+        ppp.output().tensor().set_layout("NHWC");
+    }
 
     ppp.build();
 }
