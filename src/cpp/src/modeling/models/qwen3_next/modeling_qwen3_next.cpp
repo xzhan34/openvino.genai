@@ -109,6 +109,13 @@ bool use_fused_conv_op() {
     return std::string(raw) != "0";
 }
 
+bool use_linear_attention_op() {
+    const char* raw = std::getenv("OV_GENAI_USE_LINEAR_ATTENTION_OP");
+    if (!raw || raw[0] == '\0')
+        return true;  // enabled by default
+    return std::string(raw) != "0";
+}
+
 ov::genai::modeling::models::Qwen3NextConfig apply_qwen3_next_layer_limit(
     const ov::genai::modeling::models::Qwen3NextConfig& input_cfg) {
     auto cfg = input_cfg;
@@ -135,6 +142,20 @@ ov::genai::modeling::models::Qwen3NextConfig apply_qwen3_next_layer_limit(
         cfg.mlp_only_layers = std::move(filtered);
     }
     return cfg;
+}
+
+bool is_qwen3_next_moe_enabled(const ov::genai::modeling::models::Qwen3NextConfig& cfg, int32_t layer_idx) {
+    if (cfg.num_experts <= 0) {
+        return false;
+    }
+
+    const auto mlp_only = make_index_set(cfg.mlp_only_layers);
+    if (mlp_only.count(layer_idx) != 0) {
+        return false;
+    }
+
+    const int32_t sparse_step = cfg.decoder_sparse_step > 0 ? cfg.decoder_sparse_step : 1;
+    return (((layer_idx + 1) % sparse_step) == 0);
 }
 
 }  // namespace
@@ -262,9 +283,8 @@ Tensor Qwen3NextAttention::forward(const Tensor& hidden_states,
     const Tensor* sdpa_mask = precomputed_sdpa_mask;
     std::optional<Tensor> local_mask;
     if (!sdpa_mask) {
-        local_mask = attention_mask
-                         ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
-                         : ops::llm::build_kv_causal_mask(q_heads, cached.first);
+        local_mask = attention_mask ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
+                                    : ops::llm::build_kv_causal_mask(q_heads, cached.first);
         sdpa_mask = &(*local_mask);
     }
     auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, sdpa_mask, false, policy);
@@ -319,259 +339,6 @@ Tensor Qwen3NextMLP::forward(const Tensor& x) const {
     auto up = ops::linear(x, up_proj_weight());
     auto gated = ops::silu(gate) * up;
     return ops::linear(gated, down_proj_weight());
-}
-
-Qwen3NextSparseMoeBlock::Qwen3NextSparseMoeBlock(BuilderContext& ctx,
-                                                 const std::string& name,
-                                                 const Qwen3NextConfig& cfg,
-                                                 Module* parent)
-    : Module(name, ctx, parent),
-      hidden_size_(cfg.hidden_size),
-      expert_intermediate_size_(cfg.moe_intermediate_size),
-      shared_intermediate_size_(cfg.shared_expert_intermediate_size),
-      num_experts_(cfg.num_experts),
-      top_k_(cfg.num_experts_per_tok > 0 ? cfg.num_experts_per_tok : 1),
-      norm_topk_prob_(cfg.norm_topk_prob),
-      group_size_((cfg.group_size > 0) ? static_cast<size_t>(cfg.group_size) : 128) {
-    if (!cfg.hidden_act.empty() && cfg.hidden_act != "silu") {
-        OPENVINO_THROW("Unsupported Qwen3Next MoE activation: ", cfg.hidden_act);
-    }
-    if (hidden_size_ <= 0 || expert_intermediate_size_ <= 0 || shared_intermediate_size_ <= 0 || num_experts_ <= 0) {
-        OPENVINO_THROW("Invalid Qwen3Next MoE configuration");
-    }
-    if (top_k_ <= 0 || top_k_ > num_experts_) {
-        OPENVINO_THROW("Invalid Qwen3Next MoE top-k configuration");
-    }
-
-    gate_param_ = &register_parameter("gate.weight");
-    shared_expert_gate_param_ = &register_parameter("shared_expert_gate.weight");
-    shared_gate_proj_param_ = &register_parameter("shared_expert.gate_proj.weight");
-    shared_up_proj_param_ = &register_parameter("shared_expert.up_proj.weight");
-    shared_down_proj_param_ = &register_parameter("shared_expert.down_proj.weight");
-
-    // Initialize expert parameter vectors
-    gate_experts_param_.resize(static_cast<size_t>(num_experts_));
-    up_experts_param_.resize(static_cast<size_t>(num_experts_));
-    down_experts_param_.resize(static_cast<size_t>(num_experts_));
-    
-    // Initialize scales and zps vectors for quantized MoE weights
-    gate_exps_scales_.resize(static_cast<size_t>(num_experts_));
-    gate_exps_zps_.resize(static_cast<size_t>(num_experts_));
-    up_exps_scales_.resize(static_cast<size_t>(num_experts_));
-    up_exps_zps_.resize(static_cast<size_t>(num_experts_));
-    down_exps_scales_.resize(static_cast<size_t>(num_experts_));
-    down_exps_zps_.resize(static_cast<size_t>(num_experts_));
-
-    for (int32_t i = 0; i < num_experts_; ++i) {
-        const std::string prefix = "experts." + std::to_string(i) + ".";
-        const size_t idx = static_cast<size_t>(i);
-        
-        gate_experts_param_[idx] = &register_parameter(prefix + "gate_proj.weight");
-        up_experts_param_[idx] = &register_parameter(prefix + "up_proj.weight");
-        down_experts_param_[idx] = &register_parameter(prefix + "down_proj.weight");
-        
-        // Set custom weight_loader for gate_proj to capture scales/zps
-        gate_experts_param_[idx]->set_weight_loader([this, idx](WeightParameter& param,
-                                                   weights::WeightSource& source,
-                                                   weights::WeightFinalizer& finalizer,
-                                                   const std::string& weight_name,
-                                                   const std::optional<int>& shard_id) {
-            (void)shard_id;
-            if (!param.context()) {
-                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
-            }
-            auto weight = finalizer.finalize(weight_name, source, *param.context());
-            param.bind(weight);
-            if (weight.get_auxiliary("scales") != std::nullopt &&
-                weight.get_auxiliary("zps") != std::nullopt) {
-                gate_exps_scales_[idx] = weight.auxiliary.at("scales");
-                gate_exps_zps_[idx] = weight.auxiliary.at("zps");
-            }
-        });
-
-        // Set custom weight_loader for up_proj
-        up_experts_param_[idx]->set_weight_loader([this, idx](WeightParameter& param,
-                                                 weights::WeightSource& source,
-                                                 weights::WeightFinalizer& finalizer,
-                                                 const std::string& weight_name,
-                                                 const std::optional<int>& shard_id) {
-            (void)shard_id;
-            if (!param.context()) {
-                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
-            }
-            auto weight = finalizer.finalize(weight_name, source, *param.context());
-            param.bind(weight);
-            if (weight.get_auxiliary("scales") != std::nullopt &&
-                weight.get_auxiliary("zps") != std::nullopt) {
-                up_exps_scales_[idx] = weight.auxiliary.at("scales");
-                up_exps_zps_[idx] = weight.auxiliary.at("zps");
-            }
-        });
-
-        // Set custom weight_loader for down_proj
-        down_experts_param_[idx]->set_weight_loader([this, idx](WeightParameter& param,
-                                                   weights::WeightSource& source,
-                                                   weights::WeightFinalizer& finalizer,
-                                                   const std::string& weight_name,
-                                                   const std::optional<int>& shard_id) {
-            (void)shard_id;
-            if (!param.context()) {
-                OPENVINO_THROW("WeightParameter has no OpContext: ", param.name());
-            }
-            auto weight = finalizer.finalize(weight_name, source, *param.context());
-            param.bind(weight);
-            if (weight.get_auxiliary("scales") != std::nullopt &&
-                weight.get_auxiliary("zps") != std::nullopt) {
-                down_exps_scales_[idx] = weight.auxiliary.at("scales");
-                down_exps_zps_[idx] = weight.auxiliary.at("zps");
-            }
-        });
-    }
-}
-
-const Tensor& Qwen3NextSparseMoeBlock::gate_weight() const {
-    if (!gate_param_) {
-        OPENVINO_THROW("Qwen3NextSparseMoeBlock gate parameter is not registered");
-    }
-    return gate_param_->value();
-}
-
-const Tensor& Qwen3NextSparseMoeBlock::shared_expert_gate_weight() const {
-    if (!shared_expert_gate_param_) {
-        OPENVINO_THROW("Qwen3NextSparseMoeBlock shared_expert_gate parameter is not registered");
-    }
-    return shared_expert_gate_param_->value();
-}
-
-const Tensor& Qwen3NextSparseMoeBlock::shared_gate_proj_weight() const {
-    if (!shared_gate_proj_param_) {
-        OPENVINO_THROW("Qwen3NextSparseMoeBlock shared gate_proj parameter is not registered");
-    }
-    return shared_gate_proj_param_->value();
-}
-
-const Tensor& Qwen3NextSparseMoeBlock::shared_up_proj_weight() const {
-    if (!shared_up_proj_param_) {
-        OPENVINO_THROW("Qwen3NextSparseMoeBlock shared up_proj parameter is not registered");
-    }
-    return shared_up_proj_param_->value();
-}
-
-const Tensor& Qwen3NextSparseMoeBlock::shared_down_proj_weight() const {
-    if (!shared_down_proj_param_) {
-        OPENVINO_THROW("Qwen3NextSparseMoeBlock shared down_proj parameter is not registered");
-    }
-    return shared_down_proj_param_->value();
-}
-
-Tensor Qwen3NextSparseMoeBlock::gate_expert_weights() const {
-    std::vector<Tensor> ws;
-    ws.reserve(gate_experts_param_.size());
-    for (auto* p : gate_experts_param_) {
-        ws.push_back(p->value());
-    }
-    auto result = ops::concat(ws, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::up_expert_weights() const {
-    std::vector<Tensor> ws;
-    ws.reserve(up_experts_param_.size());
-    for (auto* p : up_experts_param_) {
-        ws.push_back(p->value());
-    }
-    auto result = ops::concat(ws, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::down_expert_weights() const {
-    std::vector<Tensor> ws;
-    ws.reserve(down_experts_param_.size());
-    for (auto* p : down_experts_param_) {
-        ws.push_back(p->value());
-    }
-    auto result = ops::concat(ws, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::gate_exps_scales() const {
-    auto result = ops::concat(gate_exps_scales_, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::gate_exps_zps() const {
-    auto result = ops::concat(gate_exps_zps_, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::up_exps_scales() const {
-    auto result = ops::concat(up_exps_scales_, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::up_exps_zps() const {
-    auto result = ops::concat(up_exps_zps_, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::down_exps_scales() const {
-    auto result = ops::concat(down_exps_scales_, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::down_exps_zps() const {
-    auto result = ops::concat(down_exps_zps_, 0);
-    result.output().get_node()->get_rt_info()["postponed_constant"] = true;
-    return result;
-}
-
-Tensor Qwen3NextSparseMoeBlock::forward(const Tensor& hidden_states) const {
-    auto* op_ctx = hidden_states.context();
-    auto input_dtype = hidden_states.dtype();
-
-    auto flat = hidden_states.reshape({-1, hidden_size_});
-    auto flat_f32 = flat.to(ov::element::f32);
-    
-    // Use optimized MoE kernel for routed experts
-    auto routed_out = ops::moe3gemm_fused_compressed(
-        flat_f32,
-        gate_weight(),
-        gate_expert_weights(),
-        gate_exps_scales(),
-        gate_exps_zps(),
-        up_expert_weights(),
-        up_exps_scales(),
-        up_exps_zps(),
-        down_expert_weights(),
-        down_exps_scales(),
-        down_exps_zps(),
-        hidden_size_,
-        expert_intermediate_size_,
-        num_experts_,
-        top_k_,
-        group_size_,
-        ov::element::f16);
-
-    // Shared expert computation (using standard linear ops)
-    auto shared_gate = ops::linear(flat_f32, shared_gate_proj_weight().to(ov::element::f32));
-    auto shared_up = ops::linear(flat_f32, shared_up_proj_weight().to(ov::element::f32));
-    auto shared_hidden = ops::silu(shared_gate) * shared_up;
-    auto shared_out = ops::linear(shared_hidden, shared_down_proj_weight().to(ov::element::f32));
-
-    // Gated combination of routed and shared expert outputs
-    auto shared_gate_logits = ops::linear(flat_f32, shared_expert_gate_weight().to(ov::element::f32));
-    auto shared_gate_sigmoid = Tensor(std::make_shared<ov::op::v0::Sigmoid>(shared_gate_logits.output()), op_ctx);
-    auto combined = routed_out + (shared_out * shared_gate_sigmoid);
-    auto restored = combined.reshape(shape::of(hidden_states), false);
-    return restored.to(input_dtype);
 }
 
 Qwen3NextGatedDeltaNet::Qwen3NextGatedDeltaNet(BuilderContext& ctx,
@@ -759,15 +526,19 @@ Tensor Qwen3NextGatedDeltaNet::forward(const Tensor& hidden_states,
     auto conv_var = std::make_shared<ov::op::util::Variable>(conv_info);
     Tensor mixed_after_conv;
     if (use_fused_conv_op()) {
+        // -- FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice --
         auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
+
         auto fused_result = ops::fused_conv(
-            mixed_qkv,
-            conv_w_2d,
-            beam_idx,
-            conv_init,
+            mixed_qkv,                                       // [B, conv_dim, S]
+            conv_w_2d,                                       // [conv_dim, kernel_size]
+            beam_idx,                                        // [B]
+            conv_init,                                       // [B, conv_dim, kernel_size]
             conv_var);
-        mixed_after_conv = fused_result.first;
+
+        mixed_after_conv = fused_result.first;               // [B, conv_dim, S]
     } else {
+        // -- Fallback: original decomposed path --
         auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
         auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
 
@@ -786,7 +557,7 @@ Tensor Qwen3NextGatedDeltaNet::forward(const Tensor& hidden_states,
     auto k_heads = k_conv.reshape({0, 0, num_k_heads_, head_k_dim_});
     auto v_heads = v_conv.reshape({0, 0, num_v_heads_, head_v_dim_});
 
-    if (ratio > 1) {
+    if (ratio > 1 && !use_linear_attention_op()) {
         q_heads = ops::llm::repeat_kv(q_heads.permute({0, 2, 1, 3}), num_v_heads_, num_k_heads_, head_k_dim_)
                       .permute({0, 2, 1, 3});
         k_heads = ops::llm::repeat_kv(k_heads.permute({0, 2, 1, 3}), num_v_heads_, num_k_heads_, head_k_dim_)
@@ -797,11 +568,6 @@ Tensor Qwen3NextGatedDeltaNet::forward(const Tensor& hidden_states,
     auto q_f32 = q_heads.to(ov::element::f32);
     auto k_f32 = k_heads.to(ov::element::f32);
     auto v_f32 = v_heads.to(ov::element::f32);
-    auto q_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(q_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
-    auto k_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(k_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
-    auto q_normed = q_f32 * (q_ss + 1e-6f).rsqrt();
-    auto k_normed = k_f32 * (k_ss + 1e-6f).rsqrt();
-    auto q_scaled = q_normed * (1.0f / std::sqrt(static_cast<float>(head_k_dim_)));
 
     auto beta = Tensor(std::make_shared<ov::op::v0::Sigmoid>(b.to(ov::element::f32).output()), op_ctx);
     auto softplus_in = a.to(ov::element::f32) + dt_bias().to(ov::element::f32);
@@ -818,342 +584,92 @@ Tensor Qwen3NextGatedDeltaNet::forward(const Tensor& hidden_states,
                                               ov::element::f32,
                                               state_prefix + ".recurrent"};
     auto recurrent_var = std::make_shared<ov::op::util::Variable>(recurrent_info);
-    auto recurrent_read = std::make_shared<ov::op::v6::ReadValue>(recurrent_init.output(), recurrent_var);
-    auto recurrent_cached = ops::gather(Tensor(recurrent_read->output(0), op_ctx), beam_idx, 0);
 
-    auto q_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
-    auto k_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
-    auto v_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_v_dim_});
-    auto g_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
-    auto b_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
-    auto state_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, num_v_heads_, head_k_dim_, head_v_dim_});
-
-    auto axis_seq = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
-    auto q_s = std::make_shared<ov::op::v0::Squeeze>(q_t, axis_seq);
-    auto k_s = std::make_shared<ov::op::v0::Squeeze>(k_t, axis_seq);
-    auto v_s = std::make_shared<ov::op::v0::Squeeze>(v_t, axis_seq);
-    auto g_s = std::make_shared<ov::op::v0::Squeeze>(g_t, axis_seq);
-    auto b_s = std::make_shared<ov::op::v0::Squeeze>(b_t, axis_seq);
-
-    auto g_exp = std::make_shared<ov::op::v0::Exp>(g_s);
-    auto g_exp_u1 = std::make_shared<ov::op::v0::Unsqueeze>(g_exp, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto g_exp_e = std::make_shared<ov::op::v0::Unsqueeze>(g_exp_u1, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto state_decay = std::make_shared<ov::op::v1::Multiply>(state_t, g_exp_e, ov::op::AutoBroadcastType::NUMPY);
-
-    auto k_uns = std::make_shared<ov::op::v0::Unsqueeze>(k_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto state_k = std::make_shared<ov::op::v1::Multiply>(state_decay, k_uns, ov::op::AutoBroadcastType::NUMPY);
-    auto kv_mem = std::make_shared<ov::op::v1::ReduceSum>(state_k,
-                                                           ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
-                                                           false);
-
-    auto b_uns = std::make_shared<ov::op::v0::Unsqueeze>(b_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto delta = std::make_shared<ov::op::v1::Multiply>(
-        std::make_shared<ov::op::v1::Subtract>(v_s, kv_mem, ov::op::AutoBroadcastType::NUMPY),
-        b_uns,
-        ov::op::AutoBroadcastType::NUMPY);
-
-    auto delta_uns = std::make_shared<ov::op::v0::Unsqueeze>(delta, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-2}));
-    auto outer = std::make_shared<ov::op::v1::Multiply>(k_uns, delta_uns, ov::op::AutoBroadcastType::NUMPY);
-    auto state_new = std::make_shared<ov::op::v1::Add>(state_decay, outer, ov::op::AutoBroadcastType::NUMPY);
-
-    auto q_uns = std::make_shared<ov::op::v0::Unsqueeze>(q_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
-    auto y_state = std::make_shared<ov::op::v1::Multiply>(state_new, q_uns, ov::op::AutoBroadcastType::NUMPY);
-    auto y_t_step = std::make_shared<ov::op::v1::ReduceSum>(y_state,
-                                                            ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
-                                                            false);
-    auto y_t_unsq = std::make_shared<ov::op::v0::Unsqueeze>(y_t_step, axis_seq);
-
-    auto state_result = std::make_shared<ov::op::v0::Result>(state_new);
-    auto y_result = std::make_shared<ov::op::v0::Result>(y_t_unsq);
-    auto body = std::make_shared<ov::Model>(ov::OutputVector{state_result->output(0), y_result->output(0)},
-                                            ov::ParameterVector{q_t, k_t, v_t, g_t, b_t, state_t});
-
-    auto ti = std::make_shared<ov::op::v0::TensorIterator>();
-    ti->set_body(body);
-    ti->set_sliced_input(q_t, q_scaled.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(k_t, k_normed.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(v_t, v_f32.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(g_t, g.output(), 0, 1, 1, -1, 1);
-    ti->set_sliced_input(b_t, beta.output(), 0, 1, 1, -1, 1);
-    ti->set_merged_input(state_t, recurrent_cached.output(), state_result);
-
-    auto recurrent_final = ti->get_iter_value(state_result, -1);
-    auto core_attn = ti->get_concatenated_slices(y_result, 0, 1, 1, -1, 1);
-    auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final, recurrent_var);
-    ctx().register_sink(recurrent_assign);
-
-    auto core_attn_tensor = Tensor(core_attn, op_ctx);
-    auto core_flat = core_attn_tensor.reshape({-1, head_v_dim_});
-    auto z_flat = z.reshape({-1, head_v_dim_});
-    auto gated = rms_norm_gated(core_flat, z_flat);
-    auto gated_4d = gated.reshape(shape::of(z), false);
-    auto merged = gated_4d.reshape({0, 0, value_dim_});
-    return ops::linear(merged, out_proj_weight()).to(masked_hidden.dtype());
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Qwen3NextGatedDeltaNet2 — uses ops::linear_attention instead of TensorIterator
-// ─────────────────────────────────────────────────────────────────────────────
-
-Qwen3NextGatedDeltaNet2::Qwen3NextGatedDeltaNet2(BuilderContext& ctx,
-                                                 const std::string& name,
-                                                 const Qwen3NextConfig& cfg,
-                                                 int32_t layer_idx,
-                                                 Module* parent)
-    : Module(name, ctx, parent),
-      layer_idx_(layer_idx),
-      hidden_size_(cfg.hidden_size),
-      num_v_heads_(cfg.linear_num_value_heads),
-      num_k_heads_(cfg.linear_num_key_heads),
-      head_k_dim_(cfg.linear_key_head_dim),
-      head_v_dim_(cfg.linear_value_head_dim),
-      key_dim_(head_k_dim_ * num_k_heads_),
-      value_dim_(head_v_dim_ * num_v_heads_),
-      conv_dim_(key_dim_ * 2 + value_dim_),
-      conv_kernel_size_(cfg.linear_conv_kernel_dim),
-      conv_state_size_(cfg.linear_conv_kernel_dim),
-      eps_(cfg.rms_norm_eps) {
-    if (!cfg.hidden_act.empty() && cfg.hidden_act != "silu") {
-        OPENVINO_THROW("Unsupported Qwen3Next linear attention activation: ", cfg.hidden_act);
-    }
-    if (hidden_size_ <= 0 || num_v_heads_ <= 0 || num_k_heads_ <= 0 || head_k_dim_ <= 0 || head_v_dim_ <= 0) {
-        OPENVINO_THROW("Invalid Qwen3Next linear attention configuration");
-    }
-    if (conv_kernel_size_ <= 0) {
-        OPENVINO_THROW("Qwen3Next linear_conv_kernel_dim must be > 0");
-    }
-    if ((num_v_heads_ % num_k_heads_) != 0) {
-        OPENVINO_THROW("Qwen3Next linear_num_value_heads must be divisible by linear_num_key_heads");
-    }
-
-    in_proj_qkvz_param_ = &register_parameter("in_proj_qkvz.weight");
-    in_proj_ba_param_ = &register_parameter("in_proj_ba.weight");
-    conv1d_param_ = &register_parameter("conv1d.weight");
-    a_log_param_ = &register_parameter("A_log");
-    dt_bias_param_ = &register_parameter("dt_bias");
-    norm_param_ = &register_parameter("norm.weight");
-    out_proj_param_ = &register_parameter("out_proj.weight");
-}
-
-const Tensor& Qwen3NextGatedDeltaNet2::in_proj_qkvz_weight() const {
-    if (!in_proj_qkvz_param_) {
-        OPENVINO_THROW("Qwen3NextGatedDeltaNet2 in_proj_qkvz parameter is not registered");
-    }
-    return in_proj_qkvz_param_->value();
-}
-
-const Tensor& Qwen3NextGatedDeltaNet2::in_proj_ba_weight() const {
-    if (!in_proj_ba_param_) {
-        OPENVINO_THROW("Qwen3NextGatedDeltaNet2 in_proj_ba parameter is not registered");
-    }
-    return in_proj_ba_param_->value();
-}
-
-const Tensor& Qwen3NextGatedDeltaNet2::conv1d_weight() const {
-    if (!conv1d_param_) {
-        OPENVINO_THROW("Qwen3NextGatedDeltaNet2 conv1d parameter is not registered");
-    }
-    return conv1d_param_->value();
-}
-
-const Tensor& Qwen3NextGatedDeltaNet2::a_log() const {
-    if (!a_log_param_) {
-        OPENVINO_THROW("Qwen3NextGatedDeltaNet2 A_log parameter is not registered");
-    }
-    return a_log_param_->value();
-}
-
-const Tensor& Qwen3NextGatedDeltaNet2::dt_bias() const {
-    if (!dt_bias_param_) {
-        OPENVINO_THROW("Qwen3NextGatedDeltaNet2 dt_bias parameter is not registered");
-    }
-    return dt_bias_param_->value();
-}
-
-const Tensor& Qwen3NextGatedDeltaNet2::out_proj_weight() const {
-    if (!out_proj_param_) {
-        OPENVINO_THROW("Qwen3NextGatedDeltaNet2 out_proj parameter is not registered");
-    }
-    return out_proj_param_->value();
-}
-
-Tensor Qwen3NextGatedDeltaNet2::apply_depthwise_causal_conv(const Tensor& mixed_qkv,
-                                                            const Tensor& prev_conv_state,
-                                                            Tensor* next_conv_state) const {
-    auto* op_ctx = mixed_qkv.context();
-    auto input_with_state = ops::concat({prev_conv_state, mixed_qkv}, 2);
-
-    auto conv_weight = conv1d_weight().reshape({conv_dim_, 1, 1, conv_kernel_size_}, false);
-    auto conv = std::make_shared<ov::op::v1::GroupConvolution>(input_with_state.output(),
-                                                                conv_weight.output(),
-                                                                ov::Strides{1},
-                                                                ov::CoordinateDiff{0},
-                                                                ov::CoordinateDiff{0},
-                                                                ov::Strides{1});
-    auto conv_act = ops::silu(Tensor(conv, op_ctx));
-
-    auto seq_len = shape::dim(mixed_qkv, 2);
-    auto conv_len = shape::dim(conv_act, 2);
-    auto out_start = std::make_shared<ov::op::v1::Subtract>(conv_len, seq_len);
-    auto out_slice = std::make_shared<ov::op::v8::Slice>(conv_act.output(),
-                                                         out_start,
-                                                         conv_len,
-                                                         ops::const_vec(op_ctx, std::vector<int64_t>{1}),
-                                                         ops::const_vec(op_ctx, std::vector<int64_t>{2}));
-
-    auto total_len = shape::dim(input_with_state, 2);
-    auto kernel = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(conv_state_size_)});
-    auto state_start = std::make_shared<ov::op::v1::Subtract>(total_len, kernel);
-    auto state_slice = std::make_shared<ov::op::v8::Slice>(input_with_state.output(),
-                                                           state_start,
-                                                           total_len,
-                                                           ops::const_vec(op_ctx, std::vector<int64_t>{1}),
-                                                           ops::const_vec(op_ctx, std::vector<int64_t>{2}));
-    if (next_conv_state) {
-        *next_conv_state = Tensor(state_slice, op_ctx);
-    }
-    return Tensor(out_slice, op_ctx);
-}
-
-Tensor Qwen3NextGatedDeltaNet2::rms_norm_gated(const Tensor& x, const Tensor& z) const {
-    auto x_f32 = x.to(ov::element::f32);
-    auto z_f32 = z.to(ov::element::f32);
-    auto var = x_f32.pow(2.0f).mean(-1, true);
-    auto norm = x_f32 * (var + eps_).rsqrt();
-    auto gate = ops::silu(z_f32);
-    auto weighted = norm * norm_param_->value().to(ov::element::f32);
-    return (weighted * gate).to(x.dtype());
-}
-
-Tensor Qwen3NextGatedDeltaNet2::forward(const Tensor& hidden_states,
-                                        const Tensor& beam_idx,
-                                        const Tensor* attention_mask,
-                                        const Tensor* cache_position) const {
-    (void)cache_position;
-    auto* op_ctx = hidden_states.context();
-
-    Tensor masked_hidden = hidden_states;
-    if (attention_mask) {
-        masked_hidden = hidden_states * attention_mask->to(hidden_states.dtype()).unsqueeze(2);
-    }
-
-    const int32_t ratio = num_v_heads_ / num_k_heads_;
-
-    // ── linear projections ──
-    auto projected_qkvz = ops::linear(masked_hidden, in_proj_qkvz_weight());
-    auto projected_ba = ops::linear(masked_hidden, in_proj_ba_weight());
-
-    auto mixed_qkvz = projected_qkvz.reshape({0, 0, num_k_heads_, 2 * head_k_dim_ + 2 * ratio * head_v_dim_});
-    auto mixed_ba = projected_ba.reshape({0, 0, num_k_heads_, 2 * ratio});
-
-    auto q_pre = ops::slice(mixed_qkvz, 0, head_k_dim_, 1, 3);
-    auto k_pre = ops::slice(mixed_qkvz, head_k_dim_, 2 * head_k_dim_, 1, 3);
-    auto v_pre = ops::slice(mixed_qkvz, 2 * head_k_dim_, 2 * head_k_dim_ + ratio * head_v_dim_, 1, 3);
-    auto z = ops::slice(mixed_qkvz,
-                        2 * head_k_dim_ + ratio * head_v_dim_,
-                        2 * head_k_dim_ + 2 * ratio * head_v_dim_,
-                        1,
-                        3);
-    auto b = ops::slice(mixed_ba, 0, ratio, 1, 3);
-    auto a = ops::slice(mixed_ba, ratio, 2 * ratio, 1, 3);
-
-    auto value_pre = v_pre.reshape({0, 0, num_v_heads_, head_v_dim_});
-    z = z.reshape({0, 0, num_v_heads_, head_v_dim_});
-    b = b.reshape({0, 0, num_v_heads_});
-    a = a.reshape({0, 0, num_v_heads_});
-
-    // ── causal depthwise convolution ──
-    auto q_flat = q_pre.reshape({0, 0, key_dim_});
-    auto k_flat = k_pre.reshape({0, 0, key_dim_});
-    auto v_flat = value_pre.reshape({0, 0, value_dim_});
-
-    auto mixed_qkv = ops::concat({q_flat, k_flat, v_flat}, 2).permute({0, 2, 1});
-
-    auto batch = shape::dim(masked_hidden, 0);
-    auto conv_shape = shape::make({batch,
-                                   ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(conv_dim_)}),
-                                   ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(conv_state_size_)})});
-    auto conv_init = shape::broadcast_to(Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(masked_hidden.dtype()), conv_shape);
-
-    auto state_prefix = "linear_states." + std::to_string(layer_idx_);
-    ov::op::util::VariableInfo conv_info{ov::PartialShape{-1, conv_dim_, conv_state_size_},
-                                         masked_hidden.dtype(),
-                                         state_prefix + ".conv"};
-    auto conv_var = std::make_shared<ov::op::util::Variable>(conv_info);
-    Tensor mixed_after_conv;
-    if (use_fused_conv_op()) {
-        auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
-        auto fused_result = ops::fused_conv(
-            mixed_qkv,
-            conv_w_2d,
-            beam_idx,
-            conv_init,
-            conv_var);
-        mixed_after_conv = fused_result.first;
+    Tensor core_attn_tensor;  // [B, S, num_v_heads, head_v_dim]
+    if (use_linear_attention_op()) {
+        // ── Fused LinearAttention op path (mirrors FusedConv pattern) ──
+        // No ReadValue/Assign — LinearAttention manages the variable exclusively.
+        // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
+        // and writes updated state directly to variable memory.
+        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+        core_attn_tensor = la_result.first;
     } else {
-        auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
-        auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
+        // ── TensorIterator path (default) ──
+        // Traditional ReadValue + Gather + Assign pattern for variable state management.
+        auto recurrent_read = std::make_shared<ov::op::v6::ReadValue>(recurrent_init.output(), recurrent_var);
+        auto recurrent_cached = ops::gather(Tensor(recurrent_read->output(0), op_ctx), beam_idx, 0);
 
-        Tensor next_conv_state;
-        mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
-        auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
-        ctx().register_sink(conv_assign);
+        auto q_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(q_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
+        auto k_ss = Tensor(std::make_shared<ov::op::v1::ReduceSum>(k_f32.pow(2.0f).output(), reduce_kdim, true), op_ctx);
+        auto q_normed = q_f32 * (q_ss + 1e-6f).rsqrt();
+        auto k_normed = k_f32 * (k_ss + 1e-6f).rsqrt();
+        auto q_scaled = q_normed * (1.0f / std::sqrt(static_cast<float>(head_k_dim_)));
+
+        auto q_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
+        auto k_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_k_dim_});
+        auto v_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_, head_v_dim_});
+        auto g_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
+        auto b_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, num_v_heads_});
+        auto state_t = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, num_v_heads_, head_k_dim_, head_v_dim_});
+
+        auto axis_seq = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+        auto q_s = std::make_shared<ov::op::v0::Squeeze>(q_t, axis_seq);
+        auto k_s = std::make_shared<ov::op::v0::Squeeze>(k_t, axis_seq);
+        auto v_s = std::make_shared<ov::op::v0::Squeeze>(v_t, axis_seq);
+        auto g_s = std::make_shared<ov::op::v0::Squeeze>(g_t, axis_seq);
+        auto b_s = std::make_shared<ov::op::v0::Squeeze>(b_t, axis_seq);
+
+        auto g_exp = std::make_shared<ov::op::v0::Exp>(g_s);
+        auto g_exp_u1 = std::make_shared<ov::op::v0::Unsqueeze>(g_exp, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto g_exp_e = std::make_shared<ov::op::v0::Unsqueeze>(g_exp_u1, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto state_decay = std::make_shared<ov::op::v1::Multiply>(state_t, g_exp_e, ov::op::AutoBroadcastType::NUMPY);
+
+        auto k_uns = std::make_shared<ov::op::v0::Unsqueeze>(k_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto state_k = std::make_shared<ov::op::v1::Multiply>(state_decay, k_uns, ov::op::AutoBroadcastType::NUMPY);
+        auto kv_mem = std::make_shared<ov::op::v1::ReduceSum>(state_k,
+                                                               ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
+                                                               false);
+
+        auto b_uns = std::make_shared<ov::op::v0::Unsqueeze>(b_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto delta = std::make_shared<ov::op::v1::Multiply>(
+            std::make_shared<ov::op::v1::Subtract>(v_s, kv_mem, ov::op::AutoBroadcastType::NUMPY),
+            b_uns,
+            ov::op::AutoBroadcastType::NUMPY);
+
+        auto delta_uns = std::make_shared<ov::op::v0::Unsqueeze>(delta, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-2}));
+        auto outer = std::make_shared<ov::op::v1::Multiply>(k_uns, delta_uns, ov::op::AutoBroadcastType::NUMPY);
+        auto state_new = std::make_shared<ov::op::v1::Add>(state_decay, outer, ov::op::AutoBroadcastType::NUMPY);
+
+        auto q_uns = std::make_shared<ov::op::v0::Unsqueeze>(q_s, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
+        auto y_state = std::make_shared<ov::op::v1::Multiply>(state_new, q_uns, ov::op::AutoBroadcastType::NUMPY);
+        auto y_t_step = std::make_shared<ov::op::v1::ReduceSum>(y_state,
+                                                                ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}),
+                                                                false);
+        auto y_t_unsq = std::make_shared<ov::op::v0::Unsqueeze>(y_t_step, axis_seq);
+
+        auto state_result = std::make_shared<ov::op::v0::Result>(state_new);
+        auto y_result = std::make_shared<ov::op::v0::Result>(y_t_unsq);
+        auto body = std::make_shared<ov::Model>(ov::OutputVector{state_result->output(0), y_result->output(0)},
+                                                ov::ParameterVector{q_t, k_t, v_t, g_t, b_t, state_t});
+
+        auto ti = std::make_shared<ov::op::v0::TensorIterator>();
+        ti->set_body(body);
+        ti->set_sliced_input(q_t, q_scaled.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(k_t, k_normed.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(v_t, v_f32.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(g_t, g.output(), 0, 1, 1, -1, 1);
+        ti->set_sliced_input(b_t, beta.output(), 0, 1, 1, -1, 1);
+        ti->set_merged_input(state_t, recurrent_cached.output(), state_result);
+
+        auto recurrent_final = ti->get_iter_value(state_result, -1);
+        auto core_attn = ti->get_concatenated_slices(y_result, 0, 1, 1, -1, 1);
+        auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final, recurrent_var);
+        ctx().register_sink(recurrent_assign);
+
+        core_attn_tensor = Tensor(core_attn, op_ctx);
     }
 
-    auto mixed_bt = mixed_after_conv.permute({0, 2, 1});
-    auto q_conv = ops::slice(mixed_bt, 0, key_dim_, 1, 2);
-    auto k_conv = ops::slice(mixed_bt, key_dim_, key_dim_ * 2, 1, 2);
-    auto v_conv = ops::slice(mixed_bt, key_dim_ * 2, key_dim_ * 2 + value_dim_, 1, 2);
-
-    auto q_heads = q_conv.reshape({0, 0, num_k_heads_, head_k_dim_});
-    auto k_heads = k_conv.reshape({0, 0, num_k_heads_, head_k_dim_});
-    auto v_heads = v_conv.reshape({0, 0, num_v_heads_, head_v_dim_});
-
-    // if (ratio > 1) {
-    //     q_heads = ops::llm::repeat_kv(q_heads.permute({0, 2, 1, 3}), num_v_heads_, num_k_heads_, head_k_dim_)
-    //                   .permute({0, 2, 1, 3});
-    //     k_heads = ops::llm::repeat_kv(k_heads.permute({0, 2, 1, 3}), num_v_heads_, num_k_heads_, head_k_dim_)
-    //                   .permute({0, 2, 1, 3});
-    // }
-
-    // ── beta and g computation (identical to v1) ──
-    auto beta = Tensor(std::make_shared<ov::op::v0::Sigmoid>(b.to(ov::element::f32).output()), op_ctx);
-    auto softplus_in = a.to(ov::element::f32) + dt_bias().to(ov::element::f32);
-    auto softplus = Tensor(std::make_shared<ov::op::v4::SoftPlus>(softplus_in.output()), op_ctx);
-    auto g = -(a_log().to(ov::element::f32).exp() * softplus);
-
-    // ── recurrent state via ReadValue / Assign ──
-    auto recurrent_shape = shape::make({batch,
-                                        ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(num_v_heads_)}),
-                                        ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(head_k_dim_)}),
-                                        ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(head_v_dim_)})});
-    auto recurrent_init = shape::broadcast_to(Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx), recurrent_shape);
-
-    ov::op::util::VariableInfo recurrent_info{ov::PartialShape{-1, num_v_heads_, head_k_dim_, head_v_dim_},
-                                              ov::element::f32,
-                                              state_prefix + ".recurrent"};
-    auto recurrent_var = std::make_shared<ov::op::util::Variable>(recurrent_info);
-    auto recurrent_read = std::make_shared<ov::op::v6::ReadValue>(recurrent_init.output(), recurrent_var);
-    auto recurrent_cached = ops::gather(Tensor(recurrent_read->output(0), op_ctx), beam_idx, 0);
-
-    // ── ops::linear_attention replaces the TensorIterator loop ──
-    // linear_attention expects: q [B, S, H, K], k [B, S, H, K], v [B, S, H, V],
-    //                           beta [B, S, H], g [B, S, H], state [B, H, K, V]
-    // and returns: (output [B, S, H, V], new_state [B, H, K, V])
-    // Note: q/k/v are passed in their original dtype (f16/bf16); the OCL kernel
-    //       converts to float internally. Normalization is also done inside the kernel.
-    auto la_result = ops::linear_attention(q_heads, k_heads, v_heads, beta, g, recurrent_cached);
-    auto core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
-    auto recurrent_final = la_result.second;    // [B, num_v_heads, head_k_dim, head_v_dim]
-
-    auto recurrent_assign = std::make_shared<ov::opset13::Assign>(recurrent_final.output(), recurrent_var);
-    ctx().register_sink(recurrent_assign);
-
-    // ── post-processing: gated RMS norm + out projection ──
-    auto core_flat = core_attn_tensor.reshape({-1, head_v_dim_});
-    auto z_flat = z.reshape({-1, head_v_dim_});
-    auto gated = rms_norm_gated(core_flat, z_flat);
-    auto gated_4d = gated.reshape(shape::of(z), false);
+    auto gated_4d = rms_norm_gated(core_attn_tensor, z);
     auto merged = gated_4d.reshape({0, 0, value_dim_});
     return ops::linear(merged, out_proj_weight()).to(masked_hidden.dtype());
 }
@@ -1170,17 +686,12 @@ Qwen3NextDecoderLayer::Qwen3NextDecoderLayer(BuilderContext& ctx,
     if (layer_type_ == "full_attention") {
         self_attn_ = std::make_unique<Qwen3NextAttention>(ctx, "self_attn", cfg, this);
     } else if (layer_type_ == "linear_attention") {
-        linear_attn_ = std::make_unique<Qwen3NextGatedDeltaNet2>(ctx, "linear_attn", cfg, layer_idx, this);
+        linear_attn_ = std::make_unique<Qwen3NextGatedDeltaNet>(ctx, "linear_attn", cfg, layer_idx, this);
     } else {
         OPENVINO_THROW("Unsupported Qwen3Next layer type: ", layer_type_);
     }
 
-    const auto mlp_only = make_index_set(cfg.mlp_only_layers);
-    const int32_t sparse_step = cfg.decoder_sparse_step > 0 ? cfg.decoder_sparse_step : 1;
-    const bool use_moe = (cfg.num_experts > 0) &&
-                         (mlp_only.count(layer_idx) == 0) &&
-                         (((layer_idx + 1) % sparse_step) == 0);
-    if (use_moe) {
+    if (is_qwen3_next_moe_enabled(cfg, layer_idx)) {
         moe_mlp_ = std::make_unique<Qwen3NextSparseMoeBlock>(ctx, "mlp", cfg, this);
     } else {
         dense_mlp_ = std::make_unique<Qwen3NextMLP>(ctx, "mlp", cfg, cfg.intermediate_size, this);
@@ -1209,13 +720,12 @@ std::pair<Tensor, Tensor> Qwen3NextDecoderLayer::forward(const Tensor& hidden_st
 
     Tensor mixed;
     if (layer_type_ == "full_attention") {
-        mixed = self_attn_->forward(
-            normed,
-            beam_idx,
-            rope_cos,
-            rope_sin,
-            full_attention_mask,
-            precomputed_full_attn_sdpa_mask);
+        mixed = self_attn_->forward(normed,
+                                    beam_idx,
+                                    rope_cos,
+                                    rope_sin,
+                                    full_attention_mask,
+                                    precomputed_full_attn_sdpa_mask);
     } else {
         mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position);
     }
