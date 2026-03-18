@@ -234,6 +234,10 @@ if(ENABLE_OPENVINO_NEW_ARCH)
     target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_OPENVINO_NEW_ARCH=1)
 endif()
 
+if(ENABLE_MODELING_PRIVATE)
+    target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_MODELING_PRIVATE=1)
+endif()
+
 target_include_directories(${TARGET_NAME_OBJ}
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>"

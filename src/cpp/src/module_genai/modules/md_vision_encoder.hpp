@@ -12,7 +12,7 @@
 #if defined(ENABLE_MODELING_PRIVATE)
 
 #include "module_genai/modules/models/qwen3_5/qwen3_5config.hpp"
-#include "modeling/models/qwen3_omni/processing_qwen3_omni.hpp"
+#include "modeling_private/models/qwen3_omni/processing_qwen3_omni.hpp"
 #include "models/qwen3_omni/qwen3_omni_config.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 

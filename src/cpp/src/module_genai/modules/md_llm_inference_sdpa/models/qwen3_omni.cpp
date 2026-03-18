@@ -10,7 +10,7 @@
 
 #if defined(ENABLE_MODELING_PRIVATE)
 
-#    include "modeling/models/qwen3_omni/processing_qwen3_omni.hpp"
+#    include "modeling_private/models/qwen3_omni/processing_qwen3_omni.hpp"
 #    include "modeling/models/qwen3_vl/processing_qwen3_vl.hpp"
 #    include "module_genai/utils/com_utils.hpp"
 #    include "module_genai/utils/profiler.hpp"
