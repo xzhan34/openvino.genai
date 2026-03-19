@@ -3,6 +3,7 @@
 #include <openvino/runtime/properties.hpp>
 
 #include <stdexcept>
+#include <vector>
 
 #include "utils/vision_utils.hpp"
 #include "yaml-cpp/yaml.h"
@@ -80,16 +81,22 @@ inline ov::AnyMap parse_inputs_from_yaml_cfg_for_image_generation(const std::fil
 
 int main(int argc, char* argv[]) {
     try {
+        std::vector<std::string> args(argv, argv + argc);
+        auto usage_prompts = std::string{"Usage: "} + argv[0] +
+                             "  -cfg config.yaml \n"
+                             "  -cache_dir: [Optional] string path, default empty\n"
+                             "  -prompt: input prompt\n"
+                             "  --height: default 512\n"
+                             "  --width: default 512\n"
+                             "  --num_inference_steps: default 9\n"
+                             "  --guidance_scale: default 2.0\n"
+                             "  --max_sequence_length: default 512\n";
         if (argc <= 1) {
-            throw std::runtime_error(std::string{"Usage: "} + argv[0] + "\n"
-                                     "  -cfg config.yaml \n"
-                                     "  -cache_dir: [Optional] string path, default empty\n"
-                                     "  -prompt: input prompt\n"
-                                     "  --height: default 512\n"
-                                     "  --width: default 512\n"
-                                     "  --num_inference_steps: default 9\n"
-                                     "  --guidance_scale: default 2.0\n"
-                                     "  --max_sequence_length: default 512\n");
+            throw std::runtime_error(usage_prompts);
+        } else if (utils::contains_key("-h", args) ||
+                   utils::contains_key("--help", args)) {
+            std::cout << usage_prompts << std::endl;
+            return EXIT_SUCCESS;
         }
 
         std::filesystem::path config_path = utils::get_input_arg(argc, argv, "-cfg");
