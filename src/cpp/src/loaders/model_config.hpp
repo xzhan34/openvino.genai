@@ -200,6 +200,15 @@ struct ModelConfig {
     /// Audio encoder output embedding size (thinker_config.audio_config.output_dim)
     int32_t audio_output_dim = 0;
 
+    /// Audio encoder raw chunk size before CNN (thinker_config.audio_config.n_window)
+    int32_t audio_n_window = 0;
+
+    /// Audio encoder grouped attention window before flattening (thinker_config.audio_config.n_window_infer)
+    int32_t audio_n_window_infer = 0;
+
+    /// Audio encoder convolution batching hint (thinker_config.audio_config.conv_chunksize)
+    int32_t audio_conv_chunksize = 0;
+
     /// Audio encoder activation (thinker_config.audio_config.activation_function)
     std::string audio_hidden_act;
     

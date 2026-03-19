@@ -77,18 +77,33 @@ int64_t qwen3_asr_feat_extract_output_length(int64_t input_length) {
     return output_lengths;
 }
 
+int64_t qwen3_asr_audio_attention_window_length(int64_t n_window, int64_t n_window_infer) {
+    if (n_window <= 0 || n_window_infer <= 0) {
+        OPENVINO_THROW("Qwen3-ASR audio attention window inputs must be > 0");
+    }
+
+    const int64_t chunk_input_frames = n_window * 2;
+    const int64_t chunk_output_frames = qwen3_asr_feat_extract_output_length(chunk_input_frames);
+    const int64_t attention_group_factor = std::max<int64_t>(1, n_window_infer / chunk_input_frames);
+    return std::max<int64_t>(1, chunk_output_frames * attention_group_factor);
+}
+
 namespace {
 
-Tensor compute_cnn_output_lengths(const Tensor& input_lengths) {
+Tensor qwen3_asr_chunked_output_lengths(const Tensor& input_lengths) {
     auto* ctx = input_lengths.context();
+    auto lengths = input_lengths.to(ov::element::i64);
+    auto zero = Tensor(ops::const_scalar(ctx, int64_t{0}), ctx);
     auto one = Tensor(ops::const_scalar(ctx, int64_t{1}), ctx);
     auto two = Tensor(ops::const_scalar(ctx, int64_t{2}), ctx);
+    auto hundred = Tensor(ops::const_scalar(ctx, int64_t{100}), ctx);
+    auto thirteen = Tensor(ops::const_scalar(ctx, int64_t{13}), ctx);
 
-    auto lengths = input_lengths.to(ov::element::i64);
-    for (int i = 0; i < 3; ++i) {
-        lengths = ((lengths - one) / two) + one;
-    }
-    return lengths;
+    auto remainder = Tensor(std::make_shared<ov::op::v1::Mod>(lengths.output(), hundred.output()), ctx);
+    auto feat_lengths = ((remainder - one) / two) + one;
+    auto output_lengths = (((((feat_lengths - one) / two) + one - one) / two) + one) + ((lengths / hundred) * thirteen);
+    auto non_empty = ops::greater_equal(lengths, one);
+    return ops::where(non_empty, output_lengths, zero);
 }
 
 Tensor build_valid_mask(const Tensor& lengths, const Tensor& sequence_tensor) {
@@ -100,6 +115,37 @@ Tensor build_valid_mask(const Tensor& lengths, const Tensor& sequence_tensor) {
     return ops::less_equal(idx, len_minus_one);  // [B, T]
 }
 
+Tensor build_chunk_attention_mask(const Tensor& lengths,
+                                  const Tensor& sequence_tensor,
+                                  int64_t attention_window) {
+    auto* ctx = sequence_tensor.context();
+    auto seq_len = Tensor(shape::dim(sequence_tensor, 1), ctx).squeeze(0);
+    auto idx = ops::range(seq_len, 0, 1, ov::element::i64).unsqueeze(0);  // [1, T]
+    auto valid_mask = build_valid_mask(lengths, sequence_tensor);          // [B, T]
+
+    auto q_idx = idx.unsqueeze(2);  // [1, T, 1]
+    auto k_idx = idx.unsqueeze(1);  // [1, 1, T]
+
+    auto window = Tensor(ops::const_scalar(ctx, attention_window), ctx);
+    auto one = Tensor(ops::const_scalar(ctx, int64_t{1}), ctx);
+    auto q_block_start = (q_idx / window) * window;
+    auto q_block_end = q_block_start + window - one;
+
+    auto in_block_ge = ops::greater_equal(k_idx, q_block_start);
+    auto in_block_le = ops::less_equal(k_idx, q_block_end);
+    auto false_mask = Tensor(ops::const_scalar(ctx, false), ctx);
+    auto in_same_block = ops::where(in_block_ge, in_block_le, false_mask);
+
+    auto query_valid = valid_mask.unsqueeze(2);
+    auto key_valid = valid_mask.unsqueeze(1);
+    auto keys_allowed = ops::where(key_valid, in_same_block, false_mask);
+    auto allowed = ops::where(query_valid, keys_allowed, false_mask);
+
+    auto zero = Tensor(ops::const_scalar(ctx, 0.0f), ctx);
+    auto neg = Tensor(ops::const_scalar(ctx, -65504.0f), ctx);
+    return ops::where(allowed, zero, neg).unsqueeze(1);  // [B,1,T,T]
+}
+
 class Qwen3ASRAudioAttentionLite : public Module {
 public:
     Qwen3ASRAudioAttentionLite(BuilderContext& ctx,
@@ -109,6 +155,7 @@ public:
         : Module(name, ctx, parent),
           num_heads_(cfg.encoder_attention_heads),
           head_dim_(cfg.d_model / cfg.encoder_attention_heads),
+          attention_window_(qwen3_asr_audio_attention_window_length(cfg.n_window, cfg.n_window_infer)),
           scale_(1.0f / std::sqrt(static_cast<float>(head_dim_))) {
         q_proj_w_ = &register_parameter("q_proj.weight");
         q_proj_b_ = &register_parameter("q_proj.bias");
@@ -120,8 +167,7 @@ public:
         out_proj_b_ = &register_parameter("out_proj.bias");
     }
 
-    Tensor forward(const Tensor& hidden_states, const Tensor& valid_mask) const {
-        auto* op_ctx = hidden_states.context();
+    Tensor forward(const Tensor& hidden_states, const Tensor& lengths) const {
         auto q = ops::linear(hidden_states, q_proj_w_->value()) + q_proj_b_->value();
         auto k = ops::linear(hidden_states, k_proj_w_->value()) + k_proj_b_->value();
         auto v = ops::linear(hidden_states, v_proj_w_->value()) + v_proj_b_->value();
@@ -130,9 +176,9 @@ public:
         auto kh = k.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
         auto vh = v.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
 
-        auto zero = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx);
-        auto neg = Tensor(ops::const_scalar(op_ctx, -65504.0f), op_ctx);
-        auto pad_mask = ops::where(valid_mask, zero, neg).unsqueeze({1, 2});  // [B,1,1,T]
+        // Match the reference encoder's non-FA2 path: allow attention only
+        // inside fixed post-CNN windows, not across the full valid sequence.
+        auto pad_mask = build_chunk_attention_mask(lengths, hidden_states, attention_window_);
 
         auto attn = ops::llm::sdpa(qh, kh, vh, scale_, 3, &pad_mask, false, &ctx().op_policy());
         auto merged = attn.permute({0, 2, 1, 3}).reshape({0, 0, static_cast<int64_t>(num_heads_ * head_dim_)});
@@ -142,6 +188,7 @@ public:
 private:
     int32_t num_heads_ = 0;
     int32_t head_dim_ = 0;
+    int64_t attention_window_ = 1;
     float scale_ = 1.0f;
 
     WeightParameter* q_proj_w_ = nullptr;
@@ -172,9 +219,9 @@ public:
         ln2_b_ = &register_parameter("final_layer_norm.bias");
     }
 
-    Tensor forward(const Tensor& x, const Tensor& valid_mask, const std::string& activation) const {
+    Tensor forward(const Tensor& x, const Tensor& lengths, const Tensor& valid_mask, const std::string& activation) const {
         auto norm1 = ops::nn::layer_norm(x, ln1_w_->value(), &ln1_b_->value(), 1e-5f, -1);
-        auto attn = self_attn_.forward(norm1, valid_mask);
+        auto attn = self_attn_.forward(norm1, lengths);
         auto h = x + attn;
 
         auto norm2 = ops::nn::layer_norm(h, ln2_w_->value(), &ln2_b_->value(), 1e-5f, -1);
@@ -234,32 +281,77 @@ public:
     }
 
     std::pair<Tensor, Tensor> forward(const Tensor& input_features, const Tensor& audio_feature_lengths) const {
-        // input_features: [B, mel, T]
-        auto x = input_features.unsqueeze(1);  // [B,1,mel,T]
+        // Match the reference encoder: split raw mel frames into fixed-size chunks
+        // before the conv stem so positional embedding restarts per chunk.
+        auto* op_ctx = input_features.context();
+        auto batch_dim = shape::dim(input_features, 0);
+        auto mel_dim = shape::dim(input_features, 1);
+        auto time_dim = Tensor(shape::dim(input_features, 2), op_ctx).squeeze(0);
+        auto batch_size = Tensor(shape::dim(input_features, 0), op_ctx).squeeze(0);
+        auto chunk_input_frames = Tensor(ops::const_scalar(op_ctx, int64_t{cfg_.n_window * 2}), op_ctx);
+        auto one = Tensor(ops::const_scalar(op_ctx, int64_t{1}), op_ctx);
+        auto zero_f = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx);
+
+        auto max_chunks = (time_dim + chunk_input_frames - one) / chunk_input_frames;
+        auto padded_time = max_chunks * chunk_input_frames;
+        auto pad_time = padded_time - time_dim;
+        auto pad_tensor = shape::broadcast_to(zero_f,
+                                              shape::make({batch_dim,
+                                                           mel_dim,
+                                                           pad_time.unsqueeze(0).output()}));
+        auto padded_features = ops::concat({input_features, pad_tensor}, 2);
+
+        auto chunk_shape = shape::make({batch_dim,
+                                        mel_dim,
+                                        max_chunks.unsqueeze(0).output(),
+                                        ops::const_vec(op_ctx, std::vector<int64_t>{cfg_.n_window * 2})});
+        auto chunked = padded_features.reshape(chunk_shape, false).permute({0, 2, 1, 3});  // [B,C,mel,Tc]
+
+        auto batch_chunks = batch_size * max_chunks;
+        auto chunk_batch_shape = shape::make({batch_chunks.unsqueeze(0).output(),
+                                              ops::const_vec(op_ctx, std::vector<int64_t>{1}),
+                                              mel_dim,
+                                              ops::const_vec(op_ctx, std::vector<int64_t>{cfg_.n_window * 2})});
+        auto x = chunked.reshape(chunk_batch_shape, false);  // [B*C,1,mel,Tc]
 
         x = ops::nn::gelu(ops::nn::conv2d(x, conv2d1_w_->value(), conv2d1_b_->value(), {2, 2}, {1, 1}, {1, 1}), true);
         x = ops::nn::gelu(ops::nn::conv2d(x, conv2d2_w_->value(), conv2d2_b_->value(), {2, 2}, {1, 1}, {1, 1}), true);
         x = ops::nn::gelu(ops::nn::conv2d(x, conv2d3_w_->value(), conv2d3_b_->value(), {2, 2}, {1, 1}, {1, 1}), true);
 
-        // [B,C,F,T] -> [B,T,C,F] -> [B,T,C*F]
+        // [B*C,C,F,T] -> [B*C,T,C,F] -> [B*C,T,D]
         x = x.permute({0, 3, 1, 2});
         x = x.reshape({0, 0, -1});
         x = ops::linear(x, conv_out_w_->value());
 
-        // Add sinusoidal positional embedding
-        auto* op_ctx = x.context();
-        auto t = Tensor(shape::dim(x, 1), op_ctx).squeeze(0);
-        auto pos_idx = ops::range(t, 0, 1, ov::element::i64);
-        auto pos = ops::gather(positional_const_, pos_idx, 0);  // [T, D]
+        auto chunk_time = Tensor(shape::dim(x, 1), op_ctx).squeeze(0);
+        auto pos_idx = ops::range(chunk_time, 0, 1, ov::element::i64);
+        auto pos = ops::gather(positional_const_, pos_idx, 0);  // [Tc', D]
         auto pos_b = shape::broadcast_to(pos.unsqueeze(0), shape::make({shape::dim(x, 0), shape::dim(x, 1), shape::dim(x, 2)}));
         x = x + pos_b.to(x.dtype());
 
-        auto cnn_lengths = compute_cnn_output_lengths(audio_feature_lengths);
-        auto valid_mask = build_valid_mask(cnn_lengths, x);  // [B, T]
+        auto chunked_seq_shape = shape::make({batch_dim,
+                                              max_chunks.unsqueeze(0).output(),
+                                              shape::dim(x, 1),
+                                              shape::dim(x, 2)});
+        x = x.reshape(chunked_seq_shape, false);
+        auto stitched_time = max_chunks * chunk_time;
+        auto stitched_shape = shape::make({batch_dim,
+                                           stitched_time.unsqueeze(0).output(),
+                                           shape::dim(x, 3)});
+        x = x.reshape(stitched_shape, false);
 
+        auto cnn_lengths = qwen3_asr_chunked_output_lengths(audio_feature_lengths);
+        auto max_valid_len = Tensor(std::make_shared<ov::op::v1::ReduceMax>(cnn_lengths.output(),
+                                                                            ops::const_vec(op_ctx, std::vector<int64_t>{0}),
+                                                                            false),
+                                    op_ctx);
+        auto trim_idx = ops::range(max_valid_len, 0, 1, ov::element::i64);
+        x = ops::gather(x, trim_idx, 1);
+
+        auto valid_mask = build_valid_mask(cnn_lengths, x);  // [B, T]
         x = x * valid_mask.unsqueeze(2).to(x.dtype());
         for (const auto& layer : layers_) {
-            x = layer.forward(x, valid_mask, cfg_.activation_function);
+            x = layer.forward(x, cnn_lengths, valid_mask, cfg_.activation_function);
         }
 
         x = ops::nn::layer_norm(x, ln_post_w_->value(), &ln_post_b_->value(), 1e-5f, -1);
@@ -456,15 +548,17 @@ std::shared_ptr<ov::Model> build_qwen3_asr_audio_encoder_model(
 
     Qwen3ASRAudioConfig cfg;
     cfg.architecture = "qwen3_asr_audio_encoder";
-    cfg.d_model = config.hidden_size > 0 ? config.hidden_size : 1280;
-    cfg.encoder_layers = config.num_hidden_layers > 0 ? config.num_hidden_layers : 32;
-    cfg.encoder_attention_heads = config.num_attention_heads > 0 ? config.num_attention_heads : 20;
-    cfg.encoder_ffn_dim = config.intermediate_size > 0 ? config.intermediate_size : 5120;
-    cfg.max_source_positions = config.max_position_embeddings > 0 ? config.max_position_embeddings : 1500;
-    cfg.num_mel_bins = 128;
-    cfg.downsample_hidden_size = 480;
-    cfg.output_dim = 3584;
-    cfg.activation_function = config.hidden_act.empty() ? "gelu" : config.hidden_act;
+    cfg.num_mel_bins = config.audio_num_mel_bins > 0 ? config.audio_num_mel_bins : 128;
+    cfg.d_model = config.audio_hidden_size > 0 ? config.audio_hidden_size : (config.hidden_size > 0 ? config.hidden_size : 1280);
+    cfg.encoder_layers = config.audio_num_hidden_layers > 0 ? config.audio_num_hidden_layers : (config.num_hidden_layers > 0 ? config.num_hidden_layers : 32);
+    cfg.encoder_attention_heads = config.audio_num_attention_heads > 0 ? config.audio_num_attention_heads : (config.num_attention_heads > 0 ? config.num_attention_heads : 20);
+    cfg.encoder_ffn_dim = config.audio_intermediate_size > 0 ? config.audio_intermediate_size : (config.intermediate_size > 0 ? config.intermediate_size : 5120);
+    cfg.max_source_positions = config.audio_max_position_embeddings > 0 ? config.audio_max_position_embeddings : (config.max_position_embeddings > 0 ? config.max_position_embeddings : 1500);
+    cfg.downsample_hidden_size = config.audio_downsample_hidden_size > 0 ? config.audio_downsample_hidden_size : 480;
+    cfg.output_dim = config.audio_output_dim > 0 ? config.audio_output_dim : 3584;
+    cfg.n_window = config.audio_n_window > 0 ? config.audio_n_window : cfg.n_window;
+    cfg.n_window_infer = config.audio_n_window_infer > 0 ? config.audio_n_window_infer : cfg.n_window_infer;
+    cfg.activation_function = !config.audio_hidden_act.empty() ? config.audio_hidden_act : (config.hidden_act.empty() ? "gelu" : config.hidden_act);
     return create_qwen3_asr_audio_encoder_model(cfg, weight_source, weight_finalizer);
 }
 

@@ -47,6 +47,14 @@ TEST(Qwen3ASRModeling, FeatureLengthFormulaBasicCases) {
     }
 }
 
+TEST(Qwen3ASRModeling, AudioAttentionWindowMatchesReferenceDefaults) {
+      using ov::genai::modeling::models::qwen3_asr_audio_attention_window_length;
+
+      EXPECT_EQ(qwen3_asr_audio_attention_window_length(100, 400), 52);
+      EXPECT_EQ(qwen3_asr_audio_attention_window_length(100, 200), 26);
+      EXPECT_EQ(qwen3_asr_audio_attention_window_length(100, 100), 26);
+}
+
 TEST(Qwen3ASRModeling, ModelConfigParsesNestedThinkerTextConfig) {
     namespace fs = std::filesystem;
 
@@ -120,6 +128,10 @@ TEST(Qwen3ASRModeling, ModelConfigParsesNestedThinkerTextConfig) {
     EXPECT_EQ(cfg.num_attention_heads, 20);
     EXPECT_EQ(cfg.max_position_embeddings, 1500);
     EXPECT_EQ(cfg.hidden_act, "gelu");
+    EXPECT_EQ(cfg.audio_num_mel_bins, 128);
+    EXPECT_EQ(cfg.audio_hidden_size, 1280);
+    EXPECT_EQ(cfg.audio_num_hidden_layers, 32);
+    EXPECT_EQ(cfg.audio_num_attention_heads, 20);
 
     std::error_code ec;
     fs::remove(tmp, ec);
@@ -206,6 +218,78 @@ TEST(Qwen3ASRModeling, ModelConfigParsesNestedThinkerTextConfig) {
     EXPECT_EQ(model->output(0).get_partial_shape().rank().get_length(), 3);
     EXPECT_EQ(model->output(1).get_partial_shape().rank().get_length(), 1);
   }
+
+TEST(Qwen3ASRModeling, AudioEncoderTrimsOutputsToChunkedReferenceLength) {
+      ov::genai::modeling::models::Qwen3ASRAudioConfig cfg;
+      cfg.num_mel_bins = 8;
+      cfg.d_model = 4;
+      cfg.encoder_layers = 1;
+      cfg.encoder_attention_heads = 2;
+      cfg.encoder_ffn_dim = 8;
+      cfg.output_dim = 6;
+      cfg.max_source_positions = 64;
+      cfg.downsample_hidden_size = 2;
+      cfg.activation_function = "gelu";
+
+      const size_t conv_out_in = static_cast<size_t>(cfg.downsample_hidden_size) *
+                                             static_cast<size_t>(((((cfg.num_mel_bins + 1) / 2 + 1) / 2 + 1) / 2));
+
+      test_utils::DummyWeightSource weights;
+      weights.add("audio_tower.conv2d1.weight", test_utils::make_tensor(test_utils::make_seq(2 * 1 * 3 * 3, 0.01f, 0.001f), {2, 1, 3, 3}));
+      weights.add("audio_tower.conv2d1.bias", test_utils::make_tensor(test_utils::make_seq(2, 0.0f, 0.0f), {2}));
+      weights.add("audio_tower.conv2d2.weight", test_utils::make_tensor(test_utils::make_seq(2 * 2 * 3 * 3, 0.01f, 0.001f), {2, 2, 3, 3}));
+      weights.add("audio_tower.conv2d2.bias", test_utils::make_tensor(test_utils::make_seq(2, 0.0f, 0.0f), {2}));
+      weights.add("audio_tower.conv2d3.weight", test_utils::make_tensor(test_utils::make_seq(2 * 2 * 3 * 3, 0.01f, 0.001f), {2, 2, 3, 3}));
+      weights.add("audio_tower.conv2d3.bias", test_utils::make_tensor(test_utils::make_seq(2, 0.0f, 0.0f), {2}));
+      weights.add("audio_tower.conv_out.weight", test_utils::make_tensor(test_utils::make_seq(4 * conv_out_in, 0.01f, 0.001f), {4, conv_out_in}));
+
+      weights.add("audio_tower.layers[0].self_attn.q_proj.weight", test_utils::make_tensor(test_utils::make_seq(4 * 4, 0.01f, 0.001f), {4, 4}));
+      weights.add("audio_tower.layers[0].self_attn.q_proj.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].self_attn.k_proj.weight", test_utils::make_tensor(test_utils::make_seq(4 * 4, 0.01f, 0.001f), {4, 4}));
+      weights.add("audio_tower.layers[0].self_attn.k_proj.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].self_attn.v_proj.weight", test_utils::make_tensor(test_utils::make_seq(4 * 4, 0.01f, 0.001f), {4, 4}));
+      weights.add("audio_tower.layers[0].self_attn.v_proj.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].self_attn.out_proj.weight", test_utils::make_tensor(test_utils::make_seq(4 * 4, 0.01f, 0.001f), {4, 4}));
+      weights.add("audio_tower.layers[0].self_attn.out_proj.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].self_attn_layer_norm.weight", test_utils::make_tensor(test_utils::make_seq(4, 1.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].self_attn_layer_norm.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].final_layer_norm.weight", test_utils::make_tensor(test_utils::make_seq(4, 1.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].final_layer_norm.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.layers[0].fc1.weight", test_utils::make_tensor(test_utils::make_seq(8 * 4, 0.01f, 0.001f), {8, 4}));
+      weights.add("audio_tower.layers[0].fc1.bias", test_utils::make_tensor(test_utils::make_seq(8, 0.0f, 0.0f), {8}));
+      weights.add("audio_tower.layers[0].fc2.weight", test_utils::make_tensor(test_utils::make_seq(4 * 8, 0.01f, 0.001f), {4, 8}));
+      weights.add("audio_tower.layers[0].fc2.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.ln_post.weight", test_utils::make_tensor(test_utils::make_seq(4, 1.0f, 0.0f), {4}));
+      weights.add("audio_tower.ln_post.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.proj1.weight", test_utils::make_tensor(test_utils::make_seq(4 * 4, 0.01f, 0.001f), {4, 4}));
+      weights.add("audio_tower.proj1.bias", test_utils::make_tensor(test_utils::make_seq(4, 0.0f, 0.0f), {4}));
+      weights.add("audio_tower.proj2.weight", test_utils::make_tensor(test_utils::make_seq(6 * 4, 0.01f, 0.001f), {6, 4}));
+      weights.add("audio_tower.proj2.bias", test_utils::make_tensor(test_utils::make_seq(6, 0.0f, 0.0f), {6}));
+
+      test_utils::DummyWeightFinalizer finalizer;
+      auto model = ov::genai::modeling::models::create_qwen3_asr_audio_encoder_model(cfg, weights, finalizer);
+      ASSERT_NE(model, nullptr);
+
+      ov::Core core;
+      auto compiled = core.compile_model(model, "CPU");
+      auto request = compiled.create_infer_request();
+
+      ov::Tensor features(ov::element::f32, ov::Shape{1, static_cast<size_t>(cfg.num_mel_bins), 256});
+      std::fill(features.data<float>(), features.data<float>() + features.get_size(), 0.0f);
+      ov::Tensor lengths(ov::element::i64, ov::Shape{1});
+      lengths.data<int64_t>()[0] = 256;
+
+      request.set_tensor("input_audio_features", features);
+      request.set_tensor("audio_feature_lengths", lengths);
+      request.infer();
+
+      const auto audio_embeds = request.get_tensor("audio_embeds");
+      const auto audio_lengths = request.get_tensor("audio_output_lengths");
+
+      ASSERT_EQ(audio_lengths.get_shape(), ov::Shape({1}));
+      EXPECT_EQ(audio_lengths.data<const int64_t>()[0], 33);
+      EXPECT_EQ(audio_embeds.get_shape(), ov::Shape({1, 33, 6}));
+}
 
   TEST(Qwen3ASRModeling, TextModelBuildsWithThinkerPrefixedWeightsAndAudioInputs) {
     // Tiny text config for build-time smoke test.
