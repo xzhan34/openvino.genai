@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <openvino/openvino.hpp>
@@ -41,7 +42,27 @@ std::string build_prompt(const std::string& user_prompt, int64_t image_tokens) {
     return prompt;
 }
 
-int64_t argmax_last_token(const ov::Tensor& logits) {
+// Apply repetition penalty to logits (f32 buffer) in-place.
+// For tokens in penalty_set: positive logits are divided by penalty, negative are multiplied.
+void apply_repetition_penalty(float* logits,
+                              size_t vocab,
+                              const std::unordered_set<int64_t>& penalty_set,
+                              float penalty) {
+    if (penalty == 1.0f || penalty_set.empty()) return;
+    for (int64_t token_id : penalty_set) {
+        if (static_cast<size_t>(token_id) >= vocab) continue;
+        float& val = logits[static_cast<size_t>(token_id)];
+        if (val >= 0.0f) {
+            val /= penalty;
+        } else {
+            val *= penalty;
+        }
+    }
+}
+
+int64_t argmax_with_penalty(const ov::Tensor& logits,
+                            const std::unordered_set<int64_t>& penalty_set,
+                            float repetition_penalty) {
     const auto shape = logits.get_shape();
     if (shape.size() != 3) {
         throw std::runtime_error("logits must have shape [B, S, V]");
@@ -53,39 +74,28 @@ int64_t argmax_last_token(const ov::Tensor& logits) {
     const size_t vocab = shape[2];
     const size_t offset = (seq_len - 1) * vocab;
 
+    // Convert last-token logits to f32 for penalty application
+    std::vector<float> buf(vocab);
     if (logits.get_element_type() == ov::element::f16) {
         const auto* data = logits.data<const ov::float16>() + offset;
-        ov::float16 max_val = data[0];
-        size_t max_idx = 0;
-        for (size_t i = 1; i < vocab; ++i) {
-            if (data[i] > max_val) {
-                max_val = data[i];
-                max_idx = i;
-            }
-        }
-        return static_cast<int64_t>(max_idx);
-    }
-    if (logits.get_element_type() == ov::element::bf16) {
+        for (size_t i = 0; i < vocab; ++i) buf[i] = static_cast<float>(data[i]);
+    } else if (logits.get_element_type() == ov::element::bf16) {
         const auto* data = logits.data<const ov::bfloat16>() + offset;
-        ov::bfloat16 max_val = data[0];
-        size_t max_idx = 0;
-        for (size_t i = 1; i < vocab; ++i) {
-            if (data[i] > max_val) {
-                max_val = data[i];
-                max_idx = i;
-            }
-        }
-        return static_cast<int64_t>(max_idx);
-    }
-    if (logits.get_element_type() != ov::element::f32) {
+        for (size_t i = 0; i < vocab; ++i) buf[i] = static_cast<float>(data[i]);
+    } else if (logits.get_element_type() == ov::element::f32) {
+        const auto* data = logits.data<const float>() + offset;
+        std::copy(data, data + vocab, buf.begin());
+    } else {
         throw std::runtime_error("Unsupported logits dtype");
     }
-    const auto* data = logits.data<const float>() + offset;
-    float max_val = data[0];
+
+    apply_repetition_penalty(buf.data(), vocab, penalty_set, repetition_penalty);
+
+    float max_val = buf[0];
     size_t max_idx = 0;
     for (size_t i = 1; i < vocab; ++i) {
-        if (data[i] > max_val) {
-            max_val = data[i];
+        if (buf[i] > max_val) {
+            max_val = buf[i];
             max_idx = i;
         }
     }
@@ -126,7 +136,7 @@ bool is_eos(int64_t token_id, const std::vector<int32_t>& eos_ids) {
 int main(int argc, char* argv[]) try {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] "
+                  << " <MODEL_DIR> <IMAGE_PATH> [PROMPT] [DEVICE] [MAX_NEW_TOKENS] [REPETITION_PENALTY] "
                   << "[VISION_QUANT] [VISION_GS] [VISION_BACKUP] "
                   << "[TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP]\n";
         return 1;
@@ -137,15 +147,16 @@ int main(int argc, char* argv[]) try {
     const std::string user_prompt = (argc > 3) ? argv[3] : "<|begin_of_image|><|image|><|end_of_image|>\nConvert the document to markdown./nothink";
     const std::string device = (argc > 4) ? argv[4] : "GPU";
     const int max_new_tokens = (argc > 5) ? std::stoi(argv[5]) : 300;
+    const float repetition_penalty = (argc > 6) ? std::stof(argv[6]) : 1.1f;
 
     // Optional quantization args
-    std::string vision_quant_mode = (argc > 6) ? argv[6] : "";
-    int vision_group_size = (argc > 7) ? std::stoi(argv[7]) : 128;
-    std::string vision_backup_mode = (argc > 8) ? argv[8] : "";
+    std::string vision_quant_mode = (argc > 7) ? argv[7] : "";
+    int vision_group_size = (argc > 8) ? std::stoi(argv[8]) : 128;
+    std::string vision_backup_mode = (argc > 9) ? argv[9] : "";
 
-    std::string text_quant_mode = (argc > 9) ? argv[9] : "";
-    int text_group_size = (argc > 10) ? std::stoi(argv[10]) : 128;
-    std::string text_backup_mode = (argc > 11) ? argv[11] : "";
+    std::string text_quant_mode = (argc > 10) ? argv[10] : "";
+    int text_group_size = (argc > 11) ? std::stoi(argv[11]) : 128;
+    std::string text_backup_mode = (argc > 12) ? argv[12] : "";
 
     auto vision_quant_config = create_quantization_config(vision_quant_mode, vision_group_size, vision_backup_mode);
     auto text_quant_config = create_quantization_config(text_quant_mode, text_group_size, text_backup_mode);
@@ -226,11 +237,22 @@ int main(int argc, char* argv[]) try {
     text_request.infer();
 
     ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::GlmOcrTextIO::kLogits);
-    int64_t next_id = argmax_last_token(logits);
+
+    // Build penalty set from prompt tokens + generated tokens
+    std::unordered_set<int64_t> penalty_set;
+    {
+        const int64_t* prompt_ids = input_ids.data<const int64_t>();
+        for (size_t i = 0; i < input_ids.get_size(); ++i) {
+            penalty_set.insert(prompt_ids[i]);
+        }
+    }
+
+    int64_t next_id = argmax_with_penalty(logits, penalty_set, repetition_penalty);
     const auto prefill_end = std::chrono::steady_clock::now();
     std::vector<int64_t> generated;
     generated.reserve(static_cast<size_t>(max_new_tokens));
     generated.push_back(next_id);
+    penalty_set.insert(next_id);
 
     ov::Tensor step_ids(ov::element::i64, {batch, 1});
     ov::Tensor step_mask(ov::element::i64, {batch, 1});
@@ -268,8 +290,9 @@ int main(int argc, char* argv[]) try {
 
         text_request.infer();
         logits = text_request.get_tensor(ov::genai::modeling::models::GlmOcrTextIO::kLogits);
-        next_id = argmax_last_token(logits);
+        next_id = argmax_with_penalty(logits, penalty_set, repetition_penalty);
         generated.push_back(next_id);
+        penalty_set.insert(next_id);
         decode_steps += 1;
         past_len += 1;
     }
@@ -286,6 +309,7 @@ int main(int argc, char* argv[]) try {
                                   : 0.0;
 
     std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Repetition penalty: " << repetition_penalty << std::endl;
     std::cout << "Prompt token size: " << prompt_len << std::endl;
     std::cout << "Output token size: " << generated.size() << std::endl;
     std::cout << "Preprocess time: " << preprocess_ms << " ms" << std::endl;
