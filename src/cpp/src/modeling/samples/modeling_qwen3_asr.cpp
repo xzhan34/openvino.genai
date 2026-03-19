@@ -298,6 +298,8 @@ ov::genai::modeling::models::Qwen3ASRAudioConfig to_audio_cfg(const ov::genai::l
                                                                       : (cfg.max_position_embeddings > 0 ? cfg.max_position_embeddings : out.max_source_positions);
     out.downsample_hidden_size = cfg.audio_downsample_hidden_size > 0 ? cfg.audio_downsample_hidden_size : out.downsample_hidden_size;
     out.output_dim = cfg.audio_output_dim > 0 ? cfg.audio_output_dim : out.output_dim;
+    out.n_window = cfg.audio_n_window > 0 ? cfg.audio_n_window : out.n_window;
+    out.n_window_infer = cfg.audio_n_window_infer > 0 ? cfg.audio_n_window_infer : out.n_window_infer;
     out.activation_function = !cfg.audio_hidden_act.empty() ? cfg.audio_hidden_act
                                                              : (cfg.hidden_act.empty() ? out.activation_function : cfg.hidden_act);
 
@@ -769,6 +771,8 @@ int main(int argc, char* argv[]) try {
             text_only = true;
         } else if (arg == "--cached-model" || arg == "--cache-model") {
             cache_model = true;
+        } else if (arg.rfind("--", 0) == 0) {
+            throw std::runtime_error("Unknown option: " + arg);
         } else {
             positional.push_back(arg);
         }

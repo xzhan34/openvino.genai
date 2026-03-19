@@ -58,6 +58,8 @@ struct Qwen3ASRAudioConfig {
     int32_t output_dim = 3584;
     int32_t max_source_positions = 1500;
     int32_t downsample_hidden_size = 480;
+    int32_t n_window = 100;
+    int32_t n_window_infer = 400;
     std::string activation_function = "gelu";
 };
 
@@ -81,6 +83,10 @@ struct Qwen3ASRAudioIO {
 
 // Same formula used by vLLM Qwen3-ASR multimodal processor.
 int64_t qwen3_asr_feat_extract_output_length(int64_t input_length);
+
+// Reference audio encoder attends within fixed post-CNN windows derived from
+// n_window and n_window_infer in the HF config.
+int64_t qwen3_asr_audio_attention_window_length(int64_t n_window, int64_t n_window_infer);
 
 std::shared_ptr<ov::Model> create_qwen3_asr_text_model(
     const Qwen3ASRTextConfig& cfg,

@@ -332,6 +332,9 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
                 config.audio_max_position_embeddings = extract_json_int(audio_json, "max_source_positions", 0);
                 config.audio_downsample_hidden_size = extract_json_int(audio_json, "downsample_hidden_size", 0);
                 config.audio_output_dim = extract_json_int(audio_json, "output_dim", 0);
+                config.audio_n_window = extract_json_int(audio_json, "n_window", 0);
+                config.audio_n_window_infer = extract_json_int(audio_json, "n_window_infer", 0);
+                config.audio_conv_chunksize = extract_json_int(audio_json, "conv_chunksize", 0);
                 config.audio_hidden_act = extract_json_string(audio_json, "activation_function");
             }
         }
@@ -355,6 +358,18 @@ ModelConfig ModelConfig::from_hf_json(const std::filesystem::path& config_path) 
         if (config.hidden_act.empty()) {
             config.hidden_act = "gelu";
         }
+        config.audio_num_mel_bins = extract_json_int(json, "num_mel_bins", 0);
+        config.audio_hidden_size = config.hidden_size;
+        config.audio_intermediate_size = config.intermediate_size;
+        config.audio_num_hidden_layers = config.num_hidden_layers;
+        config.audio_num_attention_heads = config.num_attention_heads;
+        config.audio_max_position_embeddings = config.max_position_embeddings;
+        config.audio_downsample_hidden_size = extract_json_int(json, "downsample_hidden_size", 0);
+        config.audio_output_dim = extract_json_int(json, "output_dim", 0);
+        config.audio_n_window = extract_json_int(json, "n_window", 0);
+        config.audio_n_window_infer = extract_json_int(json, "n_window_infer", 0);
+        config.audio_conv_chunksize = extract_json_int(json, "conv_chunksize", 0);
+        config.audio_hidden_act = config.hidden_act;
         return config;
     }
 
