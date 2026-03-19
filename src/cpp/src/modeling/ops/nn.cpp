@@ -5,6 +5,7 @@
 
 #include <openvino/op/interpolate.hpp>
 #include <openvino/opsets/opset13.hpp>
+#include <ov_ops/rms.hpp>
 
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
@@ -171,6 +172,18 @@ Tensor layer_norm(const Tensor& input,
                   float eps,
                   int64_t axis) {
     return layer_norm(input, weight, nullptr, eps, axis);
+}
+
+Tensor rms_norm(const Tensor& input,
+                const Tensor& weight,
+                float eps,
+                int64_t /* axis */) {
+    auto orig_dtype = input.dtype();
+    auto xf = input.to(ov::element::f32);
+    auto wf = weight.to(ov::element::f32);
+    auto rms_node = std::make_shared<ov::op::internal::RMS>(
+        xf.output(), wf.output(), static_cast<double>(eps), orig_dtype);
+    return Tensor(rms_node->output(0), input.context());
 }
 
 Tensor group_norm(const Tensor& input,

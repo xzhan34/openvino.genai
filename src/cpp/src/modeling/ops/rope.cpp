@@ -87,6 +87,30 @@ Tensor mrope_interleaved(const Tensor& freqs, const std::vector<int32_t>& mrope_
     return out;
 }
 
+Tensor mrope_chunked(const Tensor& freqs, const std::vector<int32_t>& mrope_section) {
+    if (mrope_section.size() != 3) {
+        OPENVINO_THROW("mrope_chunked expects mrope_section size 3");
+    }
+    auto* ctx = freqs.context();
+    // freqs shape: [3, batch, seq, half_dim]
+    // Extract temporal (0), height (1), width (2) components
+    auto t = ops::slice(freqs, 0, 1, 1, 0).squeeze(0);  // [batch, seq, half_dim]
+    auto h = ops::slice(freqs, 1, 2, 1, 0).squeeze(0);
+    auto w = ops::slice(freqs, 2, 3, 1, 0).squeeze(0);
+
+    const int64_t s0 = static_cast<int64_t>(mrope_section[0]);
+    const int64_t s1 = static_cast<int64_t>(mrope_section[1]);
+    const int64_t s2 = static_cast<int64_t>(mrope_section[2]);
+
+    // Slice contiguous blocks from each component along the last dim
+    auto t_chunk = ops::slice(t, 0, s0, 1, 2);                // [batch, seq, s0]
+    auto h_chunk = ops::slice(h, s0, s0 + s1, 1, 2);          // [batch, seq, s1]
+    auto w_chunk = ops::slice(w, s0 + s1, s0 + s1 + s2, 1, 2); // [batch, seq, s2]
+
+    // Concatenate: [batch, seq, s0+s1+s2] = [batch, seq, half_dim]
+    return ops::concat({t_chunk, h_chunk, w_chunk}, 2);
+}
+
 }  // namespace rope
 }  // namespace ops
 }  // namespace modeling
