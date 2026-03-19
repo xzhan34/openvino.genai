@@ -147,8 +147,9 @@ Tensor GlmOcrTextAttention::forward(const Tensor& hidden_states,
     auto v_heads = v.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
 
     auto* policy = &ctx().op_policy();
-    auto q_rot = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, head_dim_, policy);
-    auto k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
+    // GLM-OCR text model uses interleaved RoPE (rotate_half_llm: even/odd pairs)
+    auto q_rot = ops::llm::apply_rope_interleave(q_heads, rope_cos, rope_sin, head_dim_, policy);
+    auto k_rot = ops::llm::apply_rope_interleave(k_heads, rope_cos, rope_sin, head_dim_, policy);
 
     auto cached = append_kv_cache(k_rot, v_heads, beam_idx);
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
