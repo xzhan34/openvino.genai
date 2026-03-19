@@ -28,6 +28,7 @@ class WeightSource;
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
 #include "modeling/layers/vocab_embedding.hpp"
+#include "modeling/models/qwen3_next/modeling_qwen3_next_moe.hpp"
 #include "modeling/ops/tensor.hpp"
 
 namespace ov {
@@ -165,55 +166,6 @@ private:
     WeightParameter* out_proj_param_ = nullptr;
 };
 
-/// Qwen3NextGatedDeltaNet2 — equivalent to Qwen3NextGatedDeltaNet but replaces
-/// the TensorIterator-based recurrent loop with the fused `ops::linear_attention`
-/// operation.  The pre-processing (projection, conv1d, normalization, gating) and
-/// post-processing (rms_norm_gated, out projection) remain identical.
-class Qwen3NextGatedDeltaNet2 : public Module {
-public:
-    Qwen3NextGatedDeltaNet2(BuilderContext& ctx, const std::string& name, const Qwen3NextConfig& cfg, int32_t layer_idx, Module* parent = nullptr);
-
-    Tensor forward(const Tensor& hidden_states,
-                   const Tensor& beam_idx,
-                   const Tensor* attention_mask,
-                   const Tensor* cache_position) const;
-
-private:
-    const Tensor& in_proj_qkvz_weight() const;
-    const Tensor& in_proj_ba_weight() const;
-    const Tensor& conv1d_weight() const;
-    const Tensor& a_log() const;
-    const Tensor& dt_bias() const;
-    const Tensor& out_proj_weight() const;
-
-    Tensor apply_depthwise_causal_conv(const Tensor& mixed_qkv,
-                                       const Tensor& prev_conv_state,
-                                       Tensor* next_conv_state) const;
-
-    Tensor rms_norm_gated(const Tensor& x, const Tensor& z) const;
-
-    int32_t layer_idx_ = 0;
-    int32_t hidden_size_ = 0;
-    int32_t num_v_heads_ = 0;
-    int32_t num_k_heads_ = 0;
-    int32_t head_k_dim_ = 0;
-    int32_t head_v_dim_ = 0;
-    int32_t key_dim_ = 0;
-    int32_t value_dim_ = 0;
-    int32_t conv_dim_ = 0;
-    int32_t conv_kernel_size_ = 4;
-    int32_t conv_state_size_ = 0;
-    float eps_ = 1e-6f;
-
-    WeightParameter* in_proj_qkvz_param_ = nullptr;
-    WeightParameter* in_proj_ba_param_ = nullptr;
-    WeightParameter* conv1d_param_ = nullptr;
-    WeightParameter* a_log_param_ = nullptr;
-    WeightParameter* dt_bias_param_ = nullptr;
-    WeightParameter* norm_param_ = nullptr;
-    WeightParameter* out_proj_param_ = nullptr;
-};
-
 class Qwen3NextMLP : public Module {
 public:
     Qwen3NextMLP(BuilderContext& ctx,
@@ -232,58 +184,6 @@ private:
     WeightParameter* gate_proj_param_ = nullptr;
     WeightParameter* up_proj_param_ = nullptr;
     WeightParameter* down_proj_param_ = nullptr;
-};
-
-class Qwen3NextSparseMoeBlock : public Module {
-public:
-    Qwen3NextSparseMoeBlock(BuilderContext& ctx, const std::string& name, const Qwen3NextConfig& cfg, Module* parent = nullptr);
-
-    Tensor forward(const Tensor& hidden_states) const;
-
-private:
-    const Tensor& gate_weight() const;
-    const Tensor& shared_expert_gate_weight() const;
-    const Tensor& shared_gate_proj_weight() const;
-    const Tensor& shared_up_proj_weight() const;
-    const Tensor& shared_down_proj_weight() const;
-    
-    // MoE expert weights (stacked)
-    Tensor gate_expert_weights() const;
-    Tensor up_expert_weights() const;
-    Tensor down_expert_weights() const;
-    
-    // MoE quantization scales and zero-points (stacked)
-    Tensor gate_exps_scales() const;
-    Tensor gate_exps_zps() const;
-    Tensor up_exps_scales() const;
-    Tensor up_exps_zps() const;
-    Tensor down_exps_scales() const;
-    Tensor down_exps_zps() const;
-
-    int32_t hidden_size_ = 0;
-    int32_t expert_intermediate_size_ = 0;
-    int32_t shared_intermediate_size_ = 0;
-    int32_t num_experts_ = 0;
-    int32_t top_k_ = 1;
-    bool norm_topk_prob_ = true;
-    size_t group_size_ = 128;
-
-    WeightParameter* gate_param_ = nullptr;
-    WeightParameter* shared_expert_gate_param_ = nullptr;
-    WeightParameter* shared_gate_proj_param_ = nullptr;
-    WeightParameter* shared_up_proj_param_ = nullptr;
-    WeightParameter* shared_down_proj_param_ = nullptr;
-    std::vector<WeightParameter*> gate_experts_param_;
-    std::vector<WeightParameter*> up_experts_param_;
-    std::vector<WeightParameter*> down_experts_param_;
-    
-    // Quantization scales and zero-points for each expert
-    std::vector<Tensor> gate_exps_scales_;
-    std::vector<Tensor> gate_exps_zps_;
-    std::vector<Tensor> up_exps_scales_;
-    std::vector<Tensor> up_exps_zps_;
-    std::vector<Tensor> down_exps_scales_;
-    std::vector<Tensor> down_exps_zps_;
 };
 
 class Qwen3NextDecoderLayer : public Module {
@@ -307,7 +207,7 @@ public:
 private:
     std::string layer_type_;
     std::unique_ptr<Qwen3NextAttention> self_attn_;
-    std::unique_ptr<Qwen3NextGatedDeltaNet2> linear_attn_;
+    std::unique_ptr<Qwen3NextGatedDeltaNet> linear_attn_;
     std::unique_ptr<Qwen3NextMLP> dense_mlp_;
     std::unique_ptr<Qwen3NextSparseMoeBlock> moe_mlp_;
     Qwen3NextRMSNorm input_layernorm_;

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // E2E numerical equivalence test: GatedDeltaNet (v1, TensorIterator) vs
-// GatedDeltaNet2 (v2, ops::linear_attention).
+// GatedDeltaNet (ops::linear_attention).
 //
 // The test exercises the full stateful prefill + multi-step decode pipeline with
 // identical weights and inputs for both implementations.  If the beta/g inputs
@@ -165,7 +165,7 @@ void set_inputs(ov::InferRequest& req, const ov::Tensor& hs, const ov::Tensor& b
 //      compound rapidly across decode steps.
 // =============================================================================
 
-TEST(GatedDeltaNetV1vsV2, PrefillAndMultiStepDecodeMatchOnGPU) {
+TEST(GatedDeltaNetV1vsLinearAttention, PrefillAndMultiStepDecodeMatchOnGPU) {
     const auto cfg = make_cfg();
     const size_t hidden = static_cast<size_t>(cfg.hidden_size);
     const size_t prefill_len = 8;
@@ -174,7 +174,7 @@ TEST(GatedDeltaNetV1vsV2, PrefillAndMultiStepDecodeMatchOnGPU) {
 
     // Build both models with dynamic sequence length (for prefill & decode).
     auto model_v1 = build_model<ov::genai::modeling::models::Qwen3NextGatedDeltaNet>(cfg, true);
-    auto model_v2 = build_model<ov::genai::modeling::models::Qwen3NextGatedDeltaNet2>(cfg, true);
+    auto model_v2 = build_model<ov::genai::modeling::models::Qwen3NextGatedDeltaNet>(cfg, true);
 
     ov::Core core;
     auto req_v1 = core.compile_model(model_v1, "GPU").create_infer_request();
@@ -217,9 +217,9 @@ TEST(GatedDeltaNetV1vsV2, PrefillAndMultiStepDecodeMatchOnGPU) {
                   << "  mean_diff=" << stats.mean_abs_diff
                   << "  nan_v1=" << stats.nan_count_a << "  nan_v2=" << stats.nan_count_b << "\n";
         EXPECT_EQ(stats.nan_count_a, stats.nan_count_b)
-            << "Prefill: NaN count mismatch between v1 and v2";
+            << "Prefill: NaN count mismatch between two linear-attention paths";
         EXPECT_LT(stats.max_abs_diff, tolerance)
-            << "Prefill: v1 vs v2 outputs diverged (max_diff=" << stats.max_abs_diff << ")";
+            << "Prefill: path A vs path B outputs diverged (max_diff=" << stats.max_abs_diff << ")";
     }
 
     // ── Step 2: Multiple decode steps (state carries over) ──
@@ -243,9 +243,9 @@ TEST(GatedDeltaNetV1vsV2, PrefillAndMultiStepDecodeMatchOnGPU) {
                   << "  mean_diff=" << stats.mean_abs_diff
                   << "  nan_v1=" << stats.nan_count_a << "  nan_v2=" << stats.nan_count_b << "\n";
         EXPECT_EQ(stats.nan_count_a, stats.nan_count_b)
-            << "Decode step " << step + 1 << ": NaN count mismatch between v1 and v2";
+            << "Decode step " << step + 1 << ": NaN count mismatch between two linear-attention paths";
         EXPECT_LT(stats.max_abs_diff, tolerance)
-            << "Decode step " << step + 1 << ": v1 vs v2 outputs diverged (max_diff="
+            << "Decode step " << step + 1 << ": path A vs path B outputs diverged (max_diff="
             << stats.max_abs_diff << ")";
     }
 }

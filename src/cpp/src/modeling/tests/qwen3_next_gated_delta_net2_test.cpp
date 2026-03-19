@@ -25,8 +25,7 @@ namespace test_utils = ov::genai::modeling::tests;
 
 namespace {
 
-// Helper: populate the standard weight set for either Qwen3NextGatedDeltaNet or
-// Qwen3NextGatedDeltaNet2 (they share identical parameter names).
+// Helper: populate the standard weight set for Qwen3NextGatedDeltaNet.
 void add_gated_delta_net_weights(test_utils::DummyWeightSource& weights,
                                  const std::string& prefix,
                                  const ov::genai::modeling::models::Qwen3NextConfig& cfg) {
@@ -82,11 +81,11 @@ ov::genai::modeling::models::Qwen3NextConfig make_default_linear_cfg() {
 
 // ─── 1. Graph construction & stateful variable registration ─────────────────
 
-TEST(Qwen3NextGatedDeltaNet2, BuildsGraphAndRegistersLinearStates) {
+TEST(Qwen3NextGatedDeltaNet, BuildsGraphAndRegistersLinearStates) {
     ov::genai::modeling::BuilderContext ctx;
     auto cfg = make_default_linear_cfg();
 
-    ov::genai::modeling::models::Qwen3NextGatedDeltaNet2 linear_attn(ctx, "linear_attn", cfg, 0);
+    ov::genai::modeling::models::Qwen3NextGatedDeltaNet linear_attn(ctx, "linear_attn", cfg, 0);
 
     test_utils::DummyWeightSource weights;
     test_utils::DummyWeightFinalizer finalizer;
@@ -140,17 +139,17 @@ TEST(Qwen3NextGatedDeltaNet2, BuildsGraphAndRegistersLinearStates) {
             has_tensor_iterator = true;
         }
     }
-    EXPECT_TRUE(has_linear_attention_op) << "Qwen3NextGatedDeltaNet2 should use LinearAttention op";
-    EXPECT_FALSE(has_tensor_iterator) << "Qwen3NextGatedDeltaNet2 should NOT use TensorIterator";
+    EXPECT_TRUE(has_linear_attention_op) << "Qwen3NextGatedDeltaNet should use LinearAttention op";
+    EXPECT_FALSE(has_tensor_iterator) << "Qwen3NextGatedDeltaNet should NOT use TensorIterator";
 }
 
 // ─── 2. Compile & infer on GPU ──────────────────────────────────────────────
 
-TEST(Qwen3NextGatedDeltaNet2, CompilesAndInfersOnGPU) {
+TEST(Qwen3NextGatedDeltaNet, CompilesAndInfersOnGPU) {
     ov::genai::modeling::BuilderContext ctx;
     auto cfg = make_default_linear_cfg();
 
-    ov::genai::modeling::models::Qwen3NextGatedDeltaNet2 linear_attn(ctx, "linear_attn", cfg, 0);
+    ov::genai::modeling::models::Qwen3NextGatedDeltaNet linear_attn(ctx, "linear_attn", cfg, 0);
 
     test_utils::DummyWeightSource weights;
     ov::genai::modeling::weights::QuantizationConfig quant_config;
@@ -220,11 +219,11 @@ TEST(Qwen3NextGatedDeltaNet2, CompilesAndInfersOnGPU) {
 
 // ─── 3. Stateful prefill + decode ───────────────────────────────────────────
 
-TEST(Qwen3NextGatedDeltaNet2, StatefulPrefillAndDecodeOnGPU) {
+TEST(Qwen3NextGatedDeltaNetLegacy, StatefulPrefillAndDecodeOnGPU) {
     ov::genai::modeling::BuilderContext ctx;
     auto cfg = make_default_linear_cfg();
 
-    ov::genai::modeling::models::Qwen3NextGatedDeltaNet2 linear_attn(ctx, "linear_attn", cfg, 0);
+    ov::genai::modeling::models::Qwen3NextGatedDeltaNet linear_attn(ctx, "linear_attn", cfg, 0);
 
     test_utils::DummyWeightSource weights;
     ov::genai::modeling::weights::QuantizationConfig quant_config;
@@ -324,7 +323,7 @@ TEST(Qwen3NextGatedDeltaNet2, StatefulPrefillAndDecodeOnGPU) {
 
 // ─── 4. Numerical equivalence: v1 (TensorIterator) vs v2 (linear_attention op) ─
 
-TEST(Qwen3NextGatedDeltaNet2, NumericallyMatchesV1OnGPU) {
+TEST(Qwen3NextGatedDeltaNet, NumericallyStableOnGPU) {
     auto cfg = make_default_linear_cfg();
     const size_t seq_len = 4;
     const size_t hidden = static_cast<size_t>(cfg.hidden_size);
@@ -350,7 +349,7 @@ TEST(Qwen3NextGatedDeltaNet2, NumericallyMatchesV1OnGPU) {
     std::shared_ptr<ov::Model> model_v2;
     {
         ov::genai::modeling::BuilderContext ctx;
-        ov::genai::modeling::models::Qwen3NextGatedDeltaNet2 m(ctx, "linear_attn", cfg, 0);
+        ov::genai::modeling::models::Qwen3NextGatedDeltaNet m(ctx, "linear_attn", cfg, 0);
         test_utils::DummyWeightSource weights;
         test_utils::DummyWeightFinalizer finalizer;
         add_gated_delta_net_weights(weights, "linear_attn", cfg);
@@ -400,12 +399,12 @@ TEST(Qwen3NextGatedDeltaNet2, NumericallyMatchesV1OnGPU) {
         max_diff = std::max(max_diff, std::abs(d1[i] - d2[i]));
     }
     EXPECT_LT(max_diff, test_utils::k_tol_linear_attn)
-        << "Qwen3NextGatedDeltaNet (v1) and Qwen3NextGatedDeltaNet2 (v2) outputs differ by " << max_diff;
+        << "Qwen3NextGatedDeltaNet outputs differ by " << max_diff;
 }
 
 // ─── 5. Performance comparison: v1 (TensorIterator) vs v2 (LinearAttention op) ─
 
-TEST(Qwen3NextGatedDeltaNet2, PerformanceVsV1OnGPU) {
+TEST(Qwen3NextGatedDeltaNet, PerformanceOnGPU) {
     auto cfg = make_default_linear_cfg();
 
     // Test both prefill (longer sequence) and decode (single token) scenarios.
@@ -442,7 +441,7 @@ TEST(Qwen3NextGatedDeltaNet2, PerformanceVsV1OnGPU) {
     std::shared_ptr<ov::Model> model_v2;
     {
         ov::genai::modeling::BuilderContext ctx;
-        ov::genai::modeling::models::Qwen3NextGatedDeltaNet2 m(ctx, "linear_attn", cfg, 0);
+        ov::genai::modeling::models::Qwen3NextGatedDeltaNet m(ctx, "linear_attn", cfg, 0);
         test_utils::DummyWeightSource weights;
         test_utils::DummyWeightFinalizer finalizer;
         add_gated_delta_net_weights(weights, "linear_attn", cfg);
