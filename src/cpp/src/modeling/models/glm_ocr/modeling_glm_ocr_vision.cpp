@@ -335,7 +335,7 @@ Tensor GlmOcrVisionPatchMerger::forward(const Tensor& hidden_states) const {
     // proj + LayerNorm + GELU
     auto projected = ops::linear(hidden_states, proj_weight());
     auto normed = ops::nn::layer_norm(projected, norm_weight(), &norm_bias(), eps_, -1);
-    auto activated = ops::nn::gelu(normed, true);
+    auto activated = ops::nn::gelu(normed, false);  // exact GELU (erf), matching PyTorch nn.GELU()
     // gate/up/down MLP with SiLU
     auto gate = ops::linear(activated, gate_proj_weight());
     auto up = ops::linear(activated, up_proj_weight());
@@ -396,59 +396,26 @@ Tensor GlmOcrVisionModel::forward(const Tensor& pixel_values,
     hidden_states = ops::nn::rms_norm(hidden_states, post_layernorm_weight(), eps_, -1);
 
     // Downsample via Conv2d(1024→1536, k=2, s=2)
-    // hidden_states: [num_patches, 1024]
-    // We need to reshape to [N_images, H, W, C] then conv2d then reshape back
-    // Use grid_thw to get spatial dims. For single image: grid_thw = [1, t, h, w]
-    // After patch_embed, we have t*h*w patches per image (before merge)
-    // The grid_thw gives us (t, grid_h, grid_w) where grid_h/w are in patch units
-    // We need to reshape hidden_states into spatial layout for conv2d
-
-    // For the downsample conv2d, we reshape [total_patches, hidden] -> [batch*t, C, H, W]
-    // then apply conv2d with stride=2, then reshape back to [merged_patches, out_hidden]
-    // grid_thw shape: [N_images, 3] where each row is (t, h, w) in patch coords
-
-    // Since this is a graph-level op, we use dynamic reshape based on grid_thw
-    // For simplicity in the OV graph: assume single image, reshape using grid dims
-    // hidden_states: [total_patches, hidden_size]
-    // Reshape to [1, hidden_size, total_h, total_w] (transposed for NCHW conv2d)
-    // But total_patches = t * h * w, and we need 2D spatial for conv2d
-
-    // Actually the downsample operates on the 2D spatial grid per temporal frame.
-    // For a single image with t=1: [h*w, C] -> [1, C, h, w] -> conv2d(s=2) -> [1, out_C, h/2, w/2] -> [(h/2)*(w/2), out_C]
-    // This matches spatial_merge_size=2
-
-    // Use the grid_thw to compute spatial dims dynamically
-    // For the OV graph, we'll hardcode the reshape using grid_thw as a parameter
-    // Since grid_thw is a runtime input, we need dynamic reshape
-
-    // Approach: reshape hidden_states to [t, h, w, C], permute to [t, C, h, w],
-    // apply conv2d per temporal frame, reshape back
-    // For the graph, use grid_thw to determine the spatial dims
-
-    // Simple approach: permute to NCHW format for conv2d
-    // [num_patches, C] where num_patches = t*h*w
-    // We need [t, C, h, w] -> conv2d -> [t, out_C, h/2, w/2] -> [t*h/2*w/2, out_C]
-
-    // Build dynamic reshape using grid_thw
+    // Match PyTorch's view(-1, merge_size, merge_size, C) + Conv2d
+    // Patches are ordered block_h→block_w→merge_h→merge_w, so every
+    // merge_size*merge_size consecutive patches form one spatial merge group.
+    // PyTorch: hidden_states.view(-1, merge, merge, C).permute(0,3,1,2) -> conv2d
     auto hidden_for_conv = hidden_states.to(downsample_weight().dtype());
 
-    // Reshape: [num_patches, C] -> [t, h, w, C] where dims from grid_thw
-    // Then permute to [t, C, h, w] for conv2d
-    auto grid_t = ops::slice(grid_thw, 0, 1, 1, 1).squeeze(1).squeeze(0);  // scalar t
-    auto grid_h = ops::slice(grid_thw, 1, 2, 1, 1).squeeze(1).squeeze(0);  // scalar h
-    auto grid_w = ops::slice(grid_thw, 2, 3, 1, 1).squeeze(1).squeeze(0);  // scalar w
-    auto hidden_dim = Tensor(ops::const_scalar(hidden_states.context(), static_cast<int64_t>(cfg_.hidden_size)), hidden_states.context());
+    // Reshape: [num_patches, C] -> [-1, merge, merge, C]
+    auto reshaped = hidden_for_conv.reshape({-1,
+        static_cast<int64_t>(cfg_.spatial_merge_size),
+        static_cast<int64_t>(cfg_.spatial_merge_size),
+        static_cast<int64_t>(cfg_.hidden_size)});
 
-    // Reshape to [t, h, w, C] using dynamic shape
-    auto target_shape = ops::concat({grid_t.unsqueeze(0), grid_h.unsqueeze(0),
-                                     grid_w.unsqueeze(0), hidden_dim.unsqueeze(0)}, 0);
-    auto reshaped = hidden_for_conv.reshape(target_shape.output());
-
-    // Permute to [t, C, h, w] for conv2d
+    // Permute to [-1, C, merge, merge] for conv2d
     auto nchw = reshaped.permute({0, 3, 1, 2});
 
-    // Apply Conv2d(hidden_size→out_hidden_size, kernel=2, stride=2)
-    const std::vector<int64_t> strides_2d = {2, 2};
+    // Apply Conv2d(hidden_size→out_hidden_size, kernel=merge, stride=merge)
+    // kernel=2, stride=2 on a 2x2 input → 1x1 output per group
+    const std::vector<int64_t> strides_2d = {
+        static_cast<int64_t>(cfg_.spatial_merge_size),
+        static_cast<int64_t>(cfg_.spatial_merge_size)};
     const std::vector<int64_t> pads_2d = {0, 0};
     Tensor conv_out;
     if (const auto* b = downsample_bias()) {
@@ -457,10 +424,8 @@ Tensor GlmOcrVisionModel::forward(const Tensor& pixel_values,
         conv_out = ops::nn::conv2d(nchw, downsample_weight(), strides_2d, pads_2d, pads_2d);
     }
 
-    // conv_out: [t, out_hidden_size, h/2, w/2]
-    // Permute to [t, h/2, w/2, out_hidden_size] then reshape to [t*h/2*w/2, out_hidden_size]
-    auto permuted = conv_out.permute({0, 2, 3, 1});
-    auto flat = permuted.reshape({-1, cfg_.out_hidden_size});
+    // conv_out: [-1, out_hidden_size, 1, 1] -> reshape to [-1, out_hidden_size]
+    auto flat = conv_out.reshape({-1, cfg_.out_hidden_size});
 
     // Apply merger (proj + LN + GELU + gate/up/down MLP)
     return merger_.forward(flat);

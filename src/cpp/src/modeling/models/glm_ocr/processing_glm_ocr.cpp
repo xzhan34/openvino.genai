@@ -153,7 +153,21 @@ std::pair<size_t, size_t> smart_resize(size_t height,
     return {h_bar, w_bar};
 }
 
-void resize_bilinear_to_chw(const uint8_t* src,
+// Catmull-Rom (Keys a=-0.5) cubic kernel, matching PIL/Pillow BICUBIC
+float cubic_kernel(float x) {
+    float abs_x = std::abs(x);
+    if (abs_x <= 1.0f) {
+        return (1.5f * abs_x - 2.5f) * abs_x * abs_x + 1.0f;
+    } else if (abs_x < 2.0f) {
+        return ((-0.5f * abs_x + 2.5f) * abs_x - 4.0f) * abs_x + 2.0f;
+    }
+    return 0.0f;
+}
+
+// Bicubic resize with antialiasing (matching PIL/Pillow BICUBIC behavior).
+// When downscaling, the kernel is widened by the scale factor to avoid aliasing.
+// Output is in CHW float format with rescale (÷255) and normalize (mean/std).
+void resize_bicubic_to_chw(const uint8_t* src,
                             size_t src_h,
                             size_t src_w,
                             size_t channels,
@@ -166,34 +180,48 @@ void resize_bilinear_to_chw(const uint8_t* src,
     dst_chw.assign(channels * dst_h * dst_w, 0.0f);
     const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
     const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
+    // Antialiasing: widen kernel when downscaling (scale > 1)
+    const float filter_scale_y = std::max(1.0f, scale_y);
+    const float filter_scale_x = std::max(1.0f, scale_x);
+    // Bicubic support radius is 2; scaled by filter factor for antialiasing
+    const float support_y = 2.0f * filter_scale_y;
+    const float support_x = 2.0f * filter_scale_x;
 
-    auto fetch = [&](size_t y, size_t x, size_t c) -> float {
+    auto fetch = [&](int y, int x, size_t c) -> float {
+        y = std::max(0, std::min(y, static_cast<int>(src_h) - 1));
+        x = std::max(0, std::min(x, static_cast<int>(src_w) - 1));
         size_t idx = 0;
         if (nchw) {
-            idx = (c * src_h + y) * src_w + x;
+            idx = (c * src_h + static_cast<size_t>(y)) * src_w + static_cast<size_t>(x);
         } else {
-            idx = (y * src_w + x) * channels + c;
+            idx = (static_cast<size_t>(y) * src_w + static_cast<size_t>(x)) * channels + c;
         }
         return static_cast<float>(src[idx]);
     };
 
     for (size_t y = 0; y < dst_h; ++y) {
-        float in_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
-        in_y = std::max(0.0f, std::min(in_y, static_cast<float>(src_h - 1)));
-        size_t y0 = static_cast<size_t>(std::floor(in_y));
-        size_t y1 = std::min(y0 + 1, src_h - 1);
-        float wy = in_y - static_cast<float>(y0);
+        float center_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
+        int y_start = static_cast<int>(std::floor(center_y - support_y + 0.5f));
+        int y_end = static_cast<int>(std::floor(center_y + support_y + 0.5f));
         for (size_t x = 0; x < dst_w; ++x) {
-            float in_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
-            in_x = std::max(0.0f, std::min(in_x, static_cast<float>(src_w - 1)));
-            size_t x0 = static_cast<size_t>(std::floor(in_x));
-            size_t x1 = std::min(x0 + 1, src_w - 1);
-            float wx = in_x - static_cast<float>(x0);
+            float center_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
+            int x_start = static_cast<int>(std::floor(center_x - support_x + 0.5f));
+            int x_end = static_cast<int>(std::floor(center_x + support_x + 0.5f));
             for (size_t c = 0; c < channels; ++c) {
-                float val = fetch(y0, x0, c) * (1 - wy) * (1 - wx) +
-                            fetch(y1, x0, c) * wy * (1 - wx) +
-                            fetch(y0, x1, c) * (1 - wy) * wx +
-                            fetch(y1, x1, c) * wy * wx;
+                float sum = 0.0f;
+                float weight_sum = 0.0f;
+                for (int iy = y_start; iy <= y_end; ++iy) {
+                    float wy = cubic_kernel((static_cast<float>(iy) - center_y) / filter_scale_y);
+                    for (int ix = x_start; ix <= x_end; ++ix) {
+                        float wx = cubic_kernel((static_cast<float>(ix) - center_x) / filter_scale_x);
+                        float w = wy * wx;
+                        sum += w * fetch(iy, ix, c);
+                        weight_sum += w;
+                    }
+                }
+                float val = weight_sum > 0.0f ? sum / weight_sum : 0.0f;
+                // Clamp to [0, 255] like PIL does (bicubic can overshoot)
+                val = std::max(0.0f, std::min(val, 255.0f));
                 val = val / 255.0f;
                 val = (val - mean[c]) / std[c];
                 dst_chw[(c * dst_h + y) * dst_w + x] = val;
@@ -684,19 +712,12 @@ GlmOcrInputPlan GlmOcrInputPlanner::build_plan(const ov::Tensor& input_ids,
             pos_data[2 * batch * seq_len + base] = pos_w[i];
         }
 
-        if (attention_mask) {
-            for (size_t s = 0; s < seq_len; ++s) {
-                const size_t idx = b * seq_len + s;
-                if (mask_value(*attention_mask, idx)) {
-                    continue;
-                }
-                pos_data[0 * batch * seq_len + idx] = 1;
-                pos_data[1 * batch * seq_len + idx] = 1;
-                pos_data[2 * batch * seq_len + idx] = 1;
-            }
-        }
+        // Masked/padding positions stay at 0 (matching PyTorch torch.zeros init)
+        // position_ids was already memset to 0, so no action needed for masked positions
 
-        delta_data[b] = max_pos + 1 - static_cast<int64_t>(seq_len);
+        // Use active token count (not raw seq_len which includes padding)
+        // to match PyTorch: max_pos + 1 - len(current_input_ids)
+        delta_data[b] = max_pos + 1 - static_cast<int64_t>(tokens.size());
         grid_index = local_grid_index;
     }
 
@@ -850,7 +871,7 @@ GlmOcrVisionInputs GlmOcrVisionPreprocessor::preprocess(const ov::Tensor& images
         }
 
         std::vector<float> frame;
-        resize_bilinear_to_chw(src_img,
+        resize_bicubic_to_chw(src_img,
                                in_h,
                                in_w,
                                channels,

@@ -187,11 +187,50 @@ int main(int argc, char* argv[]) try {
     auto compiled_text = core.compile_model(text_model, device);
 
     auto image = utils::load_image(image_path);
+    {
+        auto s = image.get_shape();
+        std::cout << "Image shape: [";
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << s[i];
+        }
+        std::cout << "]" << std::endl;
+    }
 
     ov::genai::modeling::models::GlmOcrVisionPreprocessor preprocessor(cfg.vision, pre_cfg);
     const auto preprocess_start = std::chrono::steady_clock::now();
     auto vision_inputs = preprocessor.preprocess(image);
     const auto preprocess_end = std::chrono::steady_clock::now();
+
+    // Debug: print pixel_values and grid_thw info
+    {
+        auto pv_shape = vision_inputs.pixel_values.get_shape();
+        std::cout << "pixel_values shape: [";
+        for (size_t i = 0; i < pv_shape.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << pv_shape[i];
+        }
+        std::cout << "]" << std::endl;
+
+        auto g = vision_inputs.grid_thw.data<const int64_t>();
+        auto gs = vision_inputs.grid_thw.get_shape();
+        for (size_t i = 0; i < gs[0]; ++i) {
+            std::cout << "grid_thw[" << i << "]: t=" << g[i*3] << " h=" << g[i*3+1] << " w=" << g[i*3+2] << std::endl;
+        }
+
+        const float* pv = vision_inputs.pixel_values.data<const float>();
+        size_t pv_size = vision_inputs.pixel_values.get_size();
+        float pv_min = pv[0], pv_max = pv[0], pv_sum = 0;
+        for (size_t i = 0; i < pv_size; ++i) {
+            pv_min = std::min(pv_min, pv[i]);
+            pv_max = std::max(pv_max, pv[i]);
+            pv_sum += pv[i];
+        }
+        std::cout << "pixel_values: min=" << pv_min << " max=" << pv_max
+                  << " mean=" << (pv_sum / static_cast<float>(pv_size))
+                  << " first5=[" << pv[0] << "," << pv[1] << "," << pv[2] << "," << pv[3] << "," << pv[4] << "]"
+                  << std::endl;
+    }
 
     auto vision_request = compiled_vision.create_infer_request();
     vision_request.set_tensor(ov::genai::modeling::models::GlmOcrVisionIO::kPixelValues, vision_inputs.pixel_values);
