@@ -147,7 +147,7 @@ int main(int argc, char* argv[]) try {
     const std::string user_prompt = (argc > 3) ? argv[3] : "<|begin_of_image|><|image|><|end_of_image|>\nConvert the document to markdown./nothink";
     const std::string device = (argc > 4) ? argv[4] : "GPU";
     const int max_new_tokens = (argc > 5) ? std::stoi(argv[5]) : 300;
-    const float repetition_penalty = (argc > 6) ? std::stof(argv[6]) : 1.1f;
+    const float repetition_penalty = (argc > 6) ? std::stof(argv[6]) : 1.0f;
 
     // Optional quantization args
     std::string vision_quant_mode = (argc > 7) ? argv[7] : "";
