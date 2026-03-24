@@ -33,6 +33,11 @@
 
 namespace {
 
+struct ParsedASROutput {
+    std::string language;
+    std::string text;
+};
+
 std::string trim_copy(const std::string& s);
 std::string normalize_language_name(const std::string& raw);
 
@@ -698,16 +703,56 @@ std::string normalize_language_name(const std::string& raw) {
     return out;
 }
 
-std::string clean_transcript_text(const std::string& raw_text) {
-    std::string out = raw_text;
-    const std::array<std::string, 6> control_tokens = {
-        "<asr_text>", "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<|im_start|>", "<|im_end|>"};
-    for (const auto& token : control_tokens) {
+std::string to_lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+void erase_all_tokens(std::string& text, const std::vector<std::string>& tokens) {
+    for (const auto& token : tokens) {
         std::string::size_type pos = 0;
-        while ((pos = out.find(token, pos)) != std::string::npos) {
-            out.erase(pos, token.size());
+        while ((pos = text.find(token, pos)) != std::string::npos) {
+            text.erase(pos, token.size());
         }
     }
+}
+
+std::string strip_after_markdown_fence(const std::string& text) {
+    const std::string::size_type pos = text.find("```");
+    if (pos == std::string::npos) {
+        return text;
+    }
+    return text.substr(0, pos);
+}
+
+void strip_leading_asr_separators(std::string& text) {
+    static const std::array<std::string, 4> prefixes = {"<asr_text>", "BitFields", "<LM>", "(Initialized)"};
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        text = trim_copy(text);
+        for (const auto& prefix : prefixes) {
+            if (text.rfind(prefix, 0) == 0) {
+                text.erase(0, prefix.size());
+                changed = true;
+                break;
+            }
+        }
+        while (!text.empty() &&
+               (text.front() == '.' || text.front() == ',' || text.front() == ';' || text.front() == ':' ||
+                text.front() == '!' || text.front() == '?' || std::isspace(static_cast<unsigned char>(text.front())))) {
+            text.erase(text.begin());
+            changed = true;
+        }
+    }
+}
+
+std::string clean_transcript_text(const std::string& raw_text) {
+    std::string out = raw_text;
+    erase_all_tokens(out, {"<asr_text>", "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<|im_start|>", "<|im_end|>", "<BR>"});
+    out = strip_after_markdown_fence(out);
     out = trim_copy(out);
     while (!out.empty() && (out.front() == '.' || out.front() == ',' || out.front() == ';' || out.front() == ':' ||
                              out.front() == '!' || out.front() == '?' || std::isspace(static_cast<unsigned char>(out.front())))) {
@@ -717,7 +762,6 @@ std::string clean_transcript_text(const std::string& raw_text) {
 }
 
 std::string extract_language_from_prefix(std::string& text) {
-    // Example prefix seen in some generations: "language English ..."
     static const std::regex lang_prefix(R"(^\s*language\s+([A-Za-z]+)\s*)", std::regex_constants::icase);
     std::smatch m;
     if (std::regex_search(text, m, lang_prefix) && m.size() >= 2) {
@@ -727,6 +771,83 @@ std::string extract_language_from_prefix(std::string& text) {
         return lang;
     }
     return {};
+}
+
+ParsedASROutput parse_asr_output(const std::string& raw_text) {
+    ParsedASROutput result;
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return result;
+    }
+
+    const std::string asr_tag = "<asr_text>";
+    const std::string::size_type tag_pos = text.find(asr_tag);
+    if (tag_pos != std::string::npos) {
+        std::string meta_part = text.substr(0, tag_pos);
+        std::string text_part = text.substr(tag_pos + asr_tag.size());
+        const std::string meta_lower = to_lower_ascii(meta_part);
+        if (meta_lower.find("language none") != std::string::npos) {
+            strip_leading_asr_separators(text_part);
+            result.text = clean_transcript_text(text_part);
+            return result;
+        }
+        std::string parsed_lang = extract_language_from_prefix(meta_part);
+        if (!parsed_lang.empty()) {
+            result.language = parsed_lang;
+        }
+        strip_leading_asr_separators(text_part);
+        result.text = clean_transcript_text(text_part);
+        return result;
+    }
+
+    std::string text_part = text;
+    const std::string parsed_lang = extract_language_from_prefix(text_part);
+    if (!parsed_lang.empty()) {
+        if (to_lower_ascii(parsed_lang) != "none") {
+            result.language = parsed_lang;
+        }
+        strip_leading_asr_separators(text_part);
+        result.text = clean_transcript_text(text_part);
+        return result;
+    }
+
+    result.text = clean_transcript_text(text);
+    return result;
+}
+
+std::string build_python_style_asr_prompt(ov::genai::Tokenizer& tokenizer,
+                                          const std::string& context,
+                                          const std::optional<std::string>& forced_language) {
+    const std::string effective_context = context.empty() ? "Transcribe this audio." : context;
+    std::string prompt;
+
+    if (!tokenizer.get_chat_template().empty()) {
+        try {
+            ov::genai::ChatHistory history;
+            history.push_back({{"role", "system"}, {"content", effective_context}});
+
+            ov::genai::JsonContainer user_content = ov::genai::JsonContainer::array();
+            user_content.push_back(ov::genai::JsonContainer({{"type", "audio"}, {"audio", ""}}));
+            history.push_back({{"role", "user"}, {"content", user_content}});
+
+            constexpr bool add_generation_prompt = true;
+            prompt = tokenizer.apply_chat_template(history, add_generation_prompt);
+        } catch (const std::exception&) {
+            prompt.clear();
+        }
+    }
+
+    if (prompt.empty()) {
+        prompt = "<|im_start|>system\n" + effective_context + "<|im_end|>\n";
+        prompt +=
+            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n";
+    }
+
+    if (forced_language.has_value() && !forced_language->empty()) {
+        prompt += "language " + *forced_language + "<asr_text>";
+    }
+
+    return prompt;
 }
 
 }  // namespace
@@ -970,10 +1091,7 @@ int main(int argc, char* argv[]) try {
     if (text_only) {
         instruction_prompt = prompt_override.value_or("Please answer briefly: hello.");
     } else {
-        // Approximate the Python processor instruction path:
-        // <|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.
-        instruction_prompt =
-            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.<|im_end|>\n<|im_start|>assistant\n";
+        instruction_prompt = build_python_style_asr_prompt(tokenizer, prompt_override.value_or(""), std::nullopt);
     }
     auto encoded_prompt = tokenizer.encode(instruction_prompt, {ov::genai::add_special_tokens(false)});
     std::vector<int64_t> prompt_ids = tensor_row_to_i64_vector(encoded_prompt.input_ids);
@@ -1202,22 +1320,31 @@ int main(int argc, char* argv[]) try {
         }
     }
 
-    std::string transcript_text;
+    std::string raw_transcript_text;
     if (!generated_ids.empty()) {
-        transcript_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(true)});
+        raw_transcript_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(false)});
     }
-    transcript_text = clean_transcript_text(transcript_text);
+    ParsedASROutput parsed_asr_output = parse_asr_output(raw_transcript_text);
+    std::string transcript_text = parsed_asr_output.text;
 
-    std::string language_tag = detect_language_from_tokens(tokenizer, generated_ids);
-    const std::string language_from_tokens = detect_language_from_language_prefix_tokens(tokenizer, generated_ids);
-    if (!language_from_tokens.empty()) {
-        language_tag = language_from_tokens;
+    std::string language_tag = parsed_asr_output.language;
+    if (language_tag.empty()) {
+        language_tag = detect_language_from_tokens(tokenizer, generated_ids);
     }
-    if (language_tag == "unknown") {
+    if (language_tag.empty() || language_tag == "unknown") {
+        const std::string language_from_tokens = detect_language_from_language_prefix_tokens(tokenizer, generated_ids);
+        if (!language_from_tokens.empty()) {
+            language_tag = language_from_tokens;
+        }
+    }
+    if (language_tag.empty() || language_tag == "unknown") {
         const std::string language_from_text = extract_language_from_prefix(transcript_text);
         if (!language_from_text.empty()) {
             language_tag = language_from_text;
         }
+    }
+    if (language_tag.empty()) {
+        language_tag = "unknown";
     }
     if (text_only && language_tag == "unknown") {
         language_tag = "n/a";
