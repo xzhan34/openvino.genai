@@ -815,33 +815,112 @@ ParsedASROutput parse_asr_output(const std::string& raw_text) {
     return result;
 }
 
+bool is_metadata_only_asr_output(const std::string& raw_text) {
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return false;
+    }
+
+    const std::string asr_tag = "<asr_text>";
+    const std::string::size_type tag_pos = text.find(asr_tag);
+    std::string text_part;
+    if (tag_pos != std::string::npos) {
+        std::string meta_part = text.substr(0, tag_pos);
+        if (extract_language_from_prefix(meta_part).empty()) {
+            return false;
+        }
+        text_part = text.substr(tag_pos + asr_tag.size());
+    } else {
+        text_part = text;
+        if (extract_language_from_prefix(text_part).empty()) {
+            return false;
+        }
+    }
+
+    strip_leading_asr_separators(text_part);
+    return clean_transcript_text(text_part).empty();
+}
+
+bool has_recent_metadata_prefix_loop(ov::genai::Tokenizer& tokenizer,
+                                     const std::vector<int64_t>& ids,
+                                     size_t min_ngram,
+                                     size_t max_ngram) {
+    if (min_ngram == 0 || max_ngram < min_ngram) {
+        return false;
+    }
+    const size_t capped_max = std::min(max_ngram, ids.size() / 2);
+    if (capped_max < min_ngram) {
+        return false;
+    }
+
+    for (size_t n = capped_max; n >= min_ngram; --n) {
+        const size_t off0 = ids.size() - 2 * n;
+        const size_t off1 = ids.size() - n;
+        bool same = true;
+        for (size_t i = 0; i < n; ++i) {
+            if (ids[off0 + i] != ids[off1 + i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            const std::vector<int64_t> tail(ids.begin() + static_cast<std::ptrdiff_t>(off1), ids.end());
+            if (is_metadata_only_asr_output(tokenizer.decode(tail, {ov::genai::skip_special_tokens(false)}))) {
+                return true;
+            }
+        }
+        if (n == min_ngram) {
+            break;
+        }
+    }
+    return false;
+}
+
+bool trim_recent_metadata_prefix_ngram(ov::genai::Tokenizer& tokenizer,
+                                       std::vector<int64_t>& ids,
+                                       size_t min_ngram,
+                                       size_t max_ngram) {
+    if (min_ngram == 0 || max_ngram < min_ngram) {
+        return false;
+    }
+    const size_t capped_max = std::min(max_ngram, ids.size() / 2);
+    if (capped_max < min_ngram) {
+        return false;
+    }
+
+    for (size_t n = capped_max; n >= min_ngram; --n) {
+        const size_t off0 = ids.size() - 2 * n;
+        const size_t off1 = ids.size() - n;
+        bool same = true;
+        for (size_t i = 0; i < n; ++i) {
+            if (ids[off0 + i] != ids[off1 + i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            const std::vector<int64_t> tail(ids.begin() + static_cast<std::ptrdiff_t>(off1), ids.end());
+            if (is_metadata_only_asr_output(tokenizer.decode(tail, {ov::genai::skip_special_tokens(false)}))) {
+                ids.resize(ids.size() - 2 * n);
+                return true;
+            }
+        }
+        if (n == min_ngram) {
+            break;
+        }
+    }
+    return false;
+}
+
 std::string build_python_style_asr_prompt(ov::genai::Tokenizer& tokenizer,
                                           const std::string& context,
                                           const std::optional<std::string>& forced_language) {
     const std::string effective_context = context.empty() ? "Transcribe this audio." : context;
-    std::string prompt;
+    (void)tokenizer;
 
-    if (!tokenizer.get_chat_template().empty()) {
-        try {
-            ov::genai::ChatHistory history;
-            history.push_back({{"role", "system"}, {"content", effective_context}});
-
-            ov::genai::JsonContainer user_content = ov::genai::JsonContainer::array();
-            user_content.push_back(ov::genai::JsonContainer({{"type", "audio"}, {"audio", ""}}));
-            history.push_back({{"role", "user"}, {"content", user_content}});
-
-            constexpr bool add_generation_prompt = true;
-            prompt = tokenizer.apply_chat_template(history, add_generation_prompt);
-        } catch (const std::exception&) {
-            prompt.clear();
-        }
-    }
-
-    if (prompt.empty()) {
-        prompt = "<|im_start|>system\n" + effective_context + "<|im_end|>\n";
-        prompt +=
-            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n";
-    }
+    std::string prompt = "<|im_start|>system\n" + effective_context + "<|im_end|>\n";
+    prompt +=
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n";
 
     if (forced_language.has_value() && !forced_language->empty()) {
         prompt += "language " + *forced_language + "<asr_text>";
@@ -1175,47 +1254,6 @@ int main(int argc, char* argv[]) try {
     size_t decode_tail_tokens = 0;
     size_t infer_steps = 0;
     const auto asr_infer_start = std::chrono::steady_clock::now();
-
-    auto should_stop_after_push = [&](int64_t pushed_token_id) -> bool {
-        if (pushed_token_id == prev_token_id) {
-            ++same_token_run;
-        } else {
-            prev_token_id = pushed_token_id;
-            same_token_run = 1;
-        }
-        if (same_token_run >= 32) {
-            return true;
-        }
-
-        if (text_only) {
-            if (has_recent_ngram_loop(generated_ids, 8, 3) || has_recent_ngram_loop(generated_ids, 12, 3)) {
-                return true;
-            }
-            if (generated_ids.size() >= 64) {
-                if (pushed_token_id == dot_token_id || pushed_token_id == excl_token_id || pushed_token_id == qmark_token_id) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // ASR outputs can get stuck in repeated phrase loops; stop early when
-        // recent n-grams are repeated to keep transcript quality stable.
-        bool repeated_loop = has_recent_ngram_loop(generated_ids, 8, 3) ||
-                             has_recent_ngram_loop(generated_ids, 12, 3) ||
-                             has_recent_ngram_loop(generated_ids, 16, 2);
-        if (!repeated_loop) {
-            // Some ASR loops are shorter (e.g., ~10-15 tokens repeated twice).
-            for (size_t n = 6; n <= 16; ++n) {
-                if (has_recent_ngram_loop(generated_ids, n, 2)) {
-                    repeated_loop = true;
-                    break;
-                }
-            }
-        }
-        return repeated_loop;
-    };
-
     text_request.reset_state();
     ov::Tensor beam_idx = make_i32({batch}, 0);
     text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx,
@@ -1256,13 +1294,13 @@ int main(int argc, char* argv[]) try {
     size_t total_seq_len = prompt_seq_len;
     auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
         logits_shape = logits.get_shape();
-        const int64_t next_token_id = argmax_last_token_id_excluding(logits, excluded_decode_ids);
+        const int64_t next_token_id = argmax_last_token_id(logits);
         if ((eos_token_id >= 0 && next_token_id == eos_token_id) ||
             (stop_token_ids.find(next_token_id) != stop_token_ids.end())) {
             return true;
         }
         generated_ids.push_back(next_token_id);
-        return should_stop_after_push(next_token_id);
+        return false;
     };
 
     bool stop_generation = false;
@@ -1314,15 +1352,13 @@ int main(int argc, char* argv[]) try {
     }
     const auto asr_infer_end = std::chrono::steady_clock::now();
 
-    if (!text_only) {
-        // If we stopped right after closing a duplicated tail, keep only one copy.
-        while (trim_recent_duplicate_ngram(generated_ids, 6, 16)) {
-        }
-    }
-
     std::string raw_transcript_text;
     if (!generated_ids.empty()) {
         raw_transcript_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(false)});
+    }
+    if (!text_only && is_metadata_only_asr_output(raw_transcript_text)) {
+        raw_transcript_text.clear();
+        generated_ids.clear();
     }
     ParsedASROutput parsed_asr_output = parse_asr_output(raw_transcript_text);
     std::string transcript_text = parsed_asr_output.text;
