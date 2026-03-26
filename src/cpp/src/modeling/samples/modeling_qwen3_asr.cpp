@@ -38,8 +38,30 @@ struct ParsedASROutput {
     std::string text;
 };
 
+struct ASRDecodeResult {
+    std::string raw_text;
+    std::string language;
+    std::string text;
+    std::vector<int64_t> generated_ids;
+    size_t prompt_token_size = 0;
+    ov::Shape logits_shape;
+    ov::Shape audio_embeds_shape;
+    int64_t audio_output_length = 0;
+    double audio_encode_ms = 0.0;
+    double ttft_ms = 0.0;
+    double decode_ms = 0.0;
+    size_t decode_tail_tokens = 0;
+    size_t infer_steps = 0;
+    double infer_ms = 0.0;
+};
+
 std::string trim_copy(const std::string& s);
 std::string normalize_language_name(const std::string& raw);
+
+std::string rollback_text_by_token_count(ov::genai::Tokenizer& tokenizer,
+                                         const std::string& text,
+                                         size_t rollback_tokens);
+std::string merge_prefix_and_continuation_text(const std::string& prefix, const std::string& continuation);
 
 bool has_ir_model_pair(const std::filesystem::path& xml_path, const std::filesystem::path& bin_path) {
     return std::filesystem::exists(xml_path) && std::filesystem::is_regular_file(xml_path) &&
@@ -76,16 +98,23 @@ void print_usage(const char* argv0) {
         << "Qwen3-ASR modeling sample\n"
         << "Usage:\n"
         << "  " << argv0
-        << " <TEXT_MODEL_DIR> [AUDIO_MODEL_DIR] [DEVICE] [--wav <AUDIO.wav>] [--device <DEVICE>] [--max_new_tokens <N>] [--text-only] [--prompt <TEXT>]\n\n"
+        << " <TEXT_MODEL_DIR> [AUDIO_MODEL_DIR] [DEVICE] [--wav <AUDIO.wav>] [--device <DEVICE>] [--max_new_tokens <N>] [--text-only] [--prompt <TEXT>] [--streaming]\n\n"
         << "Examples:\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR/text C:/models/Qwen3-ASR/audio GPU\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR --wav C:/audio/test.wav --device GPU --max_new_tokens 128\n"
+        << "  " << argv0 << " C:/models/Qwen3-ASR --wav C:/audio/test.wav --streaming --stream_chunk_sec 0.5 --stream_window_sec 4.0\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR --text-only --prompt \"Summarize this sentence.\" --device GPU\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR --cached-model\n\n"
         << "Options:\n"
-        << "  --cached-model (or --cache-model)  Serialize built IR to model directory before inference\n\n"
-        << "In-flight quantization (optional, env-based):\n"
+        << "  --cached-model (or --cache-model)  Serialize built IR to model directory before inference\n"
+        << "  --streaming                        Run bounded-window streaming ASR over --wav input\n"
+        << "  --stream_chunk_sec <S>             Audio seconds per streaming step (default: 0.5)\n"
+        << "  --stream_window_sec <S>            Trailing audio window seconds to re-decode (default: 4.0)\n"
+        << "  --stream_unfixed_chunk_num <N>     Initial streaming steps without text-prefix reuse (default: 2)\n"
+        << "  --stream_unfixed_token_num <N>     Tokens rolled back before text-prefix reuse (default: 5)\n\n"
+        << "  --n_window <N>                     Override audio encoder chunk window size\n"
+        << "  --n_window_infer <N>               Override audio encoder inference window size\n\n"
         << "  OV_GENAI_INFLIGHT_QUANT_MODE\n"
         << "  OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE\n"
         << "  OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE\n";
@@ -385,6 +414,48 @@ ov::Tensor make_audio_features_from_wav(const std::filesystem::path& wav_path,
     return tensor;
 }
 
+ov::Tensor make_audio_features_from_pcm(const std::vector<float>& raw,
+                                        ov::genai::WhisperFeatureExtractor& extractor,
+                                        size_t expected_mel_bins,
+                                        double* audio_duration_seconds = nullptr,
+                                        uint32_t* used_sample_rate = nullptr) {
+    const uint32_t target_sample_rate = static_cast<uint32_t>(std::max<size_t>(1, extractor.sampling_rate));
+    if (used_sample_rate != nullptr) {
+        *used_sample_rate = target_sample_rate;
+    }
+    if (raw.empty()) {
+        throw std::runtime_error("Input audio has no samples");
+    }
+    if (audio_duration_seconds != nullptr) {
+        *audio_duration_seconds = static_cast<double>(raw.size()) / static_cast<double>(target_sample_rate);
+    }
+
+    ov::genai::WhisperFeatures features = extractor.extract(raw);
+    if (features.n_frames == 0 || features.feature_size == 0) {
+        throw std::runtime_error("Failed to extract audio features from PCM input");
+    }
+
+    const size_t actual_mel_bins = features.feature_size;
+    const size_t frames = features.n_frames;
+    const size_t mel_bins = expected_mel_bins > 0 ? expected_mel_bins : actual_mel_bins;
+
+    ov::Tensor tensor(ov::element::f32, ov::Shape{1, mel_bins, frames});
+    float* dst = tensor.data<float>();
+    const float* src = features.data.data();
+
+    for (size_t m = 0; m < mel_bins; ++m) {
+        const float* src_row = (m < actual_mel_bins) ? (src + m * frames) : nullptr;
+        float* dst_row = dst + m * frames;
+        if (src_row != nullptr) {
+            std::copy(src_row, src_row + frames, dst_row);
+        } else {
+            std::fill(dst_row, dst_row + frames, 0.0f);
+        }
+    }
+
+    return tensor;
+}
+
 ov::Tensor make_position_ids_3d(size_t batch, size_t seq_len) {
     ov::Tensor t(ov::element::i64, ov::Shape{3, batch, seq_len});
     int64_t* ptr = t.data<int64_t>();
@@ -422,36 +493,6 @@ ov::Tensor make_audio_pos_mask_from_flags(const std::vector<char>& flags) {
     return t;
 }
 
-ov::Tensor make_padded_audio_embeds(const ov::Tensor& audio_embeds, size_t target_seq_len) {
-    const auto src_shape = audio_embeds.get_shape();
-    if (src_shape.size() != 3) {
-        throw std::runtime_error("audio_embeds rank must be 3 for padding");
-    }
-    const size_t batch = src_shape[0];
-    const size_t src_seq = src_shape[1];
-    const size_t hidden = src_shape[2];
-    if (target_seq_len < src_seq) {
-        throw std::runtime_error("target_seq_len is smaller than audio_embeds sequence length");
-    }
-
-    ov::Tensor out(audio_embeds.get_element_type(), ov::Shape{batch, target_seq_len, hidden});
-    if (out.get_element_type() != ov::element::f32 || audio_embeds.get_element_type() != ov::element::f32) {
-        throw std::runtime_error("Expected f32 audio_embeds tensor");
-    }
-
-    const float* src = audio_embeds.data<const float>();
-    float* dst = out.data<float>();
-    std::fill(dst, dst + out.get_size(), 0.0f);
-
-    const size_t copy_per_batch = src_seq * hidden;
-    const size_t dst_stride = target_seq_len * hidden;
-    for (size_t b = 0; b < batch; ++b) {
-        std::copy(src + b * copy_per_batch,
-                  src + b * copy_per_batch + copy_per_batch,
-                  dst + b * dst_stride);
-    }
-    return out;
-}
 
 std::vector<int64_t> tensor_row_to_i64_vector(const ov::Tensor& t) {
     const auto shape = t.get_shape();
@@ -517,85 +558,6 @@ int64_t argmax_last_token_id(const ov::Tensor& logits) {
     return static_cast<int64_t>(best_idx);
 }
 
-int64_t argmax_last_token_id_excluding(const ov::Tensor& logits, const std::unordered_set<int64_t>& excluded_ids) {
-    const auto shape = logits.get_shape();
-    if (shape.size() != 3 || shape[0] == 0 || shape[1] == 0 || shape[2] == 0) {
-        throw std::runtime_error("Unexpected logits shape for argmax");
-    }
-
-    const size_t vocab = shape[2];
-    const size_t offset = (shape[0] - 1) * shape[1] * vocab + (shape[1] - 1) * vocab;
-    const float* row = logits.data<const float>() + offset;
-
-    int64_t best_idx = -1;
-    float best_val = -std::numeric_limits<float>::infinity();
-    for (size_t i = 0; i < vocab; ++i) {
-        const int64_t tid = static_cast<int64_t>(i);
-        if (excluded_ids.find(tid) != excluded_ids.end()) {
-            continue;
-        }
-        if (row[i] > best_val) {
-            best_val = row[i];
-            best_idx = tid;
-        }
-    }
-
-    if (best_idx < 0) {
-        return argmax_last_token_id(logits);
-    }
-    return best_idx;
-}
-
-bool has_recent_ngram_loop(const std::vector<int64_t>& ids, size_t ngram, size_t repeats) {
-    if (ngram == 0 || repeats < 2) {
-        return false;
-    }
-    const size_t needed = ngram * repeats;
-    if (ids.size() < needed) {
-        return false;
-    }
-
-    const size_t base = ids.size() - needed;
-    for (size_t r = 1; r < repeats; ++r) {
-        for (size_t i = 0; i < ngram; ++i) {
-            if (ids[base + i] != ids[base + r * ngram + i]) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool trim_recent_duplicate_ngram(std::vector<int64_t>& ids, size_t min_ngram, size_t max_ngram) {
-    if (min_ngram == 0 || max_ngram < min_ngram) {
-        return false;
-    }
-    const size_t capped_max = std::min(max_ngram, ids.size() / 2);
-    if (capped_max < min_ngram) {
-        return false;
-    }
-
-    // Prefer trimming longer duplicated tails first.
-    for (size_t n = capped_max; n >= min_ngram; --n) {
-        const size_t off0 = ids.size() - 2 * n;
-        const size_t off1 = ids.size() - n;
-        bool same = true;
-        for (size_t i = 0; i < n; ++i) {
-            if (ids[off0 + i] != ids[off1 + i]) {
-                same = false;
-                break;
-            }
-        }
-        if (same) {
-            ids.resize(ids.size() - n);
-            return true;
-        }
-        if (n == min_ngram) {
-            break;
-        }
-    }
-    return false;
-}
 
 bool is_language_tag_token(const std::string& token) {
     // Expected shape like: <|en|>, <|zh|>, <|yue|>
@@ -914,7 +876,8 @@ bool trim_recent_metadata_prefix_ngram(ov::genai::Tokenizer& tokenizer,
 
 std::string build_python_style_asr_prompt(ov::genai::Tokenizer& tokenizer,
                                           const std::string& context,
-                                          const std::optional<std::string>& forced_language) {
+                                          const std::optional<std::string>& forced_language,
+                                          const std::string& transcript_prefix = {}) {
     const std::string effective_context = context.empty() ? "Transcribe this audio." : context;
     (void)tokenizer;
 
@@ -926,7 +889,77 @@ std::string build_python_style_asr_prompt(ov::genai::Tokenizer& tokenizer,
         prompt += "language " + *forced_language + "<asr_text>";
     }
 
+    if (!transcript_prefix.empty()) {
+        prompt += transcript_prefix;
+    }
+
     return prompt;
+}
+
+std::string rollback_text_by_token_count(ov::genai::Tokenizer& tokenizer,
+                                         const std::string& text,
+                                         size_t rollback_tokens) {
+    if (text.empty() || rollback_tokens == 0) {
+        return text;
+    }
+
+    auto encoded = tokenizer.encode(text, {ov::genai::add_special_tokens(false)});
+    std::vector<int64_t> ids = tensor_row_to_i64_vector(encoded.input_ids);
+    if (ids.size() <= rollback_tokens) {
+        return {};
+    }
+
+    ids.resize(ids.size() - rollback_tokens);
+    return trim_copy(tokenizer.decode(ids, {ov::genai::skip_special_tokens(false)}));
+}
+
+bool should_insert_ascii_join_space(const std::string& left, const std::string& right) {
+    if (left.empty() || right.empty()) {
+        return false;
+    }
+
+    const unsigned char left_last = static_cast<unsigned char>(left.back());
+    const unsigned char right_first = static_cast<unsigned char>(right.front());
+    if (std::isspace(left_last) || std::isspace(right_first)) {
+        return false;
+    }
+
+    if (left_last >= 0x80 || right_first >= 0x80) {
+        return false;
+    }
+
+    return true;
+}
+
+std::string merge_prefix_and_continuation_text(const std::string& prefix, const std::string& continuation) {
+    const std::string left = trim_copy(prefix);
+    const std::string right = trim_copy(continuation);
+    if (left.empty()) {
+        return right;
+    }
+    if (right.empty()) {
+        return left;
+    }
+
+    const size_t max_overlap = std::min(left.size(), right.size());
+    size_t overlap = 0;
+    for (size_t n = max_overlap; n >= 8; --n) {
+        if (left.compare(left.size() - n, n, right, 0, n) == 0) {
+            overlap = n;
+            break;
+        }
+        if (n == 8) {
+            break;
+        }
+    }
+
+    if (overlap > 0) {
+        return trim_copy(left + right.substr(overlap));
+    }
+    if (should_insert_ascii_join_space(left, right)) {
+        return left + " " + right;
+    }
+    return trim_copy(left + right);
 }
 
 }  // namespace
@@ -942,8 +975,15 @@ int main(int argc, char* argv[]) try {
     std::optional<std::string> device_override;
     std::optional<int32_t> max_new_tokens_override;
     std::optional<std::string> prompt_override;
+    std::optional<double> stream_chunk_sec_override;
+    std::optional<double> stream_window_sec_override;
+    std::optional<int32_t> stream_unfixed_chunk_num_override;
+    std::optional<int32_t> stream_unfixed_token_num_override;
+    std::optional<int32_t> n_window_override;
+    std::optional<int32_t> n_window_infer_override;
     bool text_only = false;
     bool cache_model = false;
+    bool streaming = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -967,6 +1007,38 @@ int main(int argc, char* argv[]) try {
                 throw std::runtime_error("Missing value for --prompt");
             }
             prompt_override = std::string(argv[++i]);
+        } else if (arg == "--streaming") {
+            streaming = true;
+        } else if (arg == "--stream_chunk_sec") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_chunk_sec");
+            }
+            stream_chunk_sec_override = std::stod(argv[++i]);
+        } else if (arg == "--stream_window_sec") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_window_sec");
+            }
+            stream_window_sec_override = std::stod(argv[++i]);
+        } else if (arg == "--stream_unfixed_chunk_num") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_unfixed_chunk_num");
+            }
+            stream_unfixed_chunk_num_override = std::stoi(argv[++i]);
+        } else if (arg == "--stream_unfixed_token_num") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_unfixed_token_num");
+            }
+            stream_unfixed_token_num_override = std::stoi(argv[++i]);
+        } else if (arg == "--n_window") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --n_window");
+            }
+            n_window_override = std::stoi(argv[++i]);
+        } else if (arg == "--n_window_infer") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --n_window_infer");
+            }
+            n_window_infer_override = std::stoi(argv[++i]);
         } else if (arg == "--text-only" || arg == "--text_only") {
             text_only = true;
         } else if (arg == "--cached-model" || arg == "--cache-model") {
@@ -1001,7 +1073,19 @@ int main(int argc, char* argv[]) try {
                                             : ov::genai::loaders::ModelConfig::from_hf_json(audio_model_dir / "config.json");
 
     const auto text_cfg = to_text_cfg(text_loader_cfg);
-    const auto audio_cfg = to_audio_cfg(audio_loader_cfg);
+    auto audio_cfg = to_audio_cfg(audio_loader_cfg);
+    if (n_window_override.has_value()) {
+        if (*n_window_override <= 0) {
+            throw std::runtime_error("--n_window must be > 0");
+        }
+        audio_cfg.n_window = *n_window_override;
+    }
+    if (n_window_infer_override.has_value()) {
+        if (*n_window_infer_override <= 0) {
+            throw std::runtime_error("--n_window_infer must be > 0");
+        }
+        audio_cfg.n_window_infer = *n_window_infer_override;
+    }
 
     std::shared_ptr<ov::Model> text_model;
     std::shared_ptr<ov::Model> audio_model;
@@ -1016,12 +1100,30 @@ int main(int argc, char* argv[]) try {
     const std::filesystem::path audio_bin = audio_model_dir / "modeling_qwen3_asr_audio.bin";
 
     auto quant_cfg = ov::genai::modeling::weights::parse_quantization_config_from_env();
-    if (quant_cfg.enabled() && quant_cfg.group_size <= 0) {
+    if (quant_cfg.enabled() && quant_cfg.group_size < -1) {
         throw std::runtime_error(
-            "OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > 0 when OV_GENAI_INFLIGHT_QUANT_MODE is enabled");
+            "OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > -1 when OV_GENAI_INFLIGHT_QUANT_MODE is enabled");
     }
     std::cout << "[quant] enabled=" << (quant_cfg.enabled() ? "true" : "false")
               << ", group_size=" << quant_cfg.group_size << std::endl;
+
+    const double stream_chunk_sec = stream_chunk_sec_override.value_or(audio_cfg.n_window / 100.0f);
+    const double stream_window_sec = stream_window_sec_override.value_or(audio_cfg.n_window_infer / 100.0f);
+    const int32_t stream_unfixed_chunk_num = stream_unfixed_chunk_num_override.value_or(2);
+    const int32_t stream_unfixed_token_num = stream_unfixed_token_num_override.value_or(5);
+    if (streaming && text_only) {
+        throw std::runtime_error("--streaming is not supported with --text-only");
+    }
+    if (streaming && !wav_path.has_value()) {
+        throw std::runtime_error("--streaming requires --wav <AUDIO.wav>");
+    }
+    if (streaming && (stream_chunk_sec <= 0.0 || stream_window_sec <= 0.0)) {
+        throw std::runtime_error("--stream_chunk_sec and --stream_window_sec must be > 0");
+    }
+    if (streaming && (stream_unfixed_chunk_num < 0 || stream_unfixed_token_num < 0)) {
+        throw std::runtime_error("--stream_unfixed_chunk_num and --stream_unfixed_token_num must be >= 0");
+    }
+
 
     ov::Core core;
     bool load_text_from_ir = false;
@@ -1098,60 +1200,17 @@ int main(int argc, char* argv[]) try {
 
     const size_t batch = 1;
     const size_t mel_bins = static_cast<size_t>(std::max(1, audio_cfg.num_mel_bins));
-    ov::Tensor input_audio_features;
-    double input_audio_duration_seconds = 0.0;
-    uint32_t input_audio_sample_rate = 0;
-    const auto feature_extract_start = std::chrono::steady_clock::now();
+    std::filesystem::path preprocessor_cfg;
     if (!text_only) {
-        if (wav_path.has_value()) {
-            std::filesystem::path preprocessor_cfg = audio_model_dir / "preprocessor_config.json";
-            if (!std::filesystem::exists(preprocessor_cfg)) {
-                preprocessor_cfg = text_model_dir / "preprocessor_config.json";
-            }
-            input_audio_features = make_audio_features_from_wav(*wav_path,
-                                                                preprocessor_cfg,
-                                                                mel_bins,
-                                                                &input_audio_duration_seconds,
-                                                                &input_audio_sample_rate);
-        } else {
-            input_audio_features = make_audio_features(batch, mel_bins, 300);
-            input_audio_duration_seconds = static_cast<double>(input_audio_features.get_shape()[2]) / 100.0;
+        preprocessor_cfg = audio_model_dir / "preprocessor_config.json";
+        if (!std::filesystem::exists(preprocessor_cfg)) {
+            preprocessor_cfg = text_model_dir / "preprocessor_config.json";
         }
     }
-    const auto feature_extract_end = std::chrono::steady_clock::now();
-
-    const auto audio_encode_start = std::chrono::steady_clock::now();
-    ov::Tensor audio_embeds;
-    ov::Tensor audio_out_lengths;
-    ov::Shape embeds_shape;
-    size_t audio_seq_len = 0;
+    std::optional<ov::genai::WhisperFeatureExtractor> feature_extractor;
     if (!text_only) {
-        const size_t audio_frames = input_audio_features.get_shape()[2];
-
-        audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kInputAudioFeatures, input_audio_features);
-
-        auto input_lengths = make_i64({batch});
-        input_lengths.data<int64_t>()[0] = static_cast<int64_t>(audio_frames);
-        audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioFeatureLengths, input_lengths);
-
-        audio_request->infer();
-        audio_embeds = audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioEmbeds);
-        audio_out_lengths =
-            audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioOutputLengths);
-
-        embeds_shape = audio_embeds.get_shape();
-        if (embeds_shape.size() != 3) {
-            throw std::runtime_error("Audio encoder output rank must be 3");
-        }
-
-        audio_seq_len = embeds_shape[1];
-        const size_t embed_dim = embeds_shape[2];
-
-        if (embed_dim != static_cast<size_t>(text_cfg.hidden_size)) {
-            throw std::runtime_error("audio_embeds hidden dimension does not match text hidden_size");
-        }
+        feature_extractor.emplace(preprocessor_cfg);
     }
-    const auto audio_encode_end = std::chrono::steady_clock::now();
 
     ov::genai::Tokenizer tokenizer(text_model_dir, ov::AnyMap{{"fix_mistral_regex", true}});
     const auto vocab = tokenizer.get_vocab();
@@ -1166,278 +1225,459 @@ int main(int argc, char* argv[]) try {
         bos_token_id = eos_token_id >= 0 ? eos_token_id : 1;
     }
 
-    std::string instruction_prompt;
-    if (text_only) {
-        instruction_prompt = prompt_override.value_or("Please answer briefly: hello.");
-    } else {
-        instruction_prompt = build_python_style_asr_prompt(tokenizer, prompt_override.value_or(""), std::nullopt);
-    }
-    auto encoded_prompt = tokenizer.encode(instruction_prompt, {ov::genai::add_special_tokens(false)});
-    std::vector<int64_t> prompt_ids = tensor_row_to_i64_vector(encoded_prompt.input_ids);
-
-    std::vector<int64_t> input_ids;
-    input_ids.reserve(prompt_ids.size() + audio_seq_len + static_cast<size_t>(max_new_tokens));
-    if (text_only) {
-        input_ids = prompt_ids;
-        if (input_ids.empty()) {
-            input_ids.push_back(bos_token_id);
-        }
-    } else {
-        bool replaced_audio_placeholder = false;
-        for (int64_t tid : prompt_ids) {
-            if (!replaced_audio_placeholder && tid == audio_pad_token_id) {
-                input_ids.insert(input_ids.end(), audio_seq_len, audio_pad_token_id);
-                replaced_audio_placeholder = true;
-            } else {
-                input_ids.push_back(tid);
-            }
-        }
-        if (!replaced_audio_placeholder) {
-            // Fallback: if template/prompt changed, keep sample functional.
-            input_ids.insert(input_ids.begin(), audio_seq_len, audio_pad_token_id);
-            input_ids.push_back(bos_token_id);
-        }
-    }
-    const size_t prompt_token_size = input_ids.size();
-
-    std::vector<char> base_audio_pos_flags(input_ids.size(), 0);
-    for (size_t i = 0; i < input_ids.size(); ++i) {
-        if (input_ids[i] == audio_pad_token_id) {
-            base_audio_pos_flags[i] = 1;
-        }
-    }
-
-    ov::Tensor prompt_audio_embeds;
-    ov::Tensor prompt_audio_pos_mask;
-    ov::Tensor step_audio_embeds;
-    ov::Tensor step_audio_pos_mask;
-    if (!text_only) {
-        prompt_audio_embeds = make_audio_embeds_for_mask_positions(audio_embeds, base_audio_pos_flags);
-        prompt_audio_pos_mask = make_audio_pos_mask_from_flags(base_audio_pos_flags);
-
-        std::vector<char> no_audio_flags(1, 0);
-        ov::Tensor empty_audio_embeds(ov::element::f32, ov::Shape{1, 0, embeds_shape[2]});
-        step_audio_embeds = make_audio_embeds_for_mask_positions(empty_audio_embeds, no_audio_flags);
-        step_audio_pos_mask = make_audio_pos_mask_from_flags(no_audio_flags);
-    }
-
-    std::vector<int64_t> generated_ids;
-    generated_ids.reserve(static_cast<size_t>(max_new_tokens));
-    int64_t prev_token_id = std::numeric_limits<int64_t>::min();
-    int32_t same_token_run = 0;
-
-    std::unordered_set<int64_t> excluded_decode_ids;
-    add_token_if_found(vocab, "<|audio_pad|>", excluded_decode_ids);
-    add_token_if_found(vocab, "<|audio_start|>", excluded_decode_ids);
-    add_token_if_found(vocab, "<|audio_end|>", excluded_decode_ids);
-    add_token_if_found(vocab, "<|im_start|>", excluded_decode_ids);
-    add_token_if_found(vocab, "<|im_end|>", excluded_decode_ids);
-    add_token_if_found(vocab, "<non_speech>", excluded_decode_ids);
-    add_token_if_found(vocab, "<asr_text>", excluded_decode_ids);
-    add_token_if_found(vocab, "<|asr_text|>", excluded_decode_ids);
-    for (int i = 1; i <= 27; ++i) {
-        add_token_if_found(vocab, "<blank" + std::to_string(i) + ">", excluded_decode_ids);
-    }
-
-    const int64_t dot_token_id = find_token_id(vocab, {"."}, -1);
-    const int64_t excl_token_id = find_token_id(vocab, {"!"}, -1);
-    const int64_t qmark_token_id = find_token_id(vocab, {"?"}, -1);
-
     std::unordered_set<int64_t> stop_token_ids;
     add_token_if_found(vocab, "<|endoftext|>", stop_token_ids);
     add_token_if_found(vocab, "<|im_end|>", stop_token_ids);
     add_token_if_found(vocab, "<|eot_id|>", stop_token_ids);
 
-    ov::Shape logits_shape;
-    double ttft_ms = 0.0;
-    double decode_ms = 0.0;
-    size_t decode_tail_tokens = 0;
-    size_t infer_steps = 0;
-    const auto asr_infer_start = std::chrono::steady_clock::now();
-    text_request.reset_state();
-    ov::Tensor beam_idx = make_i32({batch}, 0);
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx,
-                            beam_idx);
+    auto run_asr_decode = [&](const ov::Tensor& input_audio_features,
+                              double input_audio_duration_seconds,
+                              uint32_t input_audio_sample_rate,
+                              const std::string& instruction_prompt) -> ASRDecodeResult {
+        ASRDecodeResult result;
+        const auto asr_infer_start = std::chrono::steady_clock::now();
 
-    const size_t max_total_seq_len = prompt_token_size + static_cast<size_t>(max_new_tokens);
-    std::vector<int64_t> attention_mask_storage(max_total_seq_len, 1);
-    auto make_attention_mask_view = [&](size_t seq_len) -> ov::Tensor {
-        if (seq_len == 0 || seq_len > max_total_seq_len) {
-            throw std::runtime_error("Invalid seq_len for attention mask view");
-        }
-        return ov::Tensor(ov::element::i64,
-                          ov::Shape{batch, seq_len},
-                          attention_mask_storage.data());
-    };
-
-    // Prefill: run full prompt once to initialize KV cache.
-    const size_t prompt_seq_len = input_ids.size();
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
-                            make_i64_from_vector(input_ids));
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                            make_attention_mask_view(prompt_seq_len));
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
-                            make_position_ids_3d(batch, prompt_seq_len));
-    if (!text_only) {
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds,
-                                prompt_audio_embeds);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask,
-                                prompt_audio_pos_mask);
-    }
-
-    const auto prefill_start = std::chrono::steady_clock::now();
-    text_request.infer();
-    const auto prefill_end = std::chrono::steady_clock::now();
-    ttft_ms = elapsed_ms(prefill_start, prefill_end);
-    infer_steps += 1;
-
-    size_t total_seq_len = prompt_seq_len;
-    auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
-        logits_shape = logits.get_shape();
-        const int64_t next_token_id = argmax_last_token_id(logits);
-        if ((eos_token_id >= 0 && next_token_id == eos_token_id) ||
-            (stop_token_ids.find(next_token_id) != stop_token_ids.end())) {
-            return true;
-        }
-        generated_ids.push_back(next_token_id);
-        return false;
-    };
-
-    bool stop_generation = false;
-    {
-        ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
-        stop_generation = process_logits_and_append(logits);
-    }
-
-    ov::Tensor one_token_ids(ov::element::i64, ov::Shape{1, 1});
-    ov::Tensor one_token_pos_ids(ov::element::i64, ov::Shape{3, 1, 1});
-    int64_t* one_token_pos_ptr = one_token_pos_ids.data<int64_t>();
-
-    while (!stop_generation && generated_ids.size() < static_cast<size_t>(max_new_tokens)) {
-        const int64_t token_to_feed = generated_ids.back();
-        one_token_ids.data<int64_t>()[0] = token_to_feed;
-
-        total_seq_len += 1;
-        const int64_t pos = static_cast<int64_t>(total_seq_len - 1);
-        one_token_pos_ptr[0] = pos;
-        one_token_pos_ptr[1] = pos;
-        one_token_pos_ptr[2] = pos;
-
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
-                                one_token_ids);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                                make_attention_mask_view(total_seq_len));
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
-                                one_token_pos_ids);
+        ov::Tensor audio_embeds;
+        size_t audio_seq_len = 0;
         if (!text_only) {
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds,
-                                    step_audio_embeds);
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask,
-                                    step_audio_pos_mask);
+            const size_t audio_frames = input_audio_features.get_shape()[2];
+            audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kInputAudioFeatures, input_audio_features);
+
+            auto input_lengths = make_i64({batch});
+            input_lengths.data<int64_t>()[0] = static_cast<int64_t>(audio_frames);
+            audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioFeatureLengths, input_lengths);
+
+            const auto audio_encode_start = std::chrono::steady_clock::now();
+            audio_request->infer();
+            const auto audio_encode_end = std::chrono::steady_clock::now();
+            result.audio_encode_ms = elapsed_ms(audio_encode_start, audio_encode_end);
+            audio_embeds = audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioEmbeds);
+            ov::Tensor audio_out_lengths =
+                audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioOutputLengths);
+
+            result.audio_embeds_shape = audio_embeds.get_shape();
+            if (result.audio_embeds_shape.size() != 3) {
+                throw std::runtime_error("Audio encoder output rank must be 3");
+            }
+
+            audio_seq_len = result.audio_embeds_shape[1];
+            result.audio_output_length = audio_out_lengths.data<const int64_t>()[0];
+            const size_t embed_dim = result.audio_embeds_shape[2];
+            if (embed_dim != static_cast<size_t>(text_cfg.hidden_size)) {
+                throw std::runtime_error("audio_embeds hidden dimension does not match text hidden_size");
+            }
         }
 
-        const auto step_start = std::chrono::steady_clock::now();
+        auto encoded_prompt = tokenizer.encode(instruction_prompt, {ov::genai::add_special_tokens(false)});
+        std::vector<int64_t> prompt_ids = tensor_row_to_i64_vector(encoded_prompt.input_ids);
+
+        std::vector<int64_t> input_ids;
+        input_ids.reserve(prompt_ids.size() + audio_seq_len + static_cast<size_t>(max_new_tokens));
+        if (text_only) {
+            input_ids = prompt_ids;
+            if (input_ids.empty()) {
+                input_ids.push_back(bos_token_id);
+            }
+        } else {
+            bool replaced_audio_placeholder = false;
+            for (int64_t tid : prompt_ids) {
+                if (!replaced_audio_placeholder && tid == audio_pad_token_id) {
+                    input_ids.insert(input_ids.end(), audio_seq_len, audio_pad_token_id);
+                    replaced_audio_placeholder = true;
+                } else {
+                    input_ids.push_back(tid);
+                }
+            }
+            if (!replaced_audio_placeholder) {
+                input_ids.insert(input_ids.begin(), audio_seq_len, audio_pad_token_id);
+                input_ids.push_back(bos_token_id);
+            }
+        }
+
+        std::vector<char> base_audio_pos_flags(input_ids.size(), 0);
+        for (size_t i = 0; i < input_ids.size(); ++i) {
+            if (input_ids[i] == audio_pad_token_id) {
+                base_audio_pos_flags[i] = 1;
+            }
+        }
+
+        ov::Tensor prompt_audio_embeds;
+        ov::Tensor prompt_audio_pos_mask;
+        ov::Tensor step_audio_embeds;
+        ov::Tensor step_audio_pos_mask;
+        if (!text_only) {
+            prompt_audio_embeds = make_audio_embeds_for_mask_positions(audio_embeds, base_audio_pos_flags);
+            prompt_audio_pos_mask = make_audio_pos_mask_from_flags(base_audio_pos_flags);
+
+            std::vector<char> no_audio_flags(1, 0);
+            ov::Tensor empty_audio_embeds(ov::element::f32, ov::Shape{1, 0, result.audio_embeds_shape[2]});
+            step_audio_embeds = make_audio_embeds_for_mask_positions(empty_audio_embeds, no_audio_flags);
+            step_audio_pos_mask = make_audio_pos_mask_from_flags(no_audio_flags);
+        }
+
+        std::vector<int64_t> generated_ids;
+        generated_ids.reserve(static_cast<size_t>(max_new_tokens));
+
+        text_request.reset_state();
+        ov::Tensor beam_idx = make_i32({batch}, 0);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx, beam_idx);
+
+        const size_t max_total_seq_len = input_ids.size() + static_cast<size_t>(max_new_tokens);
+        std::vector<int64_t> attention_mask_storage(max_total_seq_len, 1);
+        auto make_attention_mask_view = [&](size_t seq_len) -> ov::Tensor {
+            if (seq_len == 0 || seq_len > max_total_seq_len) {
+                throw std::runtime_error("Invalid seq_len for attention mask view");
+            }
+            return ov::Tensor(ov::element::i64, ov::Shape{batch, seq_len}, attention_mask_storage.data());
+        };
+
+        const size_t prompt_seq_len = input_ids.size();
+        result.prompt_token_size = prompt_seq_len;
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds, make_i64_from_vector(input_ids));
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask, make_attention_mask_view(prompt_seq_len));
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds, make_position_ids_3d(batch, prompt_seq_len));
+        if (!text_only) {
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds, prompt_audio_embeds);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask, prompt_audio_pos_mask);
+        }
+
+        const auto prefill_start = std::chrono::steady_clock::now();
         text_request.infer();
-        const auto step_end = std::chrono::steady_clock::now();
-        const double step_ms = elapsed_ms(step_start, step_end);
-        decode_ms += step_ms;
-        decode_tail_tokens += 1;
-        infer_steps += 1;
+        const auto prefill_end = std::chrono::steady_clock::now();
+        result.ttft_ms = elapsed_ms(prefill_start, prefill_end);
+        result.infer_steps += 1;
 
-        ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
-        if (process_logits_and_append(logits)) {
-            stop_generation = true;
-            break;
-        }
-    }
-    const auto asr_infer_end = std::chrono::steady_clock::now();
+        size_t total_seq_len = prompt_seq_len;
+        auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
+            result.logits_shape = logits.get_shape();
+            const int64_t next_token_id = argmax_last_token_id(logits);
+            if ((eos_token_id >= 0 && next_token_id == eos_token_id) ||
+                (stop_token_ids.find(next_token_id) != stop_token_ids.end())) {
+                return true;
+            }
+            generated_ids.push_back(next_token_id);
+            return false;
+        };
 
-    std::string raw_transcript_text;
-    if (!generated_ids.empty()) {
-        raw_transcript_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(false)});
-    }
-    if (!text_only && is_metadata_only_asr_output(raw_transcript_text)) {
-        raw_transcript_text.clear();
-        generated_ids.clear();
-    }
-    ParsedASROutput parsed_asr_output = parse_asr_output(raw_transcript_text);
-    std::string transcript_text = parsed_asr_output.text;
+        bool stop_generation = false;
+        {
+            ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
+            stop_generation = process_logits_and_append(logits);
+        }
 
-    std::string language_tag = parsed_asr_output.language;
-    if (language_tag.empty()) {
-        language_tag = detect_language_from_tokens(tokenizer, generated_ids);
-    }
-    if (language_tag.empty() || language_tag == "unknown") {
-        const std::string language_from_tokens = detect_language_from_language_prefix_tokens(tokenizer, generated_ids);
-        if (!language_from_tokens.empty()) {
-            language_tag = language_from_tokens;
-        }
-    }
-    if (language_tag.empty() || language_tag == "unknown") {
-        const std::string language_from_text = extract_language_from_prefix(transcript_text);
-        if (!language_from_text.empty()) {
-            language_tag = language_from_text;
-        }
-    }
-    if (language_tag.empty()) {
-        language_tag = "unknown";
-    }
-    if (text_only && language_tag == "unknown") {
-        language_tag = "n/a";
-    }
+        ov::Tensor one_token_ids(ov::element::i64, ov::Shape{1, 1});
+        ov::Tensor one_token_pos_ids(ov::element::i64, ov::Shape{3, 1, 1});
+        int64_t* one_token_pos_ptr = one_token_pos_ids.data<int64_t>();
 
-    std::string preview;
-    const size_t preview_count = std::min<size_t>(generated_ids.size(), 10);
-    for (size_t i = 0; i < preview_count; ++i) {
-        if (i > 0) {
-            preview += " | ";
-        }
-        preview += std::to_string(generated_ids[i]);
-        preview += ":";
-        preview += tokenizer.decode({generated_ids[i]}, {ov::genai::skip_special_tokens(false)});
-    }
+        while (!stop_generation && generated_ids.size() < static_cast<size_t>(max_new_tokens)) {
+            const int64_t token_to_feed = generated_ids.back();
+            one_token_ids.data<int64_t>()[0] = token_to_feed;
 
-    std::cout << "Qwen3-ASR smoke run completed" << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  device: " << device << std::endl;
-    std::cout << "  text_only: " << (text_only ? "true" : "false") << std::endl;
-    if (wav_path.has_value()) {
-        std::cout << "  wav: " << wav_path->string() << std::endl;
-    }
-    if (!text_only) {
-        std::cout << "  audio_embeds shape: [" << embeds_shape[0] << ", " << embeds_shape[1] << ", " << embeds_shape[2]
-                  << "]" << std::endl;
-        std::cout << "  audio_output_lengths[0]: " << audio_out_lengths.data<int64_t>()[0] << std::endl;
-        if (input_audio_sample_rate > 0) {
-            std::cout << "  audio_input_sample_rate_hz: " << input_audio_sample_rate << std::endl;
+            total_seq_len += 1;
+            const int64_t pos = static_cast<int64_t>(total_seq_len - 1);
+            one_token_pos_ptr[0] = pos;
+            one_token_pos_ptr[1] = pos;
+            one_token_pos_ptr[2] = pos;
+
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds, one_token_ids);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask, make_attention_mask_view(total_seq_len));
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds, one_token_pos_ids);
+            if (!text_only) {
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds, step_audio_embeds);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask, step_audio_pos_mask);
+            }
+
+            const auto step_start = std::chrono::steady_clock::now();
+            text_request.infer();
+            const auto step_end = std::chrono::steady_clock::now();
+            result.decode_ms += elapsed_ms(step_start, step_end);
+            result.decode_tail_tokens += 1;
+            result.infer_steps += 1;
+
+            ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
+            if (process_logits_and_append(logits)) {
+                stop_generation = true;
+                break;
+            }
         }
-    }
-    std::cout << "  logits shape: [" << logits_shape[0] << ", " << logits_shape[1] << ", " << logits_shape[2] << "]"
-              << std::endl;
-    std::cout << "  generated tokens: " << generated_ids.size() << std::endl;
-    std::cout << "  token preview: " << preview << std::endl;
-    std::cout << "  language: " << language_tag << std::endl;
-    std::cout << "  text: " << transcript_text << std::endl;
+
+        result.generated_ids = generated_ids;
+        if (!generated_ids.empty()) {
+            result.raw_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(false)});
+        }
+        if (!text_only && is_metadata_only_asr_output(result.raw_text)) {
+            result.raw_text.clear();
+            result.generated_ids.clear();
+        }
+
+        ParsedASROutput parsed_asr_output = parse_asr_output(result.raw_text);
+        result.text = parsed_asr_output.text;
+        result.language = parsed_asr_output.language;
+        if (result.language.empty()) {
+            result.language = detect_language_from_tokens(tokenizer, result.generated_ids);
+        }
+        if (result.language.empty() || result.language == "unknown") {
+            const std::string language_from_tokens = detect_language_from_language_prefix_tokens(tokenizer, result.generated_ids);
+            if (!language_from_tokens.empty()) {
+                result.language = language_from_tokens;
+            }
+        }
+        if (result.language.empty() || result.language == "unknown") {
+            std::string transcript_for_lang = result.text;
+            const std::string language_from_text = extract_language_from_prefix(transcript_for_lang);
+            if (!language_from_text.empty()) {
+                result.language = language_from_text;
+                result.text = transcript_for_lang;
+            }
+        }
+        if (result.language.empty()) {
+            result.language = text_only ? "n/a" : "unknown";
+        }
+
+        const auto asr_infer_end = std::chrono::steady_clock::now();
+        result.infer_ms = elapsed_ms(asr_infer_start, asr_infer_end);
+        (void)input_audio_duration_seconds;
+        (void)input_audio_sample_rate;
+        return result;
+    };
+
+    auto make_token_preview = [&](const std::vector<int64_t>& ids) -> std::string {
+        std::string preview;
+        const size_t preview_count = std::min<size_t>(ids.size(), 10);
+        for (size_t i = 0; i < preview_count; ++i) {
+            if (i > 0) {
+                preview += " | ";
+            }
+            preview += std::to_string(ids[i]);
+            preview += ":";
+            preview += tokenizer.decode({ids[i]}, {ov::genai::skip_special_tokens(false)});
+        }
+        return preview;
+    };
 
     const double model_build_ms = elapsed_ms(build_start, build_end);
     const double model_compile_ms = elapsed_ms(compile_start, compile_end);
-    const double feature_extract_ms = elapsed_ms(feature_extract_start, feature_extract_end);
-    const double audio_encode_ms = elapsed_ms(audio_encode_start, audio_encode_end);
-    const double asr_infer_ms = elapsed_ms(asr_infer_start, asr_infer_end);
-    const double tpot_ms = decode_tail_tokens > 0 ? (decode_ms / static_cast<double>(decode_tail_tokens)) : 0.0;
-    const double throughput = decode_ms > 0.0 ? (static_cast<double>(decode_tail_tokens) * 1000.0 / decode_ms) : 0.0;
-    const double asr_rtf = (!text_only && input_audio_duration_seconds > 0.0)
-                               ? (asr_infer_ms / 1000.0) / input_audio_duration_seconds
-                               : 0.0;
+    std::cout << std::fixed << std::setprecision(2);
 
-    // Keep compatibility with reporting scripts that scan for these labels.
-    std::cout << "Prompt token size: " << prompt_token_size << std::endl;
-    std::cout << "Output token size: " << generated_ids.size() << std::endl;
-    std::cout << "Generate time: " << asr_infer_ms << " ms" << std::endl;
-    std::cout << "TTFT: " << ttft_ms << " ms" << std::endl;
-    if (decode_tail_tokens > 0) {
-        std::cout << "TPOT: " << tpot_ms << " ms" << std::endl;
-        std::cout << "Throughput: " << throughput << " tokens/s" << std::endl;
+    if (!streaming) {
+        ov::Tensor input_audio_features;
+        double input_audio_duration_seconds = 0.0;
+        uint32_t input_audio_sample_rate = 0;
+        const auto feature_extract_start = std::chrono::steady_clock::now();
+        if (!text_only) {
+            if (wav_path.has_value()) {
+                input_audio_features = make_audio_features_from_wav(*wav_path,
+                                                                    preprocessor_cfg,
+                                                                    mel_bins,
+                                                                    &input_audio_duration_seconds,
+                                                                    &input_audio_sample_rate);
+            } else {
+                input_audio_features = make_audio_features(batch, mel_bins, 300);
+                input_audio_duration_seconds = static_cast<double>(input_audio_features.get_shape()[2]) / 100.0;
+            }
+        }
+        const auto feature_extract_end = std::chrono::steady_clock::now();
+
+        const auto decode_result = run_asr_decode(text_only ? make_audio_features(batch, mel_bins, 1) : input_audio_features,
+                                                  input_audio_duration_seconds,
+                                                  input_audio_sample_rate,
+                                                  text_only ? prompt_override.value_or("Please answer briefly: hello.")
+                                                            : build_python_style_asr_prompt(tokenizer, prompt_override.value_or(""), std::nullopt));
+
+        std::cout << "Qwen3-ASR smoke run completed" << std::endl;
+        std::cout << "  device: " << device << std::endl;
+        std::cout << "  text_only: " << (text_only ? "true" : "false") << std::endl;
+        if (wav_path.has_value()) {
+            std::cout << "  wav: " << wav_path->string() << std::endl;
+        }
+        if (!text_only && !decode_result.audio_embeds_shape.empty()) {
+            std::cout << "  audio_embeds shape: [" << decode_result.audio_embeds_shape[0] << ", "
+                      << decode_result.audio_embeds_shape[1] << ", " << decode_result.audio_embeds_shape[2] << "]" << std::endl;
+            std::cout << "  audio_output_lengths[0]: " << decode_result.audio_output_length << std::endl;
+            if (input_audio_sample_rate > 0) {
+                std::cout << "  audio_input_sample_rate_hz: " << input_audio_sample_rate << std::endl;
+            }
+        }
+        if (!decode_result.logits_shape.empty()) {
+            std::cout << "  logits shape: [" << decode_result.logits_shape[0] << ", " << decode_result.logits_shape[1]
+                      << ", " << decode_result.logits_shape[2] << "]" << std::endl;
+        }
+        std::cout << "  generated tokens: " << decode_result.generated_ids.size() << std::endl;
+        std::cout << "  token preview: " << make_token_preview(decode_result.generated_ids) << std::endl;
+        std::cout << "  language: " << decode_result.language << std::endl;
+        std::cout << "  text: " << decode_result.text << std::endl;
+
+        const double feature_extract_ms = elapsed_ms(feature_extract_start, feature_extract_end);
+        const double tpot_ms = decode_result.decode_tail_tokens > 0
+                                   ? (decode_result.decode_ms / static_cast<double>(decode_result.decode_tail_tokens))
+                                   : 0.0;
+        const double throughput = decode_result.decode_ms > 0.0
+                                      ? (static_cast<double>(decode_result.decode_tail_tokens) * 1000.0 / decode_result.decode_ms)
+                                      : 0.0;
+        const double asr_rtf = (!text_only && input_audio_duration_seconds > 0.0)
+                                   ? ((feature_extract_ms + decode_result.infer_ms) / 1000.0) / input_audio_duration_seconds
+                                   : 0.0;
+
+        std::cout << "Prompt token size: " << decode_result.prompt_token_size << std::endl;
+        std::cout << "Output token size: " << decode_result.generated_ids.size() << std::endl;
+        std::cout << "Generate time: " << decode_result.infer_ms << " ms" << std::endl;
+        std::cout << "TTFT: " << decode_result.ttft_ms << " ms" << std::endl;
+        if (decode_result.decode_tail_tokens > 0) {
+            std::cout << "TPOT: " << tpot_ms << " ms" << std::endl;
+            std::cout << "Throughput: " << throughput << " tokens/s" << std::endl;
+        } else {
+            std::cout << "TPOT: N/A" << std::endl;
+            std::cout << "Throughput: N/A" << std::endl;
+        }
+
+        std::cout << "  perf.build_model_ms: " << model_build_ms << std::endl;
+        std::cout << "  perf.compile_model_ms: " << model_compile_ms << std::endl;
+        std::cout << "  perf.feature_extract_ms: " << feature_extract_ms << std::endl;
+        std::cout << "  perf.audio_encode_ms: "
+                  << (text_only ? std::string{"N/A"} : std::to_string(decode_result.audio_encode_ms)) << std::endl;
+        if (!text_only) {
+            std::cout << "  perf.audio_duration_s: " << input_audio_duration_seconds << std::endl;
+            std::cout << "  perf.asr_infer_ms: " << decode_result.infer_ms << std::endl;
+            std::cout << "  perf.asr_rtf: " << asr_rtf << std::endl;
+        }
+        std::cout << "  perf.ttft_ms: " << decode_result.ttft_ms << std::endl;
+        std::cout << "  perf.decode_ms: " << decode_result.decode_ms << std::endl;
+        std::cout << "  perf.decode_steps: " << decode_result.decode_tail_tokens << std::endl;
+        std::cout << "  perf.infer_steps_total: " << decode_result.infer_steps << std::endl;
+        if (decode_result.decode_tail_tokens > 0) {
+            std::cout << "  perf.tpot_ms: " << tpot_ms << std::endl;
+            std::cout << "  perf.throughput_toks_per_s: " << throughput << std::endl;
+        } else {
+            std::cout << "  perf.tpot_ms: N/A" << std::endl;
+            std::cout << "  perf.throughput_toks_per_s: N/A" << std::endl;
+        }
+        return 0;
+    }
+
+    const uint32_t stream_sample_rate = static_cast<uint32_t>(std::max<size_t>(1, feature_extractor->sampling_rate));
+    const std::vector<float> wav_pcm = read_wav_pcm_mono_or_stereo(*wav_path, stream_sample_rate);
+    const size_t chunk_samples = std::max<size_t>(1, static_cast<size_t>(stream_chunk_sec * static_cast<double>(stream_sample_rate) + 0.5));
+    const size_t window_samples = std::max(chunk_samples, static_cast<size_t>(stream_window_sec * static_cast<double>(stream_sample_rate) + 0.5));
+
+    std::vector<float> pending_audio;
+    std::vector<float> recent_audio;
+    std::string stream_text;
+    std::string stream_language = "unknown";
+    double total_feature_extract_ms = 0.0;
+    double total_audio_encode_ms = 0.0;
+    double total_infer_ms = 0.0;
+    double total_decode_ms = 0.0;
+    double total_ttft_ms = 0.0;
+    size_t total_generated_tokens = 0;
+    size_t total_decode_tokens = 0;
+    size_t stream_steps = 0;
+    ASRDecodeResult last_result;
+
+    auto run_stream_step = [&](bool flush_tail) {
+        if (pending_audio.empty()) {
+            return;
+        }
+
+        recent_audio.insert(recent_audio.end(), pending_audio.begin(), pending_audio.end());
+        pending_audio.clear();
+        if (recent_audio.size() > window_samples) {
+            recent_audio.erase(recent_audio.begin(), recent_audio.begin() + static_cast<std::ptrdiff_t>(recent_audio.size() - window_samples));
+        }
+
+        const std::string prefix_text = (stream_steps < static_cast<size_t>(stream_unfixed_chunk_num))
+                                            ? std::string{}
+                                            : rollback_text_by_token_count(tokenizer, stream_text, static_cast<size_t>(stream_unfixed_token_num));
+        const std::string prompt = build_python_style_asr_prompt(tokenizer,
+                                                                 prompt_override.value_or(""),
+                                                                 std::nullopt,
+                                                                 prefix_text);
+
+        const auto feature_extract_start = std::chrono::steady_clock::now();
+        double window_duration_seconds = 0.0;
+        ov::Tensor window_features = make_audio_features_from_pcm(recent_audio,
+                                                                  *feature_extractor,
+                                                                  mel_bins,
+                                                                  &window_duration_seconds,
+                                                                  nullptr);
+        const auto feature_extract_end = std::chrono::steady_clock::now();
+        total_feature_extract_ms += elapsed_ms(feature_extract_start, feature_extract_end);
+
+        last_result = run_asr_decode(window_features, window_duration_seconds, stream_sample_rate, prompt);
+        total_audio_encode_ms += last_result.audio_encode_ms;
+        total_infer_ms += last_result.infer_ms;
+        total_decode_ms += last_result.decode_ms;
+        total_ttft_ms += last_result.ttft_ms;
+        total_generated_tokens += last_result.generated_ids.size();
+        total_decode_tokens += last_result.decode_tail_tokens;
+        stream_steps += 1;
+
+        std::string merged_text = merge_prefix_and_continuation_text(prefix_text, last_result.text);
+        if (!merged_text.empty()) {
+            stream_text = merged_text;
+        }
+        if (!last_result.language.empty() && last_result.language != "unknown") {
+            stream_language = last_result.language;
+        }
+
+        std::cout << "[stream] step=" << stream_steps
+                  << ", flush=" << (flush_tail ? "true" : "false")
+                  << ", window_audio_s=" << window_duration_seconds
+                  << ", generated_tokens=" << last_result.generated_ids.size()
+                  << ", language=" << stream_language
+                  << ", text=" << stream_text << std::endl;
+    };
+
+    const auto stream_start = std::chrono::steady_clock::now();
+    size_t cursor = 0;
+    while (cursor < wav_pcm.size()) {
+        const size_t take = std::min(chunk_samples, wav_pcm.size() - cursor);
+        pending_audio.insert(pending_audio.end(), wav_pcm.begin() + static_cast<std::ptrdiff_t>(cursor),
+                             wav_pcm.begin() + static_cast<std::ptrdiff_t>(cursor + take));
+        cursor += take;
+        if (pending_audio.size() >= chunk_samples) {
+            run_stream_step(false);
+        }
+    }
+    run_stream_step(true);
+    const auto stream_end = std::chrono::steady_clock::now();
+
+    const double input_audio_duration_seconds = static_cast<double>(wav_pcm.size()) / static_cast<double>(stream_sample_rate);
+    const double total_wall_ms = elapsed_ms(stream_start, stream_end);
+    const double stream_rtf = input_audio_duration_seconds > 0.0
+                                  ? ((total_feature_extract_ms + total_infer_ms) / 1000.0) / input_audio_duration_seconds
+                                  : 0.0;
+    const double stream_tpot_ms = total_decode_tokens > 0 ? (total_decode_ms / static_cast<double>(total_decode_tokens)) : 0.0;
+    const double stream_throughput = total_decode_ms > 0.0
+                                         ? (static_cast<double>(total_decode_tokens) * 1000.0 / total_decode_ms)
+                                         : 0.0;
+
+    std::cout << "Qwen3-ASR streaming run completed" << std::endl;
+    std::cout << "  device: " << device << std::endl;
+    std::cout << "  wav: " << wav_path->string() << std::endl;
+    std::cout << "  streaming: true" << std::endl;
+    std::cout << "  stream_chunk_sec: " << stream_chunk_sec << std::endl;
+    std::cout << "  stream_window_sec: " << stream_window_sec << std::endl;
+    std::cout << "  stream_steps: " << stream_steps << std::endl;
+    std::cout << "  language: " << stream_language << std::endl;
+    std::cout << "  text: " << stream_text << std::endl;
+    if (!last_result.audio_embeds_shape.empty()) {
+        std::cout << "  last_audio_embeds shape: [" << last_result.audio_embeds_shape[0] << ", "
+                  << last_result.audio_embeds_shape[1] << ", " << last_result.audio_embeds_shape[2] << "]" << std::endl;
+        std::cout << "  last_audio_output_lengths[0]: " << last_result.audio_output_length << std::endl;
+    }
+    if (!last_result.logits_shape.empty()) {
+        std::cout << "  last_logits shape: [" << last_result.logits_shape[0] << ", " << last_result.logits_shape[1]
+                  << ", " << last_result.logits_shape[2] << "]" << std::endl;
+    }
+    std::cout << "  last_token_preview: " << make_token_preview(last_result.generated_ids) << std::endl;
+
+    std::cout << "Prompt token size: " << last_result.prompt_token_size << std::endl;
+    std::cout << "Output token size: " << total_generated_tokens << std::endl;
+    std::cout << "Generate time: " << total_infer_ms << " ms" << std::endl;
+    std::cout << "TTFT: " << (stream_steps > 0 ? total_ttft_ms / static_cast<double>(stream_steps) : 0.0) << " ms" << std::endl;
+    if (total_decode_tokens > 0) {
+        std::cout << "TPOT: " << stream_tpot_ms << " ms" << std::endl;
+        std::cout << "Throughput: " << stream_throughput << " tokens/s" << std::endl;
     } else {
         std::cout << "TPOT: N/A" << std::endl;
         std::cout << "Throughput: N/A" << std::endl;
@@ -1445,20 +1685,19 @@ int main(int argc, char* argv[]) try {
 
     std::cout << "  perf.build_model_ms: " << model_build_ms << std::endl;
     std::cout << "  perf.compile_model_ms: " << model_compile_ms << std::endl;
-    std::cout << "  perf.feature_extract_ms: " << feature_extract_ms << std::endl;
-    std::cout << "  perf.audio_encode_ms: " << audio_encode_ms << std::endl;
-    if (!text_only) {
-        std::cout << "  perf.audio_duration_s: " << input_audio_duration_seconds << std::endl;
-        std::cout << "  perf.asr_infer_ms: " << asr_infer_ms << std::endl;
-        std::cout << "  perf.asr_rtf: " << asr_rtf << std::endl;
-    }
-    std::cout << "  perf.ttft_ms: " << ttft_ms << std::endl;
-    std::cout << "  perf.decode_ms: " << decode_ms << std::endl;
-    std::cout << "  perf.decode_steps: " << decode_tail_tokens << std::endl;
-    std::cout << "  perf.infer_steps_total: " << infer_steps << std::endl;
-    if (decode_tail_tokens > 0) {
-        std::cout << "  perf.tpot_ms: " << tpot_ms << std::endl;
-        std::cout << "  perf.throughput_toks_per_s: " << throughput << std::endl;
+    std::cout << "  perf.feature_extract_ms: " << total_feature_extract_ms << std::endl;
+    std::cout << "  perf.audio_encode_ms: " << total_audio_encode_ms << std::endl;
+    std::cout << "  perf.audio_duration_s: " << input_audio_duration_seconds << std::endl;
+    std::cout << "  perf.asr_infer_ms: " << total_infer_ms << std::endl;
+    std::cout << "  perf.asr_rtf: " << stream_rtf << std::endl;
+    std::cout << "  perf.ttft_ms: " << (stream_steps > 0 ? total_ttft_ms / static_cast<double>(stream_steps) : 0.0) << std::endl;
+    std::cout << "  perf.decode_ms: " << total_decode_ms << std::endl;
+    std::cout << "  perf.decode_steps: " << total_decode_tokens << std::endl;
+    std::cout << "  perf.infer_steps_total: " << stream_steps << std::endl;
+    std::cout << "  perf.stream_wall_ms: " << total_wall_ms << std::endl;
+    if (total_decode_tokens > 0) {
+        std::cout << "  perf.tpot_ms: " << stream_tpot_ms << std::endl;
+        std::cout << "  perf.throughput_toks_per_s: " << stream_throughput << std::endl;
     } else {
         std::cout << "  perf.tpot_ms: N/A" << std::endl;
         std::cout << "  perf.throughput_toks_per_s: N/A" << std::endl;
