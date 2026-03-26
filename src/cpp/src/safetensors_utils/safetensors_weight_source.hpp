@@ -9,7 +9,6 @@
 
 #include "openvino/genai/visibility.hpp"
 #include <openvino/openvino.hpp>
-#include <openvino/runtime/aligned_buffer.hpp>
 
 #include "modeling/weights/weight_source.hpp"
 #include "safetensors_utils/safetensors_loader.hpp"
