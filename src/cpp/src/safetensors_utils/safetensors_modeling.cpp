@@ -634,7 +634,7 @@ std::shared_ptr<ov::Model> create_model_with_modeling_api(
         cfg.mlp_bias = has_key("model.layers[0].mlp.gate_proj.bias");
         cfg.tie_word_embeddings = !has_key("lm_head.weight");
         ov_model = ov::genai::modeling::models::create_smollm3_model(cfg, source, finalizer);
-    } else if (hf_config.model_type == "youtu_llm") {
+    } else if (hf_config.model_type == "youtu" || hf_config.model_type == "youtu_llm") {
         ov::genai::modeling::models::YoutuConfig cfg;
         cfg.architecture = hf_config.model_type;
         cfg.hidden_size = hf_config.hidden_size;
@@ -986,10 +986,11 @@ std::shared_ptr<ov::Model> create_from_safetensors(
     const std::string& model_type = config.model_type;
 
     // Check if new modeling API should be used
-    const bool force_modeling_api = (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5");
+    const bool force_modeling_api = (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5"
+                                  || model_type == "youtu" || model_type == "youtu_llm");
     if (((model_type == "qwen3" || model_type == "qwen3_moe" || model_type == "qwen3_next" || 
           model_type == "qwen3_5_moe" || model_type == "qwen3_5" ||
-          model_type == "smollm3" || model_type == "youtu_llm") &&
+          model_type == "smollm3" || model_type == "youtu_llm" || model_type == "youtu") &&
          (use_modeling_api() || force_modeling_api))) {
         std::cout << "[Safetensors] Using new modeling API" << std::endl;
         model = create_model_with_modeling_api(config, st_data, final_quant_config, model_dir);
