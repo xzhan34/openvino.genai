@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3.5 MTP Implementation Summary</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a2e; --accent: #0071c5; --accent-light: #e8f4fd;
+    --border: #d0d7de; --code-bg: #f6f8fa; --table-stripe: #f6f8fa;
+    --green: #1a7f37; --red: #cf222e; --orange: #bf8700;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+         line-height: 1.6; color: var(--fg); max-width: 960px; margin: 0 auto; padding: 2rem; }
+  h1 { font-size: 1.8rem; border-bottom: 2px solid var(--accent); padding-bottom: 0.5rem; margin-bottom: 1.5rem; color: var(--accent); }
+  h2 { font-size: 1.4rem; margin-top: 2rem; margin-bottom: 0.8rem; color: var(--fg); border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+  h3 { font-size: 1.15rem; margin-top: 1.5rem; margin-bottom: 0.5rem; }
+  p { margin-bottom: 0.8rem; }
+  strong { color: var(--fg); }
+  code { font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; font-size: 0.88em;
+         background: var(--code-bg); padding: 0.15em 0.4em; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+        padding: 1rem; overflow-x: auto; margin: 0.8rem 0 1.2rem; line-height: 1.5; }
+  pre code { background: none; padding: 0; font-size: 0.85em; }
+  table { width: 100%; border-collapse: collapse; margin: 0.8rem 0 1.2rem; font-size: 0.92em; }
+  th, td { padding: 0.5rem 0.75rem; border: 1px solid var(--border); text-align: left; }
+  th { background: var(--accent); color: #fff; font-weight: 600; }
+  tr:nth-child(even) { background: var(--table-stripe); }
+  .status { display: inline-block; padding: 0.2em 0.7em; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
+  .status-ok { background: #dafbe1; color: var(--green); }
+  .status-warn { background: #fff8c5; color: var(--orange); }
+  .status-neg { background: #ffebe9; color: var(--red); }
+  .delta-neg { color: var(--red); font-weight: 600; }
+  .delta-pos { color: var(--green); font-weight: 600; }
+  .note { background: var(--accent-light); border-left: 4px solid var(--accent); padding: 0.8rem 1rem; margin: 1rem 0; border-radius: 0 6px 6px 0; }
+  ol, ul { margin: 0.5rem 0 1rem 1.5rem; }
+  li { margin-bottom: 0.3rem; }
+  .toc { background: var(--table-stripe); border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.5rem; margin-bottom: 2rem; }
+  .toc ul { list-style: none; margin: 0.3rem 0 0 0; }
+  .toc li { margin-bottom: 0.2rem; }
+  .toc a { text-decoration: none; color: var(--accent); }
+  .toc a:hover { text-decoration: underline; }
+  .footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: 0.85em; color: #656d76; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Qwen3.5 MTP (Multi-Token Prediction) Implementation Summary</h1>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ul>
+    <li><a href="#overview">Overview</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#changed-files">Changed Files</a></li>
+    <li><a href="#key-decisions">Key Implementation Decisions</a></li>
+    <li><a href="#benchmark">Benchmark Results (Baseline)</a></li>
+    <li><a href="#analysis">Performance Analysis</a></li>
+    <li><a href="#next-steps">Next Steps for Performance Optimization</a></li>
+  </ul>
+</div>
+
+<!-- ======== Overview ======== -->
+<h2 id="overview">Overview</h2>
+<p>This document summarizes the initial MTP speculative decoding implementation for Qwen3.5 in the OpenVINO GenAI explicit modeling framework. This serves as the baseline for future performance optimization work.</p>
+<p><strong>Status</strong>: <span class="status status-ok">Functionally Complete</span> &nbsp;
+   Speculative decoding works end-to-end on both text and VL modes. Performance is not yet positive&mdash;throughput is currently lower than baseline due to the cost of 2-token inference and low hit rates on the 0.8B model.</p>
+
+<!-- ======== Architecture ======== -->
+<h2 id="architecture">Architecture</h2>
+
+<h3>MTP Model Pipeline</h3>
+<pre><code>Input: input_ids [B, S], hidden_states [B, S, H]
+  &darr;
+1. mtp.embed_tokens(input_ids)           &rarr; [B, S, H]       (shared with main model)
+2. mtp.pre_fc_norm_embedding(embed)      &rarr; [B, S, H]
+   mtp.pre_fc_norm_hidden(hidden)        &rarr; [B, S, H]
+3. Concat([norm_embed, norm_hidden], -1) &rarr; [B, S, 2*H]
+4. mtp.fc(concat)                        &rarr; [B, S, H]       (linear: 2*H &rarr; H)
+5. MTP decoder layers (full_attention only, dense MLP, typically 1 layer)
+6. mtp.norm(out)                         &rarr; [B, S, H]
+7. lm_head(norm)                         &rarr; [B, S, V]       (shared with main model)</code></pre>
+
+<h3>Speculative Decode Loop</h3>
+<pre><code>Given: next_id (confirmed token), mtp_draft_id (MTP's prediction)
+
+1. Feed [next_id, draft_id] as 2-token sequence to main model
+2. Main model outputs logits at both positions:
+   - logits[0] &rarr; verified_id  (what comes after next_id)
+   - logits[1] &rarr; bonus_id     (what comes after draft_id)
+3. Compare verified_id == draft_id:
+
+   ACCEPT:
+   - Emit both verified_id and bonus_id (2 tokens per infer)
+   - past_len += 2
+   - Run MTP on bonus_id's hidden_states &rarr; new draft
+
+   REJECT:
+   - Emit only verified_id (1 token per infer)
+   - Trim main model KV cache by 1 (remove draft's position)
+   - Reset MTP state (KV cache invalid after rejection)
+   - Run MTP on verified_id's hidden_states &rarr; new draft</code></pre>
+
+<!-- ======== Changed Files ======== -->
+<h2 id="changed-files">Changed Files</h2>
+
+<h3>Model Definition (6 files)</h3>
+<table>
+  <tr><th>File</th><th>Changes</th></tr>
+  <tr><td><code>processing_qwen3_5.hpp</code></td><td>Added <code>mtp_num_hidden_layers</code> to <code>Qwen3_5TextConfig</code>; added <code>Qwen3_5MtpIO</code> struct with I/O names; added <code>kHiddenStates</code> to <code>Qwen3_5TextIO</code></td></tr>
+  <tr><td><code>processing_qwen3_5.cpp</code></td><td>Parse <code>mtp_num_hidden_layers</code> from JSON config</td></tr>
+  <tr><td><code>modeling_qwen3_5_text.hpp</code></td><td>Added <code>forward_with_hidden()</code>, <code>forward_embeds_with_hidden()</code> methods; added <code>output_hidden_states</code> param to <code>create_qwen3_5_text_model()</code>; declared <code>create_qwen3_5_mtp_model()</code></td></tr>
+  <tr><td><code>modeling_qwen3_5_text.cpp</code></td><td>Implemented MTP model graph construction (<code>create_qwen3_5_mtp_model()</code>); implemented <code>forward_with_hidden()</code> to capture hidden states before LM head; MTP config: full_attention only, dense MLP, no MoE</td></tr>
+  <tr><td><code>qwen3_5_weight_specs.hpp</code></td><td>Declared <code>build_qwen3_5_mtp_weight_specs()</code></td></tr>
+  <tr><td><code>qwen3_5_weight_specs.cpp</code></td><td>Implemented MTP weight specs: <code>mtp.fc</code>, <code>mtp.pre_fc_norm_*</code>, <code>mtp.layers[i].*</code>, shared <code>embed_tokens</code> and <code>lm_head</code> via PackedMapping rules</td></tr>
+</table>
+
+<h3>Sample Application (1 file)</h3>
+<table>
+  <tr><th>File</th><th>Changes</th></tr>
+  <tr><td><code>modeling_qwen3_5.cpp</code></td><td>Added <code>--mtp</code> / <code>--mtp-layers</code> CLI args; <code>extract_logits_at_pos_f32()</code> for multi-position logit extraction; <code>trim_kv_cache_states()</code> for KV cache trimming on rejection; <code>run_mtp_draft</code> lambda for MTP inference; full speculative decode loop with accept/reject paths; MTP metrics output</td></tr>
+</table>
+
+<h3>Benchmark Script (1 file, new)</h3>
+<table>
+  <tr><th>File</th><th>Description</th></tr>
+  <tr><td><code>bench_mtp.ps1</code></td><td>PowerShell benchmark script: runs baseline vs MTP across text/VL modes, parses all metrics (TTFT, TPOT, throughput, MTP hit rate, tokens/infer), outputs summary table with speedup calculation</td></tr>
+</table>
+
+<!-- ======== Key Decisions ======== -->
+<h2 id="key-decisions">Key Implementation Decisions</h2>
+<ol>
+  <li><strong>Fresh tensors per speculative step</strong>: 2-token input tensors are created fresh each iteration rather than pre-allocated, to avoid GPU plugin output reallocation issues when switching between seq_len=1 and seq_len=2.</li>
+  <li><strong>MTP state reset on rejection</strong>: On draft rejection, MTP KV cache is fully reset (<code>mtp_request-&gt;reset_state()</code>) rather than trimmed. GPU plugin crashes when <code>set_state()</code> is called with CPU tensors on the MTP model after trim. Main model KV trim works correctly.</li>
+  <li><strong>Output copy before input reset</strong>: After 2-token inference, logits and hidden states are copied to local tensors before resetting inputs back to 1-token shapes, because GPU plugin may invalidate tensor references on input change.</li>
+  <li><strong>Shared weights</strong>: <code>embed_tokens</code> and <code>lm_head</code> weights are shared between main model and MTP model via PackedMapping weight loading rules.</li>
+</ol>
+
+<!-- ======== Benchmark ======== -->
+<h2 id="benchmark">Benchmark Results (Baseline)</h2>
+<div class="note">
+  <strong>Setup:</strong> Qwen3.5-0.8B &nbsp;|&nbsp; INT4_ASYM group_size=128 &nbsp;|&nbsp; GPU &nbsp;|&nbsp; 64 output tokens &nbsp;|&nbsp; 3 runs averaged
+</div>
+
+<h3>Text Mode</h3>
+<table>
+  <tr><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Tok/Infer</th><th>Delta</th></tr>
+  <tr><td>Baseline (no MTP)</td><td>15.09</td><td>66.28</td><td>&mdash;</td><td>1.00</td><td>&mdash;</td></tr>
+  <tr><td>MTP Speculative</td><td>22.90</td><td>43.91</td><td>27.6%</td><td>1.27</td><td class="delta-neg">&minus;33.8%</td></tr>
+</table>
+
+<h3>VL Mode</h3>
+<table>
+  <tr><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Tok/Infer</th><th>Delta</th></tr>
+  <tr><td>Baseline (no MTP)</td><td>19.90</td><td>53.53</td><td>&mdash;</td><td>1.00</td><td>&mdash;</td></tr>
+  <tr><td>MTP Speculative</td><td>22.74</td><td>44.35</td><td>38.7%</td><td>1.38</td><td class="delta-neg">&minus;17.1%</td></tr>
+</table>
+
+<!-- ======== Analysis ======== -->
+<h2 id="analysis">Performance Analysis</h2>
+<p>MTP speculative decoding currently shows <span class="status status-neg">negative throughput impact</span> (&minus;17%&thinsp;~&thinsp;&minus;34%). Root causes:</p>
+<table>
+  <tr><th>Factor</th><th>Impact</th><th>Notes</th></tr>
+  <tr><td>2-token infer cost</td><td>~2&times; single-token</td><td>GPU memory-bound; 2 tokens &asymp; 2&times; latency</td></tr>
+  <tr><td>Low hit rate</td><td>28&ndash;39%</td><td>0.8B model's single MTP layer is too weak; need &gt;50% to break even</td></tr>
+  <tr><td>KV cache trim overhead</td><td>High on rejection</td><td>GPU&rarr;CPU&rarr;GPU roundtrip for state slicing</td></tr>
+  <tr><td>MTP state reset on rejection</td><td>Reduces accuracy</td><td>Discards speculative context, hurts subsequent predictions</td></tr>
+</table>
+<p><strong>Break-even analysis:</strong> With 2&times; infer cost, the minimum hit rate for net positive throughput is ~50%. At 39% (VL mode best case), we generate 1.38 tokens/infer vs the required ~1.5 tokens/infer.</p>
+
+<!-- ======== Next Steps ======== -->
+<h2 id="next-steps">Next Steps for Performance Optimization</h2>
+<ol>
+  <li><strong>Reduce 2-token infer cost</strong>: Investigate if GPU plugin can batch 2-token inference more efficiently; explore async MTP execution</li>
+  <li><strong>Avoid MTP state reset</strong>: Implement proper MTP KV cache trim on GPU to preserve speculative context across rejections</li>
+  <li><strong>Test with larger models</strong>: 7B+ models typically achieve 60&ndash;80% MTP hit rates, making speculative decode profitable</li>
+  <li><strong>Multi-token speculation (k&gt;1)</strong>: Extend to draft k tokens ahead and verify all at once</li>
+  <li><strong>Benchmark with longer sequences</strong>: Hit rate may improve with more context</li>
+</ol>
+
+<div class="footer">
+  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Commit <code>02a719a4</code> on <code>explicit-modeling</code> &mdash; March 2026
+</div>
+
+</body>
+</html>

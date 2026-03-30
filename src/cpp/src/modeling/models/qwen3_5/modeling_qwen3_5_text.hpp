@@ -297,6 +297,29 @@ public:
                           const Tensor* visual_embeds = nullptr,
                           const Tensor* visual_pos_mask = nullptr);
 
+    // Returns {logits, hidden_states_before_lm_head}
+    std::pair<Tensor, Tensor> forward_with_hidden(
+                   const Tensor& input_ids,
+                   const Tensor& position_ids,
+                   const Tensor& beam_idx,
+                   const Tensor& full_attention_mask,
+                   const Tensor* linear_attention_mask,
+                   const Tensor* cache_position,
+                   const Tensor* visual_embeds = nullptr,
+                   const Tensor* visual_pos_mask = nullptr);
+    std::pair<Tensor, Tensor> forward_embeds_with_hidden(
+                          const Tensor& inputs_embeds,
+                          const Tensor& position_ids,
+                          const Tensor& beam_idx,
+                          const Tensor& full_attention_mask,
+                          const Tensor* linear_attention_mask,
+                          const Tensor* cache_position,
+                          const Tensor* visual_embeds = nullptr,
+                          const Tensor* visual_pos_mask = nullptr);
+
+    Qwen3_5Model& model() { return model_; }
+    LMHead& lm_head() { return lm_head_; }
+
 private:
     Qwen3_5TextModelConfig cfg_;
     Qwen3_5Model model_;
@@ -308,7 +331,16 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool use_inputs_embeds = false,
-    bool enable_visual_inputs = true);
+    bool enable_visual_inputs = true,
+    bool output_hidden_states = false);
+
+/// Build a Qwen3.5 MTP (Multi-Token Prediction) head model.
+/// The MTP model takes input_ids and hidden_states from the main model,
+/// and produces logits for the next-next token (speculative decoding).
+std::shared_ptr<ov::Model> create_qwen3_5_mtp_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
 
 }  // namespace models
 }  // namespace modeling

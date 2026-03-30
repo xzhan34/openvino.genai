@@ -68,6 +68,8 @@ struct SampleOptions {
     float presence_penalty = 1.5f;
     size_t rng_seed = 0;  // 0 = use random_device
     bool enable_thinking = true;  // --think 0/1
+    bool enable_mtp = false;  // --mtp 0/1: enable Multi-Token Prediction speculative decoding
+    int mtp_num_layers = 1;   // --mtp-layers N: number of MTP decoder layers (default: 1)
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -187,6 +189,8 @@ void print_usage(const char* argv0) {
     << "  --presence-penalty FLOAT        Subtract penalty if token appeared (default: 1.5)\n"
     << "  --rng-seed INT                  Random seed for sampling (default: 0 = random)\n"
     << "  --think 0|1                     Enable/disable thinking mode (default: 1 = enabled)\n"
+    << "  --mtp 0|1                       Enable MTP (Multi-Token Prediction) speculative decoding (default: 0)\n"
+    << "  --mtp-layers N                  Number of MTP decoder layers (default: 1)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -273,6 +277,11 @@ SampleOptions parse_cli(int argc, char* argv[]) {
         } else if (arg == "--think") {
             int val = parse_i32(take_value("--think"), "--think");
             opts.enable_thinking = (val != 0);
+        } else if (arg == "--mtp") {
+            int val = parse_i32(take_value("--mtp"), "--mtp");
+            opts.enable_mtp = (val != 0);
+        } else if (arg == "--mtp-layers") {
+            opts.mtp_num_layers = parse_i32(take_value("--mtp-layers"), "--mtp-layers");
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -376,6 +385,55 @@ std::set<int64_t> resolve_stop_token_ids(const std::filesystem::path& model_dir,
     return stop_token_ids;
 }
 
+
+// Extract logits at a specific sequence position from [1, S, V] into a float32 scratch buffer.
+void extract_logits_at_pos_f32(const ov::Tensor& logits, size_t pos, std::vector<float>& out) {
+    const auto shape = logits.get_shape();
+    const size_t vocab = shape[2];
+    const size_t offset = pos * vocab;
+    out.resize(vocab);
+    if (logits.get_element_type() == ov::element::f32) {
+        std::memcpy(out.data(), logits.data<const float>() + offset, vocab * sizeof(float));
+    } else if (logits.get_element_type() == ov::element::f16) {
+        const auto* src = logits.data<const ov::float16>() + offset;
+        for (size_t i = 0; i < vocab; ++i)
+            out[i] = static_cast<float>(src[i]);
+    } else if (logits.get_element_type() == ov::element::bf16) {
+        const auto* src = logits.data<const ov::bfloat16>() + offset;
+        for (size_t i = 0; i < vocab; ++i)
+            out[i] = static_cast<float>(src[i]);
+    } else {
+        throw std::runtime_error("Unsupported logits dtype for logit processing");
+    }
+}
+
+// Trim the KV cache of an infer request by removing the last `num_tokens` entries.
+// The KV cache states have shape [batch, num_kv_heads, seq_len, head_dim] with seq_length_axis=2.
+void trim_kv_cache_states(ov::InferRequest& request, size_t num_tokens, size_t seq_length_axis = 2) {
+    if (num_tokens == 0) return;
+    for (auto& state : request.query_state()) {
+        const auto& name = state.get_name();
+        // Only trim attention KV states
+        if (name.find("past_key_values.") == std::string::npos &&
+            name.find(".key_cache") == std::string::npos &&
+            name.find(".value_cache") == std::string::npos) {
+            continue;
+        }
+        ov::Tensor old_tensor = state.get_state();
+        auto shape = old_tensor.get_shape();
+        if (seq_length_axis >= shape.size()) continue;
+        const size_t old_seq_len = shape[seq_length_axis];
+        const size_t trim = std::min<size_t>(old_seq_len, num_tokens);
+        if (trim == 0) continue;
+        shape[seq_length_axis] = old_seq_len - trim;
+        ov::Coordinate begin(shape.size(), 0);
+        ov::Coordinate end(shape.begin(), shape.end());
+        auto trimmed = ov::Tensor(old_tensor, begin, end);
+        ov::Tensor new_tensor(old_tensor.get_element_type(), shape);
+        trimmed.copy_to(new_tensor);
+        state.set_state(new_tensor);
+    }
+}
 
 // Extract the last token's logits from [1, S, V] into a float32 scratch buffer.
 // Handles f32, f16, and bf16 logit tensors.
@@ -840,6 +898,15 @@ int main(int argc, char* argv[]) try {
     }
     apply_text_config_overrides(cfg, opts);
 
+    // MTP: override mtp_num_hidden_layers from CLI if --mtp is used
+    const bool use_mtp = opts.enable_mtp;
+    if (use_mtp) {
+        if (cfg.text.mtp_num_hidden_layers <= 0) {
+            cfg.text.mtp_num_hidden_layers = opts.mtp_num_layers;
+        }
+        std::cout << "[mtp] MTP enabled, mtp_num_hidden_layers=" << cfg.text.mtp_num_hidden_layers << std::endl;
+    }
+
     ov::genai::modeling::weights::QuantizationConfig vision_quant_config;
     ov::genai::modeling::weights::QuantizationConfig text_quant_config;
     const auto shared_quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
@@ -898,6 +965,11 @@ int main(int argc, char* argv[]) try {
                 constexpr float kDummyInitRange = 0.02f;
                 auto specs = use_vl ? ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg)
                                     : ov::genai::modeling::models::build_qwen3_5_text_weight_specs(cfg.text);
+                // Add MTP weight specs if MTP is enabled
+                if (use_mtp) {
+                    auto mtp_specs = ov::genai::modeling::models::build_qwen3_5_mtp_weight_specs(cfg.text);
+                    specs.insert(specs.end(), mtp_specs.begin(), mtp_specs.end());
+                }
                 source = std::make_unique<ov::genai::modeling::weights::SyntheticWeightSource>(
                     std::move(specs),
                     kDummySeed,
@@ -958,16 +1030,29 @@ int main(int argc, char* argv[]) try {
             weight_source,
             text_finalizer,
             false,
-            use_vl);
+            use_vl,
+            use_mtp /* output_hidden_states */);
         if (opts.cache_model) {
             ov::serialize(text_model, text_xml_path.string(), text_bin_path.string());
             std::cout << "[cache-model] Saved text IR: " << text_xml_path << std::endl;
         }
     }
 
+    // Build MTP model if enabled
+    std::shared_ptr<ov::Model> mtp_model;
+    if (use_mtp) {
+        auto& weight_source = ensure_weight_source();
+        ov::genai::safetensors::SafetensorsWeightFinalizer mtp_finalizer(text_quant_config);
+        mtp_model = ov::genai::modeling::models::create_qwen3_5_mtp_model(
+            cfg,
+            weight_source,
+            mtp_finalizer);
+        std::cout << "[mtp] MTP model built successfully" << std::endl;
+    }
+
     if (use_dummy_mode_flag && source) {
         source->release_all_cached_tensors();
-        if (!use_vl) {
+        if (!use_vl && !use_mtp) {
             source.reset();
         }
     }
@@ -982,6 +1067,13 @@ int main(int argc, char* argv[]) try {
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
     auto compiled_text = core.compile_model(text_model, opts.device);
+
+    // Compile MTP model if enabled
+    std::optional<ov::CompiledModel> compiled_mtp;
+    if (use_mtp && mtp_model) {
+        compiled_mtp = core.compile_model(mtp_model, opts.device);
+        std::cout << "[mtp] MTP model compiled on device: " << opts.device << std::endl;
+    }
 
     ov::Tensor visual_embeds;
     ov::Tensor grid_thw;
@@ -1163,6 +1255,12 @@ int main(int argc, char* argv[]) try {
     ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
     const auto prefill_end = std::chrono::steady_clock::now();
 
+    // If MTP enabled, also capture hidden_states from the main model
+    ov::Tensor main_hidden_states;
+    if (use_mtp) {
+        main_hidden_states = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
+    }
+
     // Process prefill logits and select first token.
     extract_last_logits_f32(logits, logit_buf);
     int64_t next_id;
@@ -1237,51 +1335,356 @@ int main(int argc, char* argv[]) try {
     ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, 1});
     const int64_t* rope_deltas_data = plan.rope_deltas.data<const int64_t>();
 
+    // ---------------------------------------------------------------------------
+    // MTP inference request setup (speculative decoding)
+    // ---------------------------------------------------------------------------
+    std::optional<ov::InferRequest> mtp_request;
+    ov::Tensor mtp_step_ids;
+    ov::Tensor mtp_hidden_in;
+    ov::Tensor mtp_mask;
+    ov::Tensor mtp_pos;
+    ov::Tensor mtp_beam;
+    std::optional<ov::RemoteContext> mtp_gpu_ctx;
+    size_t mtp_hits = 0;
+    size_t mtp_attempts = 0;
+    size_t mtp_main_infers = 0;  // number of main model infer calls during decode
+    int64_t mtp_draft_id = -1;  // draft token predicted by MTP for the NEXT step
+    std::vector<float> mtp_logit_buf;
+
+    if (use_mtp && compiled_mtp) {
+        mtp_request = compiled_mtp->create_infer_request();
+        mtp_gpu_ctx = try_get_gpu_context(*compiled_mtp);
+
+        mtp_step_ids = make_usm_host_tensor(mtp_gpu_ctx, ov::element::i64, {batch, 1});
+        mtp_hidden_in = make_usm_host_tensor(mtp_gpu_ctx, ov::element::f32, {batch, 1, static_cast<size_t>(cfg.text.hidden_size)});
+        mtp_mask = make_usm_host_tensor(mtp_gpu_ctx, ov::element::i64, {batch, 1});
+        auto* mtp_mask_ptr = mtp_mask.data<int64_t>();
+        for (size_t b = 0; b < batch; ++b) {
+            mtp_mask_ptr[b] = 1;
+        }
+        mtp_pos = make_usm_host_tensor(mtp_gpu_ctx, ov::element::i64, {3, batch, 1});
+        mtp_beam = make_usm_host_tensor(mtp_gpu_ctx, ov::element::i32, {batch});
+        auto* mtp_beam_ptr = mtp_beam.data<int32_t>();
+        for (size_t b = 0; b < batch; ++b) {
+            mtp_beam_ptr[b] = static_cast<int32_t>(b);
+        }
+
+        // Run MTP on prefill result to get first draft token
+        {
+            const auto hs_shape = main_hidden_states.get_shape();
+            const size_t seq_len = hs_shape[1];
+            const size_t hidden_size = hs_shape[2];
+            const size_t last_offset = (seq_len - 1) * hidden_size;
+            const float* hs_src = main_hidden_states.data<const float>() + last_offset;
+            float* hs_dst = mtp_hidden_in.data<float>();
+            std::memcpy(hs_dst, hs_src, hidden_size * sizeof(float));
+
+            auto* ids_ptr = mtp_step_ids.data<int64_t>();
+            ids_ptr[0] = next_id;
+
+            auto* pos_ptr = mtp_pos.data<int64_t>();
+            const int64_t mtp_pos_val = past_len + rope_deltas_data[0];
+            pos_ptr[0] = mtp_pos_val;
+            pos_ptr[batch] = mtp_pos_val;
+            pos_ptr[2 * batch] = mtp_pos_val;
+
+            mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kInputIds, mtp_step_ids);
+            mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kHiddenStates, mtp_hidden_in);
+            mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kAttentionMask, mtp_mask);
+            mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kPositionIds, mtp_pos);
+            mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kBeamIdx, mtp_beam);
+
+            mtp_request->reset_state();
+            mtp_request->infer();
+            ov::Tensor mtp_logits = mtp_request->get_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kLogits);
+            extract_last_logits_f32(mtp_logits, mtp_logit_buf);
+            mtp_draft_id = use_sampling
+                               ? sample_fast(mtp_logit_buf.data(), mtp_logit_buf.size(),
+                                             opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                               : argmax_f32(mtp_logit_buf);
+        }
+    }
+
+    // Lambda: run MTP inference and return draft token id.
+    // Copies hidden_states at `hs_pos` position, uses `token_id` as input.
+    // When `reset` is true, resets MTP KV cache state (after rejection).
+    auto run_mtp_draft = [&](int64_t token_id, const ov::Tensor& hidden_states, size_t hs_pos, int64_t position, bool reset = false) -> int64_t {
+        const auto hs_shape = hidden_states.get_shape();
+        const size_t hidden_size = hs_shape[2];
+        const float* hs_src = hidden_states.data<const float>() + hs_pos * hidden_size;
+        float* hs_dst = mtp_hidden_in.data<float>();
+        std::memcpy(hs_dst, hs_src, hidden_size * sizeof(float));
+
+        auto* ids_ptr = mtp_step_ids.data<int64_t>();
+        ids_ptr[0] = token_id;
+
+        auto* pos_ptr = mtp_pos.data<int64_t>();
+        const int64_t mtp_pos_val = position + rope_deltas_data[0];
+        pos_ptr[0] = mtp_pos_val;
+        pos_ptr[batch] = mtp_pos_val;
+        pos_ptr[2 * batch] = mtp_pos_val;
+
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kInputIds, mtp_step_ids);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kHiddenStates, mtp_hidden_in);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kAttentionMask, mtp_mask);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kPositionIds, mtp_pos);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kBeamIdx, mtp_beam);
+
+        if (reset) {
+            mtp_request->reset_state();
+        }
+        mtp_request->infer();
+        ov::Tensor mtp_logits = mtp_request->get_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kLogits);
+        extract_last_logits_f32(mtp_logits, mtp_logit_buf);
+        return use_sampling
+                   ? sample_fast(mtp_logit_buf.data(), mtp_logit_buf.size(),
+                                 opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                   : argmax_f32(mtp_logit_buf);
+    };
+
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
-    for (int step = 1; step < opts.max_new_tokens; ++step) {
-        if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) {
-            break;
-        }
-        auto* step_data = step_ids.data<int64_t>();
-        for (size_t b = 0; b < batch; ++b) {
-            step_data[b] = next_id;
-        }
 
-        // Fill position_ids in-place: all 3 planes get the same value per batch element
-        auto* pos_data = usm_decode_pos.data<int64_t>();
-        for (size_t b = 0; b < batch; ++b) {
-            const int64_t value = past_len + rope_deltas_data[b];
-            pos_data[b] = value;             // plane 0
-            pos_data[batch + b] = value;     // plane 1
-            pos_data[2 * batch + b] = value; // plane 2
-        }
+    // =======================================================================
+    // Speculative decode loop (when MTP is active)
+    // =======================================================================
+    // Algorithm:
+    //   1. We have `next_id` (just generated) and `mtp_draft_id` (MTP's prediction for the token after next_id).
+    //   2. Feed [next_id, draft_id] as 2-token sequence to main model.
+    //   3. Main model produces logits at both positions:
+    //      - logits[0] -> sample -> verified_id  (what main model thinks comes after next_id)
+    //      - logits[1] -> sample -> bonus_id     (what main model thinks comes after draft_id)
+    //   4. If verified_id == draft_id: ACCEPT!
+    //      - Accept both verified_id and bonus_id. past_len += 2, decode_steps += 2.
+    //      - Run MTP on bonus_id's hidden_states -> new draft.
+    //   5. If verified_id != draft_id: REJECT.
+    //      - Accept only verified_id. Trim main model KV cache by 1 (remove draft's position).
+    //      - Trim MTP KV cache entirely (1 position, the wrong draft).
+    //      - past_len += 1, decode_steps += 1.
+    //      - Run MTP on verified_id's hidden_states -> new draft.
+    // =======================================================================
+    if (use_mtp && mtp_request && mtp_draft_id >= 0) {
+        while (static_cast<int>(generated.size()) < opts.max_new_tokens) {
+            if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) break;
 
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, usm_decode_pos);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
-        if (use_vl) {
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, decode_visual);
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask);
-        }
+            // Check if we have room for 2 tokens; if only 1 slot left, fall back to normal 1-token step.
+            const int remaining = opts.max_new_tokens - static_cast<int>(generated.size());
+            if (remaining <= 1) {
+                // Normal 1-token decode for the last token
+                auto* step_data = step_ids.data<int64_t>();
+                step_data[0] = next_id;
+                auto* pos_data = usm_decode_pos.data<int64_t>();
+                for (size_t b = 0; b < batch; ++b) {
+                    const int64_t value = past_len + rope_deltas_data[b];
+                    pos_data[b] = value;
+                    pos_data[batch + b] = value;
+                    pos_data[2 * batch + b] = value;
+                }
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, usm_decode_pos);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
+                if (use_vl) {
+                    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, decode_visual);
+                    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask);
+                }
+                text_request.infer();
+                mtp_main_infers++;
+                logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
+                extract_last_logits_f32(logits, logit_buf);
+                {
+                    ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+                    penalty_processor.apply(lw);
+                    next_id = use_sampling
+                                  ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                                opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                                  : argmax_f32(logit_buf);
+                }
+                penalty_processor.register_new_generated_token(next_id);
+                generated.push_back(next_id);
+                penalty_processor.update_generated_len(generated.size());
+                decode_steps += 1;
+                past_len += 1;
+                break;
+            }
 
-        text_request.infer();
-        logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
-        extract_last_logits_f32(logits, logit_buf);
-        {
-            ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
-            penalty_processor.apply(lw);  // penalties only — O(|generated|)
-            next_id = use_sampling
-                          ? sample_fast(logit_buf.data(), logit_buf.size(),
-                                        opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
-                          : argmax_f32(logit_buf);
+            // --- Speculative step: feed [next_id, draft_id] as 2 tokens ---
+
+            // Create fresh tensors for 2-token input (matching fast_draft_strategy pattern)
+            ov::Tensor cur_spec_ids(ov::element::i64, {batch, 2});
+            auto* spec_ids_data = cur_spec_ids.data<int64_t>();
+            spec_ids_data[0] = next_id;
+            spec_ids_data[1] = mtp_draft_id;
+
+            ov::Tensor cur_spec_mask(ov::element::i64, {batch, 2});
+            auto* spec_mask_data = cur_spec_mask.data<int64_t>();
+            for (size_t i = 0; i < batch * 2; ++i) spec_mask_data[i] = 1;
+
+            ov::Tensor cur_spec_pos(ov::element::i64, {3, batch, 2});
+            auto* spec_pos_data = cur_spec_pos.data<int64_t>();
+            for (size_t b = 0; b < batch; ++b) {
+                const int64_t p0 = past_len + rope_deltas_data[b];
+                const int64_t p1 = past_len + 1 + rope_deltas_data[b];
+                spec_pos_data[b * 2 + 0] = p0;       // plane 0, pos 0
+                spec_pos_data[b * 2 + 1] = p1;       // plane 0, pos 1
+                spec_pos_data[batch * 2 + b * 2 + 0] = p0;  // plane 1, pos 0
+                spec_pos_data[batch * 2 + b * 2 + 1] = p1;  // plane 1, pos 1
+                spec_pos_data[2 * batch * 2 + b * 2 + 0] = p0; // plane 2, pos 0
+                spec_pos_data[2 * batch * 2 + b * 2 + 1] = p1; // plane 2, pos 1
+            }
+
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, cur_spec_ids);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, cur_spec_mask);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, cur_spec_pos);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
+            if (use_vl) {
+                ov::Tensor cur_spec_visual(ov::element::f32, {batch, 2, static_cast<size_t>(cfg.text.hidden_size)});
+                std::memset(cur_spec_visual.data(), 0, cur_spec_visual.get_byte_size());
+                ov::Tensor cur_spec_visual_mask(ov::element::boolean, {batch, 2});
+                std::memset(cur_spec_visual_mask.data(), 0, cur_spec_visual_mask.get_byte_size());
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, cur_spec_visual);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, cur_spec_visual_mask);
+            }
+
+            text_request.infer();
+            mtp_main_infers++;
+
+            // Get output tensors BEFORE resetting inputs (GPU plugin may invalidate outputs on input change)
+            logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
+            main_hidden_states = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
+
+            // Copy logits and hidden states to local buffers since we'll reset inputs
+            // (GPU plugin may invalidate tensor references)
+            const auto logits_shape = logits.get_shape();
+            const auto hs_shape = main_hidden_states.get_shape();
+            ov::Tensor logits_copy(logits.get_element_type(), logits_shape);
+            logits.copy_to(logits_copy);
+            ov::Tensor hs_copy(main_hidden_states.get_element_type(), hs_shape);
+            main_hidden_states.copy_to(hs_copy);
+            logits = logits_copy;
+            main_hidden_states = hs_copy;
+
+            // Reset inputs back to 1-token shapes to match GPU plugin expectations
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, usm_decode_pos);
+            if (use_vl) {
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, decode_visual);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask);
+            }
+
+            // logits shape: [batch, 2, vocab]
+            // logits[0] = prediction for "what comes after next_id" = verified_id
+            // logits[1] = prediction for "what comes after draft_id" = bonus_id
+            extract_logits_at_pos_f32(logits, 0, logit_buf);
+            int64_t verified_id;
+            {
+                ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+                penalty_processor.apply(lw);
+                verified_id = use_sampling
+                                  ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                                opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                                  : argmax_f32(logit_buf);
+            }
+
+            mtp_attempts++;
+
+            if (verified_id == mtp_draft_id) {
+                // ACCEPT: draft was correct!
+                mtp_hits++;
+
+                // Also sample bonus token from logits[1]
+                extract_logits_at_pos_f32(logits, 1, logit_buf);
+                int64_t bonus_id;
+                {
+                    // Register the verified (draft) token before applying penalties for bonus
+                    penalty_processor.register_new_generated_token(verified_id);
+                    generated.push_back(verified_id);
+                    penalty_processor.update_generated_len(generated.size());
+
+                    ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+                    penalty_processor.apply(lw);
+                    bonus_id = use_sampling
+                                   ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                                 opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                                   : argmax_f32(logit_buf);
+                }
+
+                penalty_processor.register_new_generated_token(bonus_id);
+                generated.push_back(bonus_id);
+                penalty_processor.update_generated_len(generated.size());
+                decode_steps += 2;
+                past_len += 2;
+                next_id = bonus_id;
+
+                // Run MTP on bonus_id's hidden_states (position 1) to get new draft
+                mtp_draft_id = run_mtp_draft(bonus_id, main_hidden_states, 1, past_len);
+
+            } else {
+                // REJECT: draft was wrong.
+                // Accept only verified_id. Trim main model KV cache by 1 (remove draft position).
+                trim_kv_cache_states(text_request, 1);
+
+                penalty_processor.register_new_generated_token(verified_id);
+                generated.push_back(verified_id);
+                penalty_processor.update_generated_len(generated.size());
+                decode_steps += 1;
+                past_len += 1;
+                next_id = verified_id;
+
+                // Run MTP on verified_id's hidden_states (position 0) to get new draft
+                // Reset MTP state since we rejected → MTP KV cache is invalid
+                mtp_draft_id = run_mtp_draft(verified_id, main_hidden_states, 0, past_len, /*reset=*/true);
+            }
         }
-        penalty_processor.register_new_generated_token(next_id);
-        generated.push_back(next_id);
-        penalty_processor.update_generated_len(generated.size());
-        decode_steps += 1;
-        past_len += 1;
+    } else {
+        // =======================================================================
+        // Normal decode loop (no MTP)
+        // =======================================================================
+        for (int step = 1; step < opts.max_new_tokens; ++step) {
+            if (!stop_token_ids.empty() && stop_token_ids.count(next_id) > 0) {
+                break;
+            }
+            auto* step_data = step_ids.data<int64_t>();
+            for (size_t b = 0; b < batch; ++b) {
+                step_data[b] = next_id;
+            }
+
+            auto* pos_data = usm_decode_pos.data<int64_t>();
+            for (size_t b = 0; b < batch; ++b) {
+                const int64_t value = past_len + rope_deltas_data[b];
+                pos_data[b] = value;
+                pos_data[batch + b] = value;
+                pos_data[2 * batch + b] = value;
+            }
+
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, usm_decode_pos);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
+            if (use_vl) {
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, decode_visual);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask);
+            }
+
+            text_request.infer();
+            logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
+            extract_last_logits_f32(logits, logit_buf);
+            {
+                ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
+                penalty_processor.apply(lw);
+                next_id = use_sampling
+                              ? sample_fast(logit_buf.data(), logit_buf.size(),
+                                            opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
+                              : argmax_f32(logit_buf);
+            }
+
+            penalty_processor.register_new_generated_token(next_id);
+            generated.push_back(next_id);
+            penalty_processor.update_generated_len(generated.size());
+            decode_steps += 1;
+            past_len += 1;
+        }
     }
     const auto decode_end = std::chrono::steady_clock::now();
 
@@ -1309,6 +1712,17 @@ int main(int argc, char* argv[]) try {
         std::cout << "Throughput: N/A" << std::endl;
     }
 
+    if (use_mtp && mtp_attempts > 0) {
+        const double hit_rate = 100.0 * static_cast<double>(mtp_hits) / static_cast<double>(mtp_attempts);
+        std::cout << "MTP hits: " << mtp_hits << "/" << mtp_attempts
+                  << " (" << hit_rate << "%)" << std::endl;
+        std::cout << "MTP main model infers: " << mtp_main_infers << std::endl;
+        if (mtp_main_infers > 0) {
+            const double tokens_per_infer = static_cast<double>(decode_steps) / static_cast<double>(mtp_main_infers);
+            std::cout << "MTP tokens/infer: " << tokens_per_infer << std::endl;
+        }
+    }
+
     if (tokenizer) {
         std::cout << tokenizer->decode(generated, ov::genai::skip_special_tokens(true)) << std::endl;
     } else {
@@ -1322,7 +1736,10 @@ int main(int argc, char* argv[]) try {
     return 0;
 } catch (const std::exception& error) {
     try {
-        std::cerr << error.what() << '\n';
+        std::cerr << error.what() << std::endl;
+        std::cerr.flush();
+        std::cout << "[ERROR] " << error.what() << std::endl;
+        std::cout.flush();
     } catch (const std::ios_base::failure&) {
     }
     return 1;
