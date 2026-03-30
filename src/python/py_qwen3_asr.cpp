@@ -48,6 +48,19 @@ struct Qwen3ASRDecodedResult {
     std::string raw_text;
     std::string language;
     std::string text;
+    size_t prompt_token_size = 0;
+    size_t generated_tokens = 0;
+    int64_t audio_output_length = 0;
+    double feature_extract_ms = 0.0;
+    double audio_encode_ms = 0.0;
+    double ttft_ms = 0.0;
+    double decode_ms = 0.0;
+    size_t decode_steps = 0;
+    size_t infer_steps = 0;
+    size_t stream_steps = 0;
+    double infer_ms = 0.0;
+    double audio_duration_s = 0.0;
+    double asr_rtf = 0.0;
 };
 
 bool has_ir_model_pair(const std::filesystem::path& xml_path, const std::filesystem::path& bin_path) {
@@ -643,7 +656,8 @@ void add_token_if_found(const std::unordered_map<std::string, int64_t>& vocab,
 
 std::string build_python_style_asr_prompt(ov::genai::Tokenizer& tokenizer,
                                           const std::string& context,
-                                          const std::optional<std::string>& forced_language) {
+                                          const std::optional<std::string>& forced_language,
+                                          const std::string& transcript_prefix = {}) {
     const std::string effective_context = context.empty() ? "Transcribe this audio." : context;
     (void)tokenizer;
 
@@ -655,13 +669,29 @@ std::string build_python_style_asr_prompt(ov::genai::Tokenizer& tokenizer,
         prompt += "language " + *forced_language + "<asr_text>";
     }
 
+    if (!transcript_prefix.empty()) {
+        prompt += transcript_prefix;
+    }
+
     return prompt;
 }
 
 ov::Tensor make_audio_features_from_pcm(const std::vector<float>& raw,
-                                        const std::filesystem::path& preprocessor_json,
-                                        size_t expected_mel_bins) {
-    ov::genai::WhisperFeatureExtractor extractor(preprocessor_json);
+                                        ov::genai::WhisperFeatureExtractor& extractor,
+                                        size_t expected_mel_bins,
+                                        double* audio_duration_seconds = nullptr,
+                                        uint32_t* used_sample_rate = nullptr) {
+    const uint32_t target_sample_rate = static_cast<uint32_t>(std::max<size_t>(1, extractor.sampling_rate));
+    if (used_sample_rate != nullptr) {
+        *used_sample_rate = target_sample_rate;
+    }
+    if (raw.empty()) {
+        throw std::runtime_error("Input audio has no samples");
+    }
+    if (audio_duration_seconds != nullptr) {
+        *audio_duration_seconds = static_cast<double>(raw.size()) / static_cast<double>(target_sample_rate);
+    }
+
     ov::genai::WhisperFeatures features = extractor.extract(raw);
     if (features.n_frames == 0 || features.feature_size == 0) {
         throw std::runtime_error("Failed to extract audio features from PCM input");
@@ -688,12 +718,80 @@ ov::Tensor make_audio_features_from_pcm(const std::vector<float>& raw,
     return tensor;
 }
 
+std::string rollback_text_by_token_count(ov::genai::Tokenizer& tokenizer,
+                                         const std::string& text,
+                                         size_t rollback_tokens) {
+    if (text.empty() || rollback_tokens == 0) {
+        return text;
+    }
+
+    auto encoded = tokenizer.encode(text, {ov::genai::add_special_tokens(false)});
+    std::vector<int64_t> ids = tensor_row_to_i64_vector(encoded.input_ids);
+    if (ids.size() <= rollback_tokens) {
+        return {};
+    }
+
+    ids.resize(ids.size() - rollback_tokens);
+    return trim_copy(tokenizer.decode(ids, {ov::genai::skip_special_tokens(false)}));
+}
+
+bool should_insert_ascii_join_space(const std::string& left, const std::string& right) {
+    if (left.empty() || right.empty()) {
+        return false;
+    }
+
+    const unsigned char left_last = static_cast<unsigned char>(left.back());
+    const unsigned char right_first = static_cast<unsigned char>(right.front());
+    if (std::isspace(left_last) || std::isspace(right_first)) {
+        return false;
+    }
+
+    if (left_last >= 0x80 || right_first >= 0x80) {
+        return false;
+    }
+
+    return true;
+}
+
+std::string merge_prefix_and_continuation_text(const std::string& prefix, const std::string& continuation) {
+    const std::string left = trim_copy(prefix);
+    const std::string right = trim_copy(continuation);
+    if (left.empty()) {
+        return right;
+    }
+    if (right.empty()) {
+        return left;
+    }
+
+    const size_t max_overlap = std::min(left.size(), right.size());
+    size_t overlap = 0;
+    for (size_t n = max_overlap; n >= 8; --n) {
+        if (left.compare(left.size() - n, n, right, 0, n) == 0) {
+            overlap = n;
+            break;
+        }
+        if (n == 8) {
+            break;
+        }
+    }
+
+    if (overlap > 0) {
+        return trim_copy(left + right.substr(overlap));
+    }
+    if (should_insert_ascii_join_space(left, right)) {
+        return left + " " + right;
+    }
+    return trim_copy(left + right);
+}
+
 class Qwen3ASRInferenceEngine {
 public:
     Qwen3ASRInferenceEngine(const std::filesystem::path& text_model_dir,
                            const std::optional<std::filesystem::path>& audio_model_dir,
                            const std::string& device,
                            int32_t max_new_tokens,
+                           const std::optional<int32_t>& n_window,
+                           const std::optional<int32_t>& n_window_infer,
                            bool cache_model,
                            const ov::AnyMap& compile_properties)
         : text_model_dir_(text_model_dir),
@@ -707,6 +805,18 @@ public:
 
         text_cfg_ = to_text_cfg(ov::genai::loaders::ModelConfig::from_hf_json(text_model_dir_ / "config.json"));
         audio_cfg_ = to_audio_cfg(ov::genai::loaders::ModelConfig::from_hf_json(audio_model_dir_ / "config.json"));
+        if (n_window.has_value()) {
+            if (*n_window <= 0) {
+                throw std::runtime_error("n_window must be > 0");
+            }
+            audio_cfg_.n_window = *n_window;
+        }
+        if (n_window_infer.has_value()) {
+            if (*n_window_infer <= 0) {
+                throw std::runtime_error("n_window_infer must be > 0");
+            }
+            audio_cfg_.n_window_infer = *n_window_infer;
+        }
 
         const std::filesystem::path text_xml = text_model_dir_ / "modeling_qwen3_asr_text_with_audio.xml";
         const std::filesystem::path text_bin = text_model_dir_ / "modeling_qwen3_asr_text_with_audio.bin";
@@ -714,8 +824,8 @@ public:
         const std::filesystem::path audio_bin = audio_model_dir_ / "modeling_qwen3_asr_audio.bin";
 
         auto quant_cfg = ov::genai::modeling::weights::parse_quantization_config_from_env();
-        if (quant_cfg.enabled() && quant_cfg.group_size <= 0) {
-            throw std::runtime_error("OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > 0 when quantization is enabled");
+        if (quant_cfg.enabled() && quant_cfg.group_size < -1) {
+            throw std::runtime_error("OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > -1 when quantization is enabled");
         }
 
         ov::Core core;
@@ -794,6 +904,7 @@ public:
         if (!std::filesystem::exists(preprocessor_json_)) {
             preprocessor_json_ = text_model_dir_ / "preprocessor_config.json";
         }
+        feature_extractor_.emplace(preprocessor_json_);
     }
 
     Qwen3ASRDecodedResult generate(const std::vector<float>& pcm16k,
@@ -803,8 +914,169 @@ public:
             return {};
         }
 
+        const std::optional<std::string> normalized_language =
+            (forced_language.has_value() && !forced_language->empty())
+                ? std::optional<std::string>(normalize_language_name(*forced_language))
+                : std::nullopt;
+        Qwen3ASRDecodedResult result;
+        const auto feature_extract_start = std::chrono::steady_clock::now();
+        double input_audio_duration_seconds = 0.0;
+        uint32_t input_audio_sample_rate = 0;
         ov::Tensor input_audio_features = make_audio_features_from_pcm(
-            pcm16k, preprocessor_json_, static_cast<size_t>(std::max(1, audio_cfg_.num_mel_bins)));
+            pcm16k,
+            *feature_extractor_,
+            static_cast<size_t>(std::max(1, audio_cfg_.num_mel_bins)),
+            &input_audio_duration_seconds,
+            &input_audio_sample_rate);
+        const auto feature_extract_end = std::chrono::steady_clock::now();
+
+        result = run_asr_decode(input_audio_features,
+                                input_audio_duration_seconds,
+                                input_audio_sample_rate,
+                                build_python_style_asr_prompt(*tokenizer_, context, normalized_language));
+        result.feature_extract_ms = elapsed_ms(feature_extract_start, feature_extract_end);
+        result.audio_duration_s = input_audio_duration_seconds;
+        result.asr_rtf = input_audio_duration_seconds > 0.0
+                             ? ((result.feature_extract_ms + result.infer_ms) / 1000.0) / input_audio_duration_seconds
+                             : 0.0;
+        return result;
+    }
+
+    Qwen3ASRDecodedResult generate_streaming(const std::vector<float>& pcm16k,
+                                             const std::string& context,
+                                             const std::optional<std::string>& forced_language,
+                                             const std::optional<double>& stream_chunk_sec,
+                                             const std::optional<double>& stream_window_sec,
+                                             int32_t stream_unfixed_chunk_num,
+                                             int32_t stream_unfixed_token_num) {
+        if (pcm16k.empty()) {
+            return {};
+        }
+        if (stream_unfixed_chunk_num < 0 || stream_unfixed_token_num < 0) {
+            throw std::runtime_error("stream_unfixed_chunk_num and stream_unfixed_token_num must be >= 0");
+        }
+
+        const double effective_chunk_sec = stream_chunk_sec.value_or(static_cast<double>(audio_cfg_.n_window) / 100.0);
+        const double effective_window_sec = stream_window_sec.value_or(static_cast<double>(audio_cfg_.n_window_infer) / 100.0);
+        if (effective_chunk_sec <= 0.0 || effective_window_sec <= 0.0) {
+            throw std::runtime_error("stream_chunk_sec and stream_window_sec must be > 0");
+        }
+
+        const std::optional<std::string> normalized_language =
+            (forced_language.has_value() && !forced_language->empty())
+                ? std::optional<std::string>(normalize_language_name(*forced_language))
+                : std::nullopt;
+        const uint32_t stream_sample_rate = static_cast<uint32_t>(std::max<size_t>(1, feature_extractor_->sampling_rate));
+        const size_t chunk_samples = std::max<size_t>(1, static_cast<size_t>(effective_chunk_sec * static_cast<double>(stream_sample_rate) + 0.5));
+        const size_t window_samples = std::max(chunk_samples, static_cast<size_t>(effective_window_sec * static_cast<double>(stream_sample_rate) + 0.5));
+
+        std::vector<float> pending_audio;
+        std::vector<float> recent_audio;
+        std::string stream_text;
+        std::string stream_language = normalized_language.value_or("unknown");
+        double total_feature_extract_ms = 0.0;
+        double total_audio_encode_ms = 0.0;
+        double total_infer_ms = 0.0;
+        double total_decode_ms = 0.0;
+        double total_ttft_ms = 0.0;
+        size_t total_generated_tokens = 0;
+        size_t total_decode_steps = 0;
+        size_t total_infer_steps = 0;
+        size_t stream_steps = 0;
+        Qwen3ASRDecodedResult last_result;
+
+        auto run_stream_step = [&]() {
+            if (pending_audio.empty()) {
+                return;
+            }
+
+            recent_audio.insert(recent_audio.end(), pending_audio.begin(), pending_audio.end());
+            pending_audio.clear();
+            if (recent_audio.size() > window_samples) {
+                recent_audio.erase(recent_audio.begin(), recent_audio.begin() + static_cast<std::ptrdiff_t>(recent_audio.size() - window_samples));
+            }
+
+            const std::string prefix_text = (stream_steps < static_cast<size_t>(stream_unfixed_chunk_num))
+                                                ? std::string{}
+                                                : rollback_text_by_token_count(*tokenizer_, stream_text, static_cast<size_t>(stream_unfixed_token_num));
+
+            const auto feature_extract_start = std::chrono::steady_clock::now();
+            double window_duration_seconds = 0.0;
+            ov::Tensor window_features = make_audio_features_from_pcm(
+                recent_audio,
+                *feature_extractor_,
+                static_cast<size_t>(std::max(1, audio_cfg_.num_mel_bins)),
+                &window_duration_seconds,
+                nullptr);
+            const auto feature_extract_end = std::chrono::steady_clock::now();
+            const double step_feature_extract_ms = elapsed_ms(feature_extract_start, feature_extract_end);
+
+            last_result = run_asr_decode(window_features,
+                                         window_duration_seconds,
+                                         stream_sample_rate,
+                                         build_python_style_asr_prompt(*tokenizer_, context, normalized_language, prefix_text));
+            last_result.feature_extract_ms = step_feature_extract_ms;
+
+            total_feature_extract_ms += step_feature_extract_ms;
+            total_audio_encode_ms += last_result.audio_encode_ms;
+            total_infer_ms += last_result.infer_ms;
+            total_decode_ms += last_result.decode_ms;
+            total_ttft_ms += last_result.ttft_ms;
+            total_generated_tokens += last_result.generated_tokens;
+            total_decode_steps += last_result.decode_steps;
+            total_infer_steps += last_result.infer_steps;
+            stream_steps += 1;
+
+            const std::string merged_text = merge_prefix_and_continuation_text(prefix_text, last_result.text);
+            if (!merged_text.empty()) {
+                stream_text = merged_text;
+            }
+            if (!last_result.language.empty() && last_result.language != "unknown") {
+                stream_language = last_result.language;
+            }
+        };
+
+        size_t cursor = 0;
+        while (cursor < pcm16k.size()) {
+            const size_t take = std::min(chunk_samples, pcm16k.size() - cursor);
+            pending_audio.insert(pending_audio.end(),
+                                 pcm16k.begin() + static_cast<std::ptrdiff_t>(cursor),
+                                 pcm16k.begin() + static_cast<std::ptrdiff_t>(cursor + take));
+            cursor += take;
+            if (pending_audio.size() >= chunk_samples) {
+                run_stream_step();
+            }
+        }
+        run_stream_step();
+
+        Qwen3ASRDecodedResult result = last_result;
+        result.text = stream_text;
+        result.language = stream_language;
+        result.generated_tokens = total_generated_tokens;
+        result.feature_extract_ms = total_feature_extract_ms;
+        result.audio_encode_ms = total_audio_encode_ms;
+        result.infer_ms = total_infer_ms;
+        result.decode_ms = total_decode_ms;
+        result.decode_steps = total_decode_steps;
+        result.infer_steps = total_infer_steps;
+        result.stream_steps = stream_steps;
+        result.audio_duration_s = static_cast<double>(pcm16k.size()) / static_cast<double>(stream_sample_rate);
+        result.asr_rtf = result.audio_duration_s > 0.0
+                             ? ((total_feature_extract_ms + total_infer_ms) / 1000.0) / result.audio_duration_s
+                             : 0.0;
+        if (stream_steps > 0) {
+            result.ttft_ms = total_ttft_ms / static_cast<double>(stream_steps);
+        }
+        return result;
+    }
+
+private:
+    Qwen3ASRDecodedResult run_asr_decode(const ov::Tensor& input_audio_features,
+                                         double input_audio_duration_seconds,
+                                         uint32_t input_audio_sample_rate,
+                                         const std::string& instruction_prompt) {
+        Qwen3ASRDecodedResult result;
+        const auto asr_infer_start = std::chrono::steady_clock::now();
 
         auto audio_request = compiled_audio_.create_infer_request();
         const size_t batch = 1;
@@ -814,20 +1086,20 @@ public:
         auto input_lengths = make_i64({batch});
         input_lengths.data<int64_t>()[0] = static_cast<int64_t>(audio_frames);
         audio_request.set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioFeatureLengths, input_lengths);
+        const auto audio_encode_start = std::chrono::steady_clock::now();
         audio_request.infer();
+        const auto audio_encode_end = std::chrono::steady_clock::now();
+        result.audio_encode_ms = elapsed_ms(audio_encode_start, audio_encode_end);
 
         ov::Tensor audio_embeds = audio_request.get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioEmbeds);
+        ov::Tensor audio_out_lengths = audio_request.get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioOutputLengths);
         const auto embeds_shape = audio_embeds.get_shape();
         if (embeds_shape.size() != 3 || embeds_shape[2] != static_cast<size_t>(text_cfg_.hidden_size)) {
             throw std::runtime_error("Unexpected audio_embeds shape from audio encoder");
         }
         const size_t audio_seq_len = embeds_shape[1];
+        result.audio_output_length = audio_out_lengths.data<const int64_t>()[0];
 
-        const std::optional<std::string> normalized_language =
-            (forced_language.has_value() && !forced_language->empty())
-                ? std::optional<std::string>(normalize_language_name(*forced_language))
-                : std::nullopt;
-        const std::string instruction_prompt = build_python_style_asr_prompt(*tokenizer_, context, normalized_language);
         auto encoded_prompt = tokenizer_->encode(instruction_prompt, {ov::genai::add_special_tokens(false)});
         std::vector<int64_t> prompt_ids = tensor_row_to_i64_vector(encoded_prompt.input_ids);
 
@@ -867,6 +1139,7 @@ public:
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx, make_i32({batch}, 0));
 
         const size_t prompt_seq_len = input_ids.size();
+        result.prompt_token_size = prompt_seq_len;
         const size_t max_total_seq_len = prompt_seq_len + static_cast<size_t>(max_new_tokens_);
         std::vector<int64_t> attention_mask_storage(max_total_seq_len, 1);
         auto make_attention_mask_view = [&](size_t seq_len) -> ov::Tensor {
@@ -879,12 +1152,14 @@ public:
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds, prompt_audio_embeds);
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask, prompt_audio_pos_mask);
 
+        const auto prefill_start = std::chrono::steady_clock::now();
         text_request.infer();
+        const auto prefill_end = std::chrono::steady_clock::now();
+        result.ttft_ms = elapsed_ms(prefill_start, prefill_end);
+        result.infer_steps += 1;
 
         std::vector<int64_t> generated_ids;
         generated_ids.reserve(static_cast<size_t>(max_new_tokens_));
-        int64_t prev_token_id = std::numeric_limits<int64_t>::min();
-        int32_t same_token_run = 0;
 
         auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
             const int64_t next_token_id = argmax_last_token_id(logits);
@@ -923,20 +1198,26 @@ public:
             text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds, step_audio_embeds);
             text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask, step_audio_pos_mask);
 
+            const auto step_start = std::chrono::steady_clock::now();
             text_request.infer();
+            const auto step_end = std::chrono::steady_clock::now();
+            result.decode_ms += elapsed_ms(step_start, step_end);
+            result.decode_steps += 1;
+            result.infer_steps += 1;
             ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
             if (process_logits_and_append(logits)) {
                 break;
             }
         }
 
-        Qwen3ASRDecodedResult result;
+        result.generated_tokens = generated_ids.size();
         if (!generated_ids.empty()) {
             result.raw_text = tokenizer_->decode(generated_ids, {ov::genai::skip_special_tokens(false)});
         }
         if (is_metadata_only_asr_output(result.raw_text)) {
             result.raw_text.clear();
             generated_ids.clear();
+            result.generated_tokens = 0;
         }
         ParsedASROutput parsed = parse_asr_output(result.raw_text);
         result.text = parsed.text;
@@ -953,10 +1234,17 @@ public:
         if (result.language.empty()) {
             result.language = "unknown";
         }
+
+        result.audio_duration_s = input_audio_duration_seconds;
+        const auto asr_infer_end = std::chrono::steady_clock::now();
+        result.infer_ms = elapsed_ms(asr_infer_start, asr_infer_end);
+        result.asr_rtf = input_audio_duration_seconds > 0.0
+                             ? (result.infer_ms / 1000.0) / input_audio_duration_seconds
+                             : 0.0;
+        (void)input_audio_sample_rate;
         return result;
     }
 
-private:
     std::filesystem::path text_model_dir_;
     std::filesystem::path audio_model_dir_;
     std::filesystem::path preprocessor_json_;
@@ -968,6 +1256,7 @@ private:
     ov::CompiledModel compiled_text_;
     ov::CompiledModel compiled_audio_;
     std::optional<ov::genai::Tokenizer> tokenizer_;
+    std::optional<ov::genai::WhisperFeatureExtractor> feature_extractor_;
     std::unordered_map<std::string, int64_t> vocab_;
     std::unordered_set<int64_t> excluded_decode_ids_;
     std::unordered_set<int64_t> stop_token_ids_;
@@ -985,7 +1274,20 @@ void init_qwen3_asr(py::module_& m) {
     py::class_<Qwen3ASRDecodedResult>(m, "Qwen3ASRDecodedResult", "Decoded output from the low-level Qwen3 ASR engine")
         .def_readonly("raw_text", &Qwen3ASRDecodedResult::raw_text)
         .def_readonly("language", &Qwen3ASRDecodedResult::language)
-        .def_readonly("text", &Qwen3ASRDecodedResult::text);
+        .def_readonly("text", &Qwen3ASRDecodedResult::text)
+        .def_readonly("prompt_token_size", &Qwen3ASRDecodedResult::prompt_token_size)
+        .def_readonly("generated_tokens", &Qwen3ASRDecodedResult::generated_tokens)
+        .def_readonly("audio_output_length", &Qwen3ASRDecodedResult::audio_output_length)
+        .def_readonly("feature_extract_ms", &Qwen3ASRDecodedResult::feature_extract_ms)
+        .def_readonly("audio_encode_ms", &Qwen3ASRDecodedResult::audio_encode_ms)
+        .def_readonly("ttft_ms", &Qwen3ASRDecodedResult::ttft_ms)
+        .def_readonly("decode_ms", &Qwen3ASRDecodedResult::decode_ms)
+        .def_readonly("decode_steps", &Qwen3ASRDecodedResult::decode_steps)
+        .def_readonly("infer_steps", &Qwen3ASRDecodedResult::infer_steps)
+        .def_readonly("stream_steps", &Qwen3ASRDecodedResult::stream_steps)
+        .def_readonly("infer_ms", &Qwen3ASRDecodedResult::infer_ms)
+        .def_readonly("audio_duration_s", &Qwen3ASRDecodedResult::audio_duration_s)
+        .def_readonly("asr_rtf", &Qwen3ASRDecodedResult::asr_rtf);
 
     py::class_<Qwen3ASRInferenceEngine>(m, "Qwen3ASRInferenceEngine", "Low-level OpenVINO GenAI-backed Qwen3 ASR inference engine")
         .def(
@@ -993,6 +1295,8 @@ void init_qwen3_asr(py::module_& m) {
                         const std::string& device,
                         int32_t max_new_tokens,
                         const std::optional<std::filesystem::path>& audio_model_path,
+                        const std::optional<int32_t>& n_window,
+                        const std::optional<int32_t>& n_window_infer,
                         bool cache_model,
                         const std::optional<std::string>& openvino_cache_dir,
                         const py::kwargs& kwargs) {
@@ -1001,12 +1305,14 @@ void init_qwen3_asr(py::module_& m) {
                     properties.insert({ov::cache_dir(*openvino_cache_dir)});
                 }
                 return std::make_unique<Qwen3ASRInferenceEngine>(
-                    models_path, audio_model_path, device, max_new_tokens, cache_model, properties);
+                    models_path, audio_model_path, device, max_new_tokens, n_window, n_window_infer, cache_model, properties);
             }),
             py::arg("models_path"),
             py::arg("device") = "GPU",
             py::arg("max_new_tokens") = 512,
             py::arg("audio_model_path") = py::none(),
+            py::arg("n_window") = py::none(),
+            py::arg("n_window_infer") = py::none(),
             py::arg("cache_model") = false,
             py::arg("openvino_cache_dir") = py::none(),
             R"(
@@ -1016,6 +1322,8 @@ void init_qwen3_asr(py::module_& m) {
             device (str): Device to run inference on.
             max_new_tokens (int): Maximum generated tokens per chunk.
             audio_model_path (os.PathLike | None): Optional separate audio-model directory.
+            n_window (int | None): Optional audio encoder chunk window override.
+            n_window_infer (int | None): Optional audio encoder inference window override.
             cache_model (bool): If true, cache generated IR files next to the model.
             openvino_cache_dir (str | None): Optional OpenVINO compile cache directory.
             kwargs: Additional OpenVINO compile properties.
@@ -1040,6 +1348,49 @@ void init_qwen3_asr(py::module_& m) {
             audio (numpy.ndarray): 1D waveform array.
             context (str): Optional system/context prompt.
             language (str | None): Optional forced language.
+
+            Returns:
+                Qwen3ASRDecodedResult
+        )")
+        .def(
+            "generate_streaming",
+            [](Qwen3ASRInferenceEngine& engine,
+               py::array_t<float, py::array::c_style | py::array::forcecast> audio,
+               const std::string& context,
+               const std::optional<std::string>& language,
+               const std::optional<double>& stream_chunk_sec,
+               const std::optional<double>& stream_window_sec,
+               int32_t stream_unfixed_chunk_num,
+               int32_t stream_unfixed_token_num) {
+                std::vector<float> pcm(audio.size());
+                std::copy_n(audio.data(), audio.size(), pcm.begin());
+                py::gil_scoped_release rel;
+                return engine.generate_streaming(
+                    pcm,
+                    context,
+                    language,
+                    stream_chunk_sec,
+                    stream_window_sec,
+                    stream_unfixed_chunk_num,
+                    stream_unfixed_token_num);
+            },
+            py::arg("audio"),
+            py::arg("context") = "",
+            py::arg("language") = py::none(),
+            py::arg("stream_chunk_sec") = py::none(),
+            py::arg("stream_window_sec") = py::none(),
+            py::arg("stream_unfixed_chunk_num") = 2,
+            py::arg("stream_unfixed_token_num") = 5,
+            R"(
+            Run bounded-window streaming ASR on a single 16kHz mono PCM float waveform.
+
+            audio (numpy.ndarray): 1D waveform array.
+            context (str): Optional system/context prompt.
+            language (str | None): Optional forced language.
+            stream_chunk_sec (float | None): Optional streaming chunk duration in seconds.
+            stream_window_sec (float | None): Optional re-decode window duration in seconds.
+            stream_unfixed_chunk_num (int): Initial streaming steps without prefix reuse.
+            stream_unfixed_token_num (int): Tokens rolled back before prefix reuse.
 
             Returns:
                 Qwen3ASRDecodedResult
