@@ -15,6 +15,7 @@
 #include "speculative_decoding/eagle3_model_transforms.hpp"
 #include "speculative_decoding/stateful/eagle3_strategy.hpp"
 #include "speculative_decoding/stateful/fast_draft_strategy.hpp"
+#include "speculative_decoding/stateful/dflash_strategy.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -173,6 +174,59 @@ std::pair<std::string, Any> draft_model(
     return { utils::DRAFT_MODEL_ARG_NAME, Any::make<ModelDesc>(model, tokenizer, device, plugin_config, scheduler_config, generation_config) };
 }
 
+std::pair<std::string, Any> dflash_model(
+    const std::filesystem::path& draft_model_path,
+    const std::string& device,
+    const ov::AnyMap& properties) {
+    utils::DFlashModelConfig cfg;
+    cfg.draft_model_path = draft_model_path;
+    cfg.device = device;
+    cfg.properties = properties;
+
+    // Helper: parse quantization mode string → QuantizationConfig
+    auto make_quant_cfg = [&](const std::string& mode_key, const std::string& gs_key)
+        -> std::optional<modeling::weights::QuantizationConfig> {
+        if (properties.count(mode_key) == 0) return std::nullopt;
+        auto mode_str = properties.at(mode_key).as<std::string>();
+        modeling::weights::QuantizationConfig qcfg;
+        if      (mode_str == "INT4_SYM")  qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT4_SYM;
+        else if (mode_str == "INT4_ASYM") qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+        else if (mode_str == "INT8_SYM")  qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT8_SYM;
+        else if (mode_str == "INT8_ASYM") qcfg.mode = modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+        else return std::nullopt;  // unknown mode → no quantization
+        qcfg.group_size = properties.count(gs_key) > 0
+            ? static_cast<int>(properties.at(gs_key).as<int64_t>())
+            : 128;
+        qcfg.backup_mode = qcfg.mode;  // same mode for all layers including lm_head
+        return qcfg;
+    };
+
+    // "quantization_mode" applies to both target and draft (backward compat).
+    auto both = make_quant_cfg("quantization_mode", "quantization_group_size");
+    if (both.has_value()) {
+        cfg.target_quantization_config = both;
+        cfg.draft_quantization_config  = both;
+    }
+
+    // Per-model overrides (take priority over combined key).
+    auto target_quant = make_quant_cfg("target_quantization_mode", "target_quantization_group_size");
+    if (target_quant.has_value()) cfg.target_quantization_config = target_quant;
+
+    auto draft_quant = make_quant_cfg("draft_quantization_mode", "draft_quantization_group_size");
+    if (draft_quant.has_value()) cfg.draft_quantization_config = draft_quant;
+
+    // Inference precision: "f32" or "f16" (default f16).
+    if (properties.count("inference_precision") > 0) {
+        auto prec_str = properties.at("inference_precision").as<std::string>();
+        if (prec_str == "f32" || prec_str == "FP32" || prec_str == "fp32")
+            cfg.inference_precision = ov::element::f32;
+        else
+            cfg.inference_precision = ov::element::f16;
+    }
+
+    return { utils::DFLASH_MODEL_ARG_NAME, Any::make<utils::DFlashModelConfig>(cfg) };
+}
+
 class StatefulPipeline {
 public:
 static std::unique_ptr<LLMPipelineImplBase> create(
@@ -180,6 +234,15 @@ static std::unique_ptr<LLMPipelineImplBase> create(
     const ov::genai::Tokenizer& tokenizer,
     const std::string& device,
     const ov::AnyMap& properties) {
+    // DFlash reloads the target model from safetensors itself (with quantization applied).
+    // Skip the expensive read_model() here to avoid a redundant unquantized load.
+    if (properties.count(utils::DFLASH_MODEL_ARG_NAME)) {
+        auto props_copy = properties;
+        auto dflash_cfg = utils::extract_dflash_model_from_config(props_copy);
+        auto gen_config = utils::from_config_json_if_exists(models_path);
+        ModelDesc stub_desc(nullptr, tokenizer, device, props_copy, {}, gen_config);
+        return std::make_unique<StatefulDFlashPipeline>(stub_desc, dflash_cfg, models_path);
+    }
     return create(ov::genai::utils::read_model(models_path, properties),
                   tokenizer,
                   device,
@@ -203,9 +266,16 @@ static std::unique_ptr<LLMPipelineImplBase> create(const std::shared_ptr<ov::Mod
                                                    const std::filesystem::path& models_path = {}) {
     auto properties_without_draft_model = properties;
     auto draft_model_descr = ov::genai::utils::extract_draft_model_from_config(properties_without_draft_model);
+    auto dflash_cfg = ov::genai::utils::extract_dflash_model_from_config(properties_without_draft_model);
 
     auto main_model_descr =
         ov::genai::ModelDesc(model, tokenizer, device, properties_without_draft_model, {}, generation_config);
+
+    // DFlash speculative decoding: takes priority over standard draft_model
+    if (!dflash_cfg.draft_model_path.empty()) {
+        return std::make_unique<StatefulDFlashPipeline>(
+            main_model_descr, dflash_cfg, models_path);
+    }
 
     if (draft_model_descr.model != nullptr) {
         // FIXME: Add support for StatefulSpeculativeLLMPipeline for non-NPU devices for both models.
@@ -260,7 +330,10 @@ ov::genai::LLMPipeline::LLMPipeline(
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
 
-    if (is_npu_requested) {
+    // DFlash speculative decoding: always route through StatefulPipeline::create
+    if (properties.count(utils::DFLASH_MODEL_ARG_NAME)) {
+        m_pimpl = StatefulPipeline::create(models_path, tokenizer, device, properties);
+    } else if (is_npu_requested) {
         m_pimpl = StatefulPipeline::create(models_path, tokenizer, device, properties);
     } else if (utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
@@ -298,7 +371,10 @@ ov::genai::LLMPipeline::LLMPipeline(
     bool is_npu_requested = ov::genai::utils::is_npu_requested(device, user_properties);
     auto [properties, attention_backend] = utils::extract_attention_backend(user_properties, is_npu_requested);
 
-    if (is_npu_requested) {
+    // DFlash speculative decoding: always route through StatefulPipeline::create
+    if (properties.count(utils::DFLASH_MODEL_ARG_NAME)) {
+        m_pimpl = StatefulPipeline::create(models_path, device, properties);
+    } else if (is_npu_requested) {
         m_pimpl = StatefulPipeline::create(models_path, device, properties);
     } else if (utils::explicitly_requires_paged_attention(user_properties)) {
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
