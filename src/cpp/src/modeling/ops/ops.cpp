@@ -147,6 +147,33 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
 
+std::tuple<Tensor, Tensor, Tensor> linear_attention(const Tensor& q,
+                                                    const Tensor& k,
+                                                    const Tensor& v,
+                                                    const Tensor& beta,
+                                                    const Tensor& g,
+                                                    const Tensor& initial_state,
+                                                    const std::shared_ptr<ov::op::util::Variable>& variable,
+                                                    bool snapshot_all_states) {
+    auto* ctx = q.context();
+    const Tensor* inputs[] = {&k, &v, &beta, &g, &initial_state};
+    for (const auto* t : inputs) {
+        auto* t_ctx = t->context();
+        if (ctx && t_ctx && ctx != t_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = t_ctx;
+        }
+    }
+
+    // Note: the OCL kernel expects input[3]=g, input[4]=beta (swapped relative to
+    // the C++ API parameter order), so we pass g before beta here.
+    ov::OutputVector args = {q.output(), k.output(), v.output(), g.output(), beta.output(), initial_state.output()};
+    auto node = std::make_shared<ov::op::LinearAttention>(args, variable, snapshot_all_states);
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx), Tensor(node->output(2), ctx)};
+}
+
 std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
