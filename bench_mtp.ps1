@@ -16,6 +16,7 @@ $env:OV_GENAI_USE_MODELING_API = "1"
 $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
 $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
 $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
+$env:OV_GENAI_MTP_SNAPSHOT = "1"
 $env:DEVICE = "GPU"
 
 $EXE       = "$GENAI_DIR\build-master\src\cpp\src\modeling\samples\RelWithDebInfo\modeling_qwen3_5.exe"
