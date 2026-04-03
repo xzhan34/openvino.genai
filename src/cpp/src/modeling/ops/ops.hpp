@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <tuple>
 #include <vector>
 
 #include <openvino/op/util/variable.hpp>
@@ -39,6 +40,14 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
                                            const Tensor& g,
                                            const Tensor& initial_state,
                                            const std::shared_ptr<ov::op::util::Variable>& variable);
+std::tuple<Tensor, Tensor, Tensor> linear_attention(const Tensor& q,
+                                                    const Tensor& k,
+                                                    const Tensor& v,
+                                                    const Tensor& beta,
+                                                    const Tensor& g,
+                                                    const Tensor& initial_state,
+                                                    const std::shared_ptr<ov::op::util::Variable>& variable,
+                                                    bool snapshot_all_states);
 std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
