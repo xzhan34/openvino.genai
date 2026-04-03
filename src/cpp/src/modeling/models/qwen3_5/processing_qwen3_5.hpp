@@ -147,6 +147,7 @@ struct Qwen3_5MtpIO {
     static constexpr const char* kPositionIds = "position_ids";
     static constexpr const char* kBeamIdx = "beam_idx";
     static constexpr const char* kLogits = "logits";
+    static constexpr const char* kMtpHiddenStates = "mtp_hidden_states";
 };
 
 struct Qwen3_5GraphSpec {

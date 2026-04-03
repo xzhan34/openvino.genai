@@ -143,6 +143,12 @@ public:
                    const Tensor* attention_mask,
                    const Tensor* cache_position) const;
 
+    /// Set a collector to receive the per-token all_states snapshot tensor
+    /// produced by the LinearAttention op when snapshot_all_states=true.
+    /// When non-null, forward() will use the 3-output LinearAttention overload.
+    /// Each entry is (layer_idx, tensor) so the host can match outputs to variables.
+    void set_all_states_collector(std::vector<std::pair<int32_t, Tensor>>* collector) { all_states_collector_ = collector; }
+
 private:
     const Tensor& in_proj_qkv_weight() const;
     const Tensor& in_proj_z_weight() const;
@@ -181,6 +187,8 @@ private:
     WeightParameter* dt_bias_param_ = nullptr;
     WeightParameter* norm_param_ = nullptr;
     WeightParameter* out_proj_param_ = nullptr;
+
+    mutable std::vector<std::pair<int32_t, Tensor>>* all_states_collector_ = nullptr;
 };
 
 class Qwen3_5MLP : public Module {
@@ -221,6 +229,8 @@ public:
                                       const std::optional<Tensor>& residual,
                                       const Tensor* precomputed_full_attn_sdpa_mask = nullptr) const;
 
+    Qwen3_5GatedDeltaNet* linear_attn_ptr() { return linear_attn_.get(); }
+
 private:
     std::string layer_type_;
     std::unique_ptr<Qwen3_5Attention> self_attn_;
@@ -253,6 +263,7 @@ public:
                           const Tensor* visual_pos_mask = nullptr);
 
     VocabEmbedding& embed_tokens();
+    std::vector<Qwen3_5DecoderLayer>& layers() { return layers_; }
 
 private:
     Tensor forward_impl(const Tensor* input_ids,

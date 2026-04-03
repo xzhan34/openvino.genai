@@ -72,6 +72,13 @@ bool use_fused_conv_op() {
     return std::string(raw) != "0";
 }
 
+bool use_mtp_snapshot() {
+    const char* raw = std::getenv("OV_GENAI_MTP_SNAPSHOT");
+    if (!raw || raw[0] == '\0')
+        return false;  // disabled by default
+    return std::string(raw) != "0";
+}
+
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
     const ov::genai::modeling::models::Qwen3_5TextModelConfig& input_cfg) {
     auto cfg = input_cfg;
@@ -536,8 +543,15 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // No ReadValue/Assign — LinearAttention manages the variable exclusively.
         // The GPU impl reads from variable memory (if set) or from recurrent_init (first iteration),
         // and writes updated state directly to variable memory.
-        auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
-        core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
+        if (all_states_collector_) {
+            // Snapshot mode: 3-output overload captures per-token intermediate states.
+            auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var, true);
+            core_attn_tensor = std::get<0>(la_result);   // [B, S, num_v_heads, head_v_dim]
+            all_states_collector_->push_back({layer_idx_, std::get<2>(la_result)});  // (layer_idx, [B, S, num_v_heads, K, K])
+        } else {
+            auto la_result = ops::linear_attention(q_f32, k_f32, v_f32, beta, g, recurrent_init, recurrent_var);
+            core_attn_tensor = la_result.first;   // [B, S, num_v_heads, head_v_dim]
+        }
     } else {
         // ── TensorIterator path (default) ──
         // Traditional ReadValue + Gather + Assign pattern for variable state management.
@@ -1045,6 +1059,21 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     options.report_unmatched = false;
     (void)ov::genai::modeling::weights::load_model(model, source, finalizer, options);
 
+    // Per-token linear_states snapshot: when enabled, each LinearAttention op
+    // produces a 3rd output with intermediate states for every token position.
+    // This allows the host to select the correct recurrent state after MTP
+    // batch verification without re-forwarding.
+    const bool snapshot_mode = use_mtp_snapshot();
+    std::vector<std::pair<int32_t, Tensor>> all_states_collection;
+    if (snapshot_mode) {
+        for (auto& layer : model.model().layers()) {
+            auto* la = layer.linear_attn_ptr();
+            if (la) {
+                la->set_all_states_collector(&all_states_collection);
+            }
+        }
+    }
+
     const auto float_type = ov::element::f32;
     auto attention_mask = ctx.parameter(Qwen3_5TextIO::kAttentionMask, ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter(Qwen3_5TextIO::kPositionIds, ov::element::i64, ov::PartialShape{3, -1, -1});
@@ -1111,6 +1140,19 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
         auto hidden_result = std::make_shared<ov::op::v0::Result>(hidden_states.output());
         set_name(hidden_result, Qwen3_5TextIO::kHiddenStates);
         outputs.push_back(hidden_result->output(0));
+    }
+
+    // Add per-token linear_states snapshots as model outputs.
+    // Output names: "all_linear_states.0", "all_linear_states.1", ...
+    // Each tensor: [B, T, num_v_heads, head_k_dim, head_v_dim]
+    if (snapshot_mode && !all_states_collection.empty()) {
+        for (size_t i = 0; i < all_states_collection.size(); ++i) {
+            // Name includes the actual layer index so the host can match to variables.
+            const std::string name = "all_linear_states.layer" + std::to_string(all_states_collection[i].first);
+            auto result = std::make_shared<ov::op::v0::Result>(all_states_collection[i].second.output());
+            set_name(result, name);
+            outputs.push_back(result->output(0));
+        }
     }
 
     auto ov_model = ctx.build_model(outputs);
@@ -1362,7 +1404,11 @@ std::shared_ptr<ov::Model> create_qwen3_5_mtp_model(
     auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(logits_result, Qwen3_5MtpIO::kLogits);
 
-    auto ov_model = ctx.build_model({logits_result->output(0)});
+    // Output hidden_states (before lm_head) for autoregressive MTP (K>1 drafting)
+    auto mtp_hs_result = std::make_shared<ov::op::v0::Result>(normed.output());
+    set_name(mtp_hs_result, Qwen3_5MtpIO::kMtpHiddenStates);
+
+    auto ov_model = ctx.build_model({logits_result->output(0), mtp_hs_result->output(0)});
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;
