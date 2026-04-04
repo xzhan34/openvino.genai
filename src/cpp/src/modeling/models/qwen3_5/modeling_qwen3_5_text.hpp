@@ -148,6 +148,7 @@ public:
     /// When non-null, forward() will use the 3-output LinearAttention overload.
     /// Each entry is (layer_idx, tensor) so the host can match outputs to variables.
     void set_all_states_collector(std::vector<std::pair<int32_t, Tensor>>* collector) { all_states_collector_ = collector; }
+    void set_all_conv_states_collector(std::vector<std::pair<int32_t, Tensor>>* collector) { all_conv_states_collector_ = collector; }
 
 private:
     const Tensor& in_proj_qkv_weight() const;
@@ -189,6 +190,7 @@ private:
     WeightParameter* out_proj_param_ = nullptr;
 
     mutable std::vector<std::pair<int32_t, Tensor>>* all_states_collector_ = nullptr;
+    mutable std::vector<std::pair<int32_t, Tensor>>* all_conv_states_collector_ = nullptr;
 };
 
 class Qwen3_5MLP : public Module {

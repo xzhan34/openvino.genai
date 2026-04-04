@@ -53,6 +53,12 @@ std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
                                      const Tensor& beam_idx,
                                      const Tensor& initial_state,
                                      const std::shared_ptr<ov::op::util::Variable>& variable);
+std::tuple<Tensor, Tensor, Tensor> fused_conv(const Tensor& input,
+                                              const Tensor& conv_weight,
+                                              const Tensor& beam_idx,
+                                              const Tensor& initial_state,
+                                              const std::shared_ptr<ov::op::util::Variable>& variable,
+                                              bool snapshot_all_states);
 Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& gate_inp_weight,
                                  const Tensor& gate_exps_weight,

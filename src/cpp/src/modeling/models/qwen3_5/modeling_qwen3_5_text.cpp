@@ -480,14 +480,28 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
         auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
 
-        auto fused_result = ops::fused_conv(
-            mixed_qkv,                                     // [B, conv_dim, S]
-            conv_w_2d,                                      // [conv_dim, kernel_size]
-            beam_idx,                                       // [B]
-            conv_init,                                       // [B, conv_dim, kernel_size]
-            conv_var);
+        if (all_conv_states_collector_) {
+            // Snapshot mode: 3-output overload captures per-token conv state snapshots.
+            auto fused_result = ops::fused_conv(
+                mixed_qkv,                                     // [B, conv_dim, S]
+                conv_w_2d,                                      // [conv_dim, kernel_size]
+                beam_idx,                                       // [B]
+                conv_init,                                       // [B, conv_dim, kernel_size]
+                conv_var,
+                true);                                           // snapshot_all_states
 
-        mixed_after_conv = fused_result.first;              // [B, conv_dim, S]
+            mixed_after_conv = std::get<0>(fused_result);       // [B, conv_dim, S]
+            all_conv_states_collector_->push_back({layer_idx_, std::get<2>(fused_result)});  // [B, S, conv_dim, kernel_size]
+        } else {
+            auto fused_result = ops::fused_conv(
+                mixed_qkv,                                     // [B, conv_dim, S]
+                conv_w_2d,                                      // [conv_dim, kernel_size]
+                beam_idx,                                       // [B]
+                conv_init,                                       // [B, conv_dim, kernel_size]
+                conv_var);
+
+            mixed_after_conv = fused_result.first;              // [B, conv_dim, S]
+        }
     } else {
         // ── Fallback: original decomposed path ──
         auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
@@ -1065,11 +1079,13 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     // batch verification without re-forwarding.
     const bool snapshot_mode = use_mtp_snapshot();
     std::vector<std::pair<int32_t, Tensor>> all_states_collection;
+    std::vector<std::pair<int32_t, Tensor>> all_conv_states_collection;
     if (snapshot_mode) {
         for (auto& layer : model.model().layers()) {
             auto* la = layer.linear_attn_ptr();
             if (la) {
                 la->set_all_states_collector(&all_states_collection);
+                la->set_all_conv_states_collector(&all_conv_states_collection);
             }
         }
     }
@@ -1150,6 +1166,18 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
             // Name includes the actual layer index so the host can match to variables.
             const std::string name = "all_linear_states.layer" + std::to_string(all_states_collection[i].first);
             auto result = std::make_shared<ov::op::v0::Result>(all_states_collection[i].second.output());
+            set_name(result, name);
+            outputs.push_back(result->output(0));
+        }
+    }
+
+    // Add per-token conv_states snapshots as model outputs.
+    // Output names: "all_conv_states.layerN"
+    // Each tensor: [B, T, conv_dim, kernel_size]
+    if (snapshot_mode && !all_conv_states_collection.empty()) {
+        for (size_t i = 0; i < all_conv_states_collection.size(); ++i) {
+            const std::string name = "all_conv_states.layer" + std::to_string(all_conv_states_collection[i].first);
+            auto result = std::make_shared<ov::op::v0::Result>(all_conv_states_collection[i].second.output());
             set_name(result, name);
             outputs.push_back(result->output(0));
         }

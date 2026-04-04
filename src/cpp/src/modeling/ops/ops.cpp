@@ -197,6 +197,30 @@ std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
 
+std::tuple<Tensor, Tensor, Tensor> fused_conv(const Tensor& input,
+                                              const Tensor& conv_weight,
+                                              const Tensor& beam_idx,
+                                              const Tensor& initial_state,
+                                              const std::shared_ptr<ov::op::util::Variable>& variable,
+                                              bool snapshot_all_states) {
+    auto* ctx = input.context();
+    const Tensor* inputs[] = {&conv_weight, &beam_idx, &initial_state};
+    for (const auto* t : inputs) {
+        auto* t_ctx = t->context();
+        if (ctx && t_ctx && ctx != t_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = t_ctx;
+        }
+    }
+
+    ov::OutputVector args = {input.output(), conv_weight.output(),
+                             beam_idx.output(), initial_state.output()};
+    auto node = std::make_shared<ov::op::FusedConv>(args, variable, snapshot_all_states);
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx), Tensor(node->output(2), ctx)};
+}
+
 Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& gate_inp_weight,
                                  const Tensor& gate_exps_weight,

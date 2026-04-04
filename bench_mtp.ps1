@@ -17,6 +17,11 @@ $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
 $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
 $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
 $env:OV_GENAI_MTP_SNAPSHOT = "1"
+# Disable oneDNN for FC layers to use OCL bf_tiled kernel with forced tile_b=1 for batch<=2.
+# This prevents INT4 GEMM batch-size-dependent numerical divergence that causes text degeneration
+# in MTP pure-batch mode (batch=2 verify vs batch=1 draft).
+$env:OV_GPU_USE_ONEDNN = "0"
+$env:OV_GPU_FC_SINGLE_BATCH_THRESHOLD = "2"
 $env:DEVICE = "GPU"
 
 $EXE       = "$GENAI_DIR\build-master\src\cpp\src\modeling\samples\RelWithDebInfo\modeling_qwen3_5.exe"
@@ -162,7 +167,28 @@ function Check-TextQuality([string]$output) {
     $isDegenerate = $false
     $reason = "OK"
 
-    if ($maxRepeatRun -ge 5) {
+    # Check 4: single-character repetition (e.g., "!!!!!!!!!" or "........")
+    $maxCharRepeat = 0
+    $repeatChar = ""
+    if ($genText.Length -gt 0) {
+        $currentCharRun = 1
+        for ($ci = 1; $ci -lt $genText.Length; $ci++) {
+            if ($genText[$ci] -eq $genText[$ci - 1] -and $genText[$ci] -ne ' ') {
+                $currentCharRun++
+                if ($currentCharRun -gt $maxCharRepeat) {
+                    $maxCharRepeat = $currentCharRun
+                    $repeatChar = $genText[$ci]
+                }
+            } else {
+                $currentCharRun = 1
+            }
+        }
+    }
+
+    if ($maxCharRepeat -ge 10) {
+        $isDegenerate = $true
+        $reason = "CHAR_REPEAT: '$repeatChar' x$maxCharRepeat"
+    } elseif ($maxRepeatRun -ge 5) {
         $isDegenerate = $true
         $reason = "WORD_REPEAT: '$repeatWord' x$maxRepeatRun"
     } elseif ($maxBigramRepeat -ge 4) {
@@ -356,7 +382,7 @@ foreach ($mdl in $MODELS) {
             if ($cfg.MTP -gt 0) {
                 [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)"))
                 if ($cfg.SeqVerify -gt 0) {
-                    [void]$argList.AddRange(@("--seq-verify", "0"))
+                    # pure-batch is the production requirement for MTP
                     [void]$argList.AddRange(@("--pure-batch", "1"))
                 }
             }
