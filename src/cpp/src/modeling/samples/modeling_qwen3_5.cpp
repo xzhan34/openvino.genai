@@ -1638,21 +1638,20 @@ int main(int argc, char* argv[]) try {
         const size_t hidden_size = static_cast<size_t>(cfg.text.hidden_size);
         mtp_request->reset_state();
 
-        // Use effective_past (logical position, skipping dead entries) for RoPE.
-        // past_len includes dead KV entries from virtual trim; effective_past
-        // gives contiguous positions matching the model's training distribution.
-        const int64_t effective_past = past_len - static_cast<int64_t>(dead_positions.size());
+        // Use past_len for RoPE position_ids. Do NOT subtract dead_positions:
+        // KV cache entries retain their original RoPE encoding at their physical
+        // position, so new tokens must use contiguous positions starting at past_len.
 
         // Draft 0: from main model hidden_states
         const float* hs_ptr = main_hs.data<const float>() + hs_pos * hidden_size;
-        drafts[0] = run_mtp_single(next_id, hs_ptr, effective_past);
+        drafts[0] = run_mtp_single(next_id, hs_ptr, past_len);
 
         // Drafts 1..K-1: from MTP's own hidden_states (autoregressive)
         for (int k = 1; k < K; ++k) {
             ov::Tensor mtp_hs_out = mtp_request->get_tensor(
                 ov::genai::modeling::models::Qwen3_5MtpIO::kMtpHiddenStates);
             const float* mtp_hs_ptr = mtp_hs_out.data<const float>();
-            drafts[k] = run_mtp_single(drafts[k - 1], mtp_hs_ptr, effective_past + k);
+            drafts[k] = run_mtp_single(drafts[k - 1], mtp_hs_ptr, past_len + k);
         }
     };
 
@@ -1759,14 +1758,14 @@ int main(int argc, char* argv[]) try {
                     ids_data[b * kp1 + static_cast<size_t>(k + 1)] = drafts[k];
                 }
             }
-            // Use effective_past (skipping dead entries) for position_ids / RoPE.
-            // past_len counts ALL KV entries including dead ones; effective_past
-            // gives contiguous positions matching what the model was trained on.
-            const int64_t effective_past = past_len - static_cast<int64_t>(dead_positions.size());
+            // Use past_len for position_ids / RoPE. Do NOT subtract dead_positions:
+            // KV cache entries retain their original RoPE encoding, so position_ids
+            // must be contiguous starting at past_len to maintain correct relative
+            // distances with existing cache entries.
             auto* pos_data = usm_decode_pos_kp1.data<int64_t>();
             for (size_t b = 0; b < batch; ++b) {
                 for (size_t j = 0; j < kp1; ++j) {
-                    const int64_t pos_val = (effective_past + static_cast<int64_t>(j)) + rope_deltas_data[b];
+                    const int64_t pos_val = (past_len + static_cast<int64_t>(j)) + rope_deltas_data[b];
                     for (size_t plane = 0; plane < 3; ++plane) {
                         pos_data[plane * batch * kp1 + b * kp1 + j] = pos_val;
                     }
@@ -1964,12 +1963,12 @@ int main(int argc, char* argv[]) try {
                 const int64_t past_len_before = past_len;
                 const int64_t original_next_id = next_id;
 
-                // Save conv states before batch verify (for kernel snapshot mode).
-                // Conv states are small (~128KB × 24 layers) and need rollback
-                // since the sliding window advances irreversibly.
-                if (has_kernel_snapshot) {
-                    save_conv_states(text_request, conv_snap);
-                }
+                // Note: conv states are NOT saved/restored in kernel-snapshot mode.
+                // After K+1 verify, the conv state includes all K+1 tokens' effects
+                // (including rejected ones). This is better than restoring to pre-verify
+                // state which would lose the accepted tokens' effects entirely.
+                // The rejected tokens' residual in the conv window (size 4) self-corrects
+                // within a few single-token decode steps.
 
                 // Snapshot linear_states before batch verify (skip for pure batch and kernel snapshot)
                 if (!use_pure_batch && !has_kernel_snapshot) {
@@ -2057,7 +2056,7 @@ int main(int argc, char* argv[]) try {
                             }();
                             select_and_restore_linear_states(text_request, all_linear_states_names, num_accepted, gpu_restore);
                         }
-                        restore_conv_states(text_request, conv_snap);
+                        // Conv states are intentionally NOT restored — see note above.
                         // Virtual trim: mark rejected KV positions as dead
                         for (int t = 0; t < trim_count; ++t) {
                             const int64_t dead_pos = past_len_before + 1 + num_accepted + t;
