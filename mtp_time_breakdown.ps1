@@ -20,8 +20,13 @@ $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
 $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
 $env:OV_GENAI_MTP_SNAPSHOT = "1"
 $env:OV_GENAI_SNAPSHOT_RESTORE = "3"
+$env:OV_GENAI_VALIDATE_SNAPSHOT = "0"
 # oneDNN FC accumulation mode fix (fully_connected_onednn.cpp) ensures batch-size-invariant
-# INT4 GEMM results.  No need to disable oneDNN anymore.
+# INT4 GEMM results.  SDPA threshold auto-set by exe to K+1.
+# Clean up stale env vars
+Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GPU_FC_SINGLE_BATCH_THRESHOLD -ErrorAction SilentlyContinue
 $env:OV_GENAI_STEP_PROFILE = "1"
 
 $EXE       = "$GENAI_DIR\build-master\src\cpp\src\modeling\samples\RelWithDebInfo\modeling_qwen3_5.exe"
