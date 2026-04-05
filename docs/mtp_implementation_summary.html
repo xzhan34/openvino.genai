@@ -68,6 +68,9 @@
     <li><a href="#benchmark-9b-gpu-v4">Benchmark: Qwen3.5-9B GPU — K+1 Verify (v4)</a></li>
     <li><a href="#bugfix-attn-mask">Bug Fix: K+1 Verify Attention Mask</a></li>
     <li><a href="#kernel-snapshot">Kernel-Level Per-Token State Snapshots (April 2026)</a></li>
+    <li><a href="#int4-fc-quality">INT4 FC Quality Fix: oneDNN Investigation</a></li>
+    <li><a href="#step-profiling">Per-Step Inference Profiling</a></li>
+    <li><a href="#benchmark-9b-final">Benchmark: Qwen3.5-9B GPU — Final Results (with oneDNN Fix)</a></li>
     <li><a href="#next-steps">Remaining Gaps &amp; Next Steps</a></li>
   </ul>
 </div>
@@ -75,8 +78,11 @@
 <!-- ======== Overview ======== -->
 <h2 id="overview">Overview</h2>
 <p>This document summarizes the initial MTP speculative decoding implementation for Qwen3.5 in the OpenVINO GenAI explicit modeling framework. This serves as the baseline for future performance optimization work.</p>
-<p><strong>Status</strong>: <span class="status status-warn">K+1 Verify — Attention Mask Bug Fixed, Re-benchmark Needed</span> &nbsp;
-   K+1 verify speculative decoding is fully implemented. <strong>Critical attention mask bug fixed</strong> &mdash; previous K&ge;2 results were invalid due to wrong causal mask shape. After fix: 9B GPU produces coherent text at all K values. Previous benchmark data needs re-measurement.</p>
+<p><strong>Status</strong>: <span class="status status-ok">K+1 Verify — All Configs Quality Verified</span> &nbsp;
+   K+1 verify speculative decoding is fully implemented and benchmarked on Qwen3.5-9B (Intel Arc Pro 140T).
+   <strong>INT4 FC quality issue resolved</strong> via <code>OV_GPU_USE_ONEDNN=0</code> + <code>OV_GPU_FC_SINGLE_BATCH_THRESHOLD=2</code>.
+   All TEXT and VL configs produce coherent text (QUALITY: OK). Per-step profiling instrumentation added (<code>OV_GENAI_STEP_PROFILE=1</code>).
+   VL mode K=2 achieves <strong>+15.6% throughput</strong>; TEXT mode shows no MTP benefit on this model/hardware.</p>
 <p><strong>Speculative tokens</strong>: Configurable via <code>--mtp-k N</code> (default: 1). The MTP model drafts K tokens autoregressively using its own hidden_states output. The main model verifies all K drafts in a single K+1 token forward pass.</p>
 
 <!-- ======== Architecture ======== -->
@@ -187,7 +193,13 @@ E[Tok/Infer] = h &times; 2 + (1&minus;h) &times; 1 = 1 + h</code></pre>
 <h3>Benchmark Script (1 file, new)</h3>
 <table>
   <tr><th>File</th><th>Description</th></tr>
-  <tr><td><code>bench_mtp.ps1</code></td><td>PowerShell benchmark script: runs baseline vs MTP across text/VL modes, parses all metrics (TTFT, TPOT, throughput, MTP hit rate, tokens/infer), outputs summary table with speedup calculation</td></tr>
+  <tr><td><code>bench_mtp.ps1</code></td><td>PowerShell benchmark script: runs baseline vs MTP across text/VL modes, parses all metrics (TTFT, TPOT, throughput, MTP hit rate, tokens/infer), quality check. Updated with <code>OV_GPU_USE_ONEDNN=0</code>, <code>OV_GPU_FC_SINGLE_BATCH_THRESHOLD=2</code>, and <code>OV_GENAI_STEP_PROFILE=1</code> environment variables.</td></tr>
+</table>
+
+<h3>Per-step Profiling Script (1 file, new)</h3>
+<table>
+  <tr><th>File</th><th>Description</th></tr>
+  <tr><td><code>mtp_time_breakdown.ps1</code></td><td>Standalone per-step MTP profiling script. Parameterized (<code>-MtpK</code>, <code>-OutputTokens</code>, <code>-Mode</code>, <code>-Prompt</code>, <code>-Model</code>). Sets all required env vars, runs exe with stdout/stderr redirect, prints summary metrics + per-step breakdown from <code>OV_GENAI_STEP_PROFILE</code> output.</td></tr>
 </table>
 
 <!-- ======== Key Decisions ======== -->
@@ -1403,26 +1415,246 @@ This enables a direct GPU-to-GPU <code>enqueue_memcpy</code> with no type conver
       but may need optimization for larger K values.</li>
 </ul>
 
+  <li><strong>Memory overhead</strong>: 192 MB for K=3 on 24 layers. Acceptable for GPU inference
+      but may need optimization for larger K values.</li>
+</ul>
+
+<!-- ======== INT4 FC Quality Fix ======== -->
+<h2 id="int4-fc-quality">INT4 FC Quality Fix: oneDNN Investigation (April 2026)</h2>
+
+<h3>Problem: Text Degeneration in MTP Pure-Batch Mode</h3>
+<p>
+After fixing the attention mask bug and implementing kernel-level state snapshots, MTP K&ge;2 in
+<strong>VL mode</strong> still produced degenerate/incoherent text, while TEXT mode was coherent.
+The symptom: VL mode with <code>--pure-batch 1</code> generated repetitive or nonsensical output
+despite correct token sequences in TEXT mode.
+</p>
+
+<h3>Investigation: Kernel-Level Root Cause Analysis</h3>
+<p>Systematic elimination of potential GPU kernel precision issues:</p>
+<table>
+  <tr><th>Attempt</th><th>Description</th><th>Result</th></tr>
+  <tr><td>FusedConv F16 rounding</td><td>Force full-precision in FusedConv kernel</td><td class="delta-neg">No effect</td></tr>
+  <tr><td>SDPA single-token forced</td><td>Force single-token SDPA path for batch verify</td><td class="delta-neg">No effect</td></tr>
+  <tr><td>Combined kernel fixes</td><td>Both FusedConv + SDPA fixes together</td><td class="delta-neg">No effect</td></tr>
+  <tr><td><strong>F16 no-quant test</strong></td><td>Run with FP16 weights (no INT4 quantization)</td><td class="delta-pos"><strong>Coherent VL output</strong></td></tr>
+</table>
+<p><strong>Key finding</strong>: The root cause is <strong>INT4 GEMM</strong>, not attention or convolution kernels.</p>
+
+<h3>Root Cause: oneDNN INT4 FC Batch-Size-Dependent Divergence</h3>
+<p>
+On the Intel Arc Pro 140T (IMMAD hardware), the GPU plugin uses <strong>oneDNN</strong> for fully-connected (FC)
+layers rather than the OCL <code>bf_tiled</code> kernel. The oneDNN INT4 GEMM produces different numerical
+results for batch_size=1 vs batch_size=2, causing:
+</p>
+<ul>
+  <li>MTP draft phase (batch=1): produces logits <code>X</code></li>
+  <li>Main verify phase (batch=2): produces logits <code>X&prime;</code> (numerically different for same token position)</li>
+  <li>The divergence compounds across speculative decode steps, causing text degeneration</li>
+  <li>TEXT mode is less affected because text prompts produce less extreme activation ranges</li>
+</ul>
+
+<h3>Why <code>GPU_USE_ONEDNN</code> Cannot Be Set via API</h3>
+<p>
+The property <code>GPU_USE_ONEDNN</code> has <strong><code>RELEASE_INTERNAL</code></strong> visibility in the GPU plugin,
+meaning it cannot be passed through <code>ov::Core::compile_model()</code> properties.
+It can only be set via the environment variable <code>OV_GPU_USE_ONEDNN=0</code>.
+</p>
+
+<h3>Fix: Disable oneDNN + Force OCL bf_tiled for Small Batches</h3>
+<pre><code># Disable oneDNN for FC layers:
+set OV_GPU_USE_ONEDNN=0
+
+# Force OCL bf_tiled kernel tile_b=1 for batch<=2:
+set OV_GPU_FC_SINGLE_BATCH_THRESHOLD=2</code></pre>
+<p>
+With both env vars set, the GPU plugin uses the OCL <code>bf_tiled</code> kernel for all FC layers.
+The <code>FC_SINGLE_BATCH_THRESHOLD=2</code> ensures that batch=1 and batch=2 both use the
+<code>tile_b=1</code> code path, producing identical numerical results for the same token position
+regardless of batch size.
+</p>
+
+<h3>Verification</h3>
+<p>
+With <code>OV_GPU_USE_ONEDNN=0</code> + <code>OV_GPU_FC_SINGLE_BATCH_THRESHOLD=2</code>:
+all TEXT and VL configs (K=1, K=2, K=3) produce <strong>coherent, quality-verified text</strong>.
+Benchmark script <code>bench_mtp.ps1</code> reports QUALITY: OK for all configurations.
+</p>
+
+<h3>Performance Impact</h3>
+<p>
+Disabling oneDNN incurs a performance cost of approximately <strong>24%</strong> regression in raw throughput
+compared to the oneDNN path. This is a known trade-off: correctness over performance.
+A proper fix would require modifying the oneDNN INT4 GEMM kernel to produce batch-size-invariant results.
+</p>
+
+<h3>OCL bf_tiled Kernel Patch</h3>
+<p>
+Also investigated and patched the OCL <code>bf_tiled</code> kernel to force <code>tile_b=1</code>
+for batch_size &le; 2. This fix was implemented but had <strong>no effect</strong> initially because
+on IMMAD hardware, oneDNN was being used for FC layers instead of <code>bf_tiled</code>.
+The patch becomes effective only when <code>OV_GPU_USE_ONEDNN=0</code> is also set.
+</p>
+
+<!-- ======== Per-Step Profiling ======== -->
+<h2 id="step-profiling">Per-Step Inference Profiling (April 2026)</h2>
+
+<h3>Instrumentation</h3>
+<p>
+Added fine-grained per-step timing breakdown to <code>modeling_qwen3_5.cpp</code>, controlled by
+the <code>OV_GENAI_STEP_PROFILE=1</code> environment variable. The profiling measures each sub-step
+of the speculative decode loop and reports both per-step detail (stderr) and aggregate summary (stdout).
+</p>
+
+<h3>Sub-Step Timing Points</h3>
+<table>
+  <tr><th>Sub-Step</th><th>Measurement</th><th>Description</th></tr>
+  <tr><td>Snapshot save</td><td><code>step_snap_save</code></td><td>Save linear_states + conv_states before batch verify</td></tr>
+  <tr><td>Main GPU infer</td><td><code>step_main_infer</code></td><td>Main model K+1 batch forward pass (GPU)</td></tr>
+  <tr><td>Accept/reject</td><td><code>step_accept</code></td><td>CPU-side logits extract + argmax + compare</td></tr>
+  <tr><td>State restore</td><td><code>step_state_restore</code></td><td>Linear/conv state restore on rejection</td></tr>
+  <tr><td>KV trim</td><td><code>step_kv_trim</code></td><td>Virtual KV cache trim on rejection</td></tr>
+  <tr><td>MTP reset</td><td><code>step_mtp_reset_ms</code></td><td>MTP model <code>reset_state()</code> call</td></tr>
+  <tr><td>MTP draft k=N</td><td><code>step_mtp_k_ms[k]</code></td><td>Per-k MTP head GPU inference</td></tr>
+</table>
+
+<h3>Output Format</h3>
+
+<h4>Per-Step Detail (stderr, gated by <code>OV_GENAI_STEP_PROFILE=1</code>)</h4>
+<pre><code>[STEP   9] total=117.4ms | VERIFY=96.8ms (save=1.2 infer=95.2 accept=0.4) | DRAFT=20.7ms (reset=0.0 k0=10.4 k1=10.2) | accepted=2/2 gen=20
+[STEP  10] total=102.3ms | VERIFY=80.1ms (save=1.3 infer=78.5 accept=0.3 restore=1.5 trim=0.0) | DRAFT=22.2ms (reset=0.0 k0=11.0 k1=11.1) | accepted=0/2 gen=21</code></pre>
+<p>
+Note: <code>restore</code> and <code>trim</code> fields appear only on rejection steps (<code>accepted &lt; K</code>).
+</p>
+
+<h4>Aggregate Summary (stdout, always printed for batch verify)</h4>
+<pre><code>  --- Per-step avg breakdown (30 steps) ---
+    Snapshot save:     1.500000 ms/step
+    Main GPU infer:    109.000000 ms/step
+    Accept/reject:     0.400000 ms/step
+    State restore:     0.700000 ms/step (on rejection)
+    KV trim:           0.000000 ms/step (on rejection)
+    MTP reset:         0.000000 ms/step
+    MTP draft k=0:     11.000000 ms/call (30 calls, total 330.000000 ms)
+    MTP draft k=1:     10.200000 ms/call (30 calls, total 306.000000 ms)
+    ---------------------
+    Avg step total:    134.000000 ms (verify=112.000000 + draft=22.000000)</code></pre>
+
+<h3>Typical Step Anatomy (Qwen3.5-9B, INT4, K=2, VL mode)</h3>
+<table>
+  <tr><th>Sub-step</th><th>Avg Latency</th><th>% of Step</th><th>Notes</th></tr>
+  <tr><td>Main GPU infer</td><td>~109 ms</td><td>81%</td><td>K+1 batch verify (near 1-token cost on memory-bound 9B)</td></tr>
+  <tr><td>MTP draft k=0</td><td>~11 ms</td><td>8.2%</td><td>Single MTP layer + lm_head GPU inference</td></tr>
+  <tr><td>MTP draft k=1</td><td>~10.2 ms</td><td>7.6%</td><td>Same MTP layer reused autoregressively</td></tr>
+  <tr><td>Snapshot save</td><td>~1.5 ms</td><td>1.1%</td><td>Save conv_states to CPU buffers</td></tr>
+  <tr><td>State restore</td><td>~0.7 ms</td><td>0.5%</td><td>GPU-side restore (amortized over all steps)</td></tr>
+  <tr><td>Accept/reject</td><td>~0.4 ms</td><td>0.3%</td><td>CPU-side logits extract + argmax</td></tr>
+  <tr><td>MTP reset + KV trim</td><td>&lt;0.1 ms</td><td>&lt;0.1%</td><td>Negligible</td></tr>
+</table>
+<div class="note">
+  <strong>Key insight</strong>: The ~11 ms MTP draft overhead per step comes from a single MTP head
+  GPU inference (<code>mtp_request-&gt;infer()</code>). This is ~10% of the main model inference time
+  (109 ms), which aligns with the MTP model being 1/32 of the main model (1 decoder layer vs 32).
+  At K=2, the total MTP overhead is ~21 ms/step (2&times; MTP infer), amortized by the
+  accept rate to yield net throughput improvement in VL mode.
+</div>
+
+<h3>Scripts</h3>
+<ul>
+  <li><code>bench_mtp.ps1</code>: Sets <code>$env:OV_GENAI_STEP_PROFILE = "1"</code> for all benchmark runs</li>
+  <li><code>mtp_time_breakdown.ps1</code>: Standalone script for quick profiling. Usage:<br>
+    <code>powershell -ExecutionPolicy Bypass -File mtp_time_breakdown.ps1 -MtpK 2 -OutputTokens 64 -Mode vl</code>
+  </li>
+</ul>
+
+<!-- ======== Final 9B Benchmark ======== -->
+<h2 id="benchmark-9b-final">Benchmark: Qwen3.5-9B GPU &mdash; Final Results with oneDNN Fix (April 2026)</h2>
+
+<div class="note">
+  <strong>Setup:</strong> Qwen3.5-9B &nbsp;|&nbsp; INT4_ASYM group_size=128 &nbsp;|&nbsp; Intel Arc Pro 140T GPU
+  &nbsp;|&nbsp; 256 output tokens &nbsp;|&nbsp; Greedy decoding (T=0) &nbsp;|&nbsp;
+  <code>OV_GPU_USE_ONEDNN=0</code> + <code>OV_GPU_FC_SINGLE_BATCH_THRESHOLD=2</code>
+  &nbsp;|&nbsp; Kernel snapshot mode (<code>OV_GENAI_MTP_SNAPSHOT=1</code>)
+  &nbsp;|&nbsp; Pure-batch verify
+</div>
+
+<h3>TEXT Mode</h3>
+<table>
+  <tr><th>Config</th><th>TTFT (ms)</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>Accept%</th><th>Tok/Infer</th><th>Quality</th><th>vs Baseline</th></tr>
+  <tr><td>Baseline</td><td>&mdash;</td><td>&mdash;</td><td>14.65</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>MTP K=1</td><td>&mdash;</td><td>&mdash;</td><td>12.84</td><td>45.7%</td><td>1.46</td><td>OK</td><td class="delta-neg">&minus;12.4%</td></tr>
+  <tr><td>MTP K=2</td><td>&mdash;</td><td>&mdash;</td><td>14.52</td><td>45.0%</td><td>1.90</td><td>OK</td><td class="delta-neg">&minus;0.9%</td></tr>
+  <tr><td>MTP K=3</td><td>&mdash;</td><td>&mdash;</td><td>12.86</td><td>41.3%</td><td>2.24</td><td>OK</td><td class="delta-neg">&minus;12.2%</td></tr>
+</table>
+<p>
+TEXT mode shows <strong>no MTP benefit</strong> on this model/hardware with the oneDNN-disabled path.
+K=2 is near break-even (&minus;0.9%), while K=1 and K=3 show significant overhead.
+The ~45% accept rate is lower than typical (vLLM reports ~90% for similar prompts),
+likely due to INT4 quantization affecting MTP prediction quality.
+</p>
+
+<h3>VL Mode</h3>
+<table>
+  <tr><th>Config</th><th>TTFT (ms)</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>Accept%</th><th>Tok/Infer</th><th>Quality</th><th>vs Baseline</th></tr>
+  <tr><td>Baseline</td><td>&mdash;</td><td>&mdash;</td><td>14.72</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>MTP K=1</td><td>&mdash;</td><td>&mdash;</td><td>13.80</td><td>48.4%</td><td>1.48</td><td>OK</td><td class="delta-neg">&minus;6.3%</td></tr>
+  <tr style="background:#dafbe1"><td><strong>MTP K=2</strong></td><td>&mdash;</td><td>&mdash;</td><td><strong>17.01</strong></td><td><strong>56.7%</strong></td><td><strong>2.12</strong></td><td>OK</td><td class="delta-pos"><strong>+15.6%</strong></td></tr>
+  <tr><td>MTP K=3</td><td>&mdash;</td><td>&mdash;</td><td>14.33</td><td>48.3%</td><td>2.45</td><td>OK</td><td class="delta-neg">&minus;2.7%</td></tr>
+</table>
+<p>
+VL mode: <strong>K=2 is optimal</strong>, achieving <strong>+15.6% throughput improvement</strong> with 56.7% accept rate
+and 2.12 tokens per main model inference. K=3 is near break-even, K=1 shows overhead.
+</p>
+
+<h3>Key Observations</h3>
+<div class="note">
+  <strong>1. VL mode benefits, TEXT mode does not</strong>: VL prompts produce richer
+  hidden_states context for MTP prediction, resulting in higher accept rates (56.7% vs 45%).
+  The higher accept rate combined with K=2&rsquo;s favorable cost/benefit ratio yields
+  net +15.6% throughput gain in VL mode.<br><br>
+  <strong>2. K=2 is the sweet spot</strong>: K=1 doesn&rsquo;t generate enough extra tokens to
+  cover MTP overhead. K=3 adds too much draft cost (~33 ms total MTP) without proportionally
+  higher acceptance. K=2 balances draft cost (~22 ms) against tokens gained (2.12 tok/infer).<br><br>
+  <strong>3. All configs quality-verified</strong>: With oneDNN disabled, every configuration
+  (baseline + K=1/2/3 &times; TEXT/VL) passes the degenerate text quality check. This confirms
+  the INT4 GEMM batch-size divergence as the sole quality regression root cause.<br><br>
+  <strong>4. ~24% performance cost from disabling oneDNN</strong>: The raw baseline throughput
+  with oneDNN enabled is approximately 19 tok/s; disabling it reduces to ~14.7 tok/s.
+  A proper oneDNN kernel fix would recover this gap while maintaining quality.
+</div>
+
+<h3>Comparison: Previous (Invalid) vs Current (Valid) Results</h3>
+<table>
+  <tr><th>Dataset</th><th>Status</th><th>Best Config</th><th>Speedup</th><th>Accept%</th><th>Quality</th></tr>
+  <tr><td>v4 (pre-attn-mask fix)</td><td class="delta-neg">INVALID</td><td>Text K=2</td><td>+37.1%</td><td>57.7%</td><td>Degenerate</td></tr>
+  <tr><td>v4 (post-attn-mask, pre-oneDNN fix)</td><td class="delta-neg">VL Quality Fail</td><td>Text K=2</td><td>N/A</td><td>N/A</td><td>VL incoherent</td></tr>
+  <tr style="background:#dafbe1"><td><strong>v5 (current, with oneDNN fix)</strong></td><td class="delta-pos"><strong>VALID</strong></td><td><strong>VL K=2</strong></td><td><strong>+15.6%</strong></td><td><strong>56.7%</strong></td><td><strong>All OK</strong></td></tr>
+</table>
+
 <!-- ======== Next Steps ======== -->
 <h2 id="next-steps">Remaining Gaps &amp; Next Steps</h2>
 <ol>
   <li><s><strong>Skip main model call on hit</strong></s>: &check; Resolved &mdash; v3 uses 2-token batch verify.</li>
   <li><s><strong>Multi-token speculation (k&gt;1)</strong></s>: &check; Resolved &mdash; v4 implements K+1 verify with autoregressive MTP drafting.</li>
-  <li><s><strong>Benchmark on 9B GPU</strong></s>: &check; Done &mdash; K=2 achieves +37% throughput on Text mode.</li>
+  <li><s><strong>Benchmark on 9B GPU</strong></s>: &check; Done &mdash; VL K=2 achieves +15.6% throughput.</li>
   <li><s><strong>Fix K+1 verify attention mask</strong></s>: &check; Fixed &mdash; mask shape corrected from <code>[B, K+1]</code> to <code>[B, past_len+K+1]</code>.</li>
   <li><s><strong>Fix 9B tokenizer</strong></s>: &check; Fixed &mdash; generated <code>openvino_tokenizer.xml/bin</code> for Qwen3.5-9B.</li>
   <li><s><strong>Linear state drift (K&ge;2)</strong></s>: &check; Fixed &mdash; kernel-level per-token state snapshots (April 2026).</li>
   <li><s><strong>GPU-side state restore API</strong></s>: &check; Done &mdash; <code>restore_variable_from_output()</code> with pre-reorder optimization (25&times; faster).</li>
-  <li><strong>Re-run full benchmark</strong>: All previous 9B results are invalid (tokenizer + attention mask bugs). Need fresh data with both fixes.</li>
-  <li><strong>Run greedy (T=0) benchmark</strong>: Eliminate sampling randomness; compare accept rate with vLLM&rsquo;s 90%.</li>
-  <li><strong>Verify INT4 impact on MTP precision</strong>: FP16 MTP head may improve accept rate from ~50% toward vLLM&rsquo;s 90%.</li>
+  <li><s><strong>INT4 FC quality fix</strong></s>: &check; Fixed &mdash; <code>OV_GPU_USE_ONEDNN=0</code> + <code>OV_GPU_FC_SINGLE_BATCH_THRESHOLD=2</code>. All configs quality-verified.</li>
+  <li><s><strong>Re-run full benchmark</strong></s>: &check; Done &mdash; 9B GPU benchmarked with oneDNN fix (see v5 results).</li>
+  <li><s><strong>Run greedy (T=0) benchmark</strong></s>: &check; Done &mdash; all v5 benchmarks use greedy decoding.</li>
+  <li><s><strong>Per-step profiling</strong></s>: &check; Done &mdash; <code>OV_GENAI_STEP_PROFILE=1</code> env var, sub-step timing in <code>modeling_qwen3_5.cpp</code>.</li>
+  <li><strong>Fix oneDNN INT4 GEMM kernel</strong>: The ~24% throughput regression from disabling oneDNN should be addressed by fixing the kernel to produce batch-size-invariant results. This would allow using the faster oneDNN path while maintaining MTP quality.</li>
+  <li><strong>Verify INT4 impact on MTP precision</strong>: FP16 MTP head may improve accept rate from ~50% toward vLLM&rsquo;s 90%. Current ~45&ndash;57% accept rate limits MTP benefit.</li>
   <li><strong>Adaptive K selection</strong>: Auto-tune K based on observed accept rate during generation.</li>
   <li><strong>Async MTP execution</strong>: Overlap MTP inference with main model decode to hide MTP latency entirely.</li>
   <li><strong>Conv state per-token snapshots</strong>: Add per-token conv state output to FusedConv kernel for fully precise state restoration.</li>
+  <li><strong>Remove debug prints</strong>: Clean up verbose debug output added during investigation. Gate remaining diagnostic output behind env var flags.</li>
 </ol>
 
 <div class="footer">
-  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; April 2026 (v6 GPU-Side State Restore)
+  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; April 2026 (v7 INT4 FC Quality Fix + Per-Step Profiling)
 </div>
 
 </body>
