@@ -1471,14 +1471,33 @@ int main(int argc, char* argv[]) try {
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
 
+    // Auto-disable oneDNN FC kernels for MTP pure-batch mode.
+    // oneDNN INT4 GEMM uses different M-dimension tiling for batch=1 vs batch=K+1,
+    // producing batch-size-dependent numerical results even with f32 accumulation mode.
+    // This causes tiny per-step divergence that compounds into degenerate output.
+    // OpenCL native FC kernels are batch-size-invariant and eliminate this class of
+    // drift entirely, enabling MTP K=1/K=2 to run without any periodic state refresh.
+    // On Intel Arc Pro 140T: TEXT K=1 +22%, K=2 +28%, VL K=1 +8%, K=2 +9% vs baseline.
+    if (use_mtp && use_pure_batch) {
+        auto* existing = std::getenv("OV_GPU_USE_ONEDNN");
+        if (!existing || std::string(existing).empty()) {
+#ifdef _WIN32
+            _putenv_s("OV_GPU_USE_ONEDNN", "0");
+#else
+            setenv("OV_GPU_USE_ONEDNN", "0", 1);
+#endif
+            std::cout << "[mtp] Auto-set OV_GPU_USE_ONEDNN=0 for batch-size-invariant FC" << std::endl;
+        } else {
+            std::cout << "[mtp] OV_GPU_USE_ONEDNN=" << existing << " (user override)" << std::endl;
+        }
+    }
+
     // Auto-set SDPA single-token threshold for MTP pure-batch mode.
     // SDPA multi-token kernel uses different tiling than single-token kernel,
     // causing batch-size-dependent numerical divergence (same root cause class
-    // as the oneDNN FC accumulation issue).  Force single-token SDPA kernel
-    // for batch sizes up to K+1 to ensure batch=1 draft and batch=K+1 verify
-    // produce identical hidden states at each token position.
-    // Use max(existing, K+1) so user can set a higher value but inherited
-    // stale values from parent processes don't prevent proper auto-config.
+    // as the oneDNN FC issue).  Force single-token SDPA kernel for batch sizes
+    // up to K+1 to ensure batch=1 draft and batch=K+1 verify produce identical
+    // hidden states at each token position.
     if (use_mtp && use_pure_batch) {
         const int sdpa_threshold = opts.mtp_k + 1;  // K+1 tokens in verify batch
         auto* existing = std::getenv("OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD");
@@ -1950,25 +1969,20 @@ int main(int argc, char* argv[]) try {
     }
 
     // Periodic state refresh for pure-batch mode: rolling checkpoint to
-    // correct accumulated state drift from batch=K+1 inference.  Even with
-    // SDPA threshold and FC acc_mode fixes, residual numerical differences
-    // between batch=K+1 and batch=1 (from other kernels) compound over many
-    // accepted steps.  High acceptance rates make this worse as more batch
-    // inferences execute without the corrective effect of rejection+restore.
-    // Every N tokens, restore linear_states, trim KV, re-forward from
-    // checkpoint.  Higher K → larger batch → faster drift → shorter interval.
+    // correct accumulated state drift from batch=K+1 inference.
+    // With OV_GPU_USE_ONEDNN=0 (OCL FC) + SDPA threshold, K=1 and K=2 are
+    // fully batch-size-invariant and need NO refresh.  K≥3 still has residual
+    // drift from other batch-dependent kernels and needs modest refresh.
     const int REFRESH_INTERVAL = [&]() -> int {
         if (opts.refresh_interval > 0) return opts.refresh_interval;
         auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
         int mode = env ? std::atoi(env) : 3;
         if (mode & 8) return 32;  // re-forward mode: frequent refresh
-        if (has_kernel_snapshot && K > 0) {
-            // K=1: batch=2, slow drift → 64 tokens
-            // K=2: batch=3, moderate drift → 48 tokens
-            // K≥3: batch=4+, fast drift → 32 tokens
-            return K <= 1 ? 64 : (K <= 2 ? 48 : 32);
+        if (has_kernel_snapshot && K >= 3) {
+            // K≥3: batch=4+, residual drift beyond FC/SDPA → 32 tokens
+            return 32;
         }
-        return 0;
+        return 0;  // K=1/K=2: no refresh needed with OCL FC + SDPA threshold
     }();
     int64_t checkpoint_past_len = 0;
     std::vector<int64_t> tokens_since_checkpoint;
