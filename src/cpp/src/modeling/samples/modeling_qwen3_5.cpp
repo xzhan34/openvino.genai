@@ -1821,10 +1821,29 @@ int main(int argc, char* argv[]) try {
         for (size_t b = 0; b < batch; ++b) {
             mtp_beam_ptr[b] = static_cast<int32_t>(b);
         }
+
+        // Phase A: Pre-bind all MTP input tensors once. Shapes are constant
+        // ([batch,1] for ids/mask, [3,batch,1] for pos, [batch] for beam),
+        // so we write directly to pre-bound data pointers on each step
+        // instead of calling set_tensor() 5 times per MTP inference.
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kInputIds, mtp_step_ids);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kHiddenStates, mtp_hidden_in);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kAttentionMask, mtp_mask);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kPositionIds, mtp_pos);
+        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kBeamIdx, mtp_beam);
     }
 
-    // Lambda: single MTP inference. Copies hs_src to input, sets token and position, infers.
-    // Returns sampled draft token. MTP hidden_states output accessible via kMtpHiddenStates.
+    // Phase A: Cached MTP output tensor references. Populated after the
+    // first MTP inference to avoid per-call get_tensor() overhead.
+    // Output shapes are constant ([1,1,vocab] for logits, [1,1,hidden] for hs),
+    // so the runtime reuses the same output buffers across inferences.
+    ov::Tensor mtp_logits_cached;
+    ov::Tensor mtp_hs_cached;
+    bool mtp_outputs_bound = false;
+
+    // Lambda: single MTP inference. Writes to pre-bound input buffers, infers,
+    // reads from cached output tensors. No set_tensor/get_tensor per call.
+    // Returns sampled draft token.
     auto run_mtp_single = [&](int64_t token_id, const float* hs_src, int64_t position) -> int64_t {
         const size_t hidden_size = static_cast<size_t>(cfg.text.hidden_size);
         std::memcpy(mtp_hidden_in.data<float>(), hs_src, hidden_size * sizeof(float));
@@ -1837,15 +1856,16 @@ int main(int argc, char* argv[]) try {
         pos_ptr[batch] = mtp_pos_val;
         pos_ptr[2 * batch] = mtp_pos_val;
 
-        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kInputIds, mtp_step_ids);
-        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kHiddenStates, mtp_hidden_in);
-        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kAttentionMask, mtp_mask);
-        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kPositionIds, mtp_pos);
-        mtp_request->set_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kBeamIdx, mtp_beam);
-
+        // Input tensors are pre-bound — just infer directly.
         mtp_request->infer();
-        ov::Tensor mtp_logits = mtp_request->get_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kLogits);
-        extract_last_logits_f32(mtp_logits, mtp_logit_buf);
+
+        // Cache output tensor handles after first inference
+        if (!mtp_outputs_bound) {
+            mtp_logits_cached = mtp_request->get_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kLogits);
+            mtp_hs_cached = mtp_request->get_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kMtpHiddenStates);
+            mtp_outputs_bound = true;
+        }
+        extract_last_logits_f32(mtp_logits_cached, mtp_logit_buf);
         return use_sampling
                    ? sample_fast(mtp_logit_buf.data(), mtp_logit_buf.size(),
                                  opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
@@ -1888,12 +1908,12 @@ int main(int argc, char* argv[]) try {
             step_mtp_k_ms[0] = elapsed_ms(t_k0, t_k1);
         }
 
-        // Drafts 1..K-1: from MTP's own hidden_states (autoregressive)
+        // Drafts 1..K-1: from MTP's own hidden_states (autoregressive).
+        // Use cached mtp_hs_cached (populated by run_mtp_single after first infer)
+        // instead of calling get_tensor() each iteration.
         for (int k = 1; k < K; ++k) {
             auto t_k0 = std::chrono::steady_clock::now();
-            ov::Tensor mtp_hs_out = mtp_request->get_tensor(
-                ov::genai::modeling::models::Qwen3_5MtpIO::kMtpHiddenStates);
-            const float* mtp_hs_ptr = mtp_hs_out.data<const float>();
+            const float* mtp_hs_ptr = mtp_hs_cached.data<const float>();
             drafts[k] = run_mtp_single(drafts[k - 1], mtp_hs_ptr, past_len + k);
             auto t_k1 = std::chrono::steady_clock::now();
             step_mtp_k_ms[static_cast<size_t>(k)] = elapsed_ms(t_k0, t_k1);
