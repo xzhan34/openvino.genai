@@ -5,7 +5,9 @@ param(
     [int]$NumRuns = 1,
     [int]$OutputTokens = 256,
     [string]$Mode = "all",  # "text", "vl", or "all"
-    [string]$ConfigFilter = "*"  # Wildcard filter on config Name, e.g. "*f16*" or "baseline*"
+    [string]$ConfigFilter = "*",  # Wildcard filter on config Name, e.g. "*f16*" or "baseline*"
+    [int]$CooldownSec = 15,  # Seconds to wait between configs for GPU thermal stabilization (0=disabled)
+    [switch]$IncludeSeq  # Include seq-verify configs (excluded by default, much slower than batch)
 )
 
 # --- Environment Setup ---
@@ -421,37 +423,48 @@ $configs = @(
     # --- F16 (run first: no quantization, native precision) ---
     @{ Name = "baseline f16";       MTP = 0; MtpK = 0; Verify = "none";  Quant = "f16" }
     @{ Name = "baseline f16+dnn";   MTP = 0; MtpK = 0; Verify = "none";  Quant = "f16+dnn" }
-    @{ Name = "K=1 seq f16";        MTP = 1; MtpK = 1; Verify = "seq";   Quant = "f16" }
     @{ Name = "K=1 batch f16";      MTP = 1; MtpK = 1; Verify = "batch"; Quant = "f16" }
-    @{ Name = "K=2 seq f16";        MTP = 1; MtpK = 2; Verify = "seq";   Quant = "f16" }
     @{ Name = "K=2 batch f16";      MTP = 1; MtpK = 2; Verify = "batch"; Quant = "f16" }
-    @{ Name = "K=3 seq f16";        MTP = 1; MtpK = 3; Verify = "seq";   Quant = "f16" }
     @{ Name = "K=3 batch f16";      MTP = 1; MtpK = 3; Verify = "batch"; Quant = "f16" }
     # --- INT8 ---
     @{ Name = "baseline int8";      MTP = 0; MtpK = 0; Verify = "none";  Quant = "int8" }
-    @{ Name = "K=1 seq int8";       MTP = 1; MtpK = 1; Verify = "seq";   Quant = "int8" }
     @{ Name = "K=1 batch int8";     MTP = 1; MtpK = 1; Verify = "batch"; Quant = "int8" }
-    @{ Name = "K=2 seq int8";       MTP = 1; MtpK = 2; Verify = "seq";   Quant = "int8" }
     @{ Name = "K=2 batch int8";     MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int8" }
-    @{ Name = "K=3 seq int8";       MTP = 1; MtpK = 3; Verify = "seq";   Quant = "int8" }
     @{ Name = "K=3 batch int8";     MTP = 1; MtpK = 3; Verify = "batch"; Quant = "int8" }
     # --- INT4 (oneDNN + batch-1 loop) ---
     @{ Name = "baseline int4";      MTP = 0; MtpK = 0; Verify = "none";  Quant = "int4" }
-    @{ Name = "K=1 seq int4";       MTP = 1; MtpK = 1; Verify = "seq";   Quant = "int4" }
     @{ Name = "K=1 batch int4";     MTP = 1; MtpK = 1; Verify = "batch"; Quant = "int4" }
-    @{ Name = "K=2 seq int4";       MTP = 1; MtpK = 2; Verify = "seq";   Quant = "int4" }
     @{ Name = "K=2 batch int4";     MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int4" }
-    @{ Name = "K=3 seq int4";       MTP = 1; MtpK = 3; Verify = "seq";   Quant = "int4" }
     @{ Name = "K=3 batch int4";     MTP = 1; MtpK = 3; Verify = "batch"; Quant = "int4" }
+    # --- Adaptive K (starts at K=2, auto-adjusts based on rolling accept rate) ---
+    @{ Name = "K=2 adapt int4";     MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int4"; AdaptiveK = 1 }
     # --- INT4+OCL (oneDNN disabled, OCL bf_tiled FC only) for A/B comparison ---
     @{ Name = "baseline int4+ocl";  MTP = 0; MtpK = 0; Verify = "none";  Quant = "int4+ocl" }
     @{ Name = "K=1 batch int4+ocl"; MTP = 1; MtpK = 1; Verify = "batch"; Quant = "int4+ocl" }
     @{ Name = "K=2 batch int4+ocl"; MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int4+ocl" }
 )
 
-# Apply config filter
+# Seq-verify configs (opt-in via -IncludeSeq, slower reference for batch vs seq comparison)
+$seqConfigs = @(
+    @{ Name = "K=1 seq f16";        MTP = 1; MtpK = 1; Verify = "seq";   Quant = "f16" }
+    @{ Name = "K=2 seq f16";        MTP = 1; MtpK = 2; Verify = "seq";   Quant = "f16" }
+    @{ Name = "K=3 seq f16";        MTP = 1; MtpK = 3; Verify = "seq";   Quant = "f16" }
+    @{ Name = "K=1 seq int8";       MTP = 1; MtpK = 1; Verify = "seq";   Quant = "int8" }
+    @{ Name = "K=2 seq int8";       MTP = 1; MtpK = 2; Verify = "seq";   Quant = "int8" }
+    @{ Name = "K=3 seq int8";       MTP = 1; MtpK = 3; Verify = "seq";   Quant = "int8" }
+    @{ Name = "K=1 seq int4";       MTP = 1; MtpK = 1; Verify = "seq";   Quant = "int4" }
+    @{ Name = "K=2 seq int4";       MTP = 1; MtpK = 2; Verify = "seq";   Quant = "int4" }
+    @{ Name = "K=3 seq int4";       MTP = 1; MtpK = 3; Verify = "seq";   Quant = "int4" }
+)
+if ($IncludeSeq) {
+    $configs = $configs + $seqConfigs
+    Write-Host "Including seq-verify configs ($($seqConfigs.Count) additional)" -ForegroundColor Cyan
+}
+
+# Apply config filter (supports comma-separated patterns, e.g. "baseline int4,K=1 batch int4")
 if ($ConfigFilter -ne "*") {
-    $configs = @($configs | Where-Object { $_.Name -like $ConfigFilter })
+    $patterns = $ConfigFilter -split ","
+    $configs = @($configs | Where-Object { $n = $_.Name; ($patterns | Where-Object { $n -like $_.Trim() }).Count -gt 0 })
     Write-Host "Config filter '$ConfigFilter' -> $($configs.Count) config(s): $($configs.Name -join ', ')" -ForegroundColor Cyan
 }
 
@@ -498,6 +511,9 @@ foreach ($mdl in $MODELS) {
             }
             if ($cfg.MTP -gt 0) {
                 [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)"))
+                if ($cfg.AdaptiveK) {
+                    [void]$argList.AddRange(@("--adaptive-k", "1"))
+                }
                 if ($cfg.Verify -eq "batch") {
                     [void]$argList.AddRange(@("--pure-batch", "1"))
                     # OV_GPU_USE_ONEDNN=0 and OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=K+1
@@ -509,6 +525,12 @@ foreach ($mdl in $MODELS) {
                 Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
                 # OV_GPU_USE_ONEDNN is managed by Set-QuantEnv (disabled for f16 to avoid
                 # oneDNN f16 FC degeneration on VL visual token distributions)
+            }
+
+            # GPU thermal cooldown between configs
+            if ($CooldownSec -gt 0 -and $cfg -ne $configs[0]) {
+                Write-Host "  [cooldown] Waiting ${CooldownSec}s for GPU thermal stabilization..." -ForegroundColor DarkGray
+                Start-Sleep -Seconds $CooldownSec
             }
 
             Write-Host "`n--- $($cfg.Name) ($modelName / $m mode) ---" -ForegroundColor White

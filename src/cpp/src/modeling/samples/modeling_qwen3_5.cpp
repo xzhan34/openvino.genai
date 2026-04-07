@@ -74,6 +74,7 @@ struct SampleOptions {
     bool seq_verify = false;  // --seq-verify 0/1: use sequential single-token verify (avoids multi-token SDPA)
     bool pure_batch = false;  // --pure-batch 0/1: batch verify with KV trim only (no linear_states rollback)
     int refresh_interval = 0; // --refresh N: periodic state refresh every N tokens (0=disabled)
+    bool adaptive_k = false;  // --adaptive-k 0/1: dynamically adjust K based on rolling accept rate
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -300,6 +301,9 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.pure_batch = (val != 0);
         } else if (arg == "--refresh") {
             opts.refresh_interval = parse_i32(take_value("--refresh"), "--refresh");
+        } else if (arg == "--adaptive-k") {
+            int val = parse_i32(take_value("--adaptive-k"), "--adaptive-k");
+            opts.adaptive_k = (val != 0);
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -1800,9 +1804,24 @@ int main(int argc, char* argv[]) try {
     size_t mtp_main_infers = 0;  // number of main model infer calls during decode
     std::vector<float> mtp_logit_buf;
 
-    const int K = opts.mtp_k;  // number of draft tokens per speculation step
-    std::vector<int64_t> drafts(static_cast<size_t>(K), -1);
+    const int max_K = opts.mtp_k;  // max speculation depth from CLI
+    int K = max_K;                  // current effective K (mutable for adaptive mode)
+    std::vector<int64_t> drafts(static_cast<size_t>(max_K), -1);
     bool drafts_ready = false;
+
+    // Phase C: Adaptive K selection state
+    // When enabled (--adaptive-k 1), K adapts between 1 and max_K based on
+    // a rolling accept rate. Low accept rates (creative text) → K=1 to minimize
+    // wasted drafts. High accept rates (structured/VL) → higher K.
+    const bool adaptive_k_enabled = opts.adaptive_k && max_K > 1;
+    const int adaptive_window = 16;            // rolling window size (steps)
+    const double adaptive_up_threshold = 0.70; // increase K when hit rate > 70%
+    const double adaptive_down_threshold = 0.40; // decrease K when hit rate < 40%
+    const int adaptive_warmup = 8;             // collect data before adapting
+    const int adaptive_cooldown = 4;           // min steps between K changes
+    std::deque<std::pair<int, int>> adaptive_history; // (hits, attempts) per step
+    int adaptive_cooldown_counter = 0;
+    size_t adaptive_k_changes = 0;             // count of K adaptation events
 
     if (use_mtp && compiled_mtp) {
         mtp_request = compiled_mtp->create_infer_request();
@@ -1884,7 +1903,7 @@ int main(int argc, char* argv[]) try {
     // First draft uses main model hidden_states at hs_pos. Subsequent drafts
     // use MTP's own hidden_states output (autoregressive).
     // Per-k MTP timing (declared before generate_k_drafts so lambda can capture)
-    std::vector<double> step_mtp_k_ms(static_cast<size_t>(K), 0.0);  // filled per-step in-place
+    std::vector<double> step_mtp_k_ms(static_cast<size_t>(max_K), 0.0);  // filled per-step in-place
     double step_mtp_reset_ms = 0.0;
 
     auto generate_k_drafts = [&](const ov::Tensor& main_hs, size_t hs_pos) {
@@ -1948,8 +1967,8 @@ int main(int argc, char* argv[]) try {
     double time_kv_trim_ms = 0;          // physical KV trim on rejection
     double time_mtp_reset_ms = 0;        // MTP model reset_state() call
     std::vector<double> time_mtp_each_ms; // per-k MTP head infer times within draft phase
-    time_mtp_each_ms.resize(static_cast<size_t>(K), 0.0);
-    std::vector<size_t> count_mtp_each(static_cast<size_t>(K), 0);
+    time_mtp_each_ms.resize(static_cast<size_t>(max_K), 0.0);
+    std::vector<size_t> count_mtp_each(static_cast<size_t>(max_K), 0);
     size_t step_counter = 0;
 
     // Pre-allocate snapshot buffers for linear_states rollback (batch verify path)
@@ -1998,7 +2017,7 @@ int main(int argc, char* argv[]) try {
         auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
         int mode = env ? std::atoi(env) : 3;
         if (mode & 8) return 32;  // re-forward mode: frequent refresh
-        if (has_kernel_snapshot && K >= 3) {
+        if (has_kernel_snapshot && max_K >= 3) {
             // K≥3: batch=4+, residual drift beyond FC/SDPA → 32 tokens
             return 32;
         }
@@ -2027,7 +2046,7 @@ int main(int argc, char* argv[]) try {
     // For K=2: E = h²*3 + h(1-h)*2 + (1-h)*1 = 1+h+h²
     // =======================================================================
     if (use_mtp && mtp_request && drafts_ready) {
-        const size_t kp1 = static_cast<size_t>(K + 1);
+        const size_t max_kp1 = static_cast<size_t>(max_K + 1);  // max K+1 for pre-allocation
 
         // Snapshot restore mode bitmask:
         //   1=linear from kernel snapshot, 2=conv from kernel snapshot, 3=both
@@ -2051,22 +2070,35 @@ int main(int argc, char* argv[]) try {
             tokens_since_checkpoint.push_back(next_id);
         }
 
-        // Pre-allocate K+1 token tensors for main model verify
-        ov::Tensor step_ids_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, kp1});
-        ov::Tensor usm_decode_pos_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, kp1});
+        // Pre-allocate K+1 token tensors for main model verify (max_K for allocation)
+        ov::Tensor step_ids_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, max_kp1});
+        ov::Tensor usm_decode_pos_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, max_kp1});
 
         ov::Tensor decode_visual_kp1;
         ov::Tensor decode_visual_mask_kp1;
         if (use_vl) {
             decode_visual_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::f32,
-                {batch, kp1, static_cast<size_t>(cfg.text.hidden_size)});
+                {batch, max_kp1, static_cast<size_t>(cfg.text.hidden_size)});
             std::memset(decode_visual_kp1.data(), 0, decode_visual_kp1.get_byte_size());
-            decode_visual_mask_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::boolean, {batch, kp1});
+            decode_visual_mask_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::boolean, {batch, max_kp1});
             std::memset(decode_visual_mask_kp1.data(), 0, decode_visual_mask_kp1.get_byte_size());
         }
 
-        // Helper: run K+1 token main model verify (batch) and advance past_len
+        // Helper: run K+1 token main model verify (batch) and advance past_len.
+        // Uses current effective K (may change with adaptive K).
         auto run_kp1_verify = [&]() {
+            const size_t kp1 = static_cast<size_t>(K + 1);
+
+            // Resize pre-allocated tensors to current K+1 (no realloc if ≤ max_K+1)
+            step_ids_kp1.set_shape({batch, kp1});
+            usm_decode_pos_kp1.set_shape({3, batch, kp1});
+            if (use_vl) {
+                decode_visual_kp1.set_shape({batch, kp1, static_cast<size_t>(cfg.text.hidden_size)});
+                std::memset(decode_visual_kp1.data(), 0, decode_visual_kp1.get_byte_size());
+                decode_visual_mask_kp1.set_shape({batch, kp1});
+                std::memset(decode_visual_mask_kp1.data(), 0, decode_visual_mask_kp1.get_byte_size());
+            }
+
             auto* ids_data = step_ids_kp1.data<int64_t>();
             for (size_t b = 0; b < batch; ++b) {
                 ids_data[b * kp1] = next_id;
@@ -2074,10 +2106,6 @@ int main(int argc, char* argv[]) try {
                     ids_data[b * kp1 + static_cast<size_t>(k + 1)] = drafts[k];
                 }
             }
-            // Use past_len for position_ids / RoPE. Do NOT subtract dead_positions:
-            // KV cache entries retain their original RoPE encoding, so position_ids
-            // must be contiguous starting at past_len to maintain correct relative
-            // distances with existing cache entries.
             auto* pos_data = usm_decode_pos_kp1.data<int64_t>();
             for (size_t b = 0; b < batch; ++b) {
                 for (size_t j = 0; j < kp1; ++j) {
@@ -2087,15 +2115,11 @@ int main(int argc, char* argv[]) try {
                     }
                 }
             }
-            // Attention mask must be [batch, past_len + K+1] so the model computes
-            // cache_len = (past_len + K+1) - (K+1) = past_len.  A [batch, K+1]
-            // mask would set cache_len=0, breaking attention to all cached context.
             const size_t full_mask_len = static_cast<size_t>(past_len) + kp1;
             ov::Tensor step_mask_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, full_mask_len});
             {
                 auto* p = step_mask_kp1.data<int64_t>();
                 for (size_t i = 0; i < batch * full_mask_len; ++i) p[i] = 1;
-                // Virtual trim: mask out dead KV positions (rejected drafts still in cache)
                 for (int64_t dpos : dead_positions) {
                     if (dpos >= 0 && static_cast<size_t>(dpos) < full_mask_len) {
                         for (size_t b = 0; b < batch; ++b) {
@@ -2122,9 +2146,9 @@ int main(int argc, char* argv[]) try {
         // Each uses q_len=1 → SINGLE_TOKEN SDPA kernel → baseline precision.
         // Stores logits and hidden_states per position for accept/reject.
         const size_t hidden_size = static_cast<size_t>(cfg.text.hidden_size);
-        std::vector<std::vector<float>> seq_logits(kp1);
-        std::vector<std::vector<float>> seq_hs(kp1);
-        for (size_t j = 0; j < kp1; ++j) {
+        std::vector<std::vector<float>> seq_logits(max_kp1);
+        std::vector<std::vector<float>> seq_hs(max_kp1);
+        for (size_t j = 0; j < max_kp1; ++j) {
             seq_hs[j].resize(hidden_size);
         }
 
@@ -2138,6 +2162,7 @@ int main(int argc, char* argv[]) try {
         auto run_inline_seq_verify = [&](int& num_accepted, bool& stopped,
                                          std::vector<float>& last_hs) {
             // Tokens to verify: [next_id, drafts[0], ..., drafts[K-1]]
+            const size_t kp1 = static_cast<size_t>(K + 1);
             std::vector<int64_t> verify_tokens(kp1);
             verify_tokens[0] = next_id;
             for (int k = 0; k < K; ++k) {
@@ -2536,7 +2561,8 @@ int main(int argc, char* argv[]) try {
                             // Trim ALL K+1 entries from KV cache, then re-forward accepted tokens.
                             {
                                 auto tt_trim0 = std::chrono::steady_clock::now();
-                                trim_kv_cache_states_gpu(text_request, kp1);
+                                const size_t step_kp1 = static_cast<size_t>(K + 1);
+                                trim_kv_cache_states_gpu(text_request, step_kp1);
                                 auto tt_trim1 = std::chrono::steady_clock::now();
                                 double dt = elapsed_ms(tt_trim0, tt_trim1);
                                 time_trim_ms += dt; count_trims++;
@@ -2733,7 +2759,7 @@ int main(int argc, char* argv[]) try {
 
                         {
                             auto tt0 = std::chrono::steady_clock::now();
-                            trim_kv_cache_states(text_request, kp1);
+                            trim_kv_cache_states(text_request, static_cast<size_t>(K + 1));
                             auto tt1 = std::chrono::steady_clock::now();
                             time_trim_ms += elapsed_ms(tt0, tt1); count_trims++;
                         }
@@ -2935,6 +2961,48 @@ int main(int argc, char* argv[]) try {
             }
             step_counter++;
 
+            // === Phase C: Adaptive K selection ===
+            // After each step, update rolling accept history and possibly adjust K.
+            if (adaptive_k_enabled) {
+                // Record this step's accept stats
+                adaptive_history.push_back({num_accepted, K});
+                if (static_cast<int>(adaptive_history.size()) > adaptive_window) {
+                    adaptive_history.pop_front();
+                }
+                if (adaptive_cooldown_counter > 0) {
+                    adaptive_cooldown_counter--;
+                }
+
+                // Only adapt after warmup and cooldown
+                if (static_cast<int>(adaptive_history.size()) >= adaptive_warmup &&
+                    adaptive_cooldown_counter == 0) {
+                    // Compute rolling accept rate over window
+                    int total_hits = 0, total_drafted = 0;
+                    for (const auto& [h, d] : adaptive_history) {
+                        total_hits += h;
+                        total_drafted += d;
+                    }
+                    const double rolling_rate = total_drafted > 0
+                        ? static_cast<double>(total_hits) / static_cast<double>(total_drafted) : 0.0;
+
+                    const int old_K = K;
+                    if (rolling_rate > adaptive_up_threshold && K < max_K) {
+                        K++;
+                        adaptive_cooldown_counter = adaptive_cooldown;
+                        adaptive_k_changes++;
+                    } else if (rolling_rate < adaptive_down_threshold && K > 1) {
+                        K--;
+                        adaptive_cooldown_counter = adaptive_cooldown;
+                        adaptive_k_changes++;
+                    }
+                    if (K != old_K) {
+                        fprintf(stderr, "[ADAPTIVE_K] step=%zu rate=%.1f%% K=%d→%d (window=%zu)\n",
+                            step_counter, rolling_rate * 100.0, old_K, K,
+                            adaptive_history.size());
+                    }
+                }
+            }
+
             // Per-step profiling output (to stderr, gated by OV_GENAI_STEP_PROFILE)
             if (step_profile_enabled) {
                 auto t_step_end = std::chrono::steady_clock::now();
@@ -3033,32 +3101,37 @@ int main(int argc, char* argv[]) try {
         const double hit_rate = 100.0 * static_cast<double>(mtp_hits) / static_cast<double>(mtp_attempts);
         std::cout << "MTP hits: " << mtp_hits << "/" << mtp_attempts
                   << " (" << hit_rate << "%)" << std::endl;
-        // Absolute draft acceptance rate: accepted / (steps * K)
-        const size_t total_drafts = mtp_main_infers * static_cast<size_t>(K);
-        if (total_drafts > 0) {
-            const double abs_rate = 100.0 * static_cast<double>(mtp_hits) / static_cast<double>(total_drafts);
-            std::cout << "MTP draft acceptance: " << mtp_hits << "/" << total_drafts
+        // Absolute draft acceptance rate: accepted / total_drafted
+        if (count_draft_infers > 0) {
+            const double abs_rate = 100.0 * static_cast<double>(mtp_hits) / static_cast<double>(count_draft_infers);
+            std::cout << "MTP draft acceptance: " << mtp_hits << "/" << count_draft_infers
                       << " (" << abs_rate << "%)" << std::endl;
         }
         // Mean accepted tokens per step
         if (mtp_main_infers > 0) {
             const double mean_accepted = static_cast<double>(mtp_hits) / static_cast<double>(mtp_main_infers);
-            std::cout << "MTP mean accepted/step: " << mean_accepted << " (of K=" << K << ")" << std::endl;
+            std::cout << "MTP mean accepted/step: " << mean_accepted << " (of K=" << K
+                      << (adaptive_k_enabled ? ", adaptive" : "") << ")" << std::endl;
         }
         std::cout << "MTP main model infers: " << mtp_main_infers << std::endl;
         if (mtp_main_infers > 0) {
             const double tokens_per_infer = static_cast<double>(decode_steps) / static_cast<double>(mtp_main_infers);
             std::cout << "MTP tokens/infer: " << tokens_per_infer << std::endl;
         }
+        if (adaptive_k_enabled) {
+            std::cout << "MTP adaptive K: max=" << max_K << " final=" << K
+                      << " changes=" << adaptive_k_changes << std::endl;
+        }
         // Profiling breakdown
         const char* verify_mode_str = use_seq_verify ? " [sequential]"
             : (has_kernel_snapshot ? " [kernel-snapshot]"
             : (use_pure_batch ? " [pure-batch]" : " [batch+rollback]"));
-        std::cout << "--- Spec decode profiling (K+1 verify" << verify_mode_str << ", K=" << K << ") ---" << std::endl;
+        std::cout << "--- Spec decode profiling (K+1 verify" << verify_mode_str << ", K=" << K
+                  << (adaptive_k_enabled ? " adaptive" : "") << ") ---" << std::endl;
         std::cout << "  Main verify (K+1):  " << time_verify_ms << " ms (" << count_verify_infers << " calls)"
                   << (count_verify_infers > 0 ? (", avg " + std::to_string(time_verify_ms / count_verify_infers) + " ms") : "")
                   << std::endl;
-        std::cout << "  MTP draft (x" << K << "):    " << time_draft_ms << " ms (" << count_draft_infers << " calls)"
+        std::cout << "  MTP draft (x" << max_K << "):    " << time_draft_ms << " ms (" << count_draft_infers << " calls)"
                   << (count_draft_infers > 0 ? (", avg " + std::to_string(time_draft_ms / count_draft_infers) + " ms") : "")
                   << std::endl;
         std::cout << "  KV trim:            " << time_trim_ms << " ms (" << count_trims << " calls)"
@@ -3089,7 +3162,7 @@ int main(int argc, char* argv[]) try {
                 std::cout << "    State restore:     " << std::to_string(time_state_restore_ms / step_counter) << " ms/step (on rejection)" << std::endl;
                 std::cout << "    KV trim:           " << std::to_string(time_kv_trim_ms / step_counter) << " ms/step (on rejection)" << std::endl;
                 std::cout << "    MTP reset:         " << std::to_string(time_mtp_reset_ms / step_counter) << " ms/step" << std::endl;
-                for (int k = 0; k < K; ++k) {
+                for (int k = 0; k < max_K; ++k) {
                     auto kidx = static_cast<size_t>(k);
                     if (count_mtp_each[kidx] > 0) {
                         std::cout << "    MTP draft k=" << k << ":     "
