@@ -1860,23 +1860,37 @@ int main(int argc, char* argv[]) try {
     ov::Tensor mtp_hs_cached;
     bool mtp_outputs_bound = false;
 
+    // Phase D: MTP draft sub-step timing instrumentation.
+    // Quantifies the lm_head bottleneck (80.7% of MTP compute = 4096×248320 matmul)
+    // to justify future speculative head investment (reduced lm_head → 4096×32K).
+    double mtp_sub_memcpy_ms = 0;   // hidden_states copy to MTP input
+    double mtp_sub_infer_ms = 0;    // GPU infer (decoder layer + lm_head)
+    double mtp_sub_extract_ms = 0;  // logits extraction from GPU tensor
+    double mtp_sub_sample_ms = 0;   // argmax/sampling over vocab_size logits
+    size_t mtp_sub_count = 0;
+
     // Lambda: single MTP inference. Writes to pre-bound input buffers, infers,
     // reads from cached output tensors. No set_tensor/get_tensor per call.
     // Returns sampled draft token.
     auto run_mtp_single = [&](int64_t token_id, const float* hs_src, int64_t position) -> int64_t {
         const size_t hidden_size = static_cast<size_t>(cfg.text.hidden_size);
+
+        auto t_mc0 = std::chrono::steady_clock::now();
         std::memcpy(mtp_hidden_in.data<float>(), hs_src, hidden_size * sizeof(float));
-
         mtp_step_ids.data<int64_t>()[0] = token_id;
-
         auto* pos_ptr = mtp_pos.data<int64_t>();
         const int64_t mtp_pos_val = position + rope_deltas_data[0];
         pos_ptr[0] = mtp_pos_val;
         pos_ptr[batch] = mtp_pos_val;
         pos_ptr[2 * batch] = mtp_pos_val;
+        auto t_mc1 = std::chrono::steady_clock::now();
+        mtp_sub_memcpy_ms += elapsed_ms(t_mc0, t_mc1);
 
         // Input tensors are pre-bound — just infer directly.
+        auto t_inf0 = std::chrono::steady_clock::now();
         mtp_request->infer();
+        auto t_inf1 = std::chrono::steady_clock::now();
+        mtp_sub_infer_ms += elapsed_ms(t_inf0, t_inf1);
 
         // Cache output tensor handles after first inference
         if (!mtp_outputs_bound) {
@@ -1884,11 +1898,21 @@ int main(int argc, char* argv[]) try {
             mtp_hs_cached = mtp_request->get_tensor(ov::genai::modeling::models::Qwen3_5MtpIO::kMtpHiddenStates);
             mtp_outputs_bound = true;
         }
+
+        auto t_ext0 = std::chrono::steady_clock::now();
         extract_last_logits_f32(mtp_logits_cached, mtp_logit_buf);
-        return use_sampling
+        auto t_ext1 = std::chrono::steady_clock::now();
+        mtp_sub_extract_ms += elapsed_ms(t_ext0, t_ext1);
+
+        auto t_smp0 = std::chrono::steady_clock::now();
+        int64_t result = use_sampling
                    ? sample_fast(mtp_logit_buf.data(), mtp_logit_buf.size(),
                                  opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
                    : argmax_f32(mtp_logit_buf);
+        auto t_smp1 = std::chrono::steady_clock::now();
+        mtp_sub_sample_ms += elapsed_ms(t_smp0, t_smp1);
+        mtp_sub_count++;
+        return result;
     };
 
     // Dead position tracker for virtual trim (pure-batch mode).
@@ -3178,6 +3202,30 @@ int main(int argc, char* argv[]) try {
                 std::cout << "    Avg step total:    " << std::to_string(avg_step_total)
                           << " ms (verify=" << std::to_string(avg_verify_total)
                           << " + draft=" << std::to_string(avg_draft_total) << ")" << std::endl;
+                // Phase D: MTP draft sub-step breakdown
+                if (mtp_sub_count > 0) {
+                    const double total_draft_sub = mtp_sub_memcpy_ms + mtp_sub_infer_ms +
+                                                   mtp_sub_extract_ms + mtp_sub_sample_ms;
+                    std::cout << "  --- MTP draft sub-step breakdown (" << mtp_sub_count << " inferences) ---" << std::endl;
+                    std::cout << "    Input setup:       " << std::to_string(mtp_sub_memcpy_ms / mtp_sub_count) << " ms/call"
+                              << " (" << std::to_string(100.0 * mtp_sub_memcpy_ms / total_draft_sub) << "%)" << std::endl;
+                    std::cout << "    GPU infer:         " << std::to_string(mtp_sub_infer_ms / mtp_sub_count) << " ms/call"
+                              << " (" << std::to_string(100.0 * mtp_sub_infer_ms / total_draft_sub) << "%)  ← lm_head [4096×"
+                              << cfg.text.vocab_size << "] dominates" << std::endl;
+                    std::cout << "    Logits extract:    " << std::to_string(mtp_sub_extract_ms / mtp_sub_count) << " ms/call"
+                              << " (" << std::to_string(100.0 * mtp_sub_extract_ms / total_draft_sub) << "%)" << std::endl;
+                    std::cout << "    Argmax/sample:     " << std::to_string(mtp_sub_sample_ms / mtp_sub_count) << " ms/call"
+                              << " (" << std::to_string(100.0 * mtp_sub_sample_ms / total_draft_sub) << "%)" << std::endl;
+                    // Speculative head potential: estimate time with reduced vocab
+                    const size_t reduced_vocab = 32768;
+                    if (cfg.text.vocab_size > 0) {
+                        const double ratio = static_cast<double>(reduced_vocab) / cfg.text.vocab_size;
+                        const double est_reduced_infer = mtp_sub_infer_ms / mtp_sub_count * ratio;
+                        std::cout << "    [Spec head est]:   " << std::to_string(est_reduced_infer) << " ms/call"
+                                  << " with " << reduced_vocab << " vocab (vs " << cfg.text.vocab_size
+                                  << "), " << std::to_string((1.0 - ratio) * 100.0) << "% reduction" << std::endl;
+                    }
+                }
             }
         }
     }
