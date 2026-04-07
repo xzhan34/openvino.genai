@@ -98,7 +98,8 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
     auto is_prompt_lookup_enabled = extract_prompt_lookup_from_config(properties_without_draft_model);
     auto eagle_rt_info = utils::eagle3::extract_eagle3_info_from_config(draft_model_desr.properties, models_path);
     auto model = utils::read_model(models_path, properties_without_draft_model);
-    auto [properties_without_draft_model_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties_without_draft_model);
+    auto [properties_without_quantization, qconf_ignored] = utils::extract_quantization_config(properties_without_draft_model);
+    auto [properties_without_draft_model_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties_without_quantization);
     properties_without_draft_model_without_gguf[ov::cache_model_path.name()] = models_path;
 
     auto generation_config = utils::from_config_json_if_exists(models_path);
@@ -275,6 +276,21 @@ bool ContinuousBatchingPipeline::has_non_finished_requests() {
 
 std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::generate(const std::vector<ov::Tensor>& input_ids, const std::vector<ov::genai::GenerationConfig>& sampling_params, const StreamerVariant& streamer) {
     auto encoded_results = m_impl->generate(input_ids, sampling_params, streamer);
+
+    for (auto& encoded_result : encoded_results) {
+        encoded_result.perf_metrics.load_time = m_impl->m_load_time_ms;
+    }
+
+    return encoded_results;
+}
+
+std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::generate(
+    const std::vector<ov::Tensor>& input_ids,
+    const std::vector<ov::genai::GenerationConfig>& sampling_params,
+    const StreamerVariant& streamer,
+    const std::optional<std::vector<ov::Tensor>>& token_type_ids,
+    const std::optional<std::vector<std::pair<ov::Tensor, std::optional<int64_t>>>>& position_ids) {
+    auto encoded_results = m_impl->generate(input_ids, sampling_params, streamer, token_type_ids, position_ids);
 
     for (auto& encoded_result : encoded_results) {
         encoded_result.perf_metrics.load_time = m_impl->m_load_time_ms;
