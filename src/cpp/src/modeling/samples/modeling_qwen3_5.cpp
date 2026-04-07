@@ -2297,8 +2297,13 @@ int main(int argc, char* argv[]) try {
                 }
 
                 // Save conv states before batch verify for CPU-based restore on rejection.
-                // Conv states are small (~128KB per layer) so the save is cheap.
-                if (has_kernel_snapshot && !conv_snap.empty()) {
+                // Only needed when mode 4 is active (CPU conv restore). In mode 3
+                // (kernel snapshot restore for both linear + conv), the CPU conv_snap
+                // is never read — conv states are restored from GPU kernel snapshots.
+                // Skipping saves ~1ms/step of GPU→CPU sync overhead (2 conv layers).
+                const bool needs_conv_snap = has_kernel_snapshot && !conv_snap.empty() &&
+                                             (snapshot_restore_mode & 4);
+                if (needs_conv_snap) {
                     save_conv_states(text_request, conv_snap);
                 }
                 auto t_snap_save1 = std::chrono::steady_clock::now();
