@@ -1028,3 +1028,78 @@ Inline sequential verify 的性能代价：每个 verify step 需要 `num_accept
 | MTP 功能验证 | `--mtp 1 --mtp-k 1 --seq-verify 1` |
 | 大 K 实验 | `--mtp 1 --mtp-k 2/3 --seq-verify 1`（功能正确，throughput 较低） |
 | 不推荐 | `--mtp 1 --mtp-k 2+` 不带 `--seq-verify 1`（linear_states 污染导致退化） |
+
+---
+
+## 优化实验：Batch Verify + linear_states Snapshot/Rollback (2026-04-01)
+
+### 动机
+
+Inline sequential verify 的瓶颈是每个 verify cycle 需要 `num_accepted + 1` 次 single-token inference。
+如果能恢复 batch verify 路径（1 次 multi-token inference），理论上每次 verify 只需 1 次 GPU 调用。
+
+### 实现方案
+
+1. **Snapshot**：在 batch verify 前，深拷贝所有 48 个 `linear_states` 张量（~25MB）
+2. **Batch verify**：照常执行 K+1 token batch inference → 获取所有位置的 logits
+3. **Accept/reject**：用 batch logits 做逐位置判定（与之前相同）
+4. **若有 rejection**：
+   - `restore_linear_states()`：从 snapshot 恢复 linear_states
+   - `trim_kv_cache_states(K+1)`：全量回滚 KV cache
+   - **Re-forward**：将正确的 token `[next_id, d[0], ..., d[num_accepted-1]]` 作为 batch 重新推理
+   - 这次 re-forward 重建正确的 KV cache + linear_states
+5. **若全部 accept**：无需恢复，batch 结果完全正确
+
+CLI：`--mtp 1 --mtp-k 2`（不加 `--seq-verify`，默认使用 batch+rollback 路径）
+
+### Benchmark 结果：Batch+Rollback vs Sequential Verify
+
+9B INT4_ASYM g128 GPU, greedy T=0, 256 tokens, 1 run:
+
+| Config | TPOT (ms/tok) | Throughput | vs Baseline | Accept% | Tok/Infer |
+|--------|---------------|-----------|-------------|---------|-----------|
+| **Baseline** | **68.41** | **14.62** | — | — | 1.00 |
+| K=1 seq | 76.86 | 13.01 | -11.0% | 50.89% | 1.51 |
+| K=2 seq | 82.07 | 12.18 | -16.7% | 35.91% | 1.71 |
+| K=3 seq | 90.20 | 11.09 | -24.1% | 25.52% | 1.76 |
+| K=1 batch+rollback | 116.12 | 8.61 | **-41.1%** | 35.77%* | 1.04 |
+| K=2 batch+rollback | 148.80 | 6.72 | **-54.0%** | 18.91%* | 0.93 |
+| K=3 batch+rollback | 151.27 | 6.61 | **-54.8%** | 13.0%* | 0.90 |
+
+\* Accept% 偏低因为 `mtp_main_infers` 含 re-forward 次数
+
+### K=2 Batch+Rollback 详细 Profiling
+
+| 指标 | 数值 |
+|------|------|
+| Verify cycles | 151 |
+| Full-accept cycles | 27 (18%) |
+| Rejection cycles | 124 (82%) |
+| Batch(3) infer | ~96ms/call |
+| Snapshot save | ~8ms/call |
+| KV trim(3) | ~36ms/call |
+| Restore + re-forward | ~111ms/call |
+| Avg cycle (accept) | ~104ms → 3 tokens |
+| Avg cycle (reject) | ~251ms → ~1.3 tokens |
+
+### 失败原因分析
+
+1. **Re-forward 开销太大**：每次 rejection 需要一次完整的 re-forward inference (~111ms)，几乎等于额外的 batch inference。82% 的 cycle 都需要 re-forward
+2. **KV trim(K+1) 更慢**：全量回滚 trim 3 entries (36ms) vs 增量 trim 1 entry (~8ms)
+3. **Batch 省不了多少**：batch(3) inference ~96ms vs 3 × single ~198ms，节省 ~100ms。但只在 18% 的 full-accept cycle 中获益
+4. **SDPA 数值差异导致不同 generation 轨迹**：batch verify 的 multi-token SDPA kernel 产出与 single-token 略有不同的 logits，导致不同的 token 选择级联放大。MTP draft 基于之前 cycle 的 hidden_states 生成，不同的 trajectory 导致不同的 accept rate
+
+### 结论
+
+> **Batch+rollback 在当前 accept rate (~18-52%) 下比 sequential verify 慢 50-120%。**
+> 根本原因：rejection 引发的 restore + re-forward 开销（~147ms/rejection）远大于 batch inference 的节省（~100ms/all-accept）。
+> 只有当 accept rate > 85%（使 all-accept cycle 占多数）时，batch+rollback 才有可能优于 sequential verify。
+>
+> **Inline sequential verify (`--seq-verify 1`) 仍是 Qwen3.5 hybrid 架构的最优路径。**
+
+### 未来可能的优化方向
+
+1. **模型层面**：若能分离 SDPA 层与 recurrent 层的 inference，可以只重放 recurrent 层而不重建 KV cache
+2. **更高效的 state restore**：利用 GPU 端 state tensor 的 zero-copy 机制避免 host 端拷贝
+3. **MTP draft 质量提升**：更好的 draft 模型 → 更高 accept rate → batch verify 更有价值
+4. **Adaptive mode**：根据运行时 accept rate 动态切换 seq-verify / batch+rollback

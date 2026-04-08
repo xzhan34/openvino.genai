@@ -299,11 +299,13 @@ function Get-Averages([System.Collections.ArrayList]$resultList) {
 }
 
 # --- Configs ---
+# Sequential verify (--seq-verify 1) is recommended for Qwen3.5's hybrid architecture.
+# Batch+rollback mode is available but slower due to re-forward overhead on rejections.
 $configs = @(
-    @{ Name = "No MTP (baseline)"; MTP = 0; MtpK = 0 }
-    @{ Name = "MTP K=1";           MTP = 1; MtpK = 1 }
-    @{ Name = "MTP K=2";           MTP = 1; MtpK = 2 }
-    @{ Name = "MTP K=3";           MTP = 1; MtpK = 3 }
+    @{ Name = "No MTP (baseline)"; MTP = 0; MtpK = 0; SeqVerify = 0 }
+    @{ Name = "MTP K=1";           MTP = 1; MtpK = 1; SeqVerify = 1 }
+    @{ Name = "MTP K=2";           MTP = 1; MtpK = 2; SeqVerify = 1 }
+    @{ Name = "MTP K=3";           MTP = 1; MtpK = 3; SeqVerify = 1 }
 )
 
 $modeList = [System.Collections.ArrayList]@()
@@ -345,7 +347,10 @@ foreach ($mdl in $MODELS) {
                 [void]$argList.AddRange(@("--image", $IMAGE_PATH, "--prompt", "`"describe this picture in details: `""))
             }
             if ($cfg.MTP -gt 0) {
-                [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)", "--seq-verify", "1"))
+                [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)"))
+                if ($cfg.SeqVerify -gt 0) {
+                    [void]$argList.AddRange(@("--seq-verify", "1"))
+                }
             }
 
             Write-Host "`n--- $($cfg.Name) ($modelName / $m mode) ---" -ForegroundColor White
