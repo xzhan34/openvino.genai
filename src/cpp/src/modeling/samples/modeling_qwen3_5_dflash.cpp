@@ -472,12 +472,15 @@ int main(int argc, char* argv[]) try {
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
         {ov::hint::kv_cache_precision.name(), ov::element::f16},
-        {ov::hint::activations_scale_factor.name(), 8.0f}
+        //{ov::hint::activations_scale_factor.name(), 8.0f}
     };
 
     // Tokenizer
     ov::genai::Tokenizer tokenizer(target_dir);
-    const int64_t mask_token_id = resolve_mask_token_id(tokenizer);
+    const int64_t mask_token_id = (draft_cfg.mask_token_id > 0)
+                                     ? draft_cfg.mask_token_id
+                                     : resolve_mask_token_id(tokenizer);
+    std::cerr << "[DFlash] mask_token_id=" << mask_token_id << std::endl;
     const int64_t eos_token_id = tokenizer.get_eos_token_id();
 
     // ---- VL preprocessing (vision encode + prompt building) ----
