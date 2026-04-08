@@ -17,11 +17,12 @@ $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
 $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
 $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
 $env:OV_GENAI_MTP_SNAPSHOT = "1"
-# Disable oneDNN for FC layers to use OCL bf_tiled kernel with forced tile_b=1 for batch<=2.
-# This prevents INT4 GEMM batch-size-dependent numerical divergence that causes text degeneration
-# in MTP pure-batch mode (batch=2 verify vs batch=1 draft).
-$env:OV_GPU_USE_ONEDNN = "0"
-$env:OV_GPU_FC_SINGLE_BATCH_THRESHOLD = "2"
+# oneDNN FC accumulation mode fix (fully_connected_onednn.cpp):
+# set_accumulation_mode(f32) alongside fpmath_mode::f16 ensures batch-size-invariant
+# numerical results for INT4 GEMM.  No need to disable oneDNN anymore.
+# Override: $env:OV_GPU_ONEDNN_FC_ACC_MODE = "f16"  # revert to FP16 accumulators
+# Enable per-step profiling breakdown (sub-step timing to stderr, summary to stdout)
+$env:OV_GENAI_STEP_PROFILE = "1"
 $env:DEVICE = "GPU"
 
 $EXE       = "$GENAI_DIR\build-master\src\cpp\src\modeling\samples\RelWithDebInfo\modeling_qwen3_5.exe"
@@ -103,7 +104,7 @@ function Check-TextQuality([string]$output) {
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $l = $lines[$i].Trim()
         if ($l -eq '') { continue }  # skip trailing/inter-paragraph blanks
-        if ($l -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- Spec|Main verify|MTP draft|KV trim|Dead KV|Snapshot save|Restore|State refresh|Output token|Prompt token|Mode:|\[)') {
+        if ($l -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- |Main verify|Main GPU|MTP draft|KV trim|Dead KV|Snapshot save|Restore|State refresh|State restore|Accept|Output token|Prompt token|Mode:|Avg step|\-{5}|\[)') {
             $textStartIdx = $i + 1
             break
         }
@@ -247,7 +248,7 @@ $errOutput
         for ($ti = $outLines.Count - 1; $ti -ge 0; $ti--) {
             $tl = $outLines[$ti].Trim()
             if ($tl -eq '') { continue }
-            if ($tl -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- Spec|Main verify|MTP draft|KV trim|Dead KV|Snapshot save|Restore|State refresh|Output token|Prompt token|Mode:|\[)') {
+            if ($tl -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- |Main verify|Main GPU|MTP draft|KV trim|Dead KV|Snapshot save|Restore|State refresh|State restore|Accept|Output token|Prompt token|Mode:|Avg step|\-{5}|\[)') {
                 $txtStart = $ti + 1
                 break
             }
