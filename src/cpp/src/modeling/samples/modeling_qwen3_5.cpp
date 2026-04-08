@@ -1471,25 +1471,19 @@ int main(int argc, char* argv[]) try {
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
 
-    // Auto-disable oneDNN FC kernels for MTP pure-batch mode (INT4 only).
-    // oneDNN INT4 GEMM uses different M-dimension tiling for batch=1 vs batch=K+1,
-    // producing batch-size-dependent numerical results even with f32 accumulation mode.
-    // This causes tiny per-step divergence that compounds into degenerate output.
-    // OpenCL native FC kernels are batch-size-invariant and eliminate this class of
-    // drift entirely, enabling MTP K=1/K=2 to run without any periodic state refresh.
-    // On Intel Arc Pro 140T: TEXT K=1 +22%, K=2 +28%, VL K=1 +8%, K=2 +9% vs baseline.
+    // oneDNN INT4 FC batch-invariance: The GPU plugin's oneDNN FC implementation
+    // now includes a "batch-1 loop" that splits small verify batches (M=2..8) into
+    // M individual M=1 matmul calls, ensuring bit-identical computation to decode.
+    // This eliminates the batch-dependent GEMM tiling divergence that previously
+    // required disabling oneDNN entirely for INT4 MTP.
+    // OV_GPU_ONEDNN_FC_BATCH1_MAX controls the threshold (default 8, set 0 to disable).
     //
-    // NOTE: Only applied for INT4 quantization. For INT8/f16, oneDNN FC kernels are
-    // significantly faster (~5x) and the batch-divergence issue does not manifest.
+    // Legacy auto-disable: If OV_GPU_USE_ONEDNN is not set, we now leave it enabled
+    // (relying on the batch-1 loop).  Set OV_GPU_USE_ONEDNN=0 to force OCL path.
     if (use_mtp && use_pure_batch && text_quant_config.is_primary_4bit()) {
         auto* existing = std::getenv("OV_GPU_USE_ONEDNN");
         if (!existing || std::string(existing).empty()) {
-#ifdef _WIN32
-            _putenv_s("OV_GPU_USE_ONEDNN", "0");
-#else
-            setenv("OV_GPU_USE_ONEDNN", "0", 1);
-#endif
-            std::cout << "[mtp] Auto-set OV_GPU_USE_ONEDNN=0 for batch-size-invariant FC (INT4 mode)" << std::endl;
+            std::cout << "[mtp] oneDNN enabled for INT4 MTP (batch-1 loop ensures decode/verify identity)" << std::endl;
         } else {
             std::cout << "[mtp] OV_GPU_USE_ONEDNN=" << existing << " (user override)" << std::endl;
         }
@@ -1976,8 +1970,8 @@ int main(int argc, char* argv[]) try {
 
     // Periodic state refresh for pure-batch mode: rolling checkpoint to
     // correct accumulated state drift from batch=K+1 inference.
-    // With OV_GPU_USE_ONEDNN=0 (OCL FC) + SDPA threshold, K=1 and K=2 are
-    // fully batch-size-invariant and need NO refresh.  K≥3 still has residual
+    // With oneDNN batch-1 loop + SDPA threshold, K=1 and K=2 are fully
+    // batch-size-invariant and need NO refresh.  K≥3 still has residual
     // drift from other batch-dependent kernels and needs modest refresh.
     const int REFRESH_INTERVAL = [&]() -> int {
         if (opts.refresh_interval > 0) return opts.refresh_interval;
@@ -1988,7 +1982,7 @@ int main(int argc, char* argv[]) try {
             // K≥3: batch=4+, residual drift beyond FC/SDPA → 32 tokens
             return 32;
         }
-        return 0;  // K=1/K=2: no refresh needed with OCL FC + SDPA threshold
+        return 0;  // K=1/K=2: no refresh needed with batch-1 loop + SDPA threshold
     }();
     int64_t checkpoint_past_len = 0;
     std::vector<int64_t> tokens_since_checkpoint;
