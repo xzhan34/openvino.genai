@@ -201,7 +201,15 @@ StatefulDFlashPipeline::StatefulDFlashPipeline(
     m_target_kv_state.seq_length_axis = kv_pos.seq_len;
 
     // Token IDs
-    m_mask_token_id = resolve_mask_token_id(m_tokenizer);
+    // Prefer mask_token_id from draft config (dflash_config.mask_token_id in config.json),
+    // which matches the token used during DFlash draft model training.
+    // Fallback to resolving from tokenizer vocabulary if not specified.
+    if (draft_cfg.mask_token_id > 0) {
+        m_mask_token_id = draft_cfg.mask_token_id;
+    } else {
+        m_mask_token_id = resolve_mask_token_id(m_tokenizer);
+    }
+    std::cerr << "[DFlash] mask_token_id=" << m_mask_token_id << std::endl;
     m_eos_token_id = m_tokenizer.get_eos_token_id();
 }
 
