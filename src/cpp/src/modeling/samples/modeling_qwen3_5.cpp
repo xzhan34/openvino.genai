@@ -1812,9 +1812,17 @@ int main(int argc, char* argv[]) try {
     // Lambda: generate K draft tokens via autoregressive MTP.
     // First draft uses main model hidden_states at hs_pos. Subsequent drafts
     // use MTP's own hidden_states output (autoregressive).
+    // Per-k MTP timing (declared before generate_k_drafts so lambda can capture)
+    std::vector<double> step_mtp_k_ms(static_cast<size_t>(K), 0.0);  // filled per-step in-place
+    double step_mtp_reset_ms = 0.0;
+
     auto generate_k_drafts = [&](const ov::Tensor& main_hs, size_t hs_pos) {
         const size_t hidden_size = static_cast<size_t>(cfg.text.hidden_size);
+
+        auto t_reset0 = std::chrono::steady_clock::now();
         mtp_request->reset_state();
+        auto t_reset1 = std::chrono::steady_clock::now();
+        step_mtp_reset_ms = elapsed_ms(t_reset0, t_reset1);
 
         // Use past_len for RoPE position_ids. Do NOT subtract dead_positions:
         // KV cache entries retain their original RoPE encoding at their physical
@@ -1822,14 +1830,22 @@ int main(int argc, char* argv[]) try {
 
         // Draft 0: from main model hidden_states
         const float* hs_ptr = main_hs.data<const float>() + hs_pos * hidden_size;
-        drafts[0] = run_mtp_single(next_id, hs_ptr, past_len);
+        {
+            auto t_k0 = std::chrono::steady_clock::now();
+            drafts[0] = run_mtp_single(next_id, hs_ptr, past_len);
+            auto t_k1 = std::chrono::steady_clock::now();
+            step_mtp_k_ms[0] = elapsed_ms(t_k0, t_k1);
+        }
 
         // Drafts 1..K-1: from MTP's own hidden_states (autoregressive)
         for (int k = 1; k < K; ++k) {
+            auto t_k0 = std::chrono::steady_clock::now();
             ov::Tensor mtp_hs_out = mtp_request->get_tensor(
                 ov::genai::modeling::models::Qwen3_5MtpIO::kMtpHiddenStates);
             const float* mtp_hs_ptr = mtp_hs_out.data<const float>();
             drafts[k] = run_mtp_single(drafts[k - 1], mtp_hs_ptr, past_len + k);
+            auto t_k1 = std::chrono::steady_clock::now();
+            step_mtp_k_ms[static_cast<size_t>(k)] = elapsed_ms(t_k0, t_k1);
         }
     };
 
@@ -1847,6 +1863,23 @@ int main(int argc, char* argv[]) try {
     double time_snapshot_ms = 0, time_restore_ms = 0, time_reforward_ms = 0;
     size_t count_verify_infers = 0, count_draft_infers = 0, count_trims = 0;
     size_t count_restores = 0, count_reforwards = 0;
+
+    // Per-step profiling: fine-grained sub-step timing (enabled by OV_GENAI_STEP_PROFILE=1)
+    static const bool step_profile_enabled = []() {
+        auto* env = std::getenv("OV_GENAI_STEP_PROFILE");
+        return env && std::string(env) != "0";
+    }();
+    // Sub-step accumulators (always tracked, printed in summary when step_profile enabled)
+    double time_snapshot_save_ms = 0;    // linear_states + conv_states save before verify
+    double time_main_infer_ms = 0;       // main model GPU infer (K+1 batch)
+    double time_accept_check_ms = 0;     // CPU-side logits extract + argmax + compare
+    double time_state_restore_ms = 0;    // linear/conv state restore on rejection
+    double time_kv_trim_ms = 0;          // physical KV trim on rejection
+    double time_mtp_reset_ms = 0;        // MTP model reset_state() call
+    std::vector<double> time_mtp_each_ms; // per-k MTP head infer times within draft phase
+    time_mtp_each_ms.resize(static_cast<size_t>(K), 0.0);
+    std::vector<size_t> count_mtp_each(static_cast<size_t>(K), 0);
+    size_t step_counter = 0;
 
     // Pre-allocate snapshot buffers for linear_states rollback (batch verify path)
     auto linear_snap = init_linear_state_snapshot(text_request);
@@ -2158,6 +2191,11 @@ int main(int argc, char* argv[]) try {
             int num_accepted = 0;
             bool stopped = false;
 
+            // Per-step sub-timing (populated by batch verify path below)
+            double step_snap_save = 0, step_main_infer = 0, step_accept = 0;
+            double step_state_restore = 0, step_kv_trim = 0, step_reforward = 0;
+            int trim_count = 0;
+
             if (use_seq_verify) {
                 // Inline sequential verify: interleaves inference + accept/reject.
                 // Early stop on rejection → no KV trim, no linear_state corruption.
@@ -2176,11 +2214,9 @@ int main(int argc, char* argv[]) try {
                 // Without kernel snapshots: needed for rollback+replay on rejection.
                 // Mode 8 (re-forward): needs pre-batch snapshot even with kernel snapshots,
                 // because re-forward must start from pre-batch state (not post-accepted).
+                auto t_snap_save0 = std::chrono::steady_clock::now();
                 if (!has_kernel_snapshot || (snapshot_restore_mode & 8)) {
-                    auto ts0 = std::chrono::steady_clock::now();
                     save_linear_states(text_request, linear_snap);
-                    auto ts1 = std::chrono::steady_clock::now();
-                    time_snapshot_ms += elapsed_ms(ts0, ts1);
                 }
 
                 // Save conv states before batch verify for CPU-based restore on rejection.
@@ -2188,11 +2224,17 @@ int main(int argc, char* argv[]) try {
                 if (has_kernel_snapshot && !conv_snap.empty()) {
                     save_conv_states(text_request, conv_snap);
                 }
+                auto t_snap_save1 = std::chrono::steady_clock::now();
+                step_snap_save = elapsed_ms(t_snap_save0, t_snap_save1);
+                time_snapshot_ms += step_snap_save;
+                time_snapshot_save_ms += step_snap_save;
 
-                // DIAGNOSTIC PRE-VERIFY disabled (causes GPU hang on state.get_state())
-
-                // Batch verify: send K+1 tokens at once
+                // Batch verify: send K+1 tokens at once (main model GPU inference)
+                auto t_main_infer0 = std::chrono::steady_clock::now();
                 run_kp1_verify();
+                auto t_main_infer1 = std::chrono::steady_clock::now();
+                step_main_infer = elapsed_ms(t_main_infer0, t_main_infer1);
+                time_main_infer_ms += step_main_infer;
                 logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
                 main_hidden_states = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
 
@@ -2289,6 +2331,7 @@ int main(int argc, char* argv[]) try {
                 }
 
                 // Accept/reject phase for batch verify
+                auto t_accept0 = std::chrono::steady_clock::now();
                 for (int k = 0; k < K && !stopped; ++k) {
                     extract_logits_at_pos_f32(logits, static_cast<size_t>(k), logit_buf);
                     int64_t verified;
@@ -2359,8 +2402,12 @@ int main(int argc, char* argv[]) try {
                 }
 
                 // State fixup on rejection
+                auto t_accept1 = std::chrono::steady_clock::now();
+                step_accept = elapsed_ms(t_accept0, t_accept1);
+                time_accept_check_ms += step_accept;
+
                 bool did_reforward_this_cycle = false;
-                const int trim_count = K - num_accepted;
+                trim_count = K - num_accepted;
                 if (trim_count > 0) {
                     if (has_kernel_snapshot) {
                         // vLLM-style per-token state restore + physical KV trim.
@@ -2391,6 +2438,11 @@ int main(int argc, char* argv[]) try {
                             restore_conv_states(text_request, conv_snap);
                         }
 
+                        auto tt_restore1 = std::chrono::steady_clock::now();
+                        step_state_restore = elapsed_ms(tt0, tt_restore1);
+                        time_restore_ms += step_state_restore;
+                        time_state_restore_ms += step_state_restore;
+
                         // Mode 8: re-forward after restoring PRE-BATCH states to regenerate
                         // KV entries and recurrent states from scratch (like fallback path).
                         // Must use pre-batch linear_snap (not kernel snapshot at num_accepted),
@@ -2404,7 +2456,10 @@ int main(int argc, char* argv[]) try {
                                 auto tt_trim0 = std::chrono::steady_clock::now();
                                 trim_kv_cache_states_gpu(text_request, kp1);
                                 auto tt_trim1 = std::chrono::steady_clock::now();
-                                time_trim_ms += elapsed_ms(tt_trim0, tt_trim1); count_trims++;
+                                double dt = elapsed_ms(tt_trim0, tt_trim1);
+                                time_trim_ms += dt; count_trims++;
+                                step_kv_trim += dt;
+                                time_kv_trim_ms += dt;
                             }
                             past_len = past_len_before;
 
@@ -2477,7 +2532,10 @@ int main(int argc, char* argv[]) try {
                                 auto tt_trim0 = std::chrono::steady_clock::now();
                                 trim_kv_cache_states_gpu(text_request, static_cast<size_t>(trim_count));
                                 auto tt_trim1 = std::chrono::steady_clock::now();
-                                time_trim_ms += elapsed_ms(tt_trim0, tt_trim1); count_trims++;
+                                double dt = elapsed_ms(tt_trim0, tt_trim1);
+                                time_trim_ms += dt; count_trims++;
+                                step_kv_trim += dt;
+                                time_kv_trim_ms += dt;
                             }
                             past_len = past_len_before + 1 + static_cast<int64_t>(num_accepted);
                         }
@@ -2652,7 +2710,9 @@ int main(int argc, char* argv[]) try {
                                 ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
 
                             auto trf1 = std::chrono::steady_clock::now();
-                            time_reforward_ms += elapsed_ms(trf0, trf1);
+                            double dt = elapsed_ms(trf0, trf1);
+                            time_reforward_ms += dt;
+                            step_reforward += dt;
                         }
                         count_reforwards++;
                     }
@@ -2784,7 +2844,33 @@ int main(int argc, char* argv[]) try {
                 generate_k_drafts(main_hidden_states, static_cast<size_t>(num_accepted));
             }
             auto t_d1 = std::chrono::steady_clock::now();
-            time_draft_ms += elapsed_ms(t_d0, t_d1); count_draft_infers += K;
+            double step_draft = elapsed_ms(t_d0, t_d1);
+            time_draft_ms += step_draft; count_draft_infers += K;
+            time_mtp_reset_ms += step_mtp_reset_ms;
+            for (int k = 0; k < K; ++k) {
+                time_mtp_each_ms[static_cast<size_t>(k)] += step_mtp_k_ms[static_cast<size_t>(k)];
+                count_mtp_each[static_cast<size_t>(k)]++;
+            }
+            step_counter++;
+
+            // Per-step profiling output (to stderr, gated by OV_GENAI_STEP_PROFILE)
+            if (step_profile_enabled) {
+                auto t_step_end = std::chrono::steady_clock::now();
+                double step_total = elapsed_ms(t_v0, t_step_end);
+                double step_verify = elapsed_ms(t_v0, t_d0);  // everything before draft
+                fprintf(stderr, "[STEP %3zu] total=%.1fms | VERIFY=%.1fms (save=%.1f infer=%.1f accept=%.1f",
+                    step_counter, step_total, step_verify, step_snap_save, step_main_infer, step_accept);
+                if (trim_count > 0) {
+                    fprintf(stderr, " restore=%.1f trim=%.1f", step_state_restore, step_kv_trim);
+                    if (step_reforward > 0) fprintf(stderr, " refwd=%.1f", step_reforward);
+                }
+                fprintf(stderr, ") | DRAFT=%.1fms (reset=%.1f", step_draft, step_mtp_reset_ms);
+                for (int k = 0; k < K; ++k) {
+                    fprintf(stderr, " k%d=%.1f", k, step_mtp_k_ms[static_cast<size_t>(k)]);
+                }
+                fprintf(stderr, ") | accepted=%d/%d gen=%zu\n",
+                    num_accepted, K, generated.size());
+            }
         }
     } else {
         // =======================================================================
@@ -2911,6 +2997,32 @@ int main(int argc, char* argv[]) try {
             if (use_pure_batch || has_kernel_snapshot) {
                 std::cout << "  Dead KV positions:  " << dead_positions.size()
                           << " (virtual trim, no physical KV copies)" << std::endl;
+            }
+            // Sub-step breakdown (always printed for batch verify)
+            if (step_counter > 0) {
+                std::cout << "  --- Per-step avg breakdown (" << step_counter << " steps) ---" << std::endl;
+                std::cout << "    Snapshot save:     " << std::to_string(time_snapshot_save_ms / step_counter) << " ms/step" << std::endl;
+                std::cout << "    Main GPU infer:    " << std::to_string(time_main_infer_ms / step_counter) << " ms/step" << std::endl;
+                std::cout << "    Accept/reject:     " << std::to_string(time_accept_check_ms / step_counter) << " ms/step" << std::endl;
+                std::cout << "    State restore:     " << std::to_string(time_state_restore_ms / step_counter) << " ms/step (on rejection)" << std::endl;
+                std::cout << "    KV trim:           " << std::to_string(time_kv_trim_ms / step_counter) << " ms/step (on rejection)" << std::endl;
+                std::cout << "    MTP reset:         " << std::to_string(time_mtp_reset_ms / step_counter) << " ms/step" << std::endl;
+                for (int k = 0; k < K; ++k) {
+                    auto kidx = static_cast<size_t>(k);
+                    if (count_mtp_each[kidx] > 0) {
+                        std::cout << "    MTP draft k=" << k << ":     "
+                                  << std::to_string(time_mtp_each_ms[kidx] / count_mtp_each[kidx]) << " ms/call"
+                                  << " (" << count_mtp_each[kidx] << " calls, total " << std::to_string(time_mtp_each_ms[kidx]) << " ms)"
+                                  << std::endl;
+                    }
+                }
+                double avg_verify_total = time_verify_ms / step_counter;
+                double avg_draft_total = time_draft_ms / step_counter;
+                double avg_step_total = avg_verify_total + avg_draft_total;
+                std::cout << "    ---------------------" << std::endl;
+                std::cout << "    Avg step total:    " << std::to_string(avg_step_total)
+                          << " ms (verify=" << std::to_string(avg_verify_total)
+                          << " + draft=" << std::to_string(avg_draft_total) << ")" << std::endl;
             }
         }
     }
