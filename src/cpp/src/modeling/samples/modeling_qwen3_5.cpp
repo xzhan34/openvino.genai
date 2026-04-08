@@ -443,6 +443,43 @@ void trim_kv_cache_states(ov::InferRequest& request, size_t num_tokens, size_t s
     }
 }
 
+// Initialize snapshot buffers for linear_states (recurrent/linear attention layers).
+// Returns pre-allocated tensors matching each linear_states tensor's shape.
+std::vector<ov::Tensor> init_linear_state_snapshot(ov::InferRequest& request) {
+    std::vector<ov::Tensor> snap;
+    for (auto& state : request.query_state()) {
+        if (state.get_name().find("linear_states.") == std::string::npos) continue;
+        ov::Tensor t = state.get_state();
+        snap.emplace_back(t.get_element_type(), t.get_shape());
+    }
+    return snap;
+}
+
+// Save current linear_states into pre-allocated snapshot buffers.
+void save_linear_states(ov::InferRequest& request, std::vector<ov::Tensor>& snap) {
+    size_t idx = 0;
+    for (auto& state : request.query_state()) {
+        if (state.get_name().find("linear_states.") == std::string::npos) continue;
+        if (idx < snap.size()) {
+            state.get_state().copy_to(snap[idx]);
+            ++idx;
+        }
+    }
+}
+
+// Restore linear_states from snapshot buffers.
+void restore_linear_states(ov::InferRequest& request,
+                           const std::vector<ov::Tensor>& snap) {
+    size_t idx = 0;
+    for (auto& state : request.query_state()) {
+        if (state.get_name().find("linear_states.") == std::string::npos) continue;
+        if (idx < snap.size()) {
+            state.set_state(snap[idx]);
+            ++idx;
+        }
+    }
+}
+
 // Extract the last token's logits from [1, S, V] into a float32 scratch buffer.
 // Handles f32, f16, and bf16 logit tensors.
 void extract_last_logits_f32(const ov::Tensor& logits, std::vector<float>& out) {
@@ -916,6 +953,8 @@ int main(int argc, char* argv[]) try {
         std::cout << "[mtp] MTP enabled, mtp_num_hidden_layers=" << cfg.text.mtp_num_hidden_layers << std::endl;
         if (use_seq_verify) {
             std::cout << "[mtp] Sequential verify enabled (single-token SDPA per position)" << std::endl;
+        } else {
+            std::cout << "[mtp] Batch verify with linear_states snapshot/rollback" << std::endl;
         }
     }
 
@@ -1445,7 +1484,17 @@ int main(int argc, char* argv[]) try {
     size_t decode_steps = 0;
     // Timing accumulators for profiling speculative decode overhead
     double time_verify_ms = 0, time_draft_ms = 0, time_trim_ms = 0;
+    double time_snapshot_ms = 0, time_restore_ms = 0, time_reforward_ms = 0;
     size_t count_verify_infers = 0, count_draft_infers = 0, count_trims = 0;
+    size_t count_restores = 0, count_reforwards = 0;
+
+    // Pre-allocate snapshot buffers for linear_states rollback (batch verify path)
+    auto linear_snap = init_linear_state_snapshot(text_request);
+    if (!linear_snap.empty()) {
+        std::cout << "[mtp] linear_states snapshot: " << linear_snap.size()
+                  << " tensors pre-allocated for batch verify rollback" << std::endl;
+    }
+
     const auto decode_start = std::chrono::steady_clock::now();
 
     // =======================================================================
@@ -1674,6 +1723,21 @@ int main(int argc, char* argv[]) try {
                 // Early stop on rejection → no KV trim, no linear_state corruption.
                 run_inline_seq_verify(num_accepted, stopped, verify_hs);
             } else {
+                // Batch verify with linear_states snapshot/restore.
+                // Qwen3.5 has recurrent/linear attention (linear_states) that
+                // accumulate token effects irreversibly. On rejection, we must
+                // rollback linear_states and re-forward only the correct tokens.
+                const int64_t past_len_before = past_len;
+                const int64_t original_next_id = next_id;
+
+                // Snapshot linear_states before batch verify
+                {
+                    auto ts0 = std::chrono::steady_clock::now();
+                    save_linear_states(text_request, linear_snap);
+                    auto ts1 = std::chrono::steady_clock::now();
+                    time_snapshot_ms += elapsed_ms(ts0, ts1);
+                }
+
                 // Batch verify: send K+1 tokens at once
                 run_kp1_verify();
                 logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
@@ -1735,14 +1799,86 @@ int main(int argc, char* argv[]) try {
                     if (!stop_token_ids.empty() && stop_token_ids.count(bonus) > 0) { stopped = true; }
                 }
 
-                // KV trim for batch verify
+                // State fixup: rollback + re-forward on rejection
                 const int trim_count = K - num_accepted;
                 if (trim_count > 0) {
-                    auto tt0 = std::chrono::steady_clock::now();
-                    trim_kv_cache_states(text_request, static_cast<size_t>(trim_count));
-                    auto tt1 = std::chrono::steady_clock::now();
-                    time_trim_ms += elapsed_ms(tt0, tt1); count_trims++;
-                    past_len -= trim_count;
+                    // Restore linear_states to pre-verify snapshot
+                    {
+                        auto tr0 = std::chrono::steady_clock::now();
+                        restore_linear_states(text_request, linear_snap);
+                        auto tr1 = std::chrono::steady_clock::now();
+                        time_restore_ms += elapsed_ms(tr0, tr1);
+                    }
+                    count_restores++;
+
+                    // Full KV rollback: remove all K+1 entries from batch verify
+                    {
+                        auto tt0 = std::chrono::steady_clock::now();
+                        trim_kv_cache_states(text_request, kp1);
+                        auto tt1 = std::chrono::steady_clock::now();
+                        time_trim_ms += elapsed_ms(tt0, tt1); count_trims++;
+                    }
+                    past_len = past_len_before;
+
+                    // Re-forward only the correct tokens to rebuild KV + linear_states.
+                    // Tokens: [original_next_id, d[0], ..., d[num_accepted-1]]
+                    const size_t replay_n = static_cast<size_t>(num_accepted) + 1;
+                    {
+                        auto trf0 = std::chrono::steady_clock::now();
+
+                        ov::Tensor replay_ids = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, replay_n});
+                        auto* rids = replay_ids.data<int64_t>();
+                        for (size_t b = 0; b < batch; ++b) {
+                            rids[b * replay_n] = original_next_id;
+                            for (int k = 0; k < num_accepted; ++k) {
+                                rids[b * replay_n + static_cast<size_t>(k + 1)] = drafts[k];
+                            }
+                        }
+
+                        ov::Tensor replay_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, replay_n});
+                        auto* rpos = replay_pos.data<int64_t>();
+                        for (size_t b = 0; b < batch; ++b) {
+                            for (size_t j = 0; j < replay_n; ++j) {
+                                const int64_t val = (past_len + static_cast<int64_t>(j)) + rope_deltas_data[b];
+                                for (size_t plane = 0; plane < 3; ++plane) {
+                                    rpos[plane * batch * replay_n + b * replay_n + j] = val;
+                                }
+                            }
+                        }
+
+                        const size_t replay_mask_len = static_cast<size_t>(past_len) + replay_n;
+                        ov::Tensor replay_mask = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, replay_mask_len});
+                        {
+                            auto* p = replay_mask.data<int64_t>();
+                            for (size_t i = 0; i < batch * replay_mask_len; ++i) p[i] = 1;
+                        }
+
+                        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, replay_ids);
+                        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, replay_mask);
+                        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, replay_pos);
+                        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
+                        if (use_vl) {
+                            ov::Tensor replay_vis = make_usm_host_tensor(gpu_ctx, ov::element::f32,
+                                {batch, replay_n, static_cast<size_t>(cfg.text.hidden_size)});
+                            std::memset(replay_vis.data(), 0, replay_vis.get_byte_size());
+                            ov::Tensor replay_vis_mask = make_usm_host_tensor(gpu_ctx, ov::element::boolean, {batch, replay_n});
+                            std::memset(replay_vis_mask.data(), 0, replay_vis_mask.get_byte_size());
+                            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, replay_vis);
+                            text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, replay_vis_mask);
+                        }
+
+                        text_request.infer();
+                        past_len += static_cast<int64_t>(replay_n);
+                        mtp_main_infers++;
+
+                        // Update main_hidden_states to re-forward output for draft generation
+                        main_hidden_states = text_request.get_tensor(
+                            ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
+
+                        auto trf1 = std::chrono::steady_clock::now();
+                        time_reforward_ms += elapsed_ms(trf0, trf1);
+                    }
+                    count_reforwards++;
                 }
             }
 
@@ -1861,7 +1997,7 @@ int main(int argc, char* argv[]) try {
             std::cout << "MTP tokens/infer: " << tokens_per_infer << std::endl;
         }
         // Profiling breakdown
-        std::cout << "--- Spec decode profiling (K+1 verify" << (use_seq_verify ? " [sequential]" : " [batch]") << ", K=" << K << ") ---" << std::endl;
+        std::cout << "--- Spec decode profiling (K+1 verify" << (use_seq_verify ? " [sequential]" : " [batch+rollback]") << ", K=" << K << ") ---" << std::endl;
         std::cout << "  Main verify (K+1):  " << time_verify_ms << " ms (" << count_verify_infers << " calls)"
                   << (count_verify_infers > 0 ? (", avg " + std::to_string(time_verify_ms / count_verify_infers) + " ms") : "")
                   << std::endl;
@@ -1871,6 +2007,14 @@ int main(int argc, char* argv[]) try {
         std::cout << "  KV trim:            " << time_trim_ms << " ms (" << count_trims << " calls)"
                   << (count_trims > 0 ? (", avg " + std::to_string(time_trim_ms / count_trims) + " ms") : "")
                   << std::endl;
+        if (!use_seq_verify) {
+            std::cout << "  Snapshot save:      " << time_snapshot_ms << " ms (" << count_verify_infers << " calls)"
+                      << (count_verify_infers > 0 ? (", avg " + std::to_string(time_snapshot_ms / count_verify_infers) + " ms") : "")
+                      << std::endl;
+            std::cout << "  Restore+re-fwd:     " << (time_restore_ms + time_reforward_ms) << " ms (" << count_restores << " restores, "
+                      << count_reforwards << " re-forwards)"
+                      << std::endl;
+        }
     }
 
     if (tokenizer) {
