@@ -17,10 +17,19 @@ $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
 $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
 $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
 $env:OV_GENAI_MTP_SNAPSHOT = "1"
+$env:OV_GENAI_SNAPSHOT_RESTORE = "3"   # GPU-side state restore on draft rejection (critical for MTP perf)
+$env:OV_GENAI_VALIDATE_SNAPSHOT = "0"  # Disable snapshot validation overhead in benchmarks
 # oneDNN FC accumulation mode fix (fully_connected_onednn.cpp):
 # set_accumulation_mode(f32) alongside fpmath_mode::f16 ensures batch-size-invariant
 # numerical results for INT4 GEMM.  No need to disable oneDNN anymore.
-# Override: $env:OV_GPU_ONEDNN_FC_ACC_MODE = "f16"  # revert to FP16 accumulators
+# SDPA single-token threshold: auto-set by modeling_qwen3_5.exe to K+1 for MTP pure-batch.
+# Forces single-token SDPA kernel for verify batch to eliminate batch-size-dependent
+# numerical divergence (same class of issue as oneDNN FC).  Override if needed:
+# $env:OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD = "4"  # for K=3
+# Clean up stale env vars that could interfere with auto-configuration
+Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GPU_FC_SINGLE_BATCH_THRESHOLD -ErrorAction SilentlyContinue
 # Enable per-step profiling breakdown (sub-step timing to stderr, summary to stdout)
 $env:OV_GENAI_STEP_PROFILE = "1"
 $env:DEVICE = "GPU"
@@ -378,7 +387,7 @@ foreach ($mdl in $MODELS) {
             if ($m -eq "text") {
                 [void]$argList.AddRange(@("--prompt", "`"Hello, please write a short story about a robot learning to paint.`""))
             } else {
-                [void]$argList.AddRange(@("--image", $IMAGE_PATH, "--prompt", "`"describe this picture in details: `""))
+                [void]$argList.AddRange(@("--image", $IMAGE_PATH, "--prompt", "`"describe this picture in details`""))
             }
             if ($cfg.MTP -gt 0) {
                 [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)"))
@@ -386,6 +395,11 @@ foreach ($mdl in $MODELS) {
                     # pure-batch is the production requirement for MTP
                     [void]$argList.AddRange(@("--pure-batch", "1"))
                 }
+                # Set SDPA threshold to K+1 for batch-size-invariant numerical results.
+                # Must be set in parent env (not just inside exe) so GPU plugin sees it at init.
+                $env:OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD = "$($cfg.MtpK + 1)"
+            } else {
+                Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
             }
 
             Write-Host "`n--- $($cfg.Name) ($modelName / $m mode) ---" -ForegroundColor White
