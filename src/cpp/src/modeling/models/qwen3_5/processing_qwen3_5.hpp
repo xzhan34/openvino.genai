@@ -56,6 +56,7 @@ struct Qwen3_5TextConfig {
     bool norm_topk_prob = true;
     bool output_router_logits = false;
     float router_aux_loss_coef = 0.0f;
+    int32_t mtp_num_hidden_layers = 0;  // 0 = no MTP; typically 1
     Qwen3_5RopeConfig rope;
 
     int32_t kv_heads() const;
@@ -135,6 +136,16 @@ struct Qwen3_5TextIO {
     static constexpr const char* kVisualEmbeds = "visual_embeds";
     static constexpr const char* kVisualPosMask = "visual_pos_mask";
     static constexpr const char* kDeepstackEmbedsPrefix = "deepstack_embeds";
+    static constexpr const char* kLogits = "logits";
+    static constexpr const char* kHiddenStates = "hidden_states";
+};
+
+struct Qwen3_5MtpIO {
+    static constexpr const char* kInputIds = "input_ids";
+    static constexpr const char* kHiddenStates = "hidden_states";
+    static constexpr const char* kAttentionMask = "attention_mask";
+    static constexpr const char* kPositionIds = "position_ids";
+    static constexpr const char* kBeamIdx = "beam_idx";
     static constexpr const char* kLogits = "logits";
 };
 
