@@ -2,7 +2,7 @@
 # Usage: powershell -ExecutionPolicy Bypass -File bench_mtp.ps1
 
 param(
-    [int]$NumRuns = 3,
+    [int]$NumRuns = 1,
     [int]$OutputTokens = 256,
     [string]$Mode = "all"  # "text", "vl", or "all"
 )
@@ -80,19 +80,24 @@ function Parse-Metrics([string]$output) {
         elseif ($line -match '^MTP tokens/infer:\s+([\d.]+)') {
             $metrics.TokensPerInfer = [double]$Matches[1]
         }
+        elseif ($line -match 'Dead KV positions:\s+(\d+)') {
+            $metrics["DeadKVPositions"] = [int]$Matches[1]
+        }
     }
     return $metrics
 }
 
 # --- Helper: check generated text quality (detect degenerate repetition) ---
 function Check-TextQuality([string]$output) {
-    # Extract generated text: everything after the last metric line (Throughput/Spec decode/MTP lines)
+    # Extract generated text: everything after the last metric/profiling line.
     # The text is at the end of stdout, after all metric/profiling lines.
     $lines = $output -split "`r?`n"
     $textStartIdx = -1
+    # Scan from bottom up, skip trailing empty lines first, then find last metric line.
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $l = $lines[$i].Trim()
-        if ($l -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- Spec|  Main verify|  MTP draft|  KV trim|Output token|Prompt token|Mode:|\[)' -or $l -eq '') {
+        if ($l -eq '') { continue }  # skip trailing/inter-paragraph blanks
+        if ($l -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- Spec|Main verify|MTP draft|KV trim|Dead KV|Snapshot save|Restore|State refresh|Output token|Prompt token|Mode:|\[)') {
             $textStartIdx = $i + 1
             break
         }
@@ -214,7 +219,8 @@ $errOutput
         $txtStart = -1
         for ($ti = $outLines.Count - 1; $ti -ge 0; $ti--) {
             $tl = $outLines[$ti].Trim()
-            if ($tl -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- Spec|  Main verify|  MTP draft|  KV trim|Output token|Prompt token|Mode:|\[)' -or $tl -eq '') {
+            if ($tl -eq '') { continue }
+            if ($tl -match '^(TTFT|TPOT|Throughput|Decode time|MTP |--- Spec|Main verify|MTP draft|KV trim|Dead KV|Snapshot save|Restore|State refresh|Output token|Prompt token|Mode:|\[)') {
                 $txtStart = $ti + 1
                 break
             }
@@ -349,7 +355,8 @@ foreach ($mdl in $MODELS) {
             if ($cfg.MTP -gt 0) {
                 [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)"))
                 if ($cfg.SeqVerify -gt 0) {
-                    [void]$argList.AddRange(@("--seq-verify", "1"))
+                    [void]$argList.AddRange(@("--seq-verify", "0"))
+                    [void]$argList.AddRange(@("--pure-batch", "1"))
                 }
             }
 
