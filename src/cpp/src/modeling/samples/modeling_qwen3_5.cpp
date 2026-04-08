@@ -453,6 +453,28 @@ void trim_kv_cache_states(ov::InferRequest& request, size_t num_tokens, size_t s
     }
 }
 
+// GPU-optimized KV cache trim: zero-copy metadata-only operation.
+// Uses the GPU plugin's trim_variable_state API to reduce the logical sequence
+// length without any data movement.  Falls back to the CPU-based trim on error.
+void trim_kv_cache_states_gpu(ov::InferRequest& request, size_t num_tokens, size_t seq_length_axis = 2) {
+    if (num_tokens == 0) return;
+    for (auto& state : request.query_state()) {
+        const auto& name = state.get_name();
+        if (name.find("past_key_values.") == std::string::npos &&
+            name.find(".key_cache") == std::string::npos &&
+            name.find(".value_cache") == std::string::npos) {
+            continue;
+        }
+        try {
+            request.trim_variable_state(name, num_tokens, seq_length_axis);
+        } catch (...) {
+            // Fallback to CPU-based trim for this state
+            trim_kv_cache_states(request, num_tokens, seq_length_axis);
+            return;
+        }
+    }
+}
+
 // Initialize snapshot buffers for linear_states (recurrent/linear attention layers).
 // Returns pre-allocated tensors matching each linear_states tensor's shape.
 std::vector<ov::Tensor> init_linear_state_snapshot(ov::InferRequest& request) {
@@ -513,7 +535,28 @@ std::vector<std::string> find_all_linear_states_outputs(ov::InferRequest& reques
     return names;
 }
 
-// After batch verify with K+1 tokens, select recurrent states at the
+// Find all conv state snapshot outputs from the compiled model.
+std::vector<std::string> find_all_conv_states_outputs(ov::InferRequest& request) {
+    std::vector<std::string> names;
+    auto model = request.get_compiled_model();
+    for (size_t i = 0; i < model.outputs().size(); ++i) {
+        auto out_names = model.output(i).get_names();
+        for (const auto& n : out_names) {
+            if (n.find("all_conv_states.layer") != std::string::npos) {
+                names.push_back(n);
+                break;
+            }
+        }
+    }
+    std::sort(names.begin(), names.end(), [](const std::string& a, const std::string& b) {
+        auto idx_a = std::stoi(a.substr(a.find("layer") + 5));
+        auto idx_b = std::stoi(b.substr(b.find("layer") + 5));
+        return idx_a < idx_b;
+    });
+    return names;
+}
+
+// After batch verify with K+1 tokens, select conv states at the
 // num_accepted-th token position from the per-token snapshot outputs.
 // all_states_names: output names like "all_linear_states.layer0", ...
 // Each output tensor has shape [B, T, num_v_heads, K_HEAD_DIMS, K_HEAD_DIMS].
@@ -582,6 +625,140 @@ void select_and_restore_linear_states(ov::InferRequest& request,
 
         for (size_t b = 0; b < B; ++b) {
             const size_t src_off = (b * shape[1] + static_cast<size_t>(num_accepted)) * token_stride * elem_size;
+            const size_t dst_off = b * state_size * elem_size;
+            std::memcpy(dst + dst_off, src + src_off, state_size * elem_size);
+        }
+
+        state.set_state(target);
+    }
+}
+
+// After batch verify, select conv states at num_accepted-th token position
+// from the per-token conv snapshot outputs.
+// all_conv_states_names: output names like "all_conv_states.layer0", ...
+// Each output tensor has shape [B, T, conv_dim, kernel_size].
+// We select [:, num_accepted, :, :] and write it to the corresponding ".conv" variable.
+void select_and_restore_conv_states(ov::InferRequest& request,
+                                    const std::vector<std::string>& all_conv_states_names,
+                                    int num_accepted,
+                                    bool use_gpu_restore = true) {
+    std::unordered_map<int, std::string> output_by_layer;
+    for (const auto& name : all_conv_states_names) {
+        auto pos = name.find("layer");
+        if (pos != std::string::npos) {
+            int layer_idx = std::stoi(name.substr(pos + 5));
+            output_by_layer[layer_idx] = name;
+        }
+    }
+
+    static int conv_dbg_count = 0;
+
+    for (auto& state : request.query_state()) {
+        const auto& sname = state.get_name();
+        // Match "linear_states.{N}.conv"
+        if (sname.find("linear_states.") == std::string::npos) continue;
+        if (sname.find(".conv") == std::string::npos) continue;
+
+        auto dot1 = sname.find('.') + 1;
+        auto dot2 = sname.find('.', dot1);
+        int layer_idx = std::stoi(sname.substr(dot1, dot2 - dot1));
+
+        auto it = output_by_layer.find(layer_idx);
+        if (it == output_by_layer.end()) continue;
+
+        // Debug: dump snapshot data before restore
+        if (conv_dbg_count < 2) {
+            ov::Tensor snap_tensor = request.get_tensor(it->second);
+            const auto snap_shape = snap_tensor.get_shape();
+            // snap_shape = [B, T, conv_dim, kernel_size]
+            size_t T = snap_shape[1];
+            size_t cD = snap_shape[2];
+            size_t kS = snap_shape[3];
+
+            // Get current variable state for comparison
+            ov::Tensor cur_state = state.get_state();
+
+            fprintf(stderr, "[CONV_SNAP_DBG] %s: snap_shape=[%zu,%zu,%zu,%zu] var_shape=[",
+                    sname.c_str(), snap_shape[0], snap_shape[1], snap_shape[2], snap_shape[3]);
+            auto vs = cur_state.get_shape();
+            for (size_t i = 0; i < vs.size(); i++) fprintf(stderr, "%s%zu", i?",":"", vs[i]);
+            fprintf(stderr, "] snap_et=%s var_et=%s num_accepted=%d\n",
+                    snap_tensor.get_element_type().to_string().c_str(),
+                    cur_state.get_element_type().to_string().c_str(),
+                    num_accepted);
+
+            // Print first 8 values of snapshot at position num_accepted
+            if (snap_tensor.get_element_type() == ov::element::f32) {
+                auto* p = snap_tensor.data<float>();
+                size_t slice_off = static_cast<size_t>(num_accepted) * cD * kS;
+                fprintf(stderr, "[CONV_SNAP_DBG] snap[%d] first 8 f32: ", num_accepted);
+                for (int i = 0; i < 8 && i < (int)(cD * kS); i++)
+                    fprintf(stderr, "%.4f ", p[slice_off + i]);
+                fprintf(stderr, "\n");
+                // Also print last row (last channel)
+                fprintf(stderr, "[CONV_SNAP_DBG] snap[%d] last ch f32: ", num_accepted);
+                size_t last_ch_off = slice_off + (cD - 1) * kS;
+                for (size_t i = 0; i < kS; i++)
+                    fprintf(stderr, "%.4f ", p[last_ch_off + i]);
+                fprintf(stderr, "\n");
+            } else if (snap_tensor.get_element_type() == ov::element::f16) {
+                auto* p = reinterpret_cast<const ov::float16*>(snap_tensor.data());
+                size_t slice_off = static_cast<size_t>(num_accepted) * cD * kS;
+                fprintf(stderr, "[CONV_SNAP_DBG] snap[%d] first 8 f16: ", num_accepted);
+                for (int i = 0; i < 8 && i < (int)(cD * kS); i++)
+                    fprintf(stderr, "%.4f ", float(p[slice_off + i]));
+                fprintf(stderr, "\n");
+            }
+
+            // Print current variable state for comparison
+            if (cur_state.get_element_type() == ov::element::f16) {
+                auto* p = reinterpret_cast<const ov::float16*>(cur_state.data());
+                fprintf(stderr, "[CONV_SNAP_DBG] var first 8 f16: ");
+                for (int i = 0; i < 8 && i < (int)cur_state.get_size(); i++)
+                    fprintf(stderr, "%.4f ", float(p[i]));
+                fprintf(stderr, "\n");
+            }
+
+            // Print snap at position 1 (if T>=2) for comparison
+            if (T >= 2 && snap_tensor.get_element_type() == ov::element::f32) {
+                auto* p = snap_tensor.data<float>();
+                size_t slice_off1 = 1 * cD * kS;
+                fprintf(stderr, "[CONV_SNAP_DBG] snap[1] first 8 f32: ");
+                for (int i = 0; i < 8 && i < (int)(cD * kS); i++)
+                    fprintf(stderr, "%.4f ", p[slice_off1 + i]);
+                fprintf(stderr, "\n");
+            }
+
+            conv_dbg_count++;
+        }
+
+        if (use_gpu_restore) {
+            try {
+                request.restore_variable_from_output(sname, it->second, static_cast<size_t>(num_accepted));
+                continue;
+            } catch (const std::exception&) {
+                // Fall through to CPU path
+            } catch (...) {
+                // Fall through to CPU path
+            }
+        }
+
+        // CPU fallback path
+        ov::Tensor all_states = request.get_tensor(it->second);
+        const auto shape = all_states.get_shape();
+        // shape = [B, T, conv_dim, kernel_size]
+        const size_t B = shape[0];
+        const size_t conv_dim = shape[2];
+        const size_t kernel_size = shape[3];
+        const size_t state_size = conv_dim * kernel_size;
+
+        ov::Tensor target(all_states.get_element_type(), {B, conv_dim, kernel_size});
+        const size_t elem_size = all_states.get_element_type().size();
+        const auto* src = reinterpret_cast<const uint8_t*>(all_states.data());
+        auto* dst = reinterpret_cast<uint8_t*>(target.data());
+
+        for (size_t b = 0; b < B; ++b) {
+            const size_t src_off = (b * shape[1] + static_cast<size_t>(num_accepted)) * state_size * elem_size;
             const size_t dst_off = b * state_size * elem_size;
             std::memcpy(dst + dst_off, src + src_off, state_size * elem_size);
         }
@@ -1287,6 +1464,7 @@ int main(int argc, char* argv[]) try {
         std::cout << "[vision] Compiling vision model on device: " << vision_device << std::endl;
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
+
     auto compiled_text = core.compile_model(text_model, opts.device);
 
     // Compile MTP model if enabled
@@ -1682,10 +1860,20 @@ int main(int argc, char* argv[]) try {
     // intermediate recurrent states, allowing precise state selection after
     // batch verify without re-forward.
     auto all_linear_states_names = find_all_linear_states_outputs(text_request);
-    const bool has_kernel_snapshot = !all_linear_states_names.empty();
-    if (has_kernel_snapshot) {
+    auto all_conv_states_names = find_all_conv_states_outputs(text_request);
+    const bool has_kernel_snapshot_real = !all_linear_states_names.empty();
+    const bool has_kernel_snapshot = [&]() -> bool {
+        auto* env = std::getenv("OV_GENAI_USE_KERNEL_SNAPSHOT");
+        if (env && std::string(env) == "0") {
+            fprintf(stderr, "[MTP_DBG] Kernel snapshot restore DISABLED by OV_GENAI_USE_KERNEL_SNAPSHOT=0\n");
+            return false;
+        }
+        return has_kernel_snapshot_real;
+    }();
+    if (has_kernel_snapshot_real) {
         std::cout << "[mtp] Kernel-level per-token state snapshots: "
-                  << all_linear_states_names.size() << " outputs detected" << std::endl;
+                  << all_linear_states_names.size() << " linear + "
+                  << all_conv_states_names.size() << " conv outputs detected" << std::endl;
     }
 
     // Conv state snapshot for batch verify: conv states are small (~128KB × 24 layers)
@@ -1701,7 +1889,14 @@ int main(int argc, char* argv[]) try {
     // tokens, restore linear_states to last checkpoint, trim KV, re-forward
     // all tokens since checkpoint as a batch. This amortizes the re-forward
     // cost while keeping linear_states bounded-accurate.
-    const int REFRESH_INTERVAL = opts.refresh_interval;  // tokens between state refreshes (0=disabled)
+    // Mode 8 auto-default: if refresh not explicit, default to 64 tokens to
+    // prevent KV cache drift from batch=K+1 numerical differences.
+    const int REFRESH_INTERVAL = [&]() -> int {
+        if (opts.refresh_interval > 0) return opts.refresh_interval;
+        auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
+        int mode = env ? std::atoi(env) : 3;
+        return (mode & 8) ? 64 : 0;  // auto-enable for mode 8
+    }();
     int64_t checkpoint_past_len = 0;
     std::vector<int64_t> tokens_since_checkpoint;
     double time_refresh_ms = 0;
@@ -1727,8 +1922,21 @@ int main(int argc, char* argv[]) try {
     if (use_mtp && mtp_request && drafts_ready) {
         const size_t kp1 = static_cast<size_t>(K + 1);
 
-        // Initialize rolling checkpoint for pure-batch state refresh
-        if (use_pure_batch) {
+        // Snapshot restore mode bitmask:
+        //   1=linear from kernel snapshot, 2=conv from kernel snapshot, 3=both
+        //   4=conv from CPU pre-batch, 8=re-forward (trim all K+1 + replay accepted)
+        static const int snapshot_restore_mode = []() -> int {
+            auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
+            return env ? std::atoi(env) : 3;
+        }();
+
+        // Initialize rolling checkpoint for pure-batch state refresh.
+        // Needed when:
+        //   - No kernel snapshots (fallback): re-forward on rejection + periodic refresh
+        //   - Mode 8 (kernel snapshot + re-forward): periodic refresh to prevent
+        //     KV cache drift from batch=K+1 vs batch=1 numerical differences
+        const bool needs_refresh_tracking = !has_kernel_snapshot || (snapshot_restore_mode & 8);
+        if (needs_refresh_tracking) {
             save_linear_states(text_request, linear_snap);
             checkpoint_past_len = past_len;
             tokens_since_checkpoint.clear();
@@ -1956,32 +2164,129 @@ int main(int argc, char* argv[]) try {
                 run_inline_seq_verify(num_accepted, stopped, verify_hs);
             } else {
                 // Batch verify: send K+1 tokens in one main model inference.
-                // Three sub-modes:
-                //   kernel snapshot: per-token state selection from GPU kernel + virtual KV trim
-                //   pure_batch:     KV trim only on rejection (no linear_states handling)
-                //   snapshot mode:  save/restore linear_states + full KV rollback + re-forward on rejection
+                // Two sub-modes for state fixup on rejection:
+                //   kernel snapshot: per-token state selection from GPU kernel + physical KV trim
+                //                    (vLLM-style: spec_state_indices_tensor equivalent)
+                //   fallback:        save/restore linear_states + full KV rollback + re-forward
                 const int64_t past_len_before = past_len;
                 const int64_t original_next_id = next_id;
 
-                // Note: conv states are NOT saved/restored in kernel-snapshot mode.
-                // After K+1 verify, the conv state includes all K+1 tokens' effects
-                // (including rejected ones). This is better than restoring to pre-verify
-                // state which would lose the accepted tokens' effects entirely.
-                // The rejected tokens' residual in the conv window (size 4) self-corrects
-                // within a few single-token decode steps.
-
-                // Snapshot linear_states before batch verify (skip for pure batch and kernel snapshot)
-                if (!use_pure_batch && !has_kernel_snapshot) {
+                // Snapshot linear_states before batch verify.
+                // With kernel snapshots: not needed (per-token restore from output).
+                // Without kernel snapshots: needed for rollback+replay on rejection.
+                // Mode 8 (re-forward): needs pre-batch snapshot even with kernel snapshots,
+                // because re-forward must start from pre-batch state (not post-accepted).
+                if (!has_kernel_snapshot || (snapshot_restore_mode & 8)) {
                     auto ts0 = std::chrono::steady_clock::now();
                     save_linear_states(text_request, linear_snap);
                     auto ts1 = std::chrono::steady_clock::now();
                     time_snapshot_ms += elapsed_ms(ts0, ts1);
                 }
 
+                // Save conv states before batch verify for CPU-based restore on rejection.
+                // Conv states are small (~128KB per layer) so the save is cheap.
+                if (has_kernel_snapshot && !conv_snap.empty()) {
+                    save_conv_states(text_request, conv_snap);
+                }
+
+                // DIAGNOSTIC PRE-VERIFY disabled (causes GPU hang on state.get_state())
+
                 // Batch verify: send K+1 tokens at once
                 run_kp1_verify();
                 logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kLogits);
                 main_hidden_states = text_request.get_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
+
+                // DIAGNOSTIC: compare snapshot[last] vs final state variable for first linear layer
+                {
+                    static int diag_count = 0;
+                    if (diag_count < 5 && !all_linear_states_names.empty()) {
+                        try {
+                            // Get snapshot tensor (f32, post-reorder)
+                            ov::Tensor snap_t = text_request.get_tensor(all_linear_states_names[0]);
+                            auto snap_shape = snap_t.get_shape();
+                            size_t T_dim = snap_shape[1];
+                            size_t state_elems = 1;
+                            for (size_t d = 2; d < snap_shape.size(); ++d) state_elems *= snap_shape[d];
+
+                            // Find the matching recurrent state variable
+                            auto lpos = all_linear_states_names[0].find("layer");
+                            int snap_layer_idx = std::stoi(all_linear_states_names[0].substr(lpos + 5));
+                            std::string target_var = "linear_states." + std::to_string(snap_layer_idx) + ".recurrent";
+                            ov::Tensor var_t;
+                            for (auto& state : text_request.query_state()) {
+                                if (state.get_name() == target_var) {
+                                    var_t = state.get_state();
+                                    break;
+                                }
+                            }
+
+                            if (var_t) {
+                                auto var_et = var_t.get_element_type();
+                                auto var_shape = var_t.get_shape();
+                                size_t var_elems = 1;
+                                for (auto d : var_shape) var_elems *= d;
+                                size_t cmp_elems = std::min(state_elems, var_elems);
+
+                                // Convert variable to f32 for comparison
+                                std::vector<float> var_f32(cmp_elems);
+                                if (var_et == ov::element::f16) {
+                                    const auto* src = reinterpret_cast<const ov::float16*>(var_t.data());
+                                    for (size_t e = 0; e < cmp_elems; ++e)
+                                        var_f32[e] = float(src[e]);
+                                } else if (var_et == ov::element::f32) {
+                                    const float* src = var_t.data<float>();
+                                    std::copy(src, src + cmp_elems, var_f32.begin());
+                                } else {
+                                    fprintf(stderr, "[SNAP_DIAG] unsupported var type: %s\n", var_et.get_type_name().c_str());
+                                    diag_count++;
+                                    goto diag_done;
+                                }
+
+                                const float* snap_data = snap_t.data<float>();
+                                size_t last_pos = T_dim - 1;
+                                const float* snap_last = snap_data + last_pos * state_elems;
+
+                                double max_diff = 0.0, sum_sq = 0.0;
+                                size_t mismatches = 0;
+                                for (size_t e = 0; e < cmp_elems; ++e) {
+                                    double d = std::abs((double)snap_last[e] - (double)var_f32[e]);
+                                    if (d > 0.0) mismatches++;
+                                    max_diff = std::max(max_diff, d);
+                                    sum_sq += d * d;
+                                }
+                                double rmse = std::sqrt(sum_sq / cmp_elems);
+
+                                fprintf(stderr, "[SNAP_DIAG] iter=%d layer=%d var_et=%s "
+                                    "snap[last=%zu] vs var: max_diff=%.6e rmse=%.6e mismatches=%zu/%zu\n",
+                                    diag_count, snap_layer_idx, var_et.get_type_name().c_str(),
+                                    last_pos, max_diff, rmse, mismatches, cmp_elems);
+
+                                // Print first 8 values from each
+                                fprintf(stderr, "[SNAP_DIAG] snap[last]: ");
+                                for (size_t e = 0; e < std::min((size_t)8, cmp_elems); ++e)
+                                    fprintf(stderr, "%.6f ", snap_last[e]);
+                                fprintf(stderr, "\n[SNAP_DIAG] var(f32):   ");
+                                for (size_t e = 0; e < std::min((size_t)8, cmp_elems); ++e)
+                                    fprintf(stderr, "%.6f ", var_f32[e]);
+                                fprintf(stderr, "\n");
+
+                                // Compare snap[0] vs snap[last]
+                                if (T_dim > 1) {
+                                    double max01 = 0.0;
+                                    for (size_t e = 0; e < cmp_elems; ++e) {
+                                        double d = std::abs((double)snap_data[e] - (double)snap_last[e]);
+                                        max01 = std::max(max01, d);
+                                    }
+                                    fprintf(stderr, "[SNAP_DIAG] snap[0] vs snap[last]: max_diff=%.6e\n", max01);
+                                }
+                            }
+                            diag_done:;
+                        } catch (const std::exception& e) {
+                            fprintf(stderr, "[SNAP_DIAG] EXCEPTION: %s\n", e.what());
+                        }
+                        diag_count++;
+                    }
+                }
 
                 // Accept/reject phase for batch verify
                 for (int k = 0; k < K && !stopped; ++k) {
@@ -1996,6 +2301,18 @@ int main(int argc, char* argv[]) try {
                                        : argmax_f32(logit_buf);
                     }
                     mtp_attempts++;
+
+                    // Debug: trace token-level accept/reject
+                    {
+                        static int dbg_step = 0;
+                        if (dbg_step < 300) {
+                            fprintf(stderr, "[MTP_TRACE] step=%d k=%d verified=%lld draft=%lld %s past_len=%lld\n",
+                                dbg_step, k, (long long)verified, (long long)drafts[k],
+                                (verified == drafts[k]) ? "ACCEPT" : "REJECT",
+                                (long long)past_len);
+                        }
+                        dbg_step++;
+                    }
 
                     if (verified == drafts[k]) {
                         mtp_hits++;
@@ -2030,6 +2347,8 @@ int main(int argc, char* argv[]) try {
                                                   opts.temperature, opts.top_p, opts.top_k, rng, sampling_ctx)
                                     : argmax_f32(logit_buf);
                     }
+                    fprintf(stderr, "[MTP_TRACE] bonus=%lld (all K accepted) gen_size=%d\n",
+                        (long long)bonus, (int)generated.size());
                     penalty_processor.register_new_generated_token(bonus);
                     generated.push_back(bonus);
                     penalty_processor.update_generated_len(generated.size());
@@ -2040,47 +2359,228 @@ int main(int argc, char* argv[]) try {
                 }
 
                 // State fixup on rejection
+                bool did_reforward_this_cycle = false;
                 const int trim_count = K - num_accepted;
                 if (trim_count > 0) {
                     if (has_kernel_snapshot) {
-                        // Kernel snapshot mode: precise per-token state selection + virtual KV trim.
-                        // The GPU LinearAttention kernel wrote intermediate states for each token.
+                        // vLLM-style per-token state restore + physical KV trim.
+                        // The GPU LinearAttention kernel wrote intermediate recurrent states
+                        // for each token in the K+1 batch (like vLLM's spec_state_indices_tensor).
                         // Select the state at num_accepted position (= state after processing
-                        // next_id + num_accepted accepted drafts) and restore conv states.
+                        // next_id + num_accepted accepted drafts), then trim rejected KV entries.
                         auto tt0 = std::chrono::steady_clock::now();
-                        // Try GPU-side restore first; env OV_GENAI_GPU_RESTORE=0 disables.
-                        {
+
+                        if (snapshot_restore_mode & 1) {
                             static const bool gpu_restore = []() {
                                 auto* env = std::getenv("OV_GENAI_GPU_RESTORE");
                                 return env == nullptr || std::string(env) != "0";
                             }();
                             select_and_restore_linear_states(text_request, all_linear_states_names, num_accepted, gpu_restore);
                         }
-                        // Conv states are intentionally NOT restored — see note above.
-                        // Virtual trim: mark rejected KV positions as dead
-                        for (int t = 0; t < trim_count; ++t) {
-                            const int64_t dead_pos = past_len_before + 1 + num_accepted + t;
-                            dead_positions.push_back(dead_pos);
+                        if ((snapshot_restore_mode & 2) && !all_conv_states_names.empty()) {
+                            static const bool gpu_restore_conv = []() {
+                                auto* env = std::getenv("OV_GENAI_GPU_RESTORE_CONV");
+                                if (env) return std::string(env) != "0";
+                                env = std::getenv("OV_GENAI_GPU_RESTORE");
+                                return env == nullptr || std::string(env) != "0";
+                            }();
+                            select_and_restore_conv_states(text_request, all_conv_states_names, num_accepted, gpu_restore_conv);
                         }
+                        // Mode 4: restore conv states from CPU pre-batch snapshot (instead of kernel snapshot)
+                        if ((snapshot_restore_mode & 4) && !conv_snap.empty()) {
+                            restore_conv_states(text_request, conv_snap);
+                        }
+
+                        // Mode 8: re-forward after restoring PRE-BATCH states to regenerate
+                        // KV entries and recurrent states from scratch (like fallback path).
+                        // Must use pre-batch linear_snap (not kernel snapshot at num_accepted),
+                        // because re-forward reprocesses accepted tokens from scratch.
+                        if (snapshot_restore_mode & 8) {
+                            // Restore linear states to PRE-BATCH state (overrides any bit-1 restore above)
+                            restore_linear_states(text_request, linear_snap);
+
+                            // Trim ALL K+1 entries from KV cache, then re-forward accepted tokens.
+                            {
+                                auto tt_trim0 = std::chrono::steady_clock::now();
+                                trim_kv_cache_states_gpu(text_request, kp1);
+                                auto tt_trim1 = std::chrono::steady_clock::now();
+                                time_trim_ms += elapsed_ms(tt_trim0, tt_trim1); count_trims++;
+                            }
+                            past_len = past_len_before;
+
+                            const size_t replay_n = static_cast<size_t>(num_accepted) + 1;
+                            {
+                                ov::Tensor replay_ids = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, replay_n});
+                                auto* rids = replay_ids.data<int64_t>();
+                                for (size_t b = 0; b < batch; ++b) {
+                                    rids[b * replay_n] = original_next_id;
+                                    for (int k = 0; k < num_accepted; ++k) {
+                                        rids[b * replay_n + static_cast<size_t>(k + 1)] = drafts[k];
+                                    }
+                                }
+
+                                ov::Tensor replay_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, replay_n});
+                                auto* rpos = replay_pos.data<int64_t>();
+                                for (size_t b = 0; b < batch; ++b) {
+                                    for (size_t j = 0; j < replay_n; ++j) {
+                                        const int64_t val = (past_len + static_cast<int64_t>(j)) + rope_deltas_data[b];
+                                        for (size_t plane = 0; plane < 3; ++plane) {
+                                            rpos[plane * batch * replay_n + b * replay_n + j] = val;
+                                        }
+                                    }
+                                }
+
+                                const size_t replay_mask_len = static_cast<size_t>(past_len) + replay_n;
+                                ov::Tensor replay_mask = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, replay_mask_len});
+                                {
+                                    auto* p = replay_mask.data<int64_t>();
+                                    for (size_t i = 0; i < batch * replay_mask_len; ++i) p[i] = 1;
+                                }
+
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, replay_ids);
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, replay_mask);
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, replay_pos);
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
+                                if (use_vl) {
+                                    ov::Tensor replay_vis = make_usm_host_tensor(gpu_ctx, ov::element::f32,
+                                        {batch, replay_n, static_cast<size_t>(cfg.text.hidden_size)});
+                                    std::memset(replay_vis.data(), 0, replay_vis.get_byte_size());
+                                    ov::Tensor replay_vis_mask = make_usm_host_tensor(gpu_ctx, ov::element::boolean, {batch, replay_n});
+                                    std::memset(replay_vis_mask.data(), 0, replay_vis_mask.get_byte_size());
+                                    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, replay_vis);
+                                    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, replay_vis_mask);
+                                }
+
+                                text_request.infer();
+                                past_len += static_cast<int64_t>(replay_n);
+                                mtp_main_infers++;
+
+                                main_hidden_states = text_request.get_tensor(
+                                    ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
+                            }
+                            count_reforwards++;
+
+                            // Re-forward refreshed KV + states — reset checkpoint.
+                            // Accepted drafts are already in re-forward KV, so only
+                            // add next_id (correction/bonus) to tracking below.
+                            if (needs_refresh_tracking) {
+                                save_linear_states(text_request, linear_snap);
+                                checkpoint_past_len = past_len;
+                                tokens_since_checkpoint.clear();
+                                did_reforward_this_cycle = true;
+                            }
+                        } else {
+                            // Physical KV trim: remove rejected entries (like vLLM's seq_lens
+                            // adjustment). Avoids RoPE position gaps from dead entries.
+                            // Uses GPU-side zero-copy trim (metadata reinterpret, no data copy).
+                            {
+                                auto tt_trim0 = std::chrono::steady_clock::now();
+                                trim_kv_cache_states_gpu(text_request, static_cast<size_t>(trim_count));
+                                auto tt_trim1 = std::chrono::steady_clock::now();
+                                time_trim_ms += elapsed_ms(tt_trim0, tt_trim1); count_trims++;
+                            }
+                            past_len = past_len_before + 1 + static_cast<int64_t>(num_accepted);
+                        }
+
+                        // VALIDATE_SNAPSHOT: compare kernel-snapshot states vs fallback re-forward states
+                        static const bool validate_snapshot = []() {
+                            auto* env = std::getenv("OV_GENAI_VALIDATE_SNAPSHOT");
+                            return env && std::string(env) == "1";
+                        }();
+                        if (validate_snapshot) {
+                            // 1. Save snapshot-restored states to CPU
+                            std::vector<std::pair<std::string, ov::Tensor>> snap_states;
+                            for (auto& state : text_request.query_state()) {
+                                const auto& sname = state.get_name();
+                                if (sname.find("linear_states.") == std::string::npos) continue;
+                                if (sname.find(".recurrent") == std::string::npos && sname.find(".conv") == std::string::npos) continue;
+                                ov::Tensor t = state.get_state();
+                                ov::Tensor copy(t.get_element_type(), t.get_shape());
+                                t.copy_to(copy);
+                                snap_states.emplace_back(sname, copy);
+                            }
+
+                            // 2. Undo: restore pre-batch linear states + full KV rollback + re-forward
+                            restore_linear_states(text_request, linear_snap);
+                            // Undo the physical KV trim: we need to trim all kp1 entries
+                            // But we already trimmed `trim_count`, so now trim the remaining `num_accepted+1`
+                            trim_kv_cache_states(text_request, static_cast<size_t>(num_accepted) + 1);
+                            auto refw_past_len = past_len_before;
+                            const size_t replay_n = static_cast<size_t>(num_accepted) + 1;
+                            {
+                                ov::Tensor replay_ids = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, replay_n});
+                                auto* rids = replay_ids.data<int64_t>();
+                                for (size_t b2 = 0; b2 < batch; ++b2) {
+                                    rids[b2 * replay_n] = original_next_id;
+                                    for (int k2 = 0; k2 < num_accepted; ++k2) {
+                                        rids[b2 * replay_n + static_cast<size_t>(k2 + 1)] = drafts[k2];
+                                    }
+                                }
+                                ov::Tensor replay_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, replay_n});
+                                auto* rpos = replay_pos.data<int64_t>();
+                                for (size_t b2 = 0; b2 < batch; ++b2) {
+                                    for (size_t j2 = 0; j2 < replay_n; ++j2) {
+                                        const int64_t val = (refw_past_len + static_cast<int64_t>(j2)) + rope_deltas_data[b2];
+                                        for (size_t plane = 0; plane < 3; ++plane) {
+                                            rpos[plane * batch * replay_n + b2 * replay_n + j2] = val;
+                                        }
+                                    }
+                                }
+                                const size_t replay_mask_len = static_cast<size_t>(refw_past_len) + replay_n;
+                                ov::Tensor replay_mask = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, replay_mask_len});
+                                {
+                                    auto* p = replay_mask.data<int64_t>();
+                                    for (size_t i2 = 0; i2 < batch * replay_mask_len; ++i2) p[i2] = 1;
+                                }
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, replay_ids);
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, replay_mask);
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, replay_pos);
+                                text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
+                                if (use_vl) {
+                                    ov::Tensor replay_vis = make_usm_host_tensor(gpu_ctx, ov::element::f32,
+                                        {batch, replay_n, static_cast<size_t>(cfg.text.hidden_size)});
+                                    std::memset(replay_vis.data(), 0, replay_vis.get_byte_size());
+                                    ov::Tensor replay_vis_mask = make_usm_host_tensor(gpu_ctx, ov::element::boolean, {batch, replay_n});
+                                    std::memset(replay_vis_mask.data(), 0, replay_vis_mask.get_byte_size());
+                                    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, replay_vis);
+                                    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, replay_vis_mask);
+                                }
+                                text_request.infer();
+                                past_len = refw_past_len + static_cast<int64_t>(replay_n);
+                                main_hidden_states = text_request.get_tensor(
+                                    ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
+                            }
+
+                            // 3. Compare re-forward states vs snapshot states
+                            size_t si = 0;
+                            for (auto& state : text_request.query_state()) {
+                                const auto& sname = state.get_name();
+                                if (sname.find("linear_states.") == std::string::npos) continue;
+                                if (sname.find(".recurrent") == std::string::npos && sname.find(".conv") == std::string::npos) continue;
+                                if (si >= snap_states.size()) break;
+                                const auto& [s_name, s_tensor] = snap_states[si];
+                                if (s_name != sname) { si++; continue; }
+                                ov::Tensor refw_tensor = state.get_state();
+                                // Compare f16 values
+                                const size_t n = s_tensor.get_size();
+                                const auto* sp = reinterpret_cast<const ov::float16*>(s_tensor.data());
+                                const auto* rp = reinterpret_cast<const ov::float16*>(refw_tensor.data());
+                                float max_d = 0; size_t mismatch = 0;
+                                for (size_t e = 0; e < n; ++e) {
+                                    float diff = std::abs(float(sp[e]) - float(rp[e]));
+                                    if (diff > max_d) max_d = diff;
+                                    if (sp[e] != rp[e]) mismatch++;
+                                }
+                                if (mismatch > 0) {
+                                    fprintf(stderr, "[VALIDATE] %s: max_diff=%.6e mismatches=%zu/%zu\n",
+                                        sname.c_str(), max_d, mismatch, n);
+                                }
+                                si++;
+                            }
+                        }
+
                         auto tt1 = std::chrono::steady_clock::now();
                         time_restore_ms += elapsed_ms(tt0, tt1); count_restores++;
-                    } else if (use_pure_batch) {
-                        // Virtual trim: mark rejected positions as dead (mask=0).
-                        // No physical KV trim — zero GPU round-trips.
-                        // Dead positions are masked with -inf in SDPA and ×0 in linear attention.
-                        auto tt0 = std::chrono::steady_clock::now();
-                        for (int t = 0; t < trim_count; ++t) {
-                            // Rejected positions are at the end: past_len - trim_count + t
-                            // But past_len was already advanced by kp1 in run_kp1_verify.
-                            // After accepting num_accepted tokens, positions
-                            // past_len_before + 1 + num_accepted .. past_len_before + K
-                            // are the rejected ones.
-                            const int64_t dead_pos = past_len_before + 1 + num_accepted + t;
-                            dead_positions.push_back(dead_pos);
-                        }
-                        // Don't reduce past_len — KV entries stay in cache but masked.
-                        auto tt1 = std::chrono::steady_clock::now();
-                        time_trim_ms += elapsed_ms(tt0, tt1); count_trims++;
                     } else {
                         // Snapshot mode: restore linear_states + full KV rollback + re-forward
                         {
@@ -2158,15 +2658,15 @@ int main(int argc, char* argv[]) try {
                     }
                 }
 
-                // Track emitted tokens for periodic state refresh (pure-batch)
-                if (use_pure_batch) {
-                    // Tokens emitted this cycle: accepted drafts + correction/bonus
-                    // tokens_since_checkpoint already contains next_id from the start.
-                    // Add accepted drafts:
-                    for (int k = 0; k < num_accepted; ++k) {
-                        tokens_since_checkpoint.push_back(drafts[k]);
+                // Track emitted tokens for periodic state refresh
+                if (needs_refresh_tracking) {
+                    // After mode-8 re-forward, checkpoint was reset and accepted drafts
+                    // are already in the refreshed KV — only add next_id (correction/bonus).
+                    if (!did_reforward_this_cycle) {
+                        for (int k = 0; k < num_accepted; ++k) {
+                            tokens_since_checkpoint.push_back(drafts[k]);
+                        }
                     }
-                    // Add correction/bonus (= next_id):
                     tokens_since_checkpoint.push_back(next_id);
                 }
             }
@@ -2176,12 +2676,12 @@ int main(int argc, char* argv[]) try {
 
             if (stopped) break;
 
-            // === STATE REFRESH for pure-batch: periodic linear_states correction ===
-            // Track tokens emitted since last checkpoint. When REFRESH_INTERVAL
-            // is reached, restore linear_states to checkpoint, trim KV back,
-            // re-forward all tokens since checkpoint as a batch. This corrects
-            // linear_states drift from rejected tokens accumulating.
-            if (use_pure_batch && REFRESH_INTERVAL > 0 &&
+            // === STATE REFRESH: periodic linear_states + KV correction ===
+            // Without kernel snapshots: corrects linear_states drift from rejected tokens.
+            // With mode 8: corrects KV cache drift from batch=K+1 numerical differences.
+            // Every N generated tokens, restore linear_states to last checkpoint,
+            // trim KV, re-forward all tokens since checkpoint as a batch.
+            if (needs_refresh_tracking && REFRESH_INTERVAL > 0 &&
                 !tokens_since_checkpoint.empty() &&
                 static_cast<int>(tokens_since_checkpoint.size()) >= REFRESH_INTERVAL) {
                 auto t_rf0 = std::chrono::steady_clock::now();
@@ -2192,7 +2692,10 @@ int main(int argc, char* argv[]) try {
                 // 2. Trim KV back to checkpoint position
                 const size_t trim_amount = static_cast<size_t>(past_len - checkpoint_past_len);
                 if (trim_amount > 0) {
-                    trim_kv_cache_states(text_request, trim_amount);
+                    if (has_kernel_snapshot)
+                        trim_kv_cache_states_gpu(text_request, trim_amount);
+                    else
+                        trim_kv_cache_states(text_request, trim_amount);
                     past_len = checkpoint_past_len;
                 }
                 // After physical trim, all dead entries are removed — clear tracker.
@@ -2400,7 +2903,7 @@ int main(int argc, char* argv[]) try {
             std::cout << "  Restore+re-fwd:     " << (time_restore_ms + time_reforward_ms) << " ms (" << count_restores << " restores, "
                       << count_reforwards << " re-forwards)"
                       << std::endl;
-            if (use_pure_batch && count_refreshes > 0) {
+            if (count_refreshes > 0) {
                 std::cout << "  State refresh:      " << time_refresh_ms << " ms (" << count_refreshes << " refreshes"
                           << ", avg " << std::to_string(time_refresh_ms / count_refreshes) << " ms)"
                           << std::endl;
