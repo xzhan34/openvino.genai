@@ -4,7 +4,8 @@
 param(
     [int]$NumRuns = 1,
     [int]$OutputTokens = 256,
-    [string]$Mode = "all"  # "text", "vl", or "all"
+    [string]$Mode = "all",  # "text", "vl", or "all"
+    [string]$ConfigFilter = "*"  # Wildcard filter on config Name, e.g. "*f16*" or "baseline*"
 )
 
 # --- Environment Setup ---
@@ -13,21 +14,25 @@ $OV_DIR    = "C:\work\openvino_ws\openvino.liangali"
 $env:OPENVINO_TOKENIZERS_PATH_GENAI = "$GENAI_DIR\build-master\openvino_genai\openvino_tokenizers.dll"
 $env:PATH = "$OV_DIR\bin\intel64\RelWithDebInfo;$OV_DIR\temp\Windows_AMD64\tbb\bin;$GENAI_DIR\build-master\openvino_genai;$env:PATH"
 $env:OV_GENAI_USE_MODELING_API = "1"
-$env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
-$env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
-$env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
+# Quant env vars are set per-config (int4 vs f16). Defaults cleared here.
+Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_MODE -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE -ErrorAction SilentlyContinue
 $env:OV_GENAI_MTP_SNAPSHOT = "1"
 $env:OV_GENAI_SNAPSHOT_RESTORE = "3"   # GPU-side state restore on draft rejection (critical for MTP perf)
 $env:OV_GENAI_VALIDATE_SNAPSHOT = "0"  # Disable snapshot validation overhead in benchmarks
-# GPU kernel batch-invariance: auto-configured by modeling_qwen3_5.exe for MTP:
-#   OV_GPU_USE_ONEDNN=0: Disable oneDNN FC kernels (batch-size-dependent INT4 GEMM
-#     even with f32 acc_mode). OCL FC kernels are batch-size-invariant.
+# GPU kernel batch-invariance for MTP speculative decoding:
+#   oneDNN batch-1 loop: For INT4 compressed weights with verify batch M>1,
+#     the GPU plugin now executes the M=1 oneDNN matmul primitive M times with
+#     per-row offsets, ensuring bit-identical computation to decode (M=1).
+#     Controlled by OV_GPU_ONEDNN_FC_BATCH1_MAX (default 8, 0=disable).
 #   OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=K+1: Force single-token SDPA kernel for
 #     verify batch to eliminate batch-dependent SDPA tiling divergence.
 # Clean up stale env vars that could interfere with auto-configuration
 Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
 Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
 Remove-Item Env:\OV_GPU_FC_SINGLE_BATCH_THRESHOLD -ErrorAction SilentlyContinue
+Remove-Item Env:\OV_GPU_ONEDNN_FC_BATCH1_MAX -ErrorAction SilentlyContinue
 # Enable per-step profiling breakdown (sub-step timing to stderr, summary to stdout)
 $env:OV_GENAI_STEP_PROFILE = "1"
 $env:DEVICE = "GPU"
@@ -42,9 +47,10 @@ $MODELS = @(
 )
 
 # --- Logging Setup ---
-$LOG_DIR = Join-Path $GENAI_DIR "OV_Logs"
-if (-not (Test-Path $LOG_DIR)) { New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null }
+$LOG_ROOT = Join-Path $GENAI_DIR "OV_Logs"
 $BENCH_TIMESTAMP = Get-Date -Format "yyyyMMdd_HHmmss"
+$LOG_DIR = Join-Path $LOG_ROOT $BENCH_TIMESTAMP
+New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
 
 # --- Helper: parse metrics from stdout ---
 function Parse-Metrics([string]$output) {
@@ -60,6 +66,10 @@ function Parse-Metrics([string]$output) {
         OutputSize = "N/A"
         MTPInfers  = "N/A"
         TokensPerInfer = "N/A"
+        AcceptedTokens = "N/A"
+        DraftTokens    = "N/A"
+        VerifyAvgMs    = "N/A"
+        DraftAvgMs     = "N/A"
     }
     foreach ($line in $output -split "`r?`n") {
         $line = $line.Trim()
@@ -82,8 +92,10 @@ function Parse-Metrics([string]$output) {
             $metrics.MTPHits = "$($Matches[1])/$($Matches[2])"
             $metrics.MTPRate = [double]$Matches[3]
         }
-        elseif ($line -match '^MTP draft acceptance:\s+\d+/\d+\s+\(([\d.]+)%\)') {
-            $metrics.MTPDraftAcceptRate = [double]$Matches[1]
+        elseif ($line -match '^MTP draft acceptance:\s+(\d+)/(\d+)\s+\(([\d.]+)%\)') {
+            $metrics.MTPDraftAcceptRate = [double]$Matches[3]
+            $metrics.AcceptedTokens = [int]$Matches[1]
+            $metrics.DraftTokens = [int]$Matches[2]
         }
         elseif ($line -match '^MTP mean accepted/step:\s+([\d.]+)') {
             $metrics.MTPMeanAccepted = [double]$Matches[1]
@@ -96,6 +108,12 @@ function Parse-Metrics([string]$output) {
         }
         elseif ($line -match 'Dead KV positions:\s+(\d+)') {
             $metrics["DeadKVPositions"] = [int]$Matches[1]
+        }
+        elseif ($line -match 'Main verify \(K\+1\):\s+[\d.]+\s+ms\s+\(\d+\s+calls\),\s+avg\s+([\d.]+)\s+ms') {
+            $metrics.VerifyAvgMs = [math]::Round([double]$Matches[1], 2)
+        }
+        elseif ($line -match 'MTP draft \(x\d+\):\s+[\d.]+\s+ms\s+\(\d+\s+calls\),\s+avg\s+([\d.]+)\s+ms') {
+            $metrics.DraftAvgMs = [math]::Round([double]$Matches[1], 2)
         }
     }
     return $metrics
@@ -230,7 +248,7 @@ function Run-SingleBenchmark([string]$label, [string[]]$exeArgs, [string]$logTag
     # Save log with timestamp
     $runTs = Get-Date -Format "yyyyMMdd_HHmmss"
     $safeTag = $logTag -replace '[\s/|]+', '_'
-    $logFile = Join-Path $LOG_DIR "${BENCH_TIMESTAMP}_${safeTag}_${runTs}.log"
+    $logFile = Join-Path $LOG_DIR "${safeTag}.log"
     $cmdLine = "$EXE $($exeArgs -join ' ')"
     $logContent = @"
 === Benchmark Run Log ===
@@ -308,9 +326,12 @@ function Get-Averages([System.Collections.ArrayList]$resultList) {
         DecodeTime = "N/A"; MTPRate = "N/A"; MTPHits = "N/A"
         MTPDraftAcceptRate = "N/A"; MTPMeanAccepted = "N/A"
         TokensPerInfer = "N/A"
+        AcceptedTokens = "N/A"; DraftTokens = "N/A"; OutputSize = "N/A"
+        MTPInfers = "N/A"
+        VerifyAvgMs = "N/A"; DraftAvgMs = "N/A"
         Count = $valid.Count
     }
-    foreach ($key in @("TTFT", "TPOT", "Throughput", "DecodeTime", "MTPRate", "MTPDraftAcceptRate", "MTPMeanAccepted", "TokensPerInfer")) {
+    foreach ($key in @("TTFT", "TPOT", "Throughput", "DecodeTime", "MTPRate", "MTPDraftAcceptRate", "MTPMeanAccepted", "TokensPerInfer", "VerifyAvgMs", "DraftAvgMs")) {
         $vals = [System.Collections.ArrayList]@()
         foreach ($item in $valid) {
             $v = $item[$key]
@@ -324,6 +345,19 @@ function Get-Averages([System.Collections.ArrayList]$resultList) {
     }
     $lastMtp = $valid[$valid.Count - 1].MTPHits
     if ($lastMtp -and $lastMtp -ne "N/A") { $avg.MTPHits = $lastMtp }
+
+    # Sum-based fields (not averaged): AcceptedTokens, DraftTokens, OutputSize, MTPInfers
+    foreach ($sumKey in @("AcceptedTokens", "DraftTokens", "OutputSize", "MTPInfers")) {
+        $vals = [System.Collections.ArrayList]@()
+        foreach ($item in $valid) {
+            $v = $item[$sumKey]
+            if ($v -ne "N/A" -and $v -is [int]) { [void]$vals.Add($v) }
+        }
+        if ($vals.Count -gt 0) {
+            $sum = 0; foreach ($v in $vals) { $sum += $v }
+            $avg[$sumKey] = [math]::Round($sum / $vals.Count, 0)
+        }
+    }
 
     # Aggregate quality check results
     $qOkCount = 0; $qFailCount = 0; $qReasons = [System.Collections.ArrayList]@()
@@ -339,15 +373,87 @@ function Get-Averages([System.Collections.ArrayList]$resultList) {
     return $avg
 }
 
+# --- Quant helper: set env vars for a given precision ---
+function Set-QuantEnv([string]$quant) {
+    if ($quant -eq "int4") {
+        $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
+        $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
+        $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
+        # Force oneDNN ON: batch-1 loop in GPU plugin ensures decode/verify
+        # numerical identity for INT4 compressed FC (no more auto-disable needed).
+        $env:OV_GPU_USE_ONEDNN = "1"
+        Remove-Item Env:\OV_GPU_ONEDNN_FC_BATCH1_MAX -ErrorAction SilentlyContinue
+    } elseif ($quant -eq "int4+ocl") {
+        # INT4 with oneDNN disabled (OCL bf_tiled path) for A/B comparison
+        $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
+        $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
+        $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
+        $env:OV_GPU_USE_ONEDNN = "0"
+        Remove-Item Env:\OV_GPU_ONEDNN_FC_BATCH1_MAX -ErrorAction SilentlyContinue
+    } elseif ($quant -eq "int8") {
+        $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int8_asym"
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE -ErrorAction SilentlyContinue
+        $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int8_asym"
+        # Restore default oneDNN (exe auto-disables for pure-batch MTP)
+        Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
+    } elseif ($quant -eq "f16+dnn") {
+        # f16 with oneDNN enabled: A/B test to measure oneDNN f16 FC perf impact
+        # WARNING: produces degenerate output on VL mode (oneDNN f16 FC bug)
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE -ErrorAction SilentlyContinue
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
+    } else {
+        # f16: disable in-flight quantization
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE -ErrorAction SilentlyContinue
+        Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE -ErrorAction SilentlyContinue
+        # Disable oneDNN FC for f16: oneDNN f16 FC kernels produce degenerate output
+        # for VL visual token distributions on Arc Pro 140T GPU.
+        $env:OV_GPU_USE_ONEDNN = "0"
+    }
+}
+
 # --- Configs ---
-# Sequential verify (--seq-verify 1) is recommended for Qwen3.5's hybrid architecture.
-# Batch+rollback mode is available but slower due to re-forward overhead on rejections.
+# Two verify modes: seq (--seq-verify 1, batch=1) vs batch (--pure-batch 1, batch=K+1)
+# Two precisions: int4 (INT4_ASYM g128) vs f16 (native f16, no quantization)
 $configs = @(
-    @{ Name = "No MTP (baseline)"; MTP = 0; MtpK = 0; SeqVerify = 0 }
-    @{ Name = "MTP K=1";           MTP = 1; MtpK = 1; SeqVerify = 1 }
-    @{ Name = "MTP K=2";           MTP = 1; MtpK = 2; SeqVerify = 1 }
-    @{ Name = "MTP K=3";           MTP = 1; MtpK = 3; SeqVerify = 1 }
+    # --- F16 (run first: no quantization, native precision) ---
+    @{ Name = "baseline f16";       MTP = 0; MtpK = 0; Verify = "none";  Quant = "f16" }
+    @{ Name = "baseline f16+dnn";   MTP = 0; MtpK = 0; Verify = "none";  Quant = "f16+dnn" }
+    @{ Name = "K=1 seq f16";        MTP = 1; MtpK = 1; Verify = "seq";   Quant = "f16" }
+    @{ Name = "K=1 batch f16";      MTP = 1; MtpK = 1; Verify = "batch"; Quant = "f16" }
+    @{ Name = "K=2 seq f16";        MTP = 1; MtpK = 2; Verify = "seq";   Quant = "f16" }
+    @{ Name = "K=2 batch f16";      MTP = 1; MtpK = 2; Verify = "batch"; Quant = "f16" }
+    @{ Name = "K=3 seq f16";        MTP = 1; MtpK = 3; Verify = "seq";   Quant = "f16" }
+    @{ Name = "K=3 batch f16";      MTP = 1; MtpK = 3; Verify = "batch"; Quant = "f16" }
+    # --- INT8 ---
+    @{ Name = "baseline int8";      MTP = 0; MtpK = 0; Verify = "none";  Quant = "int8" }
+    @{ Name = "K=1 seq int8";       MTP = 1; MtpK = 1; Verify = "seq";   Quant = "int8" }
+    @{ Name = "K=1 batch int8";     MTP = 1; MtpK = 1; Verify = "batch"; Quant = "int8" }
+    @{ Name = "K=2 seq int8";       MTP = 1; MtpK = 2; Verify = "seq";   Quant = "int8" }
+    @{ Name = "K=2 batch int8";     MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int8" }
+    @{ Name = "K=3 seq int8";       MTP = 1; MtpK = 3; Verify = "seq";   Quant = "int8" }
+    @{ Name = "K=3 batch int8";     MTP = 1; MtpK = 3; Verify = "batch"; Quant = "int8" }
+    # --- INT4 (oneDNN + batch-1 loop) ---
+    @{ Name = "baseline int4";      MTP = 0; MtpK = 0; Verify = "none";  Quant = "int4" }
+    @{ Name = "K=1 seq int4";       MTP = 1; MtpK = 1; Verify = "seq";   Quant = "int4" }
+    @{ Name = "K=1 batch int4";     MTP = 1; MtpK = 1; Verify = "batch"; Quant = "int4" }
+    @{ Name = "K=2 seq int4";       MTP = 1; MtpK = 2; Verify = "seq";   Quant = "int4" }
+    @{ Name = "K=2 batch int4";     MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int4" }
+    @{ Name = "K=3 seq int4";       MTP = 1; MtpK = 3; Verify = "seq";   Quant = "int4" }
+    @{ Name = "K=3 batch int4";     MTP = 1; MtpK = 3; Verify = "batch"; Quant = "int4" }
+    # --- INT4+OCL (oneDNN disabled, OCL bf_tiled FC only) for A/B comparison ---
+    @{ Name = "baseline int4+ocl";  MTP = 0; MtpK = 0; Verify = "none";  Quant = "int4+ocl" }
+    @{ Name = "K=1 batch int4+ocl"; MTP = 1; MtpK = 1; Verify = "batch"; Quant = "int4+ocl" }
+    @{ Name = "K=2 batch int4+ocl"; MTP = 1; MtpK = 2; Verify = "batch"; Quant = "int4+ocl" }
 )
+
+# Apply config filter
+if ($ConfigFilter -ne "*") {
+    $configs = @($configs | Where-Object { $_.Name -like $ConfigFilter })
+    Write-Host "Config filter '$ConfigFilter' -> $($configs.Count) config(s): $($configs.Name -join ', ')" -ForegroundColor Cyan
+}
 
 $modeList = [System.Collections.ArrayList]@()
 if ($Mode -eq "all" -or $Mode -eq "text") { [void]$modeList.Add("text") }
@@ -373,6 +479,9 @@ foreach ($mdl in $MODELS) {
             $key = "$modelName|$m|$($cfg.Name)"
             $runResults = [System.Collections.ArrayList]::new()
 
+            # Set quant env vars for this config
+            Set-QuantEnv $cfg.Quant
+
             # Build argument list
             $argList = [System.Collections.ArrayList]@(
                 "--model", $MODEL_DIR,
@@ -389,15 +498,17 @@ foreach ($mdl in $MODELS) {
             }
             if ($cfg.MTP -gt 0) {
                 [void]$argList.AddRange(@("--mtp", "1", "--mtp-k", "$($cfg.MtpK)"))
-                if ($cfg.SeqVerify -gt 0) {
-                    # pure-batch is the production requirement for MTP
+                if ($cfg.Verify -eq "batch") {
                     [void]$argList.AddRange(@("--pure-batch", "1"))
+                    # OV_GPU_USE_ONEDNN=0 and OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=K+1
+                    # are auto-set by the exe for MTP pure-batch mode.
+                } elseif ($cfg.Verify -eq "seq") {
+                    [void]$argList.AddRange(@("--seq-verify", "1"))
                 }
-                # OV_GPU_USE_ONEDNN=0 and OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=K+1
-                # are auto-set by the exe for MTP pure-batch mode.
             } else {
                 Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
-                Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
+                # OV_GPU_USE_ONEDNN is managed by Set-QuantEnv (disabled for f16 to avoid
+                # oneDNN f16 FC degeneration on VL visual token distributions)
             }
 
             Write-Host "`n--- $($cfg.Name) ($modelName / $m mode) ---" -ForegroundColor White
@@ -416,9 +527,11 @@ foreach ($mdl in $MODELS) {
 Write-Host "`n`n" -NoNewline
 Write-Host "=================================================================" -ForegroundColor Yellow
 Write-Host " PERFORMANCE COMPARISON SUMMARY" -ForegroundColor Yellow
-Write-Host " Quant: INT4_ASYM g128 | Device: $($env:DEVICE) | Sampling: greedy (T=0)" -ForegroundColor Yellow
+Write-Host " Precisions: INT4_ASYM g128 + INT8_ASYM + F16 | Device: $($env:DEVICE) | Sampling: greedy (T=0)" -ForegroundColor Yellow
 Write-Host " Output tokens: $OutputTokens | Runs per config: $NumRuns" -ForegroundColor Yellow
 Write-Host " Logs: $LOG_DIR" -ForegroundColor Yellow
+Write-Host " Note: OutTok = MainInfers + AcceptTok  |  DraftTok = (MainInfers - 1) * K  |  Acc/Dft% = AcceptTok / DraftTok  |  Acc/Out% = AcceptTok / OutTok" -ForegroundColor Yellow
+Write-Host "       Verify(ms) = avg main model K+1 batch verify infer  |  Draft(ms) = avg single MTP head infer (called K times/step)" -ForegroundColor Yellow
 Write-Host "=================================================================" -ForegroundColor Yellow
 
 foreach ($mdl in $MODELS) {
@@ -427,30 +540,51 @@ foreach ($mdl in $MODELS) {
     foreach ($m in $modeList) {
         Write-Host "`n--- $modelName / $($m.ToUpper()) ---" -ForegroundColor Cyan
 
-        $header = "{0,-22} {1,10} {2,14} {3,16} {4,14} {5,12} {6,12} {7,10} {8,12}" -f "Config", "TTFT(ms)", "TPOT(ms/tok)", "Throughput(t/s)", "Decode(ms)", "Accept%", "Tok/Infer", "Avg Acc", "Quality"
-        $sep = "-" * 132
+        $header = "{0,-26} {1,10} {2,14} {3,16} {4,14} {5,12} {6,12} {7,12} {8,10} {9,10} {10,10} {11,8} {12,10} {13,13} {14,13} {15,10}" -f "Config", "TTFT(ms)", "TPOT(ms/tok)", "Throughput(t/s)", "Decode(ms)", "Acc/Dft%", "Acc/Out%", "Tok/Infer", "Avg Acc", "AcceptTok", "DraftTok", "OutTok", "MainInfers", "Verify(ms)", "Draft(ms)", "Quality"
+        $sep = "-" * 225
         Write-Host $sep
         Write-Host $header
         Write-Host $sep
 
-        $baselineAvg = $null
+        $baselineInt4 = $null
+        $baselineInt4Ocl = $null
+        $baselineInt8 = $null
+        $baselineF16 = $null
         foreach ($cfg in $configs) {
             $key = "$modelName|$m|$($cfg.Name)"
             $avg = Get-Averages $allResults[$key]
 
             if ($null -eq $avg) {
-                $row = "{0,-22} {1,10} {2,14} {3,16} {4,14} {5,12} {6,12} {7,10} {8,12}" -f $cfg.Name, "FAILED", "FAILED", "FAILED", "FAILED", "N/A", "N/A", "N/A", "N/A"
+                $row = "{0,-26} {1,10} {2,14} {3,16} {4,14} {5,12} {6,12} {7,12} {8,10} {9,10} {10,10} {11,8} {12,10} {13,13} {14,13} {15,10}" -f $cfg.Name, "FAILED", "FAILED", "FAILED", "FAILED", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"
                 Write-Host $row -ForegroundColor Red
                 continue
             }
 
-            if ($cfg.MTP -eq 0) { $baselineAvg = $avg }
+            if ($cfg.MTP -eq 0 -and $cfg.Quant -eq "int4") { $baselineInt4 = $avg }
+            if ($cfg.MTP -eq 0 -and $cfg.Quant -eq "int4+ocl") { $baselineInt4Ocl = $avg }
+            if ($cfg.MTP -eq 0 -and $cfg.Quant -eq "int8") { $baselineInt8 = $avg }
+            if ($cfg.MTP -eq 0 -and $cfg.Quant -eq "f16")  { $baselineF16 = $avg }
 
-            $accStr = if ($avg.MTPDraftAcceptRate -ne "N/A") { "$($avg.MTPDraftAcceptRate)%" } else { "N/A" }
+            # Acc/Dft% = AcceptedTokens / DraftTokens * 100 (draft acceptance rate)
+            #   由 exe 输出的 "MTP draft acceptance: AcceptedTokens/DraftTokens (X%)" 直接解析得到。
+            #   AcceptedTokens: 被主模型验证通过的 draft token 数量
+            #   DraftTokens: K 个 MTP draft 头总共生成的候选 token 数量 = (MainInfers - 1) * K
+            # Acc/Out% = AcceptedTokens / OutputSize * 100 (output中来自draft的比例)
+            #   OutputSize = MainInfers + AcceptedTokens，所以 Acc/Out% 体现 speculative decoding 的整体收益。
+            $accDftStr = if ($avg.MTPDraftAcceptRate -ne "N/A") { "$($avg.MTPDraftAcceptRate)%" } else { "N/A" }
+            $accOutStr = if ($avg.AcceptedTokens -ne "N/A" -and $avg.OutputSize -ne "N/A" -and $avg.OutputSize -gt 0) {
+                "$([math]::Round($avg.AcceptedTokens / $avg.OutputSize * 100, 1))%"
+            } else { "N/A" }
             $tpiStr = if ($avg.TokensPerInfer -ne "N/A") { "$($avg.TokensPerInfer)" } else { "N/A" }
             $maStr = if ($avg.MTPMeanAccepted -ne "N/A") { "$($avg.MTPMeanAccepted)" } else { "N/A" }
+            $aTokStr = if ($avg.AcceptedTokens -ne "N/A") { "$($avg.AcceptedTokens)" } else { "N/A" }
+            $dTokStr = if ($avg.DraftTokens -ne "N/A") { "$($avg.DraftTokens)" } else { "N/A" }
+            $oTokStr = if ($avg.OutputSize -ne "N/A") { "$($avg.OutputSize)" } else { "N/A" }
+            $miStr = if ($avg.MTPInfers -ne "N/A") { "$($avg.MTPInfers)" } else { "N/A" }
+            $vAvgStr = if ($avg.VerifyAvgMs -ne "N/A") { "$($avg.VerifyAvgMs)" } else { "N/A" }
+            $dAvgStr = if ($avg.DraftAvgMs -ne "N/A") { "$($avg.DraftAvgMs)" } else { "N/A" }
             $qStr = $avg.QualityStatus
-            $row = "{0,-22} {1,10} {2,14} {3,16} {4,14} {5,12} {6,12} {7,10} {8,12}" -f $cfg.Name, $avg.TTFT, $avg.TPOT, $avg.Throughput, $avg.DecodeTime, $accStr, $tpiStr, $maStr, $qStr
+            $row = "{0,-26} {1,10} {2,14} {3,16} {4,14} {5,12} {6,12} {7,12} {8,10} {9,10} {10,10} {11,8} {12,10} {13,13} {14,13} {15,10}" -f $cfg.Name, $avg.TTFT, $avg.TPOT, $avg.Throughput, $avg.DecodeTime, $accDftStr, $accOutStr, $tpiStr, $maStr, $aTokStr, $dTokStr, $oTokStr, $miStr, $vAvgStr, $dAvgStr, $qStr
             if ($avg.QualityFail -gt 0) {
                 Write-Host $row -ForegroundColor Red
             } else {
@@ -459,22 +593,27 @@ foreach ($mdl in $MODELS) {
         }
         Write-Host $sep
 
-        # Speedup/overhead summary
-        if ($null -ne $baselineAvg) {
-            foreach ($cfg in $configs) {
-                if ($cfg.MTP -eq 0) { continue }
-                $key = "$modelName|$m|$($cfg.Name)"
-                $avg = Get-Averages $allResults[$key]
-                if ($null -eq $avg -or $avg.TPOT -eq "N/A" -or $baselineAvg.TPOT -eq "N/A") { continue }
-                if ($baselineAvg.TPOT -gt 0 -and $avg.TPOT -gt 0) {
-                    $tpotPct = [math]::Round(($avg.TPOT - $baselineAvg.TPOT) / $baselineAvg.TPOT * 100, 1)
-                    $tpPct = "N/A"
-                    if ($avg.Throughput -ne "N/A" -and $baselineAvg.Throughput -ne "N/A" -and $baselineAvg.Throughput -gt 0) {
-                        $tpPct = [math]::Round(($avg.Throughput - $baselineAvg.Throughput) / $baselineAvg.Throughput * 100, 1)
-                    }
-                    $sign = if ($tpotPct -ge 0) { "+" } else { "" }
-                    Write-Host ("  {0} vs baseline: TPOT {1}{2}%, Throughput {3}%" -f $cfg.Name, $sign, $tpotPct, $(if($tpPct -ne "N/A"){if($tpPct -ge 0){"+$tpPct"}else{"$tpPct"}}else{"N/A"})) -ForegroundColor Magenta
+        # Speedup/overhead summary (each MTP config vs its same-quant baseline)
+        foreach ($cfg in $configs) {
+            if ($cfg.MTP -eq 0) { continue }
+            $baselineAvg = switch ($cfg.Quant) {
+                "int4" { $baselineInt4 }
+                "int4+ocl" { $baselineInt4Ocl }
+                "int8" { $baselineInt8 }
+                default { $baselineF16 }
+            }
+            if ($null -eq $baselineAvg) { continue }
+            $key = "$modelName|$m|$($cfg.Name)"
+            $avg = Get-Averages $allResults[$key]
+            if ($null -eq $avg -or $avg.TPOT -eq "N/A" -or $baselineAvg.TPOT -eq "N/A") { continue }
+            if ($baselineAvg.TPOT -gt 0 -and $avg.TPOT -gt 0) {
+                $tpotPct = [math]::Round(($avg.TPOT - $baselineAvg.TPOT) / $baselineAvg.TPOT * 100, 1)
+                $tpPct = "N/A"
+                if ($avg.Throughput -ne "N/A" -and $baselineAvg.Throughput -ne "N/A" -and $baselineAvg.Throughput -gt 0) {
+                    $tpPct = [math]::Round(($avg.Throughput - $baselineAvg.Throughput) / $baselineAvg.Throughput * 100, 1)
                 }
+                $sign = if ($tpotPct -ge 0) { "+" } else { "" }
+                Write-Host ("  {0} vs baseline: TPOT {1}{2}%, Throughput {3}%" -f $cfg.Name, $sign, $tpotPct, $(if($tpPct -ne "N/A"){if($tpPct -ge 0){"+$tpPct"}else{"$tpPct"}}else{"N/A"})) -ForegroundColor Magenta
             }
         }
     }
