@@ -203,6 +203,62 @@ std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_vlm
     return specs;
 }
 
+std::vector<ov::genai::modeling::weights::SyntheticWeightSpec> build_qwen3_5_mtp_weight_specs(const Qwen3_5TextConfig& cfg_in) {
+    auto cfg = cfg_in;
+    cfg.finalize();
+    cfg.validate();
+
+    const int32_t num_mtp_layers = cfg.mtp_num_hidden_layers;
+    if (num_mtp_layers <= 0) {
+        return {};
+    }
+
+    const size_t hidden = to_sz(cfg.hidden_size, "hidden_size");
+    const size_t vocab = to_sz(cfg.vocab_size, "vocab_size");
+    const size_t num_heads = to_sz(cfg.num_attention_heads, "num_attention_heads");
+    const size_t num_kv_heads = to_sz(cfg.kv_heads(), "num_key_value_heads");
+    const size_t head_dim = to_sz(cfg.resolved_head_dim(), "head_dim");
+    const size_t q_proj_out = num_heads * head_dim * 2;
+    const size_t kv_proj_out = num_kv_heads * head_dim;
+    const size_t intermediate = to_sz(cfg.intermediate_size > 0 ? cfg.intermediate_size : cfg.hidden_size * 3,
+                                      "intermediate_size");
+
+    std::vector<Spec> specs;
+    specs.reserve(8 + static_cast<size_t>(num_mtp_layers) * 12);
+
+    // MTP predictor weights (under "mtp." prefix)
+    add(specs, "mtp.embed_tokens.weight", {vocab, hidden});
+    add(specs, "mtp.pre_fc_norm_embedding.weight", {hidden});
+    add(specs, "mtp.pre_fc_norm_hidden.weight", {hidden});
+    add(specs, "mtp.fc.weight", {hidden, hidden * 2});  // projects 2*H -> H
+    add(specs, "mtp.norm.weight", {hidden});
+
+    // MTP decoder layers (full_attention only, dense MLP)
+    for (int32_t i = 0; i < num_mtp_layers; ++i) {
+        const std::string layer_prefix = "mtp.layers[" + std::to_string(i) + "].";
+        add(specs, layer_prefix + "input_layernorm.weight", {hidden});
+        add(specs, layer_prefix + "post_attention_layernorm.weight", {hidden});
+
+        const std::string attn = layer_prefix + "self_attn.";
+        add(specs, attn + "q_proj.weight", {q_proj_out, hidden});
+        add(specs, attn + "k_proj.weight", {kv_proj_out, hidden});
+        add(specs, attn + "v_proj.weight", {kv_proj_out, hidden});
+        add(specs, attn + "o_proj.weight", {hidden, num_heads * head_dim});
+        add(specs, attn + "q_norm.weight", {head_dim});
+        add(specs, attn + "k_norm.weight", {head_dim});
+
+        const std::string mlp = layer_prefix + "mlp.";
+        add(specs, mlp + "gate_proj.weight", {intermediate, hidden});
+        add(specs, mlp + "up_proj.weight", {intermediate, hidden});
+        add(specs, mlp + "down_proj.weight", {hidden, intermediate});
+    }
+
+    // lm_head (shared with main model)
+    add(specs, "lm_head.weight", {vocab, hidden});
+
+    return specs;
+}
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

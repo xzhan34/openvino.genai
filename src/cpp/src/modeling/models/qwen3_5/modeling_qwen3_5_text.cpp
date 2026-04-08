@@ -938,12 +938,55 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
     return lm_head_.forward(hidden);
 }
 
+std::pair<Tensor, Tensor> Qwen3_5ForCausalLM::forward_with_hidden(
+                   const Tensor& input_ids,
+                   const Tensor& position_ids,
+                   const Tensor& beam_idx,
+                   const Tensor& full_attention_mask,
+                   const Tensor* linear_attention_mask,
+                   const Tensor* cache_position,
+                   const Tensor* visual_embeds,
+                   const Tensor* visual_pos_mask) {
+    auto hidden = model_.forward(input_ids,
+                                 position_ids,
+                                 beam_idx,
+                                 full_attention_mask,
+                                 linear_attention_mask,
+                                 cache_position,
+                                 visual_embeds,
+                                 visual_pos_mask);
+    auto logits = lm_head_.forward(hidden);
+    return {logits, hidden};
+}
+
+std::pair<Tensor, Tensor> Qwen3_5ForCausalLM::forward_embeds_with_hidden(
+                          const Tensor& inputs_embeds,
+                          const Tensor& position_ids,
+                          const Tensor& beam_idx,
+                          const Tensor& full_attention_mask,
+                          const Tensor* linear_attention_mask,
+                          const Tensor* cache_position,
+                          const Tensor* visual_embeds,
+                          const Tensor* visual_pos_mask) {
+    auto hidden = model_.forward_embeds(inputs_embeds,
+                                        position_ids,
+                                        beam_idx,
+                                        full_attention_mask,
+                                        linear_attention_mask,
+                                        cache_position,
+                                        visual_embeds,
+                                        visual_pos_mask);
+    auto logits = lm_head_.forward(hidden);
+    return {logits, hidden};
+}
+
 std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     const Qwen3_5Config& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool use_inputs_embeds,
-    bool enable_visual_inputs) {
+    bool enable_visual_inputs,
+    bool output_hidden_states) {
     Qwen3_5TextModelConfig text_cfg;
     text_cfg.architecture = "qwen3_5";
     text_cfg.hidden_size = cfg.text.hidden_size;
@@ -1027,22 +1070,299 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     }
 
     Tensor logits;
-    if (use_inputs_embeds) {
-        logits = model.forward_embeds(inputs_embeds,
-                                      position_ids,
-                                      beam_idx,
-                                      attention_mask,
-                                      &attention_mask,
-                                      nullptr,
-                                      visual_embeds_ptr,
-                                      visual_pos_mask_ptr);
+    Tensor hidden_states;
+    if (output_hidden_states) {
+        if (use_inputs_embeds) {
+            auto result_pair = model.forward_embeds_with_hidden(inputs_embeds,
+                                          position_ids,
+                                          beam_idx,
+                                          attention_mask,
+                                          &attention_mask,
+                                          nullptr,
+                                          visual_embeds_ptr,
+                                          visual_pos_mask_ptr);
+            logits = result_pair.first;
+            hidden_states = result_pair.second;
+        } else {
+            auto result_pair = model.forward_with_hidden(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
+            logits = result_pair.first;
+            hidden_states = result_pair.second;
+        }
     } else {
-        logits = model.forward(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
+        if (use_inputs_embeds) {
+            logits = model.forward_embeds(inputs_embeds,
+                                          position_ids,
+                                          beam_idx,
+                                          attention_mask,
+                                          &attention_mask,
+                                          nullptr,
+                                          visual_embeds_ptr,
+                                          visual_pos_mask_ptr);
+        } else {
+            logits = model.forward(input_ids, position_ids, beam_idx, attention_mask, &attention_mask, nullptr, visual_embeds_ptr, visual_pos_mask_ptr);
+        }
     }
 
-    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
-    set_name(result, Qwen3_5TextIO::kLogits);
-    auto ov_model = ctx.build_model({result->output(0)});
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, Qwen3_5TextIO::kLogits);
+    std::vector<ov::Output<ov::Node>> outputs = {logits_result->output(0)};
+
+    if (output_hidden_states) {
+        auto hidden_result = std::make_shared<ov::op::v0::Result>(hidden_states.output());
+        set_name(hidden_result, Qwen3_5TextIO::kHiddenStates);
+        outputs.push_back(hidden_result->output(0));
+    }
+
+    auto ov_model = ctx.build_model(outputs);
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
+}
+
+// ---------------------------------------------------------------------------
+// MTP (Multi-Token Prediction) model
+// ---------------------------------------------------------------------------
+// Architecture (from HuggingFace Qwen3.5 MTP):
+//   Input:  input_ids [B, S],  hidden_states [B, S, H]
+//   embed_tokens(input_ids)         -> [B, S, H]
+//   pre_fc_norm_embedding(embed)    -> [B, S, H]
+//   pre_fc_norm_hidden(hidden)      -> [B, S, H]
+//   concat([norm_embed, norm_hidden], dim=-1) -> [B, S, 2*H]
+//   fc(concat)                      -> [B, S, H]
+//   decoder_layer(fc, ...)          -> [B, S, H]   (full_attention only)
+//   norm(out)                       -> [B, S, H]
+//   lm_head(norm)                   -> [B, S, V]
+
+namespace {
+
+/// Helper: build mrope cos/sin for MTP (duplicates Qwen3_5Model::build_mrope_cos_sin logic).
+std::pair<Tensor, Tensor> build_mtp_mrope_cos_sin(
+    const Tensor& position_ids,
+    int32_t rotary_dim,
+    float rope_theta,
+    bool mrope_interleaved,
+    const std::vector<int32_t>& mrope_section) {
+
+    auto* ctx = position_ids.context();
+    const int32_t half_dim = rotary_dim / 2;
+    std::vector<float> inv_freq(static_cast<size_t>(half_dim));
+    for (int32_t i = 0; i < half_dim; ++i) {
+        float exponent = static_cast<float>(2 * i) / static_cast<float>(rotary_dim);
+        inv_freq[static_cast<size_t>(i)] = 1.0f / std::pow(rope_theta, exponent);
+    }
+
+    auto inv_freq_const = ops::const_vec(ctx, inv_freq);
+    Tensor inv_freq_tensor(inv_freq_const, ctx);
+    auto inv_freq_reshaped = inv_freq_tensor.reshape({1, 1, static_cast<int64_t>(half_dim)}, false);
+
+    const auto pos_rank = position_ids.output().get_partial_shape().rank();
+    if (pos_rank.is_static() && pos_rank.get_length() == 2) {
+        auto pos_f = position_ids.to(ov::element::f32);
+        auto freqs = pos_f.unsqueeze(2) * inv_freq_reshaped;
+        return {freqs.cos(), freqs.sin()};
+    }
+
+    auto pos_t = ops::slice(position_ids, 0, 1, 1, 0).squeeze(0).to(ov::element::f32);
+    auto pos_h = ops::slice(position_ids, 1, 2, 1, 0).squeeze(0).to(ov::element::f32);
+    auto pos_w = ops::slice(position_ids, 2, 3, 1, 0).squeeze(0).to(ov::element::f32);
+
+    auto freqs_t = pos_t.unsqueeze(2) * inv_freq_reshaped;
+    if (!mrope_interleaved) {
+        return {freqs_t.cos(), freqs_t.sin()};
+    }
+
+    auto freqs_h = pos_h.unsqueeze(2) * inv_freq_reshaped;
+    auto freqs_w = pos_w.unsqueeze(2) * inv_freq_reshaped;
+    auto freqs_all = ops::tensor::stack({freqs_t, freqs_h, freqs_w}, 0);
+    auto freqs = ops::rope::mrope_interleaved(freqs_all, mrope_section);
+    return {freqs.cos(), freqs.sin()};
+}
+
+}  // anonymous namespace
+
+std::shared_ptr<ov::Model> create_qwen3_5_mtp_model(
+    const Qwen3_5Config& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+
+    const int32_t num_mtp_layers = cfg.text.mtp_num_hidden_layers;
+    OPENVINO_ASSERT(num_mtp_layers > 0, "mtp_num_hidden_layers must be > 0 for MTP model");
+
+    // Build text model config for MTP layers (full_attention only)
+    Qwen3_5TextModelConfig text_cfg;
+    text_cfg.architecture = "qwen3_5";
+    text_cfg.hidden_size = cfg.text.hidden_size;
+    text_cfg.num_attention_heads = cfg.text.num_attention_heads;
+    text_cfg.num_key_value_heads = cfg.text.num_key_value_heads > 0 ? cfg.text.num_key_value_heads : cfg.text.num_attention_heads;
+    text_cfg.head_dim = cfg.text.resolved_head_dim();
+    text_cfg.intermediate_size = cfg.text.intermediate_size;
+    text_cfg.num_hidden_layers = num_mtp_layers;
+    text_cfg.vocab_size = cfg.text.vocab_size;
+    text_cfg.max_position_embeddings = cfg.text.max_position_embeddings;
+    text_cfg.rms_norm_eps = cfg.text.rms_norm_eps;
+    text_cfg.rope_theta = cfg.text.rope_theta;
+    text_cfg.partial_rotary_factor = cfg.text.partial_rotary_factor;
+    text_cfg.hidden_act = cfg.text.hidden_act;
+    text_cfg.attention_bias = cfg.text.attention_bias;
+    text_cfg.tie_word_embeddings = cfg.text.tie_word_embeddings;
+    text_cfg.full_attention_interval = 1;  // all full_attention for MTP
+    text_cfg.mrope_interleaved = cfg.text.rope.mrope_interleaved;
+    text_cfg.mrope_section = cfg.text.rope.mrope_section;
+
+    // MTP layers are all full_attention
+    text_cfg.layer_types.clear();
+    for (int32_t i = 0; i < num_mtp_layers; ++i) {
+        text_cfg.layer_types.push_back("full_attention");
+    }
+    // Dense MLP (not MoE) - MTP uses dense intermediate_size from the main config
+    text_cfg.moe_intermediate_size = 0;
+    text_cfg.shared_expert_intermediate_size = 0;
+    text_cfg.num_experts = 0;
+    text_cfg.num_experts_per_tok = 0;
+
+    // For MoE models, MTP layers use the main model's intermediate_size
+    // (the non-MoE dense intermediate_size)
+    if (cfg.text.is_moe_enabled() && text_cfg.intermediate_size <= 0) {
+        text_cfg.intermediate_size = cfg.text.hidden_size * 3;  // fallback default
+    }
+
+    BuilderContext ctx;
+
+    // --- Build MTP module hierarchy under "mtp" prefix ---
+    // Root module (empty name)
+    Module root("", ctx, nullptr);
+
+    // MTP predictor sub-tree: mtp.*
+    Module mtp_module("mtp", ctx, &root);
+
+    // mtp.embed_tokens
+    VocabEmbedding mtp_embed_tokens(ctx, "embed_tokens", &mtp_module);
+
+    // mtp.pre_fc_norm_embedding, mtp.pre_fc_norm_hidden
+    Qwen3_5RMSNorm pre_fc_norm_embedding(ctx, "pre_fc_norm_embedding", text_cfg.rms_norm_eps, &mtp_module);
+    Qwen3_5RMSNorm pre_fc_norm_hidden(ctx, "pre_fc_norm_hidden", text_cfg.rms_norm_eps, &mtp_module);
+
+    // mtp.fc.weight (linear: hidden_size*2 -> hidden_size)
+    auto& fc_param = mtp_module.register_parameter("fc.weight");
+
+    // mtp.layers[0..N]
+    std::vector<Qwen3_5DecoderLayer> mtp_layers;
+    mtp_layers.reserve(static_cast<size_t>(num_mtp_layers));
+    for (int32_t i = 0; i < num_mtp_layers; ++i) {
+        mtp_layers.emplace_back(ctx, "layers[" + std::to_string(i) + "]", text_cfg, i, &mtp_module);
+    }
+
+    // mtp.norm
+    Qwen3_5RMSNorm mtp_norm(ctx, "norm", text_cfg.rms_norm_eps, &mtp_module);
+
+    // lm_head (at root level, shared with main model)
+    LMHead mtp_lm_head(ctx, "lm_head", &root);
+
+    // Tie embed_tokens and lm_head if configured
+    if (cfg.text.tie_word_embeddings) {
+        mtp_lm_head.tie_to(mtp_embed_tokens.weight_param());
+    }
+
+    // --- Weight mapping rules ---
+    // HF format: mtp.layers.0.* -> C++ module: mtp.layers[0].*
+    for (int32_t i = 0; i < num_mtp_layers; ++i) {
+        const std::string idx = std::to_string(i);
+        root.packed_mapping().rules.push_back(
+            {"mtp.layers." + idx + ".", "mtp.layers[" + idx + "].", 0});
+    }
+
+    // MTP's embed_tokens and lm_head are shared with the main model.
+    // HF checkpoints store them as model.language_model.embed_tokens.weight
+    // (or model.embed_tokens.weight or language_model.model.embed_tokens.weight),
+    // NOT as mtp.embed_tokens.weight.  Add fallback mapping rules.
+    root.packed_mapping().rules.push_back(
+        {"model.language_model.embed_tokens.", "mtp.embed_tokens.", 0});
+    root.packed_mapping().rules.push_back(
+        {"language_model.model.embed_tokens.", "mtp.embed_tokens.", 0});
+    root.packed_mapping().rules.push_back(
+        {"model.embed_tokens.", "mtp.embed_tokens.", 0});
+    // lm_head: try common HF naming variants
+    root.packed_mapping().rules.push_back(
+        {"model.language_model.lm_head.", "lm_head.", 0});
+    root.packed_mapping().rules.push_back(
+        {"language_model.lm_head.", "lm_head.", 0});
+
+    // --- Load weights ---
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_missing = false;
+    options.allow_unmatched = true;
+    options.report_missing = true;
+    options.report_unmatched = false;
+    (void)ov::genai::modeling::weights::load_model(root, source, finalizer, options);
+
+    // --- Build forward graph ---
+    const auto float_type = ov::element::f32;
+    auto input_ids = ctx.parameter(Qwen3_5MtpIO::kInputIds, ov::element::i64, ov::PartialShape{-1, -1});
+    auto hidden_states_input = ctx.parameter(Qwen3_5MtpIO::kHiddenStates, float_type,
+                                             ov::PartialShape{-1, -1, cfg.text.hidden_size});
+    auto attention_mask = ctx.parameter(Qwen3_5MtpIO::kAttentionMask, ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter(Qwen3_5MtpIO::kPositionIds, ov::element::i64, ov::PartialShape{3, -1, -1});
+    auto beam_idx = ctx.parameter(Qwen3_5MtpIO::kBeamIdx, ov::element::i32, ov::PartialShape{-1});
+
+    // 1. Embed input_ids
+    auto inputs_embeds = mtp_embed_tokens.forward(input_ids);
+
+    // 2. Normalize embeddings and hidden states
+    auto normed_embed = pre_fc_norm_embedding.forward(inputs_embeds);
+    auto normed_hidden = pre_fc_norm_hidden.forward(hidden_states_input);
+
+    // 3. Concatenate [normed_embed, normed_hidden] along last dimension -> [B, S, 2*H]
+    auto concatenated = ops::concat({normed_embed, normed_hidden}, -1);
+
+    // 4. FC projection: [B, S, 2*H] -> [B, S, H]
+    auto projected = ops::linear(concatenated, fc_param.value());
+
+    // 5. Build RoPE cos/sin
+    const int32_t head_dim = text_cfg.head_dim;
+    const int32_t rotary_dim = static_cast<int32_t>(
+        std::floor(static_cast<float>(head_dim) * cfg.text.partial_rotary_factor)) * 2;
+    auto cos_sin = build_mtp_mrope_cos_sin(
+        position_ids, rotary_dim, cfg.text.rope_theta,
+        cfg.text.rope.mrope_interleaved, cfg.text.rope.mrope_section);
+
+    // Build SDPA causal mask
+    auto q_len_1d = Tensor(shape::dim(input_ids, 1), input_ids.context());
+    auto shared_sdpa_mask = ops::llm::build_kv_causal_mask_with_attention_from_q_len(
+        q_len_1d, attention_mask);
+
+    // 6. Pass through MTP decoder layers
+    Tensor hidden = projected;
+    std::optional<Tensor> residual;
+    for (auto& layer : mtp_layers) {
+        auto out = layer.forward(hidden,
+                                 beam_idx,
+                                 cos_sin.first,
+                                 cos_sin.second,
+                                 &attention_mask,
+                                 nullptr,  // no linear attention
+                                 nullptr,  // no cache_position
+                                 residual,
+                                 &shared_sdpa_mask);
+        hidden = out.first;
+        residual = out.second;
+    }
+
+    // 7. Final norm
+    Tensor normed;
+    if (residual) {
+        normed = mtp_norm.forward(hidden, *residual).first;
+    } else {
+        normed = mtp_norm.forward(hidden);
+    }
+
+    // 8. LM head -> logits
+    auto logits = mtp_lm_head.forward(normed);
+
+    // --- Build OV model ---
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, Qwen3_5MtpIO::kLogits);
+
+    auto ov_model = ctx.build_model({logits_result->output(0)});
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;
