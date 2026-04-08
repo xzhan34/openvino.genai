@@ -1471,14 +1471,17 @@ int main(int argc, char* argv[]) try {
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
 
-    // Auto-disable oneDNN FC kernels for MTP pure-batch mode.
+    // Auto-disable oneDNN FC kernels for MTP pure-batch mode (INT4 only).
     // oneDNN INT4 GEMM uses different M-dimension tiling for batch=1 vs batch=K+1,
     // producing batch-size-dependent numerical results even with f32 accumulation mode.
     // This causes tiny per-step divergence that compounds into degenerate output.
     // OpenCL native FC kernels are batch-size-invariant and eliminate this class of
     // drift entirely, enabling MTP K=1/K=2 to run without any periodic state refresh.
     // On Intel Arc Pro 140T: TEXT K=1 +22%, K=2 +28%, VL K=1 +8%, K=2 +9% vs baseline.
-    if (use_mtp && use_pure_batch) {
+    //
+    // NOTE: Only applied for INT4 quantization. For INT8/f16, oneDNN FC kernels are
+    // significantly faster (~5x) and the batch-divergence issue does not manifest.
+    if (use_mtp && use_pure_batch && text_quant_config.is_primary_4bit()) {
         auto* existing = std::getenv("OV_GPU_USE_ONEDNN");
         if (!existing || std::string(existing).empty()) {
 #ifdef _WIN32
@@ -1486,19 +1489,22 @@ int main(int argc, char* argv[]) try {
 #else
             setenv("OV_GPU_USE_ONEDNN", "0", 1);
 #endif
-            std::cout << "[mtp] Auto-set OV_GPU_USE_ONEDNN=0 for batch-size-invariant FC" << std::endl;
+            std::cout << "[mtp] Auto-set OV_GPU_USE_ONEDNN=0 for batch-size-invariant FC (INT4 mode)" << std::endl;
         } else {
             std::cout << "[mtp] OV_GPU_USE_ONEDNN=" << existing << " (user override)" << std::endl;
         }
     }
 
-    // Auto-set SDPA single-token threshold for MTP pure-batch mode.
+    // Auto-set SDPA single-token threshold for MTP pure-batch mode (INT4 only).
     // SDPA multi-token kernel uses different tiling than single-token kernel,
     // causing batch-size-dependent numerical divergence (same root cause class
     // as the oneDNN FC issue).  Force single-token SDPA kernel for batch sizes
     // up to K+1 to ensure batch=1 draft and batch=K+1 verify produce identical
     // hidden states at each token position.
-    if (use_mtp && use_pure_batch) {
+    //
+    // NOTE: Only applied for INT4 quantization. INT8/f16 do not exhibit this
+    // divergence and benefit from the faster multi-token SDPA kernel.
+    if (use_mtp && use_pure_batch && text_quant_config.is_primary_4bit()) {
         const int sdpa_threshold = opts.mtp_k + 1;  // K+1 tokens in verify batch
         auto* existing = std::getenv("OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD");
         const int current = existing ? std::atoi(existing) : 0;
