@@ -9,7 +9,6 @@
 #include <pybind11/functional.h>
 
 #include "openvino/genai/llm_pipeline.hpp"
-#include "speculative_decoding/stateful/dflash_perf_metrics.hpp"
 
 #include "tokenizer/tokenizers_path.hpp"
 #include "py_utils.hpp"
@@ -25,7 +24,6 @@ using ov::genai::StreamerVariant;
 using ov::genai::DecodedResults;
 using ov::genai::Tokenizer;
 using ov::genai::draft_model;
-using ov::genai::dflash_model;
 using ov::genai::ChatHistory;
 
 namespace {
@@ -259,42 +257,4 @@ void init_llm_pipeline(py::module_& m) {
         },
         py::arg("models_path"), "folder with openvino_model.xml and openvino_tokenizer[detokenizer].xml files",
         py::arg("device") = "", "device on which inference will be performed");
-
-    m.def("dflash_model", [](
-            const std::filesystem::path& draft_model_path,
-            const std::string& device,
-            const py::kwargs& kwargs
-        ) {
-            ScopedVar env_manager(pyutils::ov_tokenizers_module_path());
-            return dflash_model(draft_model_path, device, pyutils::kwargs_to_any_map(kwargs)).second;
-        },
-        py::arg("draft_model_path"), "folder with DFlash draft model safetensors",
-        py::arg("device") = "", "device on which DFlash inference will be performed");
-
-    // DFlash-specific perf metrics (returned via DecodedResults.extended_perf_metrics)
-    py::class_<ov::genai::DFlashPerfMetrics, ov::genai::ExtendedPerfMetrics,
-               std::shared_ptr<ov::genai::DFlashPerfMetrics>>(m, "DFlashPerfMetrics")
-        .def_readonly("draft_steps",            &ov::genai::DFlashPerfMetrics::draft_steps)
-        .def_readonly("accepted_draft_tokens",  &ov::genai::DFlashPerfMetrics::accepted_draft_tokens)
-        .def_readonly("generated_tokens",       &ov::genai::DFlashPerfMetrics::generated_tokens)
-        .def_readonly("avg_accepted_per_step",  &ov::genai::DFlashPerfMetrics::avg_accepted_per_step)
-        .def_readonly("draft_acceptance_rate",  &ov::genai::DFlashPerfMetrics::draft_acceptance_rate)
-        .def_readonly("accepted_per_step",      &ov::genai::DFlashPerfMetrics::accepted_per_step)
-        .def_readonly("accepted_tokens_per_step", &ov::genai::DFlashPerfMetrics::accepted_tokens_per_step)
-        .def_readonly("draft_total_ms",         &ov::genai::DFlashPerfMetrics::draft_total_ms)
-        .def_readonly("avg_draft_step_ms",      &ov::genai::DFlashPerfMetrics::avg_draft_step_ms)
-        .def_readonly("avg_accepted_draft_token_ms", &ov::genai::DFlashPerfMetrics::avg_accepted_draft_token_ms)
-        .def_readonly("draft_decode_count",     &ov::genai::DFlashPerfMetrics::draft_decode_count)
-        .def_readonly("avg_draft_decode_ms",    &ov::genai::DFlashPerfMetrics::avg_draft_decode_ms)
-        .def_readonly("target_verify_count",    &ov::genai::DFlashPerfMetrics::target_verify_count)
-        .def_readonly("target_replay_count",    &ov::genai::DFlashPerfMetrics::target_replay_count)
-        .def_readonly("target_decode_count",    &ov::genai::DFlashPerfMetrics::target_decode_count)
-        .def_readonly("target_verify_total_ms", &ov::genai::DFlashPerfMetrics::target_verify_total_ms)
-        .def_readonly("target_replay_total_ms", &ov::genai::DFlashPerfMetrics::target_replay_total_ms)
-        .def_readonly("target_decode_total_ms", &ov::genai::DFlashPerfMetrics::target_decode_total_ms)
-        .def_readonly("avg_target_verify_ms",   &ov::genai::DFlashPerfMetrics::avg_target_verify_ms)
-        .def_readonly("avg_target_replay_ms",   &ov::genai::DFlashPerfMetrics::avg_target_replay_ms)
-        .def_readonly("avg_target_decode_ms",   &ov::genai::DFlashPerfMetrics::avg_target_decode_ms)
-        .def_readonly("verify_trace_lines",     &ov::genai::DFlashPerfMetrics::verify_trace_lines)
-        .def_readonly("snapshot_restore_trace_lines", &ov::genai::DFlashPerfMetrics::snapshot_restore_trace_lines);
 }
