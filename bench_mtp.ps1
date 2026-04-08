@@ -3,7 +3,7 @@
 
 param(
     [int]$NumRuns = 3,
-    [int]$OutputTokens = 64,
+    [int]$OutputTokens = 220,
     [string]$Mode = "all"  # "text", "vl", or "all"
 )
 
@@ -16,10 +16,11 @@ $env:OV_GENAI_USE_MODELING_API = "1"
 $env:OV_GENAI_INFLIGHT_QUANT_MODE = "int4_asym"
 $env:OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE = "128"
 $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
-$env:DEVICE = "GPU"
+$env:DEVICE = "CPU"
 
 $EXE       = "$GENAI_DIR\build-master\src\cpp\src\modeling\samples\RelWithDebInfo\modeling_qwen3_5.exe"
-$MODEL_DIR = "C:\work\openvino_ws\openvino.genai.xzhan34\tests\module_genai\cpp\test_models\Qwen3.5-0.8B"
+#$MODEL_DIR = "C:\work\openvino_ws\openvino.genai.xzhan34\tests\module_genai\cpp\test_models\Qwen3.5-0.8B"
+$MODEL_DIR = "C:\work\models\Qwen3.5-9B"
 $IMAGE_PATH = "$OV_DIR\docs\articles_en\assets\images\get_started_with_cpp.jpg"
 
 # --- Helper: parse metrics from stdout ---
@@ -176,7 +177,8 @@ foreach ($m in $modeList) {
 Write-Host "`n`n" -NoNewline
 Write-Host "=================================================================" -ForegroundColor Yellow
 Write-Host " PERFORMANCE COMPARISON SUMMARY" -ForegroundColor Yellow
-Write-Host " Model: Qwen3.5-0.8B | Quant: INT4_ASYM g128 | Device: GPU" -ForegroundColor Yellow
+$modelName = Split-Path $MODEL_DIR -Leaf
+Write-Host " Model: $modelName | Quant: INT4_ASYM g128 | Device: $($env:DEVICE)" -ForegroundColor Yellow
 Write-Host " Output tokens: $OutputTokens | Runs per config: $NumRuns" -ForegroundColor Yellow
 Write-Host "=================================================================" -ForegroundColor Yellow
 

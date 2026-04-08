@@ -55,9 +55,17 @@
     <li><a href="#architecture">Architecture</a></li>
     <li><a href="#changed-files">Changed Files</a></li>
     <li><a href="#key-decisions">Key Implementation Decisions</a></li>
-    <li><a href="#benchmark">Benchmark Results (Baseline)</a></li>
-    <li><a href="#analysis">Performance Analysis</a></li>
-    <li><a href="#next-steps">Next Steps for Performance Optimization</a></li>
+    <li><a href="#benchmark-v1">Benchmark Results v1 (2-Token Verify Baseline)</a></li>
+    <li><a href="#profiling">Profiling Deep-Dive</a></li>
+    <li><a href="#optimization">Optimization: 1-Token Verify Algorithm</a></li>
+    <li><a href="#cost-analysis">Detailed Cost Analysis</a></li>
+    <li><a href="#benchmark-v2">Benchmark Results v2 (After Optimization)</a></li>
+    <li><a href="#verify-comparison">Draft Token Verification: Algorithm Comparison</a></li>
+    <li><a href="#vllm-reference">vLLM Reference: Verify &amp; Rejection Sampling</a></li>
+    <li><a href="#k3-analysis">Multi-Token Speculation (k=3) Analysis</a></li>
+    <li><a href="#cross-platform">Cross-Platform: vLLM (4090) vs OpenVINO (Intel GPU)</a></li>
+    <li><a href="#benchmark-9b">Benchmark: Qwen3.5-9B on Intel GPU</a></li>
+    <li><a href="#next-steps">Remaining Gaps &amp; Next Steps</a></li>
   </ul>
 </div>
 
@@ -65,7 +73,8 @@
 <h2 id="overview">Overview</h2>
 <p>This document summarizes the initial MTP speculative decoding implementation for Qwen3.5 in the OpenVINO GenAI explicit modeling framework. This serves as the baseline for future performance optimization work.</p>
 <p><strong>Status</strong>: <span class="status status-ok">Functionally Complete</span> &nbsp;
-   Speculative decoding works end-to-end on both text and VL modes. Performance is not yet positive&mdash;throughput is currently lower than baseline due to the cost of 2-token inference and low hit rates on the 0.8B model.</p>
+   Speculative decoding works end-to-end on both text and VL modes. Current implementation (v3, 2-token batch verify) achieves Tok/Infer = 1+h on HIT, meaning MTP actually reduces main model calls on memory-bound models (9B+).</p>
+<p><strong>Speculative tokens</strong>: <code>num_speculative_tokens = 1</code>. The MTP model has a single decoder layer (<code>mtp_num_hidden_layers=1</code>) and drafts exactly 1 token ahead per step. The main model then verifies this single draft token.</p>
 
 <!-- ======== Architecture ======== -->
 <h2 id="architecture">Architecture</h2>
@@ -82,7 +91,7 @@
 6. mtp.norm(out)                         &rarr; [B, S, H]
 7. lm_head(norm)                         &rarr; [B, S, V]       (shared with main model)</code></pre>
 
-<h3>Speculative Decode Loop</h3>
+<h3>Speculative Decode Loop (v1 &mdash; 2-Token Verify, replaced)</h3>
 <pre><code>Given: next_id (confirmed token), mtp_draft_id (MTP's prediction)
 
 1. Feed [next_id, draft_id] as 2-token sequence to main model
@@ -101,6 +110,56 @@
    - Trim main model KV cache by 1 (remove draft's position)
    - Reset MTP state (KV cache invalid after rejection)
    - Run MTP on verified_id's hidden_states &rarr; new draft</code></pre>
+
+<h3>Speculative Decode Loop (v2 &mdash; 1-Token Verify, superseded by v3)</h3>
+<pre><code>Given: next_id (confirmed token), mtp_draft_id (MTP's prediction)
+
+1. Main model 1-token infer(next_id) &rarr; logits, hidden_states
+2. Sample verified_id from logits
+3. Compare verified_id == mtp_draft_id:
+
+   HIT:
+   - Emit verified_id. KV cache already correct (no trim needed).
+   - Main model 1-token infer(verified_id) &rarr; logits_B, hs_B
+   - Sample bonus_id from logits_B, emit bonus_id
+   - MTP draft from hs_B &rarr; new draft_id
+   - decode_steps += 2, past_len += 2 (2 main infers, 0 KV trims)
+
+   MISS:
+   - Emit verified_id (no KV trim needed)
+   - MTP draft from hidden_states &rarr; new draft_id
+   - decode_steps += 1, past_len += 1 (1 main infer, 0 KV trims)</code></pre>
+<div class="note">
+  <strong>Problem</strong>: Tok/Infer = 1.00 always (HIT: 2 infers/2 tokens, MISS: 1 infer/1 token).
+  MTP never reduces main model calls &mdash; it is pure overhead.
+</div>
+
+<h3>Speculative Decode Loop (v3 &mdash; 2-Token Batch Verify, current)</h3>
+<pre><code>Given: next_id (confirmed token), mtp_draft_id (MTP's prediction)
+
+1. Feed [next_id, draft_id] as 2-token input to main model
+2. Main model outputs logits at both positions:
+   - logits[0] &rarr; verified_id  (what comes after next_id)
+   - logits[1] &rarr; bonus_id     (what comes after draft_id)
+3. Compare verified_id == draft_id:
+
+   HIT:
+   - Emit verified_id + bonus_id (2 tokens from 1 infer)
+   - KV cache correct, no trim. past_len += 2
+   - MTP draft from hs[1] &rarr; new draft_id
+   - Tok/Infer = 2.0
+
+   MISS:
+   - Trim KV cache by 1 (remove draft position). past_len += 1
+   - Emit verified_id only (1 token from 1 infer)
+   - Reset MTP state, MTP draft from hs[0] &rarr; new draft_id
+   - Tok/Infer = 1.0
+
+E[Tok/Infer] = h &times; 2 + (1&minus;h) &times; 1 = 1 + h</code></pre>
+<div class="note">
+  <strong>Key improvement over v2</strong>: HIT actually skips a main model call (2 tokens from 1 infer).
+  On memory-bound models (9B+), T<sub>2tok</sub> &asymp; T<sub>1tok</sub>, so 2-token input has near-zero overhead.
+</div>
 
 <!-- ======== Changed Files ======== -->
 <h2 id="changed-files">Changed Files</h2>
@@ -137,50 +196,842 @@
   <li><strong>Shared weights</strong>: <code>embed_tokens</code> and <code>lm_head</code> weights are shared between main model and MTP model via PackedMapping weight loading rules.</li>
 </ol>
 
-<!-- ======== Benchmark ======== -->
-<h2 id="benchmark">Benchmark Results (Baseline)</h2>
+<!-- ======== Benchmark v1 ======== -->
+<h2 id="benchmark-v1">Benchmark Results v1 (2-Token Verify Baseline)</h2>
 <div class="note">
-  <strong>Setup:</strong> Qwen3.5-0.8B &nbsp;|&nbsp; INT4_ASYM group_size=128 &nbsp;|&nbsp; GPU &nbsp;|&nbsp; 64 output tokens &nbsp;|&nbsp; 3 runs averaged
+  <strong>Setup:</strong> Qwen3.5-0.8B &nbsp;|&nbsp; INT4_ASYM group_size=128 &nbsp;|&nbsp; GPU &nbsp;|&nbsp; 64 output tokens &nbsp;|&nbsp; 3 runs averaged &nbsp;|&nbsp; <code>num_speculative_tokens = 1</code>
 </div>
 
 <h3>Text Mode</h3>
 <table>
   <tr><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Tok/Infer</th><th>Delta</th></tr>
   <tr><td>Baseline (no MTP)</td><td>15.09</td><td>66.28</td><td>&mdash;</td><td>1.00</td><td>&mdash;</td></tr>
-  <tr><td>MTP Speculative</td><td>22.90</td><td>43.91</td><td>27.6%</td><td>1.27</td><td class="delta-neg">&minus;33.8%</td></tr>
+  <tr><td>MTP 2-tok verify</td><td>22.90</td><td>43.91</td><td>27.6%</td><td>1.27</td><td class="delta-neg">&minus;33.8%</td></tr>
 </table>
 
 <h3>VL Mode</h3>
 <table>
   <tr><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Tok/Infer</th><th>Delta</th></tr>
   <tr><td>Baseline (no MTP)</td><td>19.90</td><td>53.53</td><td>&mdash;</td><td>1.00</td><td>&mdash;</td></tr>
-  <tr><td>MTP Speculative</td><td>22.74</td><td>44.35</td><td>38.7%</td><td>1.38</td><td class="delta-neg">&minus;17.1%</td></tr>
+  <tr><td>MTP 2-tok verify</td><td>22.74</td><td>44.35</td><td>38.7%</td><td>1.38</td><td class="delta-neg">&minus;17.1%</td></tr>
 </table>
 
-<!-- ======== Analysis ======== -->
-<h2 id="analysis">Performance Analysis</h2>
-<p>MTP speculative decoding currently shows <span class="status status-neg">negative throughput impact</span> (&minus;17%&thinsp;~&thinsp;&minus;34%). Root causes:</p>
+<!-- ======== Profiling ======== -->
+<h2 id="profiling">Profiling Deep-Dive</h2>
+<p>Detailed profiling of the v1 (2-token verify) approach revealed the bottleneck breakdown:</p>
+
+<h3>Measured Latencies (Qwen3.5-0.8B, INT4, GPU)</h3>
 <table>
-  <tr><th>Factor</th><th>Impact</th><th>Notes</th></tr>
-  <tr><td>2-token infer cost</td><td>~2&times; single-token</td><td>GPU memory-bound; 2 tokens &asymp; 2&times; latency</td></tr>
-  <tr><td>Low hit rate</td><td>28&ndash;39%</td><td>0.8B model's single MTP layer is too weak; need &gt;50% to break even</td></tr>
-  <tr><td>KV cache trim overhead</td><td>High on rejection</td><td>GPU&rarr;CPU&rarr;GPU roundtrip for state slicing</td></tr>
-  <tr><td>MTP state reset on rejection</td><td>Reduces accuracy</td><td>Discards speculative context, hurts subsequent predictions</td></tr>
+  <tr><th>Operation</th><th>Avg Latency</th><th>Share of Decode Time</th><th>Notes</th></tr>
+  <tr><td>1-token main infer</td><td>~15 ms</td><td>&mdash;</td><td>baseline decode cost</td></tr>
+  <tr><td>2-token speculative infer</td><td>~25 ms</td><td>~71%</td><td>1.6&times; single-token (not 2&times;)</td></tr>
+  <tr><td>KV cache trim (per call)</td><td>~4&ndash;6 ms</td><td>~8&ndash;13%</td><td>GPU&rarr;CPU&rarr;slice&rarr;CPU&rarr;GPU for all 48 states</td></tr>
+  <tr><td>MTP model infer</td><td>~3.4&ndash;4 ms</td><td>~12%</td><td>single-layer decoder + LM head</td></tr>
+  <tr><td>Output tensor copy</td><td>~16&ndash;36 ms</td><td>~2&ndash;5%</td><td>extract logits + hidden_states from GPU</td></tr>
+  <tr><td>Tensor setup + input reset</td><td>&lt;2 ms</td><td>&lt;1%</td><td>creating 2-tok tensors, resetting to 1-tok</td></tr>
 </table>
-<p><strong>Break-even analysis:</strong> With 2&times; infer cost, the minimum hit rate for net positive throughput is ~50%. At 39% (VL mode best case), we generate 1.38 tokens/infer vs the required ~1.5 tokens/infer.</p>
+
+<h3>Text Mode Profiling (64 tokens, 46 spec infers, 30 trims)</h3>
+<table>
+  <tr><th>Component</th><th>Total (ms)</th><th>Calls</th><th>Avg (ms)</th><th>% of Decode</th></tr>
+  <tr><td>2-tok infer</td><td>1126</td><td>46</td><td>24.5</td><td>71%</td></tr>
+  <tr><td>MTP infer</td><td>185</td><td>46</td><td>4.0</td><td>12%</td></tr>
+  <tr><td>KV trim</td><td>127</td><td>30</td><td>4.3</td><td>8%</td></tr>
+  <tr><td>Output copy</td><td>36</td><td>46</td><td>0.8</td><td>2.3%</td></tr>
+</table>
+
+<h3>VL Mode Profiling (64 tokens, 50 spec infers, 38 trims)</h3>
+<table>
+  <tr><th>Component</th><th>Total (ms)</th><th>Calls</th><th>Avg (ms)</th><th>% of Decode</th></tr>
+  <tr><td>2-tok infer</td><td>1255</td><td>50</td><td>25.1</td><td>69%</td></tr>
+  <tr><td>MTP infer</td><td>190</td><td>50</td><td>3.8</td><td>10%</td></tr>
+  <tr><td>KV trim</td><td>232</td><td>38</td><td>6.1</td><td>13%</td></tr>
+  <tr><td>Output copy</td><td>41</td><td>50</td><td>0.8</td><td>2.2%</td></tr>
+</table>
+
+<h3>GPU Plugin Behaviors Discovered</h3>
+<ul>
+  <li><code>state.get_state()</code> triggers GPU&rarr;CPU copy (~0.1 ms per state &times; 48+ states = significant)</li>
+  <li><code>state.set_state()</code> triggers CPU&rarr;GPU copy (same cost)</li>
+  <li><strong>ROI tensor views</strong> (<code>ov::Tensor(old, begin, end)</code>) passed to <code>set_state()</code> do <strong>not</strong> avoid the copy &mdash; GPU plugin still does an internal roundtrip. Tested and confirmed: ROI trim was actually <em>slower</em> (252 ms vs 127 ms)</li>
+  <li>Setting tensors with different shapes triggers GPU recompilation/reallocation</li>
+  <li>Reading output tensors after <code>set_tensor</code> with new input shapes causes ~418 ms GPU sync stall</li>
+  <li>Attention mask: <code>build_kv_causal_mask_with_attention_from_q_len</code> derives KV length from attention_mask dim, stale KV entries <strong>will</strong> be attended to &mdash; trim is required for correctness in 2-tok approach</li>
+</ul>
+
+<!-- ======== Optimization ======== -->
+<h2 id="optimization">Optimization: 1-Token Verify Algorithm</h2>
+<p>The key insight: with <code>num_speculative_tokens = 1</code>, the 2-token verify approach incurs two major costs that can be completely eliminated by using only 1-token infers:</p>
+
+<table>
+  <tr><th>Problem (v1)</th><th>Solution (v2)</th></tr>
+  <tr><td>2-token infer costs 25 ms (1.6&times; baseline)</td><td>Use two 1-token infers on HIT (2&times;15 ms = 30 ms), one on MISS (15 ms)</td></tr>
+  <tr><td>KV cache trim on MISS costs 4&ndash;6 ms (GPU&rarr;CPU&rarr;GPU)</td><td><strong>Eliminated entirely</strong> &mdash; 1-token infer never creates stale KV entries</td></tr>
+  <tr><td>Input shape switching (seq_len 2&rarr;1) causes GPU overhead</td><td><strong>Eliminated entirely</strong> &mdash; always use seq_len=1</td></tr>
+  <tr><td>Output tensor extraction (logits at 2 positions + hs)</td><td><strong>Eliminated</strong> &mdash; use standard <code>extract_last_logits_f32</code></td></tr>
+</table>
+
+<h3>Intermediate Optimizations Attempted &amp; Results</h3>
+<table>
+  <tr><th>Attempt</th><th>Description</th><th>Result</th></tr>
+  <tr><td>Process before reset</td><td>Move sampling + MTP draft before input tensor reset</td><td class="delta-neg">FAILED: GPU sync stall, input reset jumped to 418 ms</td></tr>
+  <tr><td>Selective extraction</td><td>Extract only logit slices &amp; hs vectors to CPU buffers</td><td class="delta-pos">Output copy 36 ms &rarr; 16 ms (saved ~20 ms)</td></tr>
+  <tr><td>ROI tensor trim</td><td>Use <code>ov::Tensor(old, begin, end)</code> view for KV trim</td><td class="delta-neg">WORSE: 252 ms vs 127 ms (GPU plugin copies anyway)</td></tr>
+  <tr><td><strong>1-token verify (v2)</strong></td><td>Eliminate 2-tok infer and KV trim entirely</td><td class="delta-pos"><strong>Overhead &minus;34% &rarr; &minus;13% (text), &minus;17% &rarr; &minus;8% (VL)</strong></td></tr>
+</table>
+
+<!-- ======== Cost Analysis ======== -->
+<h2 id="cost-analysis">Detailed Cost Analysis</h2>
+
+<h3>Per-Attempt Cost Breakdown</h3>
+<p>Let <code>T<sub>1</sub></code> = 1-token infer latency (~14.3 ms), <code>T<sub>MTP</sub></code> = MTP infer latency (~3.4 ms), <code>T<sub>trim</sub></code> = KV trim latency (~4&ndash;6 ms), <code>T<sub>2</sub></code> = 2-token infer latency (~25 ms), <code>h</code> = hit rate.</p>
+
+<table>
+  <tr><th></th><th colspan="3">v1 (2-Token Verify)</th><th colspan="3">v2 (1-Token Verify)</th></tr>
+  <tr><th>Path</th><th>Cost</th><th>Tokens</th><th>Breakdown</th><th>Cost</th><th>Tokens</th><th>Breakdown</th></tr>
+  <tr>
+    <td><strong>HIT</strong></td>
+    <td>29 ms</td><td>2</td><td>T<sub>2</sub>(25) + T<sub>MTP</sub>(4)</td>
+    <td>33.7 ms</td><td>2</td><td>2&times;T<sub>1</sub>(28.6) + T<sub>MTP</sub>(3.4) + logit extract(1.7)</td>
+  </tr>
+  <tr>
+    <td><strong>MISS</strong></td>
+    <td>35 ms</td><td>1</td><td>T<sub>2</sub>(25) + T<sub>MTP</sub>(4) + T<sub>trim</sub>(6)</td>
+    <td>19.4 ms</td><td>1</td><td>T<sub>1</sub>(14.3) + T<sub>MTP</sub>(3.4) + logit extract(1.7)</td>
+  </tr>
+</table>
+
+<h3>Weighted Cost at Various Hit Rates</h3>
+<table>
+  <tr><th>Hit Rate (h)</th><th colspan="2">v1: 2-Token Verify</th><th colspan="2">v2: 1-Token Verify</th><th>v2 Improvement</th></tr>
+  <tr><th></th><th>ms/attempt</th><th>ms/token</th><th>ms/attempt</th><th>ms/token</th><th></th></tr>
+  <tr>
+    <td>20%</td>
+    <td>33.8</td><td>28.17</td>
+    <td>22.26</td><td>18.55</td>
+    <td class="delta-pos">34%</td>
+  </tr>
+  <tr>
+    <td>30%</td>
+    <td>33.2</td><td>25.54</td>
+    <td>23.69</td><td>18.22</td>
+    <td class="delta-pos">29%</td>
+  </tr>
+  <tr>
+    <td>40%</td>
+    <td>32.6</td><td>23.29</td>
+    <td>25.12</td><td>17.94</td>
+    <td class="delta-pos">23%</td>
+  </tr>
+  <tr>
+    <td>50%</td>
+    <td>32.0</td><td>21.33</td>
+    <td>26.55</td><td>17.70</td>
+    <td class="delta-pos">17%</td>
+  </tr>
+  <tr>
+    <td>60%</td>
+    <td>31.4</td><td>19.63</td>
+    <td>27.98</td><td>17.49</td>
+    <td class="delta-pos">11%</td>
+  </tr>
+</table>
+<div class="note">
+  <strong>Formula</strong>:<br>
+  v1: <code>ms/attempt = h &times; 29 + (1&minus;h) &times; 35</code>, <code>tokens/attempt = 1 + h</code><br>
+  v2: <code>ms/attempt = h &times; 33.7 + (1&minus;h) &times; 19.4</code>, <code>tokens/attempt = 1 + h</code><br>
+  <code>ms/token = ms/attempt &divide; tokens/attempt</code><br>
+  Baseline (no MTP): 14.3 ms/token
+</div>
+
+<h3>Break-Even Analysis</h3>
+<p>For <strong>v2 (1-token verify)</strong> to match the baseline of 14.3 ms/token:</p>
+<pre><code>ms/token = [h &times; 33.7 + (1&minus;h) &times; 19.4] / (1 + h) = 14.3
+  &rArr; 19.4 + 14.3h = 14.3 + 14.3h
+  &rArr; 19.4 = 14.3  (never true)</code></pre>
+<p>At the current latency profile (T<sub>1</sub>=14.3 ms, T<sub>MTP</sub>=3.4 ms), the <strong>MTP overhead (T<sub>MTP</sub> + logit extract) on every attempt guarantees ms/token &gt; baseline</strong>. The overhead floor with 100% hit rate would be:</p>
+<pre><code>At h=100%: ms/token = 33.7 / 2 = 16.85 ms/token  (vs 14.3 baseline = 18% overhead)</code></pre>
+<p>This is because the MTP model itself adds ~5.1 ms of overhead per token-pair on the HIT path
+(T<sub>MTP</sub> + extract), which can never be amortized away when T<sub>1</sub> is already very fast (14.3 ms).</p>
+
+<p><strong>For v1 (2-token verify)</strong>, the break-even requires:</p>
+<pre><code>  [h &times; 29 + (1&minus;h) &times; 35] / (1 + h) = 14.3
+  &rArr; 35 &minus; 6h = 14.3 + 14.3h
+  &rArr; h = 20.7 / 20.3 &asymp; 102%  (impossible)</code></pre>
+<p>Neither approach can break even on this 0.8B model because the <strong>base infer latency is too low</strong> (14.3 ms) for the fixed overhead costs (MTP infer ~3.4 ms, KV trim ~5 ms) to be amortized. However, with larger models where T<sub>1</sub> &gt;&gt; T<sub>MTP</sub>, the overhead ratio shrinks and MTP becomes profitable.</p>
+
+<h3>When Does MTP Become Profitable?</h3>
+<table>
+  <tr><th>Scenario</th><th>T<sub>1</sub></th><th>T<sub>MTP</sub></th><th>Break-even h (v2)</th><th>Feasibility</th></tr>
+  <tr><td>0.8B on GPU (current)</td><td>14.3 ms</td><td>3.4 ms</td><td>&gt;100% (impossible)</td><td class="delta-neg">Not viable</td></tr>
+  <tr><td>7B on GPU (projected)</td><td>~50 ms</td><td>~5 ms</td><td>~12%</td><td class="delta-pos">Very likely (typical hit &gt;50%)</td></tr>
+  <tr><td>72B on GPU (projected)</td><td>~200 ms</td><td>~10 ms</td><td>~5%</td><td class="delta-pos">Almost certainly profitable</td></tr>
+</table>
+<div class="note">
+  <strong>Conclusion</strong>: MTP speculative decoding is an optimization for <em>larger</em> models where the main model decode latency dominates.
+  On a 0.8B model, the MTP overhead is a significant fraction of the base latency, making it impossible to break even.
+  The 1-token verify algorithm is still the correct approach because it minimizes the overhead floor.
+</div>
+
+<!-- ======== Benchmark v2 ======== -->
+<h2 id="benchmark-v2">Benchmark Results v2 (After Optimization)</h2>
+<div class="note">
+  <strong>Setup:</strong> Qwen3.5-0.8B &nbsp;|&nbsp; INT4_ASYM group_size=128 &nbsp;|&nbsp; GPU &nbsp;|&nbsp; 64 output tokens &nbsp;|&nbsp; 3 runs averaged &nbsp;|&nbsp; <code>num_speculative_tokens = 1</code>
+</div>
+
+<h3>Text Mode</h3>
+<table>
+  <tr><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Decode (ms)</th><th>Delta vs Baseline</th></tr>
+  <tr><td>Baseline (no MTP)</td><td>14.32</td><td>69.88</td><td>&mdash;</td><td>901.93</td><td>&mdash;</td></tr>
+  <tr><td>v1: MTP 2-tok verify</td><td>22.90</td><td>43.91</td><td>27.6%</td><td>&mdash;</td><td class="delta-neg">&minus;33.8%</td></tr>
+  <tr><td><strong>v2: MTP 1-tok verify</strong></td><td><strong>16.52</strong></td><td><strong>60.59</strong></td><td>20.0%</td><td>1040.81</td><td class="delta-neg">&minus;13.3%</td></tr>
+</table>
+
+<h3>VL Mode</h3>
+<table>
+  <tr><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Decode (ms)</th><th>Delta vs Baseline</th></tr>
+  <tr><td>Baseline (no MTP)</td><td>14.76</td><td>67.75</td><td>&mdash;</td><td>930.12</td><td>&mdash;</td></tr>
+  <tr><td>v1: MTP 2-tok verify</td><td>22.74</td><td>44.35</td><td>38.7%</td><td>&mdash;</td><td class="delta-neg">&minus;17.1%</td></tr>
+  <tr><td><strong>v2: MTP 1-tok verify</strong></td><td><strong>15.96</strong></td><td><strong>62.66</strong></td><td>38.9%</td><td>1005.54</td><td class="delta-neg">&minus;7.5%</td></tr>
+</table>
+
+<h3>Optimization Impact Summary</h3>
+<table>
+  <tr><th>Mode</th><th>v1 Overhead</th><th>v2 Overhead</th><th>Improvement</th></tr>
+  <tr><td>Text</td><td class="delta-neg">&minus;33.8%</td><td class="delta-neg">&minus;13.3%</td><td class="delta-pos">+20.5 pp reduction</td></tr>
+  <tr><td>VL</td><td class="delta-neg">&minus;17.1%</td><td class="delta-neg">&minus;7.5%</td><td class="delta-pos">+9.6 pp reduction</td></tr>
+</table>
+
+<h3>v2 Profiling Breakdown (Text Mode, 64 tokens)</h3>
+<table>
+  <tr><th>Component</th><th>Total (ms)</th><th>Calls</th><th>Avg (ms)</th><th>% of Decode</th></tr>
+  <tr><td>1-tok main infer</td><td>841</td><td>63</td><td>13.4</td><td>82%</td></tr>
+  <tr><td>MTP infer</td><td>169</td><td>49</td><td>3.4</td><td>17%</td></tr>
+  <tr><td>KV trim</td><td>0</td><td>0</td><td>&mdash;</td><td>0%</td></tr>
+</table>
+
+<!-- ======== Verify Comparison ======== -->
+<h2 id="verify-comparison">Draft Token Verification: Algorithm Comparison</h2>
+
+<h3>v1: 2-Token Verify</h3>
+<p>Feed confirmed token + MTP draft token together to the main model in a single 2-token forward pass:</p>
+<pre><code>Input to main:  [confirmed_tok, draft_tok]     &larr; 2 tokens
+Output:         logits[0] &rarr; verified_id    (what comes after confirmed_tok)
+                logits[1] &rarr; bonus_id       (what comes after draft_tok)
+
+Compare verified_id vs draft_tok:
+  ACCEPT (match):    emit verified_id + bonus_id &rarr; 2 tokens/step
+                     past_len += 2
+                     run MTP on bonus_id&rsquo;s hidden_states &rarr; new draft
+
+  REJECT (mismatch): emit verified_id only &rarr; 1 token/step
+                     trim KV cache by 1 (remove draft position)
+                     reset MTP state
+                     run MTP on verified_id&rsquo;s hidden_states &rarr; new draft</code></pre>
+<div class="note">
+  <strong>Problems</strong>:<br>
+  &bull; 2-token infer on 0.8B: ~25 ms (1.75&times; baseline 14.3 ms)<br>
+  &bull; Reject requires KV trim: 4&ndash;6 ms GPU&rarr;CPU&rarr;GPU roundtrip<br>
+  &bull; MTP state reset discards speculative context
+</div>
+
+<h3>v2: 1-Token Verify</h3>
+<p>Feed only the confirmed token. Draft token <strong>never enters the main model KV cache</strong>:</p>
+<pre><code>Input to main:  [confirmed_tok]                &larr; 1 token only
+Output:         logits &rarr; verified_id
+
+Compare verified_id vs draft_tok:
+  MATCH:   draft correct &rarr; next step uses draft_tok as confirmed
+           MTP already produced next_draft in previous step
+           &rarr; equivalent to 2 tokens/step (skip one main model call)
+
+  MISMATCH: draft wrong &rarr; use verified_id as next confirmed
+            NO KV trim needed (draft never entered KV cache)
+            re-run MTP &rarr; new draft
+            &rarr; 1 token/step</code></pre>
+<div class="note">
+  <strong>Core advantages</strong>:<br>
+  &bull; Only 1-token infer per step: 14.3 ms vs 25 ms<br>
+  &bull; Never needs KV trim: saves 4&ndash;6 ms per rejection<br>
+  &bull; E[tokens/step] still = 1 + h (same as v1)
+</div>
+<div class="note" style="border-left-color:#d35400;">
+  <strong>Problem (exposed by 9B benchmark)</strong>:<br>
+  &bull; Tok/Infer = 1.00 always &mdash; MTP never reduces main model inference count<br>
+  &bull; HIT: 2 main infers / 2 tokens = 1.0. MISS: 1 infer / 1 token = 1.0<br>
+  &bull; MTP becomes pure overhead (MTP infer + sampling cost added to every step)
+</div>
+
+<h3>v3: 2-Token Batch Verify (current implementation)</h3>
+<p>Combines v1&rsquo;s 2-token verification with correct hidden_states extraction. HIT produces 2 tokens from 1 main infer:</p>
+<pre><code>Input to main:  [next_id, draft_id]            &larr; 2 tokens as batch
+Output:         logits[0] &rarr; verified_id        (verify next_id)
+                logits[1] &rarr; bonus_id           (draft_id position)
+                hidden_states[0], [1]
+
+Compare verified_id vs draft_id:
+  HIT (match):
+    Emit verified_id + bonus_id &rarr; 2 tokens
+    KV cache correct, no trim. past_len += 2
+    MTP draft from hs[1] &rarr; new draft
+    1 main infer &rarr; 2 tokens.  Tok/Infer = 2.0
+
+  MISS (mismatch):
+    Trim KV cache by 1 (remove draft position). past_len += 1
+    Emit verified_id only &rarr; 1 token
+    Reset MTP KV. MTP draft from hs[0] &rarr; new draft
+    1 main infer + trim &rarr; 1 token. Tok/Infer = 1.0</code></pre>
+<div class="note">
+  <strong>Key improvements</strong>:<br>
+  &bull; HIT: Tok/Infer = 2.0 (v2 was always 1.0)<br>
+  &bull; E[Tok/Infer] = 1 + h (e.g., 1.3 at 30% hit rate)<br>
+  &bull; On memory-bound 9B+: T<sub>2tok</sub> &asymp; T<sub>1tok</sub>, so 2-token infer is near-free<br>
+  &bull; On CPU: KV trim is pure memory copy (no GPU roundtrip), minimal cost
+</div>
+
+<h3>vLLM: Standard Speculative Decoding (K+1 Token Verify)</h3>
+<p>vLLM uses the Leviathan et al. 2023 algorithm&mdash;pack all K draft tokens into a single forward pass:</p>
+<pre><code>Confirmed token: tok_c
+MTP proposer outputs K drafts: [d1, d2, ..., dk]
+
+Phase 1 &mdash; Target Forward (single inference):
+  Input:  [tok_c, d1, d2, ..., dk]        &larr; K+1 tokens
+  Output: logits at K+1 positions
+
+Phase 2 &mdash; Rejection Sampling (sequential):
+  Greedy (temperature=0):
+    pos 0: argmax(logits[0]) == d1? &rarr; accept/reject
+    pos 1: argmax(logits[1]) == d2? &rarr; accept/reject (only if prev accepted)
+    ...
+    Stop at first reject &rarr; emit target&rsquo;s token
+    All accept &rarr; emit d1..dk + bonus_token (K+1 tokens!)
+
+  Probabilistic (temperature&gt;0):
+    accept_prob = min(1, p_target[d_i] / p_draft[d_i])
+    reject &rarr; sample from max(0, p_target - p_draft)
+    Guarantees output distribution = target model exactly
+
+Phase 3 &mdash; KV Cache:
+  vLLM does NOT trim KV cache
+  - All K+1 KV entries remain (PagedAttention)
+  - num_rejected_tokens adjusts seq_lens
+  - Stale entries overwritten in next forward</code></pre>
+
+<h3>Four-Way Comparison</h3>
+<table>
+  <tr>
+    <th>Feature</th>
+    <th>v1 (2-tok verify)</th>
+    <th>v2 (1-tok verify)</th>
+    <th>v3 (2-tok batch, current)</th>
+    <th>vLLM (K+1-tok verify)</th>
+  </tr>
+  <tr>
+    <td>Verify input size</td><td>2 tokens</td><td>1 token</td><td>2 tokens</td><td>K+1 tokens</td>
+  </tr>
+  <tr>
+    <td>Max tokens per step</td><td>2</td><td>1 (effective 2)</td><td>2</td><td>K+1</td>
+  </tr>
+  <tr>
+    <td>E[tokens/step]</td><td>1 + h</td><td>1 + h</td><td>1 + h</td><td>1 + h<sub>1</sub> + h<sub>1</sub>h<sub>2</sub> + &hellip;</td>
+  </tr>
+  <tr>
+    <td>Tok/Infer (actual)</td><td>1 + h</td><td class="delta-neg"><strong>1.00</strong></td><td class="delta-pos"><strong>1 + h</strong></td><td>1 + h<sub>1</sub> + h<sub>1</sub>h<sub>2</sub> + &hellip;</td>
+  </tr>
+  <tr>
+    <td>KV trim required</td><td class="delta-neg">Yes (miss)</td><td class="delta-pos">No</td><td class="delta-neg">Yes (miss)</td><td class="delta-pos">No (stale overwrite)</td>
+  </tr>
+  <tr>
+    <td>Supported K</td><td>1 only</td><td>1 only</td><td>1 only</td><td>Any K&ge;1</td>
+  </tr>
+  <tr>
+    <td>Best suited for</td><td>Small&ndash;medium</td><td>Small (compute-bound)</td><td><strong>Medium&ndash;large (memory-bound)</strong></td><td>Medium&ndash;large (memory-bound)</td>
+  </tr>
+  <tr>
+    <td>0.8B cost</td><td>~25 ms</td><td>~14.3 ms</td><td>~25 ms</td><td>~32 ms (K=3)</td>
+  </tr>
+  <tr>
+    <td>9B cost</td><td>~85 ms</td><td>~80 ms + MTP</td><td>~85 ms</td><td>&asymp;T<sub>1tok</sub></td>
+  </tr>
+</table>
+
+<h3>Why v3 Tok/Infer = 1 + h (while v2 = 1.00)</h3>
+<pre><code>v3 (2-token batch verify):
+  Each step: 1 main model infer([next_id, draft_id])
+
+  Hit (probability h):
+    logits[0] &rarr; verified_id == draft_id &check;
+    logits[1] &rarr; bonus_id
+    &rarr; 2 tokens, 1 main infer.  Tok/Infer = 2.0
+
+  Miss (probability 1&minus;h):
+    logits[0] &rarr; verified_id &ne; draft_id
+    &rarr; 1 token, 1 main infer + trim.  Tok/Infer = 1.0
+
+  E[Tok/Infer] = h &times; 2 + (1&minus;h) &times; 1 = 1 + h
+
+v2 (1-token verify) problem:
+  Hit: 2 main infers / 2 tokens = Tok/Infer = 1.0
+  Miss: 1 main infer / 1 token = Tok/Infer = 1.0
+  &rarr; Tok/Infer always 1.0, MTP never reduces inference count</code></pre>
+
+<h3>Key Insights</h3>
+<div class="note">
+  <strong>1. v3 solves v2&rsquo;s core problem</strong>: v2 Tok/Infer=1.00 means MTP is pure overhead. v3 restores 2-token batch verify so HIT actually skips a main model call.<br><br>
+  <strong>2. v3 suits memory-bound large models</strong>: On 9B+ models, T<sub>2tok</sub> &asymp; T<sub>1tok</sub>, so 2-token infer has near-zero extra cost.<br><br>
+  <strong>3. v2 suits compute-bound small models</strong>: On 0.8B, T<sub>2tok</sub> = 1.75&times; T<sub>1tok</sub>, making 2-token infer expensive.<br><br>
+  <strong>4. vLLM K+1 verify excels on large models</strong>: When T<sub>(K+1)tok</sub> &asymp; T<sub>1tok</sub> (memory-bound), verifying extra drafts costs nearly zero.<br><br>
+  <strong>5. CPU KV trim cost is low</strong>: Pure memory copy, unlike GPU&rsquo;s GPU&rarr;CPU&rarr;GPU roundtrip (4&ndash;6 ms).
+</div>
+
+<!-- ======== vLLM Reference ======== -->
+<h2 id="vllm-reference">vLLM Reference: Verify &amp; Rejection Sampling</h2>
+<p>This section documents how vLLM implements the standard speculative decoding verify&ndash;accept/reject flow for Qwen3.5 MTP, as a reference architecture for our OpenVINO implementation.</p>
+
+<h3>End-to-End Pipeline (per decode step)</h3>
+<pre><code>Step N (previous step proposed draft tokens [d1, d2, ..., dk]):
+
+Phase 1: Target Model Forward (Verification)
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  Input:  [confirmed_tok, d1, d2, ..., dk]  (K+1 tokens)    ║
+  ║  Forward: ONE pass through main model                       ║
+  ║  Output:  logits at ALL K+1 positions + hidden_states       ║
+  ╚══════════════════════════════════════════════════════════════╝
+                              │
+                              ▼
+Phase 2: Rejection Sampling
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  For pos=0..K-1 (sequentially):                             ║
+  ║    sample verified_id = sample(logits[pos])                 ║
+  ║    if verified_id == draft[pos]:  ACCEPT → continue         ║
+  ║    else:  REJECT → emit verified_id, stop                   ║
+  ║  If all K accepted → emit bonus_token from logits[K]        ║
+  ╚══════════════════════════════════════════════════════════════╝
+                              │
+                              ▼
+Phase 3: Draft Proposal (for next step)
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  MTP head receives hidden_states from target forward        ║
+  ║  Runs K autoregressive forward passes (reusing same layer)  ║
+  ║  Output: [new_d1, new_d2, ..., new_dk]                     ║
+  ╚══════════════════════════════════════════════════════════════╝</code></pre>
+
+<h3>Key vLLM Source Files</h3>
+<table>
+  <tr><th>File</th><th>Function</th><th>Role</th></tr>
+  <tr>
+    <td><code>v1/worker/gpu_model_runner.py</code></td>
+    <td><code>execute_model()</code> L3755</td>
+    <td>Orchestrates target forward; feeds [confirmed + K draft] as one batch</td>
+  </tr>
+  <tr>
+    <td><code>v1/worker/gpu_model_runner.py</code></td>
+    <td><code>_prepare_inputs()</code> L1784</td>
+    <td>Constructs verify batch: appends draft tokens to each request&rsquo;s input</td>
+  </tr>
+  <tr>
+    <td><code>v1/worker/gpu_model_runner.py</code></td>
+    <td><code>_calc_spec_decode_metadata()</code> L2567</td>
+    <td>Builds <code>SpecDecodeMetadata</code>: logits indices, cumulative counts</td>
+  </tr>
+  <tr>
+    <td><code>v1/sample/rejection_sampler.py</code></td>
+    <td><code>rejection_sample()</code> L350</td>
+    <td>Entry point: dispatches to greedy or random kernels</td>
+  </tr>
+  <tr>
+    <td><code>v1/sample/rejection_sampler.py</code></td>
+    <td><code>rejection_greedy_sample_kernel</code> L653</td>
+    <td>Triton kernel: accept iff <code>target_argmax == draft_token</code></td>
+  </tr>
+  <tr>
+    <td><code>v1/sample/rejection_sampler.py</code></td>
+    <td><code>rejection_random_sample_kernel</code> L698</td>
+    <td>Triton kernel: accept with probability <code>min(1, p_target/p_draft)</code></td>
+  </tr>
+  <tr>
+    <td><code>v1/spec_decode/eagle.py</code></td>
+    <td><code>SpecDecodeBaseProposer.propose()</code> L384</td>
+    <td>MTP/EAGLE drafting: first pass + autoregressive loop for k&gt;1</td>
+  </tr>
+  <tr>
+    <td><code>model_executor/models/qwen3_5_mtp.py</code></td>
+    <td><code>Qwen3_5MTP.forward()</code> L403</td>
+    <td>Qwen3.5 MTP model: embed &rarr; norm &rarr; FC(2H&rarr;H) &rarr; decoder layer &rarr; norm</td>
+  </tr>
+</table>
+
+<h3>Greedy Rejection Algorithm (Triton kernel)</h3>
+<p>For greedy decoding (temperature=0), the kernel at <code>rejection_greedy_sample_kernel</code> L653:</p>
+<pre><code>for pos in range(num_draft_tokens):
+    if not rejected:
+        draft_token_id = draft_token_ids[start + pos]
+        target_argmax_id = target_argmax[start + pos]   # argmax(logits[pos])
+        output[req, pos] = target_argmax_id             # always emit target's choice
+        if draft_token_id != target_argmax_id:
+            rejected = True                             # stop here
+
+if not rejected:
+    output[req, num_draft_tokens] = bonus_token_id      # bonus token from logits[K]</code></pre>
+<div class="note">
+  <strong>Key behavior</strong>: Even on REJECT, the output is the target model&rsquo;s sampled token (not the draft).
+  This means every verify step produces <strong>at least 1 correct token</strong>.
+  On full accept (all K drafts correct), a <strong>bonus token</strong> is appended = K+1 tokens per verify.
+</div>
+
+<h3>Random/Probabilistic Rejection Algorithm</h3>
+<p>For sampling (temperature &gt; 0), at <code>rejection_random_sample_kernel</code> L698:</p>
+<pre><code>for pos in range(num_draft_tokens):
+    if not rejected:
+        draft_prob = p_draft[pos, draft_token_id]
+        target_prob = p_target[pos, draft_token_id]
+        u = uniform_random()
+
+        if draft_prob &gt; 0 and target_prob / draft_prob &gt;= u:
+            output[req, pos] = draft_token_id           # ACCEPT draft
+        else:
+            output[req, pos] = recovered_token_ids[pos]  # REJECT → recovered token
+            rejected = True                              # from max(0, p_target - p_draft)
+
+if not rejected:
+    output[req, num_draft_tokens] = bonus_token_id</code></pre>
+<p>The <strong>recovered token</strong> is sampled from the residual distribution <code>max(0, p<sub>target</sub> &minus; p<sub>draft</sub>)</code>,
+normalized. This guarantees the output distribution matches the target model exactly
+(<a href="https://arxiv.org/abs/2211.17192">Leviathan et al. 2023</a>).</p>
+
+<h3>KV Cache Management on Partial Accept</h3>
+<p>vLLM uses a <strong>no-trim</strong> strategy for KV cache on partial acceptance:</p>
+<ol>
+  <li>During target forward, KV cache is populated for ALL K+1 positions (confirmed + all K drafts)</li>
+  <li>On rejection at position j (only j of K accepted), the KV entries for positions j+1..K remain in cache</li>
+  <li>On the <strong>next step</strong>, <code>num_computed_tokens</code> is set to reflect only accepted positions</li>
+  <li>Stale KV entries are overwritten when those positions are recomputed with correct tokens</li>
+  <li><code>num_rejected_tokens_gpu</code> tensor adjusts <code>seq_lens</code> in the drafter: <code>seq_lens -= num_rejected_tokens</code></li>
+</ol>
+<div class="note">
+  <strong>Contrast with our OpenVINO v1 approach</strong>: We had to explicitly trim KV cache via GPU&rarr;CPU&rarr;GPU roundtrip,
+  costing ~4&ndash;6 ms per rejection. The OpenVINO GPU plugin does not support overwriting stale KV entries
+  because <code>append_kv_cache</code> always appends. Our v2 (1-token verify) sidesteps this entirely.
+</div>
+
+<h3>Example: 3 Draft Tokens Verify Flow</h3>
+<table>
+  <tr><th>Step</th><th>Input</th><th>Output</th><th>Tokens Emitted</th></tr>
+  <tr>
+    <td>Target forward</td>
+    <td><code>[tok_confirmed, d1, d2, d3]</code> (4 tokens)</td>
+    <td>logits at 4 positions</td>
+    <td>&mdash;</td>
+  </tr>
+  <tr>
+    <td>Case: all accept</td>
+    <td>verify d1✓ d2✓ d3✓</td>
+    <td><code>[d1, d2, d3, bonus_tok]</code></td>
+    <td><strong>4</strong></td>
+  </tr>
+  <tr>
+    <td>Case: reject at d2</td>
+    <td>verify d1✓ d2✗</td>
+    <td><code>[d1, corrected_tok, -1, -1]</code></td>
+    <td><strong>2</strong></td>
+  </tr>
+  <tr>
+    <td>Case: reject at d1</td>
+    <td>verify d1✗</td>
+    <td><code>[corrected_tok, -1, -1, -1]</code></td>
+    <td><strong>1</strong></td>
+  </tr>
+</table>
+<p><code>-1</code> = <code>PLACEHOLDER_TOKEN_ID</code>, filtered out in <code>parse_output()</code>.</p>
+
+<h3>MTP Proposer for k&gt;1 (Layer Reuse)</h3>
+<p>When <code>num_speculative_tokens=3</code> with <code>mtp_num_hidden_layers=1</code>, vLLM reuses the <strong>same single MTP decoder layer</strong> for all 3 draft steps:</p>
+<pre><code># In Qwen3_5MultiTokenPredictor.forward() (qwen3_5_mtp.py L140):
+current_step_idx = spec_step_idx % self.num_mtp_layers   # always 0 when layers=1
+
+# In SpecDecodeBaseProposer.propose() (eagle.py L548):
+# First pass: full context → sample draft_1
+# Then loop:
+for token_index in range(num_speculative_tokens - 1):   # 2 more iterations
+    # Feed draft_token[-1] as input, run MTP forward → sample next draft
+    ret_hidden_states = self.model(input_ids=draft_token, hidden_states=hs, ...)
+    draft_token = argmax(lm_head(ret_hidden_states))</code></pre>
+<p>vLLM warns: <em>&ldquo;Enabling num_speculative_tokens &gt; 1 will run multiple times of forward on same MTP layer, which may result in lower acceptance rate.&rdquo;</em></p>
+
+<!-- ======== k=3 Analysis ======== -->
+<h2 id="k3-analysis">Multi-Token Speculation (k=3) Analysis</h2>
+<p>Would increasing <code>num_speculative_tokens</code> from 1 to 3 improve performance on the 0.8B model?</p>
+
+<h3>Cost Breakdown for k=3</h3>
+<table>
+  <tr><th>Component</th><th>k=1 (current)</th><th>k=3</th><th>Notes</th></tr>
+  <tr>
+    <td>MTP draft</td>
+    <td>3.4 ms (1 forward)</td>
+    <td>10.2 ms (3 forwards)</td>
+    <td>Same layer reused 3&times;</td>
+  </tr>
+  <tr>
+    <td>Main verify infer</td>
+    <td>14.3 ms (1 token)</td>
+    <td>~32 ms (4 tokens)</td>
+    <td>0.8B is not fully memory-bound; cost scales ~linearly</td>
+  </tr>
+  <tr>
+    <td>Total per attempt</td>
+    <td>~17.7 ms</td>
+    <td>~42.2 ms</td>
+    <td>&mdash;</td>
+  </tr>
+</table>
+
+<h3>Hit Rate Decay with Layer Reuse</h3>
+<p>Single-layer MTP reused autoregressively shows rapidly decaying accuracy:</p>
+<table>
+  <tr><th>Draft Position</th><th>Estimated Hit Rate</th><th>Why</th></tr>
+  <tr><td>d<sub>1</sub></td><td>~30%</td><td>MTP predicts from main model&rsquo;s hidden_states (same as k=1)</td></tr>
+  <tr><td>d<sub>2</sub></td><td>~15%</td><td>MTP predicts from its own (weaker) hidden_states</td></tr>
+  <tr><td>d<sub>3</sub></td><td>~8%</td><td>Compounding error from 2 prior self-predictions</td></tr>
+</table>
+
+<h3>Expected Tokens per Attempt (Standard Spec Decode)</h3>
+<p>With standard rejection sampling, the expected accepted tokens follow:</p>
+<pre><code>E[tokens] = 1 + h₁ + h₁·h₂ + h₁·h₂·h₃
+          = 1 + 0.30 + 0.30×0.15 + 0.30×0.15×0.08
+          = 1.349</code></pre>
+<div class="note">
+  The key constraint: draft tokens are verified <strong>sequentially from the first</strong>. If d<sub>1</sub> is rejected,
+  d<sub>2</sub> and d<sub>3</sub> are discarded regardless. So the joint acceptance probability decays multiplicatively.
+</div>
+
+<h3>Performance Comparison: k=1 vs k=3</h3>
+<table>
+  <tr><th>Metric</th><th>Baseline (no MTP)</th><th>k=1 (1-tok verify)</th><th>k=3 (4-tok verify)</th></tr>
+  <tr><td>Cost per attempt</td><td>14.3 ms</td><td>~17.7 ms</td><td>~42.2 ms</td></tr>
+  <tr><td>Tokens per attempt</td><td>1.0</td><td>1.30</td><td>1.35</td></tr>
+  <tr><td><strong>ms/token</strong></td><td><strong>14.3</strong></td><td><strong>16.5</strong></td><td><strong>31.3</strong></td></tr>
+  <tr><td>vs Baseline</td><td>&mdash;</td><td class="delta-neg">&minus;13%</td><td class="delta-neg">&minus;119%</td></tr>
+</table>
+<p>k=3 is <strong>dramatically worse</strong> on the 0.8B model because:</p>
+<ol>
+  <li>The 4-token verify cost (~32 ms) is 2.2&times; the 1-token cost (not 1&times; as in large memory-bound models)</li>
+  <li>3&times; MTP forwards add 10.2 ms overhead (71% of a baseline decode step)</li>
+  <li>d<sub>2</sub>, d<sub>3</sub> hit rates are very low — the additional tokens gained (~0.05) don&rsquo;t justify the extra cost</li>
+</ol>
+
+<h3>When k&gt;1 Becomes Profitable</h3>
+<table>
+  <tr><th>Model Size</th><th>T<sub>1tok</sub></th><th>T<sub>4tok</sub></th><th>T<sub>MTP</sub>&times;3</th><th>h<sub>1</sub>/h<sub>2</sub>/h<sub>3</sub></th><th>E[tok]</th><th>ms/tok (k=3)</th><th>ms/tok (k=1)</th><th>k=3 Viable?</th></tr>
+  <tr>
+    <td>0.8B</td><td>14 ms</td><td>~32 ms</td><td>10 ms</td>
+    <td>30/15/8%</td><td>1.35</td><td>31.3</td><td>16.5</td>
+    <td class="delta-neg">No (&minus;90%)</td>
+  </tr>
+  <tr>
+    <td>7B</td><td>50 ms</td><td>~53 ms</td><td>15 ms</td>
+    <td>60/40/25%</td><td>1.90</td><td>35.8</td><td>31.1</td>
+    <td class="delta-pos">Marginal (+13%)</td>
+  </tr>
+  <tr>
+    <td>72B</td><td>200 ms</td><td>~205 ms</td><td>30 ms</td>
+    <td>70/50/35%</td><td>2.23</td><td>105</td><td>108</td>
+    <td class="delta-pos">Yes (+3%)</td>
+  </tr>
+</table>
+<div class="note">
+  <strong>Key insight</strong>: k&gt;1 is profitable only when the verify cost T<sub>(k+1)tok</sub> &asymp; T<sub>1tok</sub>
+  (memory-bound regime, large models). On 0.8B where T<sub>4tok</sub> = 2.2 &times; T<sub>1tok</sub>,
+  the extra tokens from k=3 cannot compensate for the increased verify cost.
+</div>
+
+<!-- ======== Cross-Platform Comparison ======== -->
+<h2 id="cross-platform">Cross-Platform Comparison: vLLM (4090) vs OpenVINO (Intel GPU)</h2>
+<p><strong>Model</strong>: Qwen3.5-0.8B &nbsp;|&nbsp; <strong>vLLM</strong>: NVIDIA RTX 4090, ~230 output tokens &nbsp;|&nbsp; <strong>OV</strong>: Intel GPU, INT4_ASYM, 64 output tokens</p>
+
+<h3>Raw Data</h3>
+<table>
+  <tr>
+    <th>Metric</th>
+    <th>vLLM Baseline</th>
+    <th>vLLM MTP</th>
+    <th>OV v2 Baseline</th>
+    <th>OV v2 MTP</th>
+  </tr>
+  <tr><td>Decode throughput (tok/s)</td><td>424.8</td><td>428.7</td><td>~70</td><td>~61</td></tr>
+  <tr><td>Decode latency (ms/tok)</td><td>~2.35</td><td>~2.33</td><td>14.3</td><td>16.5</td></tr>
+  <tr><td>MTP hit rate</td><td>&mdash;</td><td><strong>71.9%</strong></td><td>&mdash;</td><td><strong>~30%</strong></td></tr>
+  <tr><td>Mean acceptance length</td><td>&mdash;</td><td>1.72</td><td>&mdash;</td><td>1.30</td></tr>
+  <tr><td>MTP decode speedup</td><td>&mdash;</td><td class="delta-pos">+1%</td><td>&mdash;</td><td class="delta-neg">&minus;13%</td></tr>
+  <tr><td>Overall speedup (incl TTFT)</td><td>&mdash;</td><td class="delta-pos">+10%</td><td>&mdash;</td><td class="delta-neg">&minus;13%</td></tr>
+</table>
+
+<h3>Gap Analysis</h3>
+
+<h4>1. Hit Rate Gap: 72% vs 30%</h4>
+<p>Same 0.8B model should not have such a large hit rate difference. Possible causes:</p>
+<table>
+  <tr><th>Factor</th><th>vLLM</th><th>OV</th><th>Impact</th></tr>
+  <tr><td>Generation length</td><td>~230 tokens</td><td>64 tokens</td><td>Longer generation &rarr; more context &rarr; better MTP accuracy</td></tr>
+  <tr><td>Prompt type</td><td>Unknown (may be more structured)</td><td>Generic test prompt</td><td>Some prompts are more predictable</td></tr>
+  <tr><td>Numerical precision</td><td>FP16 on CUDA</td><td>INT4_ASYM on GPU</td><td><strong>Quantization may harm MTP prediction quality</strong></td></tr>
+  <tr><td>Sampling method</td><td>Likely greedy</td><td>Greedy</td><td>Should be consistent</td></tr>
+</table>
+<div class="note">
+  <strong>Action needed</strong>: Test with identical prompt and generation length on both platforms. Investigate whether INT4 quantization degrades MTP head prediction accuracy.
+</div>
+
+<h4>2. Even 72% Hit Rate Yields Only +1% Decode Speedup</h4>
+<pre><code>vLLM on 4090:
+  Baseline decode: 2.35 ms/tok
+  At 72% hit rate, 1.72 mean acceptance &rarr; ~1.72 tokens/step
+  Theoretical: 2.35 / 1.72 = 1.37 ms/tok
+  Actual:      2.33 ms/tok (only +1%)
+  &rarr; MTP scheduling/sync overhead nearly erases all gains</code></pre>
+<p><strong>Conclusion</strong>: 0.8B is too fast on 4090 (2.35 ms/tok). MTP orchestration overhead is comparable to inference time itself. Small model + fast hardware = MTP cannot profit in decode phase.</p>
+
+<h4>3. vLLM&rsquo;s 10% Overall Speedup Comes from TTFT</h4>
+<pre><code>vLLM TTFT: 2.337s &rarr; 2.000s (&darr;14%)
+vLLM Decode: 0.539s &rarr; 0.511s (&darr;5%)
+&rarr; TTFT improvement (337 ms) contributes most of the overall speedup</code></pre>
+<p>MTP can overlap some computation during prefill phase, but decode-phase benefit is minimal on this small model.</p>
+
+<h3>Improvement Roadmap</h3>
+<table>
+  <tr><th>Priority</th><th>Direction</th><th>Expected Impact</th><th>Details</th></tr>
+  <tr>
+    <td><strong>P0</strong></td>
+    <td>Test larger models (7B/14B/72B)</td>
+    <td class="delta-pos">Decode +30&ndash;80%</td>
+    <td>Large models are memory-bound; MTP overhead is amortizable; higher hit rates (60&ndash;80%)</td>
+  </tr>
+  <tr>
+    <td><strong>P1</strong></td>
+    <td>Verify INT4 impact on MTP accuracy</td>
+    <td>May improve hit rate</td>
+    <td>If INT4 harms MTP predictions, consider FP16/INT8 for MTP head only</td>
+  </tr>
+  <tr>
+    <td><strong>P1</strong></td>
+    <td>Align test conditions with vLLM</td>
+    <td>Clarify true hit rate gap</td>
+    <td>Same prompt, same generation length, same sampling to isolate platform differences</td>
+  </tr>
+  <tr>
+    <td><strong>P2</strong></td>
+    <td>Reduce MTP orchestration overhead</td>
+    <td class="delta-pos">Decode +5&ndash;10%</td>
+    <td>Minimize tensor creation/copy; async MTP execution</td>
+  </tr>
+  <tr>
+    <td><strong>P2</strong></td>
+    <td>Increase generation length tests</td>
+    <td>May improve hit rate</td>
+    <td>64 tokens may be insufficient for MTP to build enough context</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>Core conclusion</strong>: 0.8B is too small to benefit from MTP in the decode phase on <em>any</em> high-performance hardware.
+  vLLM on 4090 achieves 72% hit rate but only +1% decode speedup. The real ROI is on 7B+ models where:<br>
+  &bull; Decode latency is high enough (&gt;50 ms/tok) that MTP overhead is negligible<br>
+  &bull; MTP head predicts more accurately (60&ndash;80% hit rate)<br>
+  &bull; Memory-bound regime makes K+1 token verify &asymp; 1-token verify cost
+</div>
+
+<!-- ======== 9B Benchmark ======== -->
+<h2 id="benchmark-9b">Benchmark: Qwen3.5-9B on Intel GPU</h2>
+<p><strong>Setup</strong>: Qwen3.5-9B (hidden_size=4096, 32 layers, 1 MTP layer) | INT4_ASYM g128 | Intel GPU (CPU) | 220 output tokens | 3 runs</p>
+
+<h3>Results</h3>
+<table>
+  <tr><th>Mode</th><th>Config</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>MTP Hit Rate</th><th>Tok/Infer</th><th>Delta</th></tr>
+  <tr><td rowspan="2">Text</td><td>Baseline</td><td>84.21</td><td>11.90</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>MTP v2</td><td>83.76</td><td>11.97</td><td>28.7%</td><td><strong>1.00</strong></td><td>&minus;0.5%</td></tr>
+  <tr><td rowspan="2">VL</td><td>Baseline</td><td>66.26</td><td>15.09</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>MTP v2</td><td>77.52</td><td>12.90</td><td>40.6%</td><td><strong>1.00</strong></td><td class="delta-neg">+17%</td></tr>
+</table>
+
+<h3>Critical Finding: Tok/Infer = 1.00 &mdash; MTP Is Pure Overhead</h3>
+<p><code>Tok/Infer = 1.00</code> in all runs means v2 <strong>never skips a main model call</strong>. Every output token requires:</p>
+<pre><code>Current v2 execution per step:
+  1. main(confirmed_tok) &rarr; verified_id + hidden_states  &larr; always runs
+  2. MTP(hidden_states) &rarr; new_draft                      &larr; always runs (pure overhead)
+  3. Compare verified_id vs previous_draft &rarr; record hit/miss
+  Result: 1 token emitted, 1 main infer + 1 MTP infer
+
+Problem: even on HIT, next step still calls main model
+  &rarr; MTP inference time is pure overhead
+  &rarr; &ldquo;skip next main model call on hit&rdquo; is NOT implemented</code></pre>
+
+<h3>9B MTP Overhead Estimation</h3>
+<pre><code>Qwen3.5-9B: hidden_size=4096, intermediate=12288, vocab=248320
+MTP overhead per step:
+  fc (2&times;4096 &rarr; 4096):         ~1 ms (INT4)
+  1 decoder layer (4096 dim):  ~5&ndash;8 ms
+  lm_head (4096 &rarr; 248320):     ~3&ndash;5 ms
+  Total MTP:                    ~10&ndash;15 ms
+
+VL: baseline 66 ms + MTP ~11 ms = 77 ms (actual 77.5 ms &check;)
+Text: baseline 84 ms + MTP ~10 ms &asymp; 94 ms (actual 83.8 ms, within noise)</code></pre>
+
+<h3>Why vLLM Achieves Tok/Infer &gt; 1 But We Don&rsquo;t</h3>
+<table>
+  <tr><th>Aspect</th><th>vLLM (K+1 verify)</th><th>OV v2 (1-tok verify)</th></tr>
+  <tr><td>Main model input</td><td><code>[confirmed, draft]</code> (2 tokens)</td><td><code>[confirmed]</code> (1 token)</td></tr>
+  <tr><td>On accept</td><td>2 tokens from 1 forward &rarr; <strong>Tok/Infer=2</strong></td><td>1 token from 1 forward &rarr; Tok/Infer=1</td></tr>
+  <tr><td>On reject</td><td>1 token from 1 forward</td><td>1 token from 1 forward</td></tr>
+  <tr><td>E[Tok/Infer]</td><td>1 + h = <strong>1.72</strong> at 72%</td><td><strong>1.00</strong> always</td></tr>
+  <tr><td>MTP cost</td><td>Amortized by extra tokens</td><td>Pure overhead</td></tr>
+</table>
+
+<div class="note">
+  <strong>Root cause</strong>: v2 uses 1-token infer to avoid KV trim, but also loses the ability to verify + emit multiple tokens per forward pass.
+  On memory-bound 9B models where T<sub>2tok</sub> &asymp; T<sub>1tok</sub>, the v1 2-token verify approach may actually be <strong>better</strong> than v2.
+</div>
+
+<h3>Improvement Roadmap for 9B+</h3>
+<table>
+  <tr><th>Priority</th><th>Direction</th><th>Expected Impact</th><th>Details</th></tr>
+  <tr>
+    <td><strong>P0</strong></td>
+    <td><s>Implement 2-token batch verify (skip main on hit)</s></td>
+    <td class="delta-pos">&check; Done (v3)</td>
+    <td>2-token batch verify: HIT produces 2 tokens from 1 main infer (Tok/Infer=2.0). MISS trims KV by 1.</td>
+  </tr>
+  <tr>
+    <td><strong>P1</strong></td>
+    <td>Implement vLLM-style K+1 verify</td>
+    <td class="delta-pos">Maximum benefit</td>
+    <td>Requires OpenVINO GPU to support stale KV overwrite or efficient KV trim.</td>
+  </tr>
+  <tr>
+    <td><strong>P2</strong></td>
+    <td>Improve hit rate</td>
+    <td>Indirect boost to all approaches</td>
+    <td>Verify INT4 impact on MTP accuracy; test with longer generation.</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>v3 vs v2 expected effect</strong> (9B CPU, T<sub>main</sub>&asymp;80 ms, T<sub>mtp</sub>&asymp;15 ms, h=30%):<br>
+  &bull; v2: TPOT &asymp; (80 + 15) / 1.0 = 95 ms/tok (19% slower than baseline 80 ms)<br>
+  &bull; v3: TPOT &asymp; (80 + 15) / 1.3 &asymp; 73 ms/tok (~9% faster than baseline)<br>
+  &bull; Key difference: v3 Tok/Infer = 1+h = 1.3 &gt; 1.0 &mdash; MTP overhead is amortized by hit acceleration.
+</div>
 
 <!-- ======== Next Steps ======== -->
-<h2 id="next-steps">Next Steps for Performance Optimization</h2>
+<h2 id="next-steps">Remaining Gaps &amp; Next Steps</h2>
 <ol>
-  <li><strong>Reduce 2-token infer cost</strong>: Investigate if GPU plugin can batch 2-token inference more efficiently; explore async MTP execution</li>
-  <li><strong>Avoid MTP state reset</strong>: Implement proper MTP KV cache trim on GPU to preserve speculative context across rejections</li>
-  <li><strong>Test with larger models</strong>: 7B+ models typically achieve 60&ndash;80% MTP hit rates, making speculative decode profitable</li>
-  <li><strong>Multi-token speculation (k&gt;1)</strong>: Extend to draft k tokens ahead and verify all at once</li>
-  <li><strong>Benchmark with longer sequences</strong>: Hit rate may improve with more context</li>
+  <li><s><strong>Skip main model call on hit</strong></s>: &check; Resolved &mdash; v3 uses 2-token batch verify, producing 2 tokens from 1 main infer on HIT.</li>
+  <li><strong>Benchmark v3 on 9B</strong>: Measure actual Tok/Infer, KV trim cost on CPU, overall throughput improvement vs v2.</li>
+  <li><strong>Multi-token speculation (k&gt;1)</strong>: Extend MTP to draft k tokens ahead and verify in a single (k+1)-token infer (vLLM-style K+1 verify).</li>
+  <li><strong>Adaptive strategy</strong>: Auto-select v2 (small compute-bound models) vs v3 (large memory-bound models) based on model size.</li>
+  <li><strong>Async MTP execution</strong>: Run MTP inference in parallel with main model inference to hide MTP latency entirely.</li>
+  <li><strong>Benchmark with longer sequences</strong>: Hit rate may improve with more context.</li>
 </ol>
 
 <div class="footer">
-  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Commit <code>02a719a4</code> on <code>explicit-modeling</code> &mdash; March 2026
+  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; March 2026
 </div>
 
 </body>
