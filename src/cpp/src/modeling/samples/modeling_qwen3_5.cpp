@@ -364,8 +364,14 @@ void apply_text_config_overrides(ov::genai::modeling::models::Qwen3_5Config& cfg
     cfg.validate();
 }
 
-std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens) {
-    std::string prompt = "<|im_start|>user\n<|vision_start|>";
+std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens, bool enable_thinking = true) {
+    std::string prompt;
+    // When thinking is disabled, add a system message to suppress <think> generation.
+    // This mirrors Qwen3.5's chat template behavior with enable_thinking=false.
+    if (!enable_thinking) {
+        prompt += "<|im_start|>system\n/no_think<|im_end|>\n";
+    }
+    prompt += "<|im_start|>user\n<|vision_start|>";
     prompt.reserve(prompt.size() + static_cast<size_t>(image_tokens) * 12 + user_prompt.size() + 64);
     for (int64_t i = 0; i < image_tokens; ++i) {
         prompt += "<|image_pad|>";
@@ -1465,6 +1471,32 @@ int main(int argc, char* argv[]) try {
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
 
+    // Auto-set SDPA single-token threshold for MTP pure-batch mode.
+    // SDPA multi-token kernel uses different tiling than single-token kernel,
+    // causing batch-size-dependent numerical divergence (same root cause class
+    // as the oneDNN FC accumulation issue).  Force single-token SDPA kernel
+    // for batch sizes up to K+1 to ensure batch=1 draft and batch=K+1 verify
+    // produce identical hidden states at each token position.
+    // Use max(existing, K+1) so user can set a higher value but inherited
+    // stale values from parent processes don't prevent proper auto-config.
+    if (use_mtp && use_pure_batch) {
+        const int sdpa_threshold = opts.mtp_k + 1;  // K+1 tokens in verify batch
+        auto* existing = std::getenv("OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD");
+        const int current = existing ? std::atoi(existing) : 0;
+        if (sdpa_threshold > current) {
+#ifdef _WIN32
+            _putenv_s("OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD", std::to_string(sdpa_threshold).c_str());
+#else
+            setenv("OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD", std::to_string(sdpa_threshold).c_str(), 1);
+#endif
+            std::cout << "[mtp] Auto-set OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=" << sdpa_threshold
+                      << " for batch-size-invariant SDPA" << std::endl;
+        } else if (existing) {
+            std::cout << "[mtp] OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=" << current
+                      << " (user override, K+1=" << sdpa_threshold << ")" << std::endl;
+        }
+    }
+
     auto compiled_text = core.compile_model(text_model, opts.device);
 
     // Compile MTP model if enabled
@@ -1536,7 +1568,7 @@ int main(int argc, char* argv[]) try {
                     ov::genai::modeling::models::Qwen3_5VisionPreprocessor::count_visual_tokens(
                         grid_thw,
                         cfg.vision.spatial_merge_size);
-                prompt = build_vl_prompt(opts.user_prompt, image_tokens);
+                prompt = build_vl_prompt(opts.user_prompt, image_tokens, opts.enable_thinking);
                 add_special_tokens = false;
             } else {
                 prompt = opts.user_prompt;
@@ -1918,17 +1950,25 @@ int main(int argc, char* argv[]) try {
     }
 
     // Periodic state refresh for pure-batch mode: rolling checkpoint to
-    // correct linear_states drift from rejected tokens. Every N generated
-    // tokens, restore linear_states to last checkpoint, trim KV, re-forward
-    // all tokens since checkpoint as a batch. This amortizes the re-forward
-    // cost while keeping linear_states bounded-accurate.
-    // Mode 8 auto-default: if refresh not explicit, default to 64 tokens to
-    // prevent KV cache drift from batch=K+1 numerical differences.
+    // correct accumulated state drift from batch=K+1 inference.  Even with
+    // SDPA threshold and FC acc_mode fixes, residual numerical differences
+    // between batch=K+1 and batch=1 (from other kernels) compound over many
+    // accepted steps.  High acceptance rates make this worse as more batch
+    // inferences execute without the corrective effect of rejection+restore.
+    // Every N tokens, restore linear_states, trim KV, re-forward from
+    // checkpoint.  Higher K → larger batch → faster drift → shorter interval.
     const int REFRESH_INTERVAL = [&]() -> int {
         if (opts.refresh_interval > 0) return opts.refresh_interval;
         auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
         int mode = env ? std::atoi(env) : 3;
-        return (mode & 8) ? 64 : 0;  // auto-enable for mode 8
+        if (mode & 8) return 32;  // re-forward mode: frequent refresh
+        if (has_kernel_snapshot && K > 0) {
+            // K=1: batch=2, slow drift → 64 tokens
+            // K=2: batch=3, moderate drift → 48 tokens
+            // K≥3: batch=4+, fast drift → 32 tokens
+            return K <= 1 ? 64 : (K <= 2 ? 48 : 32);
+        }
+        return 0;
     }();
     int64_t checkpoint_past_len = 0;
     std::vector<int64_t> tokens_since_checkpoint;
@@ -1968,7 +2008,8 @@ int main(int argc, char* argv[]) try {
         //   - No kernel snapshots (fallback): re-forward on rejection + periodic refresh
         //   - Mode 8 (kernel snapshot + re-forward): periodic refresh to prevent
         //     KV cache drift from batch=K+1 vs batch=1 numerical differences
-        const bool needs_refresh_tracking = !has_kernel_snapshot || (snapshot_restore_mode & 8);
+        //   - REFRESH_INTERVAL > 0: periodic refresh as safety net (e.g. K>=3)
+        const bool needs_refresh_tracking = !has_kernel_snapshot || (snapshot_restore_mode & 8) || REFRESH_INTERVAL > 0;
         if (needs_refresh_tracking) {
             save_linear_states(text_request, linear_snap);
             checkpoint_past_len = past_len;
@@ -2214,8 +2255,10 @@ int main(int argc, char* argv[]) try {
                 // Without kernel snapshots: needed for rollback+replay on rejection.
                 // Mode 8 (re-forward): needs pre-batch snapshot even with kernel snapshots,
                 // because re-forward must start from pre-batch state (not post-accepted).
+                // Periodic refresh also needs pre-batch snapshot for checkpoint rollback.
                 auto t_snap_save0 = std::chrono::steady_clock::now();
-                if (!has_kernel_snapshot || (snapshot_restore_mode & 8)) {
+                const bool needs_linear_snap = !has_kernel_snapshot || (snapshot_restore_mode & 8) || REFRESH_INTERVAL > 0;
+                if (needs_linear_snap) {
                     save_linear_states(text_request, linear_snap);
                 }
 
