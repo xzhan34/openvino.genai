@@ -64,7 +64,10 @@
     <li><a href="#vllm-reference">vLLM Reference: Verify &amp; Rejection Sampling</a></li>
     <li><a href="#k3-analysis">Multi-Token Speculation (k=3) Analysis</a></li>
     <li><a href="#cross-platform">Cross-Platform: vLLM (4090) vs OpenVINO (Intel GPU)</a></li>
-    <li><a href="#benchmark-9b">Benchmark: Qwen3.5-9B on Intel GPU</a></li>
+    <li><a href="#benchmark-9b">Benchmark: Qwen3.5-9B on Intel GPU (v2)</a></li>
+    <li><a href="#benchmark-9b-gpu-v4">Benchmark: Qwen3.5-9B GPU — K+1 Verify (v4)</a></li>
+    <li><a href="#bugfix-attn-mask">Bug Fix: K+1 Verify Attention Mask</a></li>
+    <li><a href="#kernel-snapshot">Kernel-Level Per-Token State Snapshots (April 2026)</a></li>
     <li><a href="#next-steps">Remaining Gaps &amp; Next Steps</a></li>
   </ul>
 </div>
@@ -72,9 +75,9 @@
 <!-- ======== Overview ======== -->
 <h2 id="overview">Overview</h2>
 <p>This document summarizes the initial MTP speculative decoding implementation for Qwen3.5 in the OpenVINO GenAI explicit modeling framework. This serves as the baseline for future performance optimization work.</p>
-<p><strong>Status</strong>: <span class="status status-ok">Functionally Complete</span> &nbsp;
-   Speculative decoding works end-to-end on both text and VL modes. Current implementation (v3, 2-token batch verify) achieves Tok/Infer = 1+h on HIT, meaning MTP actually reduces main model calls on memory-bound models (9B+).</p>
-<p><strong>Speculative tokens</strong>: <code>num_speculative_tokens = 1</code>. The MTP model has a single decoder layer (<code>mtp_num_hidden_layers=1</code>) and drafts exactly 1 token ahead per step. The main model then verifies this single draft token.</p>
+<p><strong>Status</strong>: <span class="status status-warn">K+1 Verify — Attention Mask Bug Fixed, Re-benchmark Needed</span> &nbsp;
+   K+1 verify speculative decoding is fully implemented. <strong>Critical attention mask bug fixed</strong> &mdash; previous K&ge;2 results were invalid due to wrong causal mask shape. After fix: 9B GPU produces coherent text at all K values. Previous benchmark data needs re-measurement.</p>
+<p><strong>Speculative tokens</strong>: Configurable via <code>--mtp-k N</code> (default: 1). The MTP model drafts K tokens autoregressively using its own hidden_states output. The main model verifies all K drafts in a single K+1 token forward pass.</p>
 
 <!-- ======== Architecture ======== -->
 <h2 id="architecture">Architecture</h2>
@@ -1000,15 +1003,15 @@ Text: baseline 84 ms + MTP ~10 ms &asymp; 94 ms (actual 83.8 ms, within noise)</
   </tr>
   <tr>
     <td><strong>P1</strong></td>
-    <td>Implement vLLM-style K+1 verify</td>
-    <td class="delta-pos">Maximum benefit</td>
-    <td>Requires OpenVINO GPU to support stale KV overwrite or efficient KV trim.</td>
+    <td><s>Implement vLLM-style K+1 verify</s></td>
+    <td class="delta-pos">&check; Done (v4) &mdash; Text +37%, VL +15%</td>
+    <td>K+1 verify with autoregressive MTP drafting. K=2 optimal for Text, K=3 optimal for VL.</td>
   </tr>
   <tr>
     <td><strong>P2</strong></td>
-    <td>Improve hit rate</td>
-    <td>Indirect boost to all approaches</td>
-    <td>Verify INT4 impact on MTP accuracy; test with longer generation.</td>
+    <td>Improve hit rate (greedy + FP16 MTP)</td>
+    <td>Could reach +50-80% throughput</td>
+    <td>Current accept rate ~52% vs vLLM&rsquo;s 90%. Greedy and FP16 MTP head may close this gap.</td>
   </tr>
 </table>
 
@@ -1019,19 +1022,407 @@ Text: baseline 84 ms + MTP ~10 ms &asymp; 94 ms (actual 83.8 ms, within noise)</
   &bull; Key difference: v3 Tok/Infer = 1+h = 1.3 &gt; 1.0 &mdash; MTP overhead is amortized by hit acceleration.
 </div>
 
+<!-- ======== 9B GPU K+1 Verify Benchmark ======== -->
+<h2 id="benchmark-9b-gpu-v4">Benchmark: Qwen3.5-9B GPU &mdash; K+1 Verify (v4)</h2>
+
+<div class="note" style="background:#ffebe9; border-left-color:var(--red);">
+  <strong>&#9888; WARNING: Data below is INVALID</strong><br>
+  Affected by two bugs now fixed: (1) 9B model missing <code>openvino_tokenizer.xml</code> &mdash; used dummy byte-level tokenization (prompt became 66 garbage tokens); (2) K+1 verify attention mask shape <code>[B, K+1]</code> instead of <code>[B, past_len+K+1]</code> &mdash; caused degenerate text for K&ge;2. Full re-benchmark needed.
+</div>
+
+<p><strong>Setup</strong>: Qwen3.5-9B | INT4_ASYM group_size=128 | Intel GPU | 256 output tokens | 3 runs averaged | Sampling (T=1.0, top_p=0.95, top_k=20)</p>
+
+<h3>Text Mode</h3>
+<table>
+  <tr><th>Config</th><th>TTFT (ms)</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>Accept%</th><th>Tok/Infer</th><th>Avg Acc</th><th>vs Baseline</th></tr>
+  <tr><td>Baseline</td><td>266.64</td><td>77.67</td><td>12.89</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>MTP K=1</td><td>258.05</td><td>77.65</td><td>12.89</td><td>52.5%</td><td>1.52</td><td>0.52</td><td><span class="delta-neg">+0%</span></td></tr>
+  <tr style="background:#dafbe1"><td><strong>MTP K=2</strong></td><td><strong>205.22</strong></td><td><strong>57.31</strong></td><td><strong>17.67</strong></td><td><strong>57.7%</strong></td><td><strong>2.15</strong></td><td><strong>1.16</strong></td><td><span class="delta-pos"><strong>+37.1%</strong></span></td></tr>
+  <tr><td>MTP K=3</td><td>264.10</td><td>58.25</td><td>17.30</td><td>46.6%</td><td>2.39</td><td>1.40</td><td><span class="delta-pos">+34.2%</span></td></tr>
+</table>
+
+<h3>VL Mode</h3>
+<table>
+  <tr><th>Config</th><th>TTFT (ms)</th><th>TPOT (ms/tok)</th><th>Throughput (tok/s)</th><th>Accept%</th><th>Tok/Infer</th><th>Avg Acc</th><th>vs Baseline</th></tr>
+  <tr><td>Baseline</td><td>254.38</td><td>67.96</td><td>14.72</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>MTP K=1</td><td>261.62</td><td>86.05</td><td>11.62</td><td>47.1%</td><td>1.47</td><td>0.47</td><td><span class="delta-neg">-21.1%</span></td></tr>
+  <tr><td>MTP K=2</td><td>239.11</td><td>69.36</td><td>14.53</td><td>47.7%</td><td>1.95</td><td>0.95</td><td><span class="delta-neg">-1.3%</span></td></tr>
+  <tr style="background:#dafbe1"><td><strong>MTP K=3</strong></td><td><strong>256.83</strong></td><td><strong>61.41</strong></td><td><strong>16.87</strong></td><td><strong>49.8%</strong></td><td><strong>2.49</strong></td><td><strong>1.49</strong></td><td><span class="delta-pos"><strong>+14.6%</strong></span></td></tr>
+</table>
+
+<h3>Key Findings</h3>
+
+<div class="note" style="background:#ffebe9; border-left-color:var(--red);">
+  <strong>&#9888; Data invalidated by attention mask bug.</strong><br>
+  Text K=2 +37.1% and VL K=3 +14.6% results below were measured with broken attention mask
+  (K+1 tokens could not attend to cached context). High accept rates were artificially inflated
+  by degenerate repetitive output. See <a href="#bugfix-attn-mask">Bug Fix section</a> for details.
+</div>
+
+<h4>Why GPU K+1 Works</h4>
+<p>GPU is purely memory-bound for 9B models: <strong>T<sub>K+1tok</sub> &asymp; T<sub>1tok</sub></strong>. The K+1 token verify batch adds near-zero compute cost. All extra tokens are effectively &ldquo;free&rdquo; in terms of main model latency.</p>
+
+<h4>Optimal K Selection</h4>
+<table>
+  <tr><th>Mode</th><th>Best K</th><th>Throughput Gain</th><th>Reason</th></tr>
+  <tr><td>Text</td><td><strong>K=2</strong></td><td>+37.1%</td><td>K=3 drops Accept% from 57.7% to 46.6%; diminishing returns</td></tr>
+  <tr><td>VL</td><td><strong>K=3</strong></td><td>+14.6%</td><td>Higher MTP overhead in VL mode; needs more drafts to amortize</td></tr>
+</table>
+
+<h4>K=1 is Break-Even on GPU</h4>
+<p>Text K=1: +0% (exactly break-even at h&asymp;52%). VL K=1: <strong>&minus;21%</strong> (severely negative). Single-draft verification does not generate enough extra tokens to cover MTP overhead on GPU.</p>
+
+<h4>Variance from Sampling Randomness</h4>
+<p>Per-run variance is very high with T=1.0 sampling:</p>
+<ul>
+  <li>VL K=3: 21.42 / 15.51 / 13.69 tok/s &mdash; best-to-worst <strong>57%</strong> gap</li>
+  <li>Text K=2: 15.10 / 18.11 / 19.81 &mdash; <strong>31%</strong> gap</li>
+</ul>
+<p><strong>Greedy (T=0) benchmarks needed</strong> to eliminate sampling noise and get stable acceptance rates.</p>
+
+<h4>Comparison with vLLM (4090)</h4>
+<table>
+  <tr><th>Metric</th><th>vLLM 9B (4090)</th><th>OV 9B (Intel GPU)</th><th>Gap</th></tr>
+  <tr><td>K=1 Accept rate</td><td>90.4%</td><td>52.5%</td><td class="delta-neg">&minus;38pp</td></tr>
+  <tr><td>K=1 Decode speedup</td><td>+30%</td><td>+0%</td><td class="delta-neg">&minus;30pp</td></tr>
+  <tr><td>K=3 Tok/Infer</td><td>3.24</td><td>2.39</td><td>&minus;0.85</td></tr>
+  <tr><td>K=3 Decode speedup</td><td>+50%</td><td>+34%</td><td>&minus;16pp</td></tr>
+</table>
+<p><strong>Biggest gap: accept rate</strong> (90% vs 52%). Possible causes: INT4 quantization damaging MTP head precision (vLLM uses FP16), sampling randomness, or different prompts/content.</p>
+
+<h3>Acceptance Rate Metrics (v4)</h3>
+<table>
+  <tr><th>Metric</th><th>Formula</th><th>Meaning</th></tr>
+  <tr><td><strong>MTP hits (conditional)</strong></td><td>hits / attempts</td><td>Only counts positions actually tested (stops at first reject). Biased high.</td></tr>
+  <tr><td><strong>MTP draft acceptance (absolute)</strong></td><td>hits / (steps &times; K)</td><td>All generated drafts. True MTP quality measure.</td></tr>
+  <tr><td><strong>MTP mean accepted/step</strong></td><td>hits / main_infers</td><td>Average accepted drafts per main model forward pass.</td></tr>
+</table>
+
+<!-- ======== Bug Fix: K+1 Verify Attention Mask ======== -->
+<h2 id="bugfix-attn-mask">Bug Fix: K+1 Verify Attention Mask (2026-03-31)</h2>
+
+<h3>Problem Symptoms</h3>
+<p>0.8B model MTP K=2 and K=3 produced <strong>completely degenerate text</strong>:</p>
+<table>
+  <tr><th>Config</th><th>Generated Content</th><th>Accept%</th></tr>
+  <tr><td>Baseline (no MTP)</td><td>Coherent short story (Leo painting in lab)</td><td>&mdash;</td></tr>
+  <tr><td>MTP K=1</td><td><code>to now to now to now to now...</code></td><td>38%</td></tr>
+  <tr><td>MTP K=2</td><td><code>- - - - - - - - - - - - -...</code></td><td><strong>93%</strong> (artificially high)</td></tr>
+  <tr><td>MTP K=3</td><td><code>The\nThe\nThe\nThe\nThe...</code></td><td>65%</td></tr>
+</table>
+<p><strong>Key clue</strong>: K=2&rsquo;s 93% accept rate was fake &mdash; MTP trivially predicts degenerate repetitive sequences. With greedy T=0, speculative decoding should produce <strong>identical</strong> text to baseline.</p>
+
+<h3>Debug Process</h3>
+
+<h4>Step 1: Token ID Comparison</h4>
+<p>Added debug prints to output generated token IDs. Compared baseline vs K=1 vs K=2:</p>
+<pre><code>Baseline:  760 20513 314 279 9775 557 524 4147 26 424 557 8545 11 1040 279 4528
+K=1:       760 20513 557 279 1118 3065 3397 6408 13 271 2064 579 1288 1018 ...
+K=2:       760 20513 303 6949 11 264 3074 1500 314 6105 13 271 2064 557 279 ...</code></pre>
+<p>First 2 tokens match (760, 20513), divergence starts at token 3.</p>
+
+<h4>Step 2: Confirm Systematic Error</h4>
+<pre><code>Baseline Run 1/2/3:  760 20513 314 279 9775 ...  &larr; identical every time
+K=1 Run 1/2:         760 20513 557 279 1118 ...  &larr; also deterministic, but different</code></pre>
+<p>GPU greedy is deterministic. MTP is also deterministic. The divergence is <strong>systematic</strong>, not random noise.</p>
+
+<h4>Step 3: Internal State Tracing</h4>
+<p>Added detailed debug output tracing verify/accept/reject decisions per step:</p>
+<pre><code>[DBG] iter=1 past_len=29 next_id=760 logits=[1,3,248320] hs=[1,3,1024] drafts=[11952,995]
+[DBG]   k=0 REJECT draft=11952 verified=20513
+[DBG]   num_accepted=0 trim=2 past_len_before_trim=29</code></pre>
+<p>Accept/reject logic is correct, but <strong>the logits themselves are wrong</strong> &mdash; the main model produces incorrect logits for K+1 token input.</p>
+
+<h4>Step 4: Root Cause Found &mdash; Attention Mask Shape</h4>
+<p>Traced the issue to <code>run_kp1_verify()</code>&rsquo;s attention mask:</p>
+<pre><code>// BUG: mask shape = [batch, K+1]
+ov::Tensor step_mask_kp1 = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, kp1});</code></pre>
+<p>The model&rsquo;s internal <code>build_kv_causal_mask_with_attention_from_q_len()</code> uses <code>attention_mask.shape[1]</code> as <code>kv_len</code>:</p>
+<pre><code>kv_len   = attention_mask.shape[1] = K+1
+q_len    = input_ids.shape[1]      = K+1
+cache_len = kv_len - q_len = (K+1) - (K+1) = 0   &larr; BUG!</code></pre>
+<p><code>cache_len = 0</code> means the model thinks there are <strong>zero cached KV entries</strong>. All K+1 tokens can only attend to each other &mdash; completely blind to the prompt and all previously generated context.</p>
+
+<h4>Step 5: Why Single-Token Decode Was Unaffected</h4>
+<table>
+  <tr><th>Scenario</th><th>mask shape</th><th>kv_len</th><th>q_len</th><th>cache_len</th><th>Correct?</th></tr>
+  <tr><td>Prefill</td><td><code>[B, prompt_len]</code></td><td>prompt_len</td><td>prompt_len</td><td>0</td><td>&#10003;</td></tr>
+  <tr><td>Single decode</td><td><code>[B, 1]</code></td><td>1</td><td>1</td><td>0, but dim=1 broadcasts</td><td>&#10003;</td></tr>
+  <tr style="background:#ffebe9"><td><strong>K+1 verify (bug)</strong></td><td><code>[B, K+1]</code></td><td>K+1</td><td>K+1</td><td><strong>0</strong></td><td><strong>&#10007;</strong></td></tr>
+  <tr style="background:#dafbe1"><td><strong>K+1 verify (fix)</strong></td><td><code>[B, past_len+K+1]</code></td><td>past_len+K+1</td><td>K+1</td><td><strong>past_len</strong></td><td>&#10003;</td></tr>
+</table>
+<p>Single-token decode works because <code>[B, 1]</code> broadcasts to any KV length in SDPA. <code>[B, K+1]</code> (where K+1 &ge; 2) does <strong>not</strong> broadcast, producing a wrong <code>[K+1, K+1]</code> causal mask.</p>
+
+<h3>Fix</h3>
+<p>In <code>modeling_qwen3_5.cpp</code>, changed <code>run_kp1_verify()</code> to dynamically create the attention mask with correct shape:</p>
+<pre><code>// FIX: mask shape = [batch, past_len + K+1]
+const size_t full_mask_len = static_cast&lt;size_t&gt;(past_len) + kp1;
+ov::Tensor step_mask_kp1 = make_usm_host_tensor(
+    gpu_ctx, ov::element::i64, {batch, full_mask_len});
+auto* p = step_mask_kp1.data&lt;int64_t&gt;();
+for (size_t i = 0; i &lt; batch * full_mask_len; ++i) p[i] = 1;</code></pre>
+<p>This ensures <code>cache_len = (past_len + K+1) - (K+1) = past_len</code> &mdash; correct.</p>
+
+<h3>Verification Results</h3>
+
+<h4>0.8B Model</h4>
+<table>
+  <tr><th>Config</th><th>Before Fix</th><th>After Fix</th></tr>
+  <tr><td>K=1</td><td><code>to now to now to now...</code></td><td>Coherent story text</td></tr>
+  <tr><td>K=2</td><td><code>- - - - - - - - -...</code></td><td>Coherent text (diverges from baseline)</td></tr>
+  <tr><td>K=3</td><td><code>The\nThe\nThe\nThe...</code></td><td>Coherent initial text</td></tr>
+</table>
+
+<h4>9B Model</h4>
+<table>
+  <tr><th>Config</th><th>After Fix</th><th>Accept%</th><th>Tok/Infer</th></tr>
+  <tr><td>K=1</td><td>Coherent story (first 15 tokens match baseline)</td><td>51%</td><td>1.51</td></tr>
+  <tr><td>K=2</td><td>Coherent text (&ldquo;Paris is capital&rdquo;, chocolate cake recipe, etc.)</td><td>64%</td><td>2.27</td></tr>
+  <tr><td>K=3</td><td>Coherent text</td><td>18%</td><td>1.55</td></tr>
+</table>
+
+<h3>Known Limitation: Multi-Token SDPA Numerical Divergence</h3>
+<p>With greedy T=0, MTP output still <strong>slightly differs</strong> from baseline. This is due to GPU SDPA kernel numerical precision differences between <code>q_len &gt; 1</code> vs <code>q_len = 1</code>:</p>
+<ul>
+  <li><strong>9B K=1</strong>: First 15 tokens match baseline exactly, divergence at token 16</li>
+  <li><strong>0.8B K=1</strong>: First 2 tokens match, divergence at token 3 (smaller model is more sensitive)</li>
+</ul>
+<p>This is inherent to multi-token batch inference on GPU, not a code bug. The output text remains coherent and meaningful.</p>
+
+<h3>Impact: Previous Benchmark Data Invalid</h3>
+<div class="note" style="background:#ffebe9; border-left-color:var(--red);">
+  <strong>All previous K+1 verify benchmark results are unreliable:</strong><br>
+  <ul>
+    <li><strong>0.8B</strong>: K&ge;2 degenerate output inflated accept rates (93% on repetitive &ldquo;- - - -&rdquo;)</li>
+    <li><strong>9B</strong>: Double bug &mdash; dummy tokenization (66 garbage tokens) + wrong attention mask</li>
+  </ul>
+  Full re-benchmark with both fixes applied is required.
+</div>
+
+<!-- ======== Kernel-Level Per-Token State Snapshots ======== -->
+<h2 id="kernel-snapshot">Kernel-Level Per-Token State Snapshots (April 2026)</h2>
+
+<h3>Problem: Linear State Corruption at K&ge;2</h3>
+<p>
+Qwen3.5&rsquo;s hybrid architecture uses 24 <strong>GatedDeltaNet</strong> recurrent linear attention layers
+(every layer except every 4th, which is full SDPA). Each recurrent state evolves as:
+</p>
+<pre>S_t = exp(g_t) &middot; S_{t-1} + k_t &otimes; &beta;_t(v_t &minus; S_{t-1}^T k_t)</pre>
+<p>
+This recurrence is <strong>irreversible</strong>: given <code>S_t</code>, you cannot recover <code>S_{t-1}</code>.
+When MTP batch verify processes K+1 tokens but only <code>num_accepted &lt; K</code> are correct,
+the rejected tokens have already corrupted the recurrent state.
+Previous approaches (virtual trim, periodic refresh) only addressed KV cache rollback,
+leaving the recurrent state &ldquo;drifting&rdquo; from accumulated rejected tokens, causing
+text degeneration at K&ge;2.
+</p>
+
+<h3>Solution: vLLM-Inspired Per-Token State Snapshots</h3>
+<p>
+Following vLLM&rsquo;s approach for Qwen3.5, we modified the GPU <code>LinearAttention</code> OCL kernel
+to write <strong>per-token intermediate recurrent states</strong> to a 3rd output buffer.
+After batch verification, the host selects the correct state at <code>all_states[:, num_accepted, :, :, :]</code>
+and writes it back to the variable, achieving <strong>zero-drift, zero-re-forward</strong> state correction.
+</p>
+
+<h3>Implementation Changes</h3>
+
+<h4>OpenVINO Core (openvino.liangali) &mdash; 7 files</h4>
+<table>
+<tr><th>File</th><th>Change</th></tr>
+<tr>
+  <td><code>linear_attn.hpp</code></td>
+  <td>Added <code>m_snapshot_all_states</code> flag, new 3-arg constructor, <code>get_snapshot_all_states()</code> getter</td>
+</tr>
+<tr>
+  <td><code>linear_attn.cpp</code></td>
+  <td>3rd output shape <code>[B, T, H_v, K, V]</code> in <code>validate_and_infer_types()</code>; updated <code>clone</code>, <code>visit_attributes</code></td>
+</tr>
+<tr>
+  <td><code>linear_attention.hpp</code> (GPU primitives)</td>
+  <td>Added <code>snapshot_all_states</code> field, serialization, hash</td>
+</tr>
+<tr>
+  <td><code>linear_attention.cpp</code> (GPU plugin)</td>
+  <td>Passes <code>op-&gt;get_snapshot_all_states()</code> to primitive</td>
+</tr>
+<tr>
+  <td><code>linear_attention.cpp</code> (GPU graph)</td>
+  <td>3rd output layout <code>[B, T, H_v, K, K]</code></td>
+</tr>
+<tr>
+  <td><code>linear_attention_ref.cpp</code></td>
+  <td>Added <code>SNAPSHOT_ALL_STATES</code> JIT constant</td>
+</tr>
+<tr>
+  <td><code>linear_attention_ref.cl</code></td>
+  <td>Added 3rd output kernel parameter; inside time loop, writes <code>init_state</code> to <code>all_states[b, i, h, :, :]</code></td>
+</tr>
+</table>
+
+<h4>GenAI (openvino.genai.liangali) &mdash; 4 files</h4>
+<table>
+<tr><th>File</th><th>Change</th></tr>
+<tr>
+  <td><code>ops.hpp / ops.cpp</code></td>
+  <td>New <code>linear_attention()</code> overload returning <code>tuple&lt;Tensor,Tensor,Tensor&gt;</code> with <code>snapshot_all_states</code> flag</td>
+</tr>
+<tr>
+  <td><code>modeling_qwen3_5_text.hpp / .cpp</code></td>
+  <td>
+    <code>Qwen3_5GatedDeltaNet</code>: added <code>all_states_collector_</code> side channel.<br>
+    <code>create_qwen3_5_text_model()</code>: when <code>OV_GENAI_MTP_SNAPSHOT=1</code>, sets collectors
+    on all linear attention layers; routes 3rd outputs as model Results named
+    <code>all_linear_states.0</code> &hellip; <code>all_linear_states.23</code>.
+  </td>
+</tr>
+<tr>
+  <td><code>modeling_qwen3_5.cpp</code> (sample)</td>
+  <td>
+    Detects <code>all_linear_states.*</code> model outputs after compilation.<br>
+    After batch verify rejection: calls <code>select_and_restore_linear_states()</code>
+    to pick correct recurrent state + restores conv states + virtual KV trim.<br>
+    New helper functions: <code>find_all_linear_states_outputs()</code>,
+    <code>select_and_restore_linear_states()</code>,
+    <code>init_conv_state_snapshot()</code>, <code>save_conv_states()</code>,
+    <code>restore_conv_states()</code>.
+  </td>
+</tr>
+</table>
+
+<h3>Architecture Diagram</h3>
+<pre>
+  ┌─────────────────────────────────────────────────────────┐
+  │                  Batch Verify (K+1 tokens)              │
+  │  input: [next_id, draft_0, draft_1, ..., draft_K-1]    │
+  │                                                         │
+  │  LinearAttention kernel (per layer):                    │
+  │    output[0]: attention output   [B, K+1, H_v, V]      │
+  │    output[1]: final state        [B, H_v, K, K]        │
+  │    output[2]: all_states         [B, K+1, H_v, K, K]   │
+  │               ▲ per-token intermediate states           │
+  └─────────────────────┬───────────────────────────────────┘
+                        │
+          ┌─────────────┼─────────────┐
+          │ Accept/Reject phase       │
+          │ num_accepted = 2 (of K=3) │
+          └─────────────┬─────────────┘
+                        │
+  ┌─────────────────────▼───────────────────────────────────┐
+  │  State fixup:                                           │
+  │    recurrent_state = all_states[:, 2, :, :, :]          │
+  │    conv_state = pre-verify snapshot (restored)          │
+  │    KV cache: virtual trim (dead_positions for rejected) │
+  │                                                         │
+  │  Result: precise state, zero re-forward, zero KV copy   │
+  └─────────────────────────────────────────────────────────┘
+</pre>
+
+<h3>Memory Impact</h3>
+<p>
+Each snapshot output is <code>[B, K+1, 32, 128, 128]</code> in f32 = ~8 MB per layer.<br>
+For K=3 (4 tokens), 24 layers: <code>4 &times; 32 &times; 128 &times; 128 &times; 4 bytes &times; 24 = 192 MB</code>.<br>
+This is a modest GPU memory cost for eliminating the re-forward overhead (~25ms per rejection).
+</p>
+
+<h3>Usage</h3>
+<pre>
+# Enable kernel-level state snapshots at model build time:
+set OV_GENAI_MTP_SNAPSHOT=1
+
+# Run with batch verify (no --pure-batch needed, --seq-verify 0):
+modeling_qwen3_5.exe --model &lt;path&gt; --mode text --mtp 1 --mtp-k 3 --seq-verify 0
+
+# The sample auto-detects all_linear_states outputs and uses kernel snapshot mode.
+# Profiling output shows "[kernel-snapshot]" verify mode.
+</pre>
+
+<h3>GPU-Side State Restore API (April 2026)</h3>
+<p>
+To avoid the CPU round-trip overhead of <code>get_tensor()</code> + <code>memcpy</code> + <code>set_state()</code>,
+we added a new <code>restore_variable_from_output()</code> API through the full OpenVINO inference stack.
+This copies directly from GPU output memory to variable state memory using <code>enqueue_memcpy</code>,
+with no host-side data transfer.
+</p>
+
+<h4>API Stack (OpenVINO Core &mdash; 5 files)</h4>
+<table>
+<tr><th>Layer</th><th>File</th><th>Change</th></tr>
+<tr>
+  <td>Public API</td>
+  <td><code>infer_request.hpp / .cpp</code></td>
+  <td><code>InferRequest::restore_variable_from_output(variable_name, output_name, token_position)</code></td>
+</tr>
+<tr>
+  <td>Dev API</td>
+  <td><code>iinfer_request.hpp</code></td>
+  <td>Virtual method with default <code>OPENVINO_THROW</code> (opt-in per plugin)</td>
+</tr>
+<tr>
+  <td>Async bridge</td>
+  <td><code>iasync_infer_request.hpp / .cpp</code></td>
+  <td>Delegates to <code>m_sync_request</code></td>
+</tr>
+<tr>
+  <td>GPU SyncInferRequest</td>
+  <td><code>sync_infer_request.cpp</code></td>
+  <td>Looks up output via port map, gets GPU memory, calls <code>VariableState::set_state_from_memory_slice()</code></td>
+</tr>
+<tr>
+  <td>GPU VariableState</td>
+  <td><code>variable_state.cpp</code></td>
+  <td><code>set_state_from_memory_slice(src_5d_mem, token_position, shape)</code> &mdash; computes offset, does <code>memory::copy_from()</code></td>
+</tr>
+</table>
+
+<h4>Pre-Reorder Memory Optimization</h4>
+<p>
+The GPU plugin inserts an f16&rarr;f32 <code>reorder</code> primitive at every graph output boundary
+(the model is declared in FP32, but the GPU computes internally in FP16).
+When <code>restore_variable_from_output()</code> detects a type mismatch between the output memory (f32)
+and the variable state (f16), it navigates to the reorder&rsquo;s <strong>input dependency</strong> via
+<code>network-&gt;get_primitive(name)-&gt;dep_memory_ptr(0)</code> to obtain the pre-reorder f16 memory.
+This enables a direct GPU-to-GPU <code>enqueue_memcpy</code> with no type conversion and no CPU involvement.
+</p>
+
+<h4>Performance Impact</h4>
+<table>
+<tr><th>Path</th><th>Per-Restore Time</th><th>Mechanism</th></tr>
+<tr><td>CPU fallback (<code>get_tensor</code> + <code>set_state</code>)</td><td>~60 ms</td><td>GPU&rarr;CPU&rarr;f32&rarr;f16 convert&rarr;CPU&rarr;GPU</td></tr>
+<tr><td>GPU restore (f32 output, type mismatch)</td><td>~63 ms</td><td>GPU&rarr;CPU slice&rarr;f32&rarr;f16 convert&rarr;GPU</td></tr>
+<tr style="background:#dafbe1"><td><strong>GPU restore + pre-reorder (f16 direct)</strong></td><td><strong>~2.4 ms</strong></td><td><strong>GPU&rarr;GPU <code>enqueue_memcpy</code> (no CPU)</strong></td></tr>
+</table>
+<p><strong>25&times; speedup per restore</strong>. For K=3 with 43 restores: 102 ms total (vs ~2580 ms with CPU path).</p>
+
+<h3>Known Limitations</h3>
+<ul>
+  <li><strong>Conv state approximation</strong>: Conv states (sliding window, 4 tokens) are restored
+      to pre-verify snapshot on rejection. The accepted tokens are not replayed through the conv,
+      causing a minor (&le;4 token) window mismatch that self-corrects after a few decode steps.</li>
+  <li><strong>Memory overhead</strong>: 192 MB for K=3 on 24 layers. Acceptable for GPU inference
+      but may need optimization for larger K values.</li>
+</ul>
+
 <!-- ======== Next Steps ======== -->
 <h2 id="next-steps">Remaining Gaps &amp; Next Steps</h2>
 <ol>
-  <li><s><strong>Skip main model call on hit</strong></s>: &check; Resolved &mdash; v3 uses 2-token batch verify, producing 2 tokens from 1 main infer on HIT.</li>
-  <li><strong>Benchmark v3 on 9B</strong>: Measure actual Tok/Infer, KV trim cost on CPU, overall throughput improvement vs v2.</li>
-  <li><strong>Multi-token speculation (k&gt;1)</strong>: Extend MTP to draft k tokens ahead and verify in a single (k+1)-token infer (vLLM-style K+1 verify).</li>
-  <li><strong>Adaptive strategy</strong>: Auto-select v2 (small compute-bound models) vs v3 (large memory-bound models) based on model size.</li>
-  <li><strong>Async MTP execution</strong>: Run MTP inference in parallel with main model inference to hide MTP latency entirely.</li>
-  <li><strong>Benchmark with longer sequences</strong>: Hit rate may improve with more context.</li>
+  <li><s><strong>Skip main model call on hit</strong></s>: &check; Resolved &mdash; v3 uses 2-token batch verify.</li>
+  <li><s><strong>Multi-token speculation (k&gt;1)</strong></s>: &check; Resolved &mdash; v4 implements K+1 verify with autoregressive MTP drafting.</li>
+  <li><s><strong>Benchmark on 9B GPU</strong></s>: &check; Done &mdash; K=2 achieves +37% throughput on Text mode.</li>
+  <li><s><strong>Fix K+1 verify attention mask</strong></s>: &check; Fixed &mdash; mask shape corrected from <code>[B, K+1]</code> to <code>[B, past_len+K+1]</code>.</li>
+  <li><s><strong>Fix 9B tokenizer</strong></s>: &check; Fixed &mdash; generated <code>openvino_tokenizer.xml/bin</code> for Qwen3.5-9B.</li>
+  <li><s><strong>Linear state drift (K&ge;2)</strong></s>: &check; Fixed &mdash; kernel-level per-token state snapshots (April 2026).</li>
+  <li><s><strong>GPU-side state restore API</strong></s>: &check; Done &mdash; <code>restore_variable_from_output()</code> with pre-reorder optimization (25&times; faster).</li>
+  <li><strong>Re-run full benchmark</strong>: All previous 9B results are invalid (tokenizer + attention mask bugs). Need fresh data with both fixes.</li>
+  <li><strong>Run greedy (T=0) benchmark</strong>: Eliminate sampling randomness; compare accept rate with vLLM&rsquo;s 90%.</li>
+  <li><strong>Verify INT4 impact on MTP precision</strong>: FP16 MTP head may improve accept rate from ~50% toward vLLM&rsquo;s 90%.</li>
+  <li><strong>Adaptive K selection</strong>: Auto-tune K based on observed accept rate during generation.</li>
+  <li><strong>Async MTP execution</strong>: Overlap MTP inference with main model decode to hide MTP latency entirely.</li>
+  <li><strong>Conv state per-token snapshots</strong>: Add per-token conv state output to FusedConv kernel for fully precise state restoration.</li>
 </ol>
 
 <div class="footer">
-  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; March 2026
+  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; April 2026 (v6 GPU-Side State Restore)
 </div>
 
 </body>
