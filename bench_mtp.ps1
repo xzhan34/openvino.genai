@@ -19,13 +19,11 @@ $env:OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE = "int4_asym"
 $env:OV_GENAI_MTP_SNAPSHOT = "1"
 $env:OV_GENAI_SNAPSHOT_RESTORE = "3"   # GPU-side state restore on draft rejection (critical for MTP perf)
 $env:OV_GENAI_VALIDATE_SNAPSHOT = "0"  # Disable snapshot validation overhead in benchmarks
-# oneDNN FC accumulation mode fix (fully_connected_onednn.cpp):
-# set_accumulation_mode(f32) alongside fpmath_mode::f16 ensures batch-size-invariant
-# numerical results for INT4 GEMM.  No need to disable oneDNN anymore.
-# SDPA single-token threshold: auto-set by modeling_qwen3_5.exe to K+1 for MTP pure-batch.
-# Forces single-token SDPA kernel for verify batch to eliminate batch-size-dependent
-# numerical divergence (same class of issue as oneDNN FC).  Override if needed:
-# $env:OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD = "4"  # for K=3
+# GPU kernel batch-invariance: auto-configured by modeling_qwen3_5.exe for MTP:
+#   OV_GPU_USE_ONEDNN=0: Disable oneDNN FC kernels (batch-size-dependent INT4 GEMM
+#     even with f32 acc_mode). OCL FC kernels are batch-size-invariant.
+#   OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=K+1: Force single-token SDPA kernel for
+#     verify batch to eliminate batch-dependent SDPA tiling divergence.
 # Clean up stale env vars that could interfere with auto-configuration
 Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
 Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
@@ -395,11 +393,11 @@ foreach ($mdl in $MODELS) {
                     # pure-batch is the production requirement for MTP
                     [void]$argList.AddRange(@("--pure-batch", "1"))
                 }
-                # Set SDPA threshold to K+1 for batch-size-invariant numerical results.
-                # Must be set in parent env (not just inside exe) so GPU plugin sees it at init.
-                $env:OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD = "$($cfg.MtpK + 1)"
+                # OV_GPU_USE_ONEDNN=0 and OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD=K+1
+                # are auto-set by the exe for MTP pure-batch mode.
             } else {
                 Remove-Item Env:\OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD -ErrorAction SilentlyContinue
+                Remove-Item Env:\OV_GPU_USE_ONEDNN -ErrorAction SilentlyContinue
             }
 
             Write-Host "`n--- $($cfg.Name) ($modelName / $m mode) ---" -ForegroundColor White
