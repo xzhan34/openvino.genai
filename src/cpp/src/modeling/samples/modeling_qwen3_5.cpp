@@ -71,7 +71,7 @@ struct SampleOptions {
     bool enable_mtp = false;  // --mtp 0/1: enable Multi-Token Prediction speculative decoding
     int mtp_num_layers = 1;   // --mtp-layers N: number of MTP decoder layers (default: 1)
     int mtp_k = 1;            // --mtp-k N: number of draft tokens per speculation step (default: 1)
-    bool seq_verify = false;  // --seq-verify 0/1: use sequential single-token verify (avoids multi-token SDPA)
+    int seq_verify = -1;  // --seq-verify -1/0/1: sequential single-token verify (-1=auto: on for K>=2)
     bool pure_batch = false;  // --pure-batch 0/1: batch verify with KV trim only (no linear_states rollback)
     int refresh_interval = 0; // --refresh N: periodic state refresh every N tokens (0=disabled)
     bool adaptive_k = false;  // --adaptive-k 0/1: dynamically adjust K based on rolling accept rate
@@ -197,9 +197,9 @@ void print_usage(const char* argv0) {
     << "  --mtp 0|1                       Enable MTP (Multi-Token Prediction) speculative decoding (default: 0)\n"
     << "  --mtp-layers N                  Number of MTP decoder layers (default: 1)\n"
     << "  --mtp-k N                       Number of draft tokens per speculation step (default: 1)\n"
-    << "  --seq-verify 0|1                Sequential single-token verify (default: 0)\n"
+    << "  --seq-verify -1|0|1             Sequential single-token verify (-1=auto: on for K>=2, default: -1)\n"
     << "  --pure-batch 0|1                Batch verify with KV trim only, no linear_states rollback (default: 0)\n"
-    << "  --refresh N                     Periodic state refresh every N tokens in pure-batch mode (default: 0=off)\n"
+    << "  --refresh N                     Periodic state refresh every N tokens in batch-verify mode (default: 0=auto)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -294,8 +294,7 @@ SampleOptions parse_cli(int argc, char* argv[]) {
         } else if (arg == "--mtp-k") {
             opts.mtp_k = parse_i32(take_value("--mtp-k"), "--mtp-k");
         } else if (arg == "--seq-verify") {
-            int val = parse_i32(take_value("--seq-verify"), "--seq-verify");
-            opts.seq_verify = (val != 0);
+            opts.seq_verify = parse_i32(take_value("--seq-verify"), "--seq-verify");
         } else if (arg == "--pure-batch") {
             int val = parse_i32(take_value("--pure-batch"), "--pure-batch");
             opts.pure_batch = (val != 0);
@@ -1281,15 +1280,28 @@ int main(int argc, char* argv[]) try {
 
     // MTP: override mtp_num_hidden_layers from CLI if --mtp is used
     const bool use_mtp = opts.enable_mtp;
-    const bool use_seq_verify = opts.seq_verify;
-    const bool use_pure_batch = opts.pure_batch;
+    // Auto-enable sequential verify for K≥2 unless explicitly overridden.
+    // Sequential verify processes K+1 tokens one at a time (each batch=1),
+    // eliminating batch-vs-sequential GPU divergence that accumulates in
+    // recurrent states and KV cache.  This divergence causes INT4 greedy
+    // degeneration with batch verify (batch=K+1 produces different FP results
+    // than K+1 individual batch=1 inferences).
+    // Performance: sequential verify is comparable to batch verify for Qwen3.5
+    // because recurrent attention (GatedDeltaNet) is inherently sequential and
+    // FC uses oneDNN batch-1 loop for INT4 weights.  It eliminates the need
+    // for periodic state refresh, making it actually faster overall.
+    const bool use_seq_verify = (opts.seq_verify == 1) ||
+                                (opts.seq_verify == -1 && !opts.pure_batch && opts.mtp_k >= 2);
+    const bool use_pure_batch = opts.pure_batch && !use_seq_verify;
     if (use_mtp) {
         if (cfg.text.mtp_num_hidden_layers <= 0) {
             cfg.text.mtp_num_hidden_layers = opts.mtp_num_layers;
         }
         std::cout << "[mtp] MTP enabled, mtp_num_hidden_layers=" << cfg.text.mtp_num_hidden_layers << std::endl;
         if (use_seq_verify) {
-            std::cout << "[mtp] Sequential verify enabled (single-token SDPA per position)" << std::endl;
+            std::cout << "[mtp] Sequential verify enabled"
+                      << (opts.seq_verify == -1 ? " (auto: K>=2)" : "")
+                      << " — single-token inference per position" << std::endl;
         } else if (use_pure_batch) {
             std::cout << "[mtp] Pure batch verify (KV trim only, no linear_states rollback)";
             if (opts.refresh_interval > 0) {
@@ -2034,35 +2046,21 @@ int main(int argc, char* argv[]) try {
                   << " tensors pre-allocated for batch verify rollback" << std::endl;
     }
 
-    // Periodic state refresh for pure-batch mode: rolling checkpoint to
+    // Periodic state refresh for batch verify mode: rolling checkpoint to
     // correct accumulated state drift from batch=K+1 inference.
-    // The batch-1 FC loop + SDPA single-token threshold eliminate the major
-    // batch-dependent divergence sources.  However, residual per-token
-    // numerical drift persists from GPU compute-path differences (different
-    // seq_len values cause slight FP rounding variation in intermediate
-    // layers).  This drift compounds across layers and generation steps:
-    //   K=1: max recurrent error ~0.004 per rejection → tolerable
-    //   K=2: max recurrent error ~0.012 per rejection → compounds
-    //         to visible quality degradation after ~100 tokens
-    //   K≥3: even larger drift → needs aggressive refresh
-    // Periodic refresh re-forwards from a clean checkpoint to reset drift.
+    // NOT needed for sequential verify (each token processed as batch=1,
+    // so there is no batch-vs-sequential divergence to correct).
     const int REFRESH_INTERVAL = [&]() -> int {
+        if (use_seq_verify) return 0;  // sequential verify: no refresh needed
         if (opts.refresh_interval > 0) return opts.refresh_interval;
+        if (opts.refresh_interval < 0) return 0;  // negative = force disable
         auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
         int mode = env ? std::atoi(env) : 3;
         if (mode & 8) return 32;  // re-forward mode: frequent refresh
         if (has_kernel_snapshot && max_K >= 3) {
-            // K≥3: batch=4+, large residual drift → 32 tokens
             return 32;
         }
         if (has_kernel_snapshot && max_K >= 2) {
-            // K=2: moderate residual drift → 10 tokens
-            // Intel GPU compute paths produce subtly different FP results for
-            // different seq_len values (seq_len=3 batch verify vs seq_len=1 decode).
-            // With K=2, max recurrent state error ~0.012 per rejection compounds
-            // to visible quality degradation (token-0 degeneracy) after ~100-130
-            // tokens in VL INT4 mode.  Refresh every 10 tokens prevents this while
-            // maintaining significantly better throughput than mode 8 (re-forward).
             return 10;
         }
         return 0;  // K=1: drift too small to cause issues
