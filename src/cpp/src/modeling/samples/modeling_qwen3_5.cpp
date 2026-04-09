@@ -2078,6 +2078,13 @@ int main(int argc, char* argv[]) try {
         // Snapshot restore mode bitmask:
         //   1=linear from kernel snapshot, 2=conv from kernel snapshot, 3=both
         //   4=conv from CPU pre-batch, 8=re-forward (trim all K+1 + replay accepted)
+        //
+        // Default: 3 (bit 0 + bit 1 = linear + conv from GPU kernel snapshots).
+        // The GPU kernels (linear_attention_ref.cl, fused_conv_ref.cl) save per-token
+        // intermediate states to snapshot memory, then load them back for f16 rounding.
+        // This memory-based round-trip prevents the GPU compiler from optimizing away
+        // the f32→f16→f32 precision loss, ensuring snapshot-restored states exactly
+        // match sequential single-token processing.
         static const int snapshot_restore_mode = []() -> int {
             auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
             return env ? std::atoi(env) : 3;
@@ -2754,19 +2761,59 @@ int main(int argc, char* argv[]) try {
                                 const auto& [s_name, s_tensor] = snap_states[si];
                                 if (s_name != sname) { si++; continue; }
                                 ov::Tensor refw_tensor = state.get_state();
-                                // Compare f16 values
+                                // Compare using actual element type (may be f16 or f32)
                                 const size_t n = s_tensor.get_size();
-                                const auto* sp = reinterpret_cast<const ov::float16*>(s_tensor.data());
-                                const auto* rp = reinterpret_cast<const ov::float16*>(refw_tensor.data());
+                                const auto et = s_tensor.get_element_type();
                                 float max_d = 0; size_t mismatch = 0;
-                                for (size_t e = 0; e < n; ++e) {
-                                    float diff = std::abs(float(sp[e]) - float(rp[e]));
-                                    if (diff > max_d) max_d = diff;
-                                    if (sp[e] != rp[e]) mismatch++;
+                                if (et == ov::element::f16) {
+                                    const auto* sp = reinterpret_cast<const ov::float16*>(s_tensor.data());
+                                    const auto* rp = reinterpret_cast<const ov::float16*>(refw_tensor.data());
+                                    for (size_t e = 0; e < n; ++e) {
+                                        float diff = std::abs(float(sp[e]) - float(rp[e]));
+                                        if (diff > max_d) max_d = diff;
+                                        if (sp[e] != rp[e]) mismatch++;
+                                    }
+                                } else {
+                                    const auto* sp = reinterpret_cast<const float*>(s_tensor.data());
+                                    const auto* rp = reinterpret_cast<const float*>(refw_tensor.data());
+                                    for (size_t e = 0; e < n; ++e) {
+                                        float diff = std::abs(sp[e] - rp[e]);
+                                        if (diff > max_d) max_d = diff;
+                                        if (sp[e] != rp[e]) mismatch++;
+                                    }
                                 }
                                 if (mismatch > 0) {
-                                    fprintf(stderr, "[VALIDATE] %s: max_diff=%.6e mismatches=%zu/%zu\n",
-                                        sname.c_str(), max_d, mismatch, n);
+                                    // Count NaN values and print first few values from each side
+                                    size_t nan_snap = 0, nan_refw = 0;
+                                    if (et == ov::element::f16) {
+                                        const auto* sp2 = reinterpret_cast<const ov::float16*>(s_tensor.data());
+                                        const auto* rp2 = reinterpret_cast<const ov::float16*>(refw_tensor.data());
+                                        for (size_t e = 0; e < n; ++e) {
+                                            if (std::isnan(float(sp2[e]))) nan_snap++;
+                                            if (std::isnan(float(rp2[e]))) nan_refw++;
+                                        }
+                                        fprintf(stderr, "[VALIDATE] %s (%s): max_diff=%.6e mismatches=%zu/%zu nan_snap=%zu nan_refw=%zu\n",
+                                            sname.c_str(), et.to_string().c_str(), max_d, mismatch, n, nan_snap, nan_refw);
+                                        fprintf(stderr, "  snap[0..7]: ");
+                                        for (int e = 0; e < 8 && e < (int)n; ++e) fprintf(stderr, "%.4f ", float(sp2[e]));
+                                        fprintf(stderr, "\n  refw[0..7]: ");
+                                        for (int e = 0; e < 8 && e < (int)n; ++e) fprintf(stderr, "%.4f ", float(rp2[e]));
+                                        fprintf(stderr, "\n");
+                                    } else {
+                                        const auto* sp2 = reinterpret_cast<const float*>(s_tensor.data());
+                                        const auto* rp2 = reinterpret_cast<const float*>(refw_tensor.data());
+                                        for (size_t e = 0; e < n; ++e) {
+                                            if (std::isnan(sp2[e])) nan_snap++;
+                                            if (std::isnan(rp2[e])) nan_refw++;
+                                        }
+                                        fprintf(stderr, "[VALIDATE] %s (%s): max_diff=%.6e mismatches=%zu/%zu nan_snap=%zu nan_refw=%zu\n",
+                                            sname.c_str(), et.to_string().c_str(), max_d, mismatch, n, nan_snap, nan_refw);
+                                        fprintf(stderr, "  snap[0..7]: ");
+                                        for (int e = 0; e < 8 && e < (int)n; ++e) fprintf(stderr, "%.6f ", sp2[e]);
+                                        fprintf(stderr, "\n  refw[0..7]: ");
+                                        for (int e = 0; e < 8 && e < (int)n; ++e) fprintf(stderr, "%.6f ", rp2[e]);
+                                        fprintf(stderr, "\n");
+                                    }
                                 }
                                 si++;
                             }
