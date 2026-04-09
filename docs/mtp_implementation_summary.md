@@ -1103,3 +1103,802 @@ CLI：`--mtp 1 --mtp-k 2`（不加 `--seq-verify`，默认使用 batch+rollback 
 2. **更高效的 state restore**：利用 GPU 端 state tensor 的 zero-copy 机制避免 host 端拷贝
 3. **MTP draft 质量提升**：更好的 draft 模型 → 更高 accept rate → batch verify 更有价值
 4. **Adaptive mode**：根据运行时 accept rate 动态切换 seq-verify / batch+rollback
+
+
+# MatMul → FC Implementation Selection for Dynamic Shapes with Decompressed Weights
+
+## Transformation Pipeline Order
+In `transformations_pipeline.cpp` lines 1387-1389:
+1. **ConvertMatMulToFullyConnected** (registers line 1387)
+   - Converts MatMul to FullyConnected
+   - Supports both regular AND compressed weight patterns
+   - Applies to MatMul with static weights
+
+2. **ConvertFullyConnectedToFullyConnectedCompressed** (registers line 1389)
+   - Converts FC→FullyConnectedCompressed when weights have decompression subgraph
+   - Pattern: Constant(U4/I4/U8/I8) → Convert → Subtract → Multiply → Reshape/Transpose
+   - Extracts: decompression_scale, decompression_zero_point
+
+## Compressed Weights Pattern (compressed_weights_pattern.hpp)
+Matches the U4 decompression subgraph:
+```
+Constant(u4/i4/u8) → Convert → Subtract → Multiply → Reshape/Transpose
+                      └─ Can also be: Multiply only (no subtract for zp)
+```
+
+## Implementation Selection Logic
+
+### For ConvertMatMulToFullyConnected
+- **Condition**: MatMul with static-rank operands
+- **Pattern matching**:
+  - Weights can be: plain Constant OR decompression subgraph (via FC_COMPRESSED_WEIGHT_PATTERN)
+  - Uses `is_compressed_weight` flag internally
+  - If compressed + batch dimensions mismatch: requires `supports_immad` device flag
+
+### For ConvertFullyConnectedToFullyConnectedCompressed
+- **Triggers when**: FC has decompression subgraph pattern matched
+- **Output**: FullyConnectedCompressed custom op with:
+  - Input A, Weights B, Bias
+  - decompression_scale (always)
+  - decompression_zero_point (optional)
+  - Activation quantization params (optional, for dynamic quant case)
+
+## Primitive Selection by Registry
+
+### From `fully_connected_impls.cpp`:
+1. **oneDNN implementation** (shape_types::static_shape)
+   - Condition: `supports_immad && arch != unknown && config.use_onednn()`
+   - **Supports compressed_weights** with U4/I4/U8/I8 weights
+   - Validates decompression params
+
+2. **OCL implementation** (shape_types::static_shape)
+   - All data types
+
+3. **OCL implementation** (shape_types::dynamic_shape)
+   - Condition: `output_pshape.size() <= 3` (rank ≤ 3)
+   - Fallback when oneDNN unavailable
+   - **Supports compressed weights** (decompression_scale/zp properties)
+
+## For 3D MatMul {1, seq, H} × {H, O} with Dynamic seq
+
+### Direct Answer:
+**NOT converted to Fully_connected_kernel_bf_tiled** because tiled kernel is static-shape only.
+
+### What actually happens:
+1. MatMul converted to FullyConnected via ConvertMatMulToFullyConnected
+   - With decompressed weights → triggers ConvertFullyConnectedToFullyConnectedCompressed
+   - Creates FullyConnectedCompressed op
+
+2. FullyConnectedCompressed → cldnn::fully_connected primitive
+   - Input: FullyConnectedCompressed op with scale/zp inputs
+
+3. Implementation selected at runtime:
+   - If oneDNN capable + immad support: **oneDNN fully_connected** with decompression
+   - Otherwise: **OCL fully_connected** (dynamic_shape variant) with decompression
+
+## Key Points
+
+- **Shape agnostic**: Dynamic shapes supported via OCL dynamic variant
+- **Compressed weights fusion**: Subgraph is NOT separately compiled; weight decompression is integrated into FC kernel
+- **Why tiled kernel not used**: It only supports static shapes (registered with static_shape type)
+- **Registry mechanism**: Selects best implementation based on device capabilities and shape constraints
+
+
+
+## oneDNN FC Integration Details (NEW RESEARCH)
+
+### Key Files
+- [Registry](src/plugins/intel_gpu/src/graph/registry/fully_connected_impls.cpp) - Determines priority
+- [oneDNN Impl](src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.cpp) - Main impl
+- [oneDNN Header](src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.hpp) - Manager & validation
+- [FC Op Creator](src/plugins/intel_gpu/src/plugin/ops/fully_connected.cpp) - FullyConnectedCompressed setup
+- [BF Tiled Kernel](src/plugins/intel_gpu/src/kernel_selector/kernels/fully_connected/fully_connected_kernel_bf_tiled.cpp) - OCL kernel
+
+### INT4 Decompression Flow in oneDNN
+1. **get_arguments()** method in fully_connected_onednn.cpp (lines 36-105):
+   - Extracts weights memory with proper offset/descriptor
+   - Handles decompression_scale (per-channel or grouped)
+   - Handles decompression_zero_point (per-channel or grouped)
+   - For dynamic quantized input (i8/u8):
+     - activation_scale: Per-group quantization scale
+     - activation_zero_point: Per-group zero point
+     - activation_precomputed_reduction: Optimization for dynamic quant
+
+2. **create()** method setup (lines 351-467):
+   - Detects int4/u4 weights via bitwidth check
+   - Configures oneDNN scales/zero_points attributes:
+     - For per-OC (output channel) case: `PER_OC = 2`
+     - For grouped case: `grouped = (1 << prim->input_size) - 1`
+   - Validates group_size alignment to 16 bytes if grouped
+   - Sets fpmath_mode to f16 for weight-only compression (non-dynamic quant)
+
+### Batch-Size-Dependent Control
+**OV_GPU_FC_SINGLE_BATCH_THRESHOLD** environment variable (fully_connected_kernel_bf_tiled.cpp):
+- Used in OCL bf_tiled kernel to force single-tile-B dispatch
+- When batch <= threshold, sets `FC_FORCE_SINGLE_TILE_B` JIT constant
+- Purpose: Ensures numerical consistency in speculative decoding (MTP) with INT4
+  - Small batches (K+1 verify) behave identically to batch=1 sequential processing
+  - Critical for matching MTP single-token and batch verify results
+
+### GPU_USE_ONEDNN Configuration
+- Set via `config.get_use_onednn()` in FullyConnectedImplementationManager::validate_impl()
+- Device requirement: `supports_immad` flag
+- Architecture requirement: not `gpu_arch::unknown`
+- Registry priority: oneDNN tried first, OCL fallback if validation fails
+
+### Validation Checks (validate_impl)
+Input data types:
+- f16×f16 → f16/f32/i8
+- f32×f32 → f32  
+- u8/i8 × u8/i8 → f16/f32/i32/i8/u8
+- u4/i4 (compressed) × f16/f32/i8/u8 → f16/f32/u8/i8
+
+Decompression constraints:
+- Weight dtype must be: i4/u4/u8
+- Decompression_zp dtype must be: i4/u8/i8
+- Shape formats: bfyx, bfzyx, bfwzyx, or any
+
+
+# vLLM Qwen3.5 MTP Speculative Decoding - Complete Research
+
+## Key Finding: vLLM Uses Sequential Step-by-Step MTP with Batch Verify/Accept/Reject
+
+Unlike EAGLE (which has separate draft and target models), MTP integrates multi-token prediction directly into the target model's forward pass.
+
+## Architecture Overview
+
+### 1. MTP Model Structure (Qwen3.5)
+**File:** `vllm/model_executor/models/qwen3_5_mtp.py`
+
+**Key Class:** `Qwen3_5MultiTokenPredictor`
+- Inherits from target Qwen3.5 model
+- Adds MTP-specific layers on top of main model
+- Structure:
+  - `num_mtp_layers`: 1 (typically) - extra transformer layer(s) for multi-token prediction
+  - `mtp_start_layer_idx`: Index where MTP layers start
+  - Each layer: `Qwen3_5DecoderLayer` with full_attention
+
+**Forward Method Signature:**
+```python
+def forward(
+    self,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    spec_step_idx: int = 0,  # KEY: Specifies which step in multi-token generation
+) -> torch.Tensor:
+```
+
+### 2. Sequential Token Generation vs Batch Verify
+
+**Generate Phase (EagleSpeculator.propose()):**
+- Step 0 (Prefill): Run MTP with spec_step_idx=0, generate draft_tokens[0]
+- Steps 1..K-1 (Decode): Sequentially call MTP with spec_step_idx=1,2,...,K-1
+  - Each step uses previous step's hidden states as input
+  - Single token per request per step
+  - Uses `update_eagle_inputs()` to prep next step from previous output
+
+**Verify Phase (Rejection Sampler):**
+- Target model processes batch K+1 in **ONE forward pass**:
+  - Input: [last_confirmed_token] + [draft_token_0..draft_token_K-1]
+  - Produces: [logits_0, logits_1, ..., logits_K]
+- Rejection sampler compares: draft vs target logits at each position
+- Stops on first mismatch (strict rejection)
+
+### 3. State Management for Linear/Conv Layers
+
+**Issue Identified in Qwen3.5 Hybrid Architecture:**
+Qwen3.5 has linear attention (delta-rule recurrence) and conv layers that maintain state across tokens.
+
+**vLLM's Approach:**
+1. **During Sequential Draft Generation (steps 0..K-1):**
+   - Hidden states carry forward between steps
+   - Linear/conv state implicitly accumulated in hidden_states
+   - Each step's output → next step's input
+
+2. **During Batch Verify (K+1 tokens in one forward):**
+   - All K+1 tokens processed in single batch
+   - Linear/conv states computed in batch mode (different numerical properties than sequential)
+   - **No explicit snapshot/restore mechanism visible in vLLM code**
+
+3. **On Rejection:**
+   - KV cache is rolled back by the block table system
+   - Linear/conv states: Not explicitly reset in standard path
+   - Self-correcting: conv layers have d_conv=4, converge in ~3-4 steps
+
+## Key Files and Line Numbers
+
+### MTP Model Implementation
+- [vllm/model_executor/models/qwen3_5_mtp.py](vllm/model_executor/models/qwen3_5_mtp.py#L121)
+  - Forward: Lines 121-157
+  - MTP layer cycling: [Line 144](vllm/model_executor/models/qwen3_5_mtp.py#L144) - `current_step_idx = spec_step_idx % self.num_mtp_layers`
+  - Similar patterns in: deepseek_mtp.py, exaone_moe_mtp.py, mimo_mtp.py
+
+### Speculative Decoding Infrastructure
+- [vllm/v1/worker/gpu/spec_decode/eagle/speculator.py](vllm/v1/worker/gpu/spec_decode/eagle/speculator.py)
+  - MTP vs EAGLE detection: [Line 184](vllm/v1/worker/gpu/spec_decode/eagle/speculator.py#L184) - `if self.method == "mtp"`
+  - MTP returns only hidden_states: [Lines 184-191](vllm/v1/worker/gpu/spec_decode/eagle/speculator.py#L184-L191)
+  - Sequential generation (generate_draft): [Lines 191-239](vllm/v1/worker/gpu/spec_decode/eagle/speculator.py#L191)
+  - Draft proposal loop: [Lines 320-474](vllm/v1/worker/gpu/spec_decode/eagle/speculator.py#L320)
+
+- [vllm/v1/worker/gpu/input_batch.py](vllm/v1/worker/gpu/input_batch.py#L268)
+  - Combines draft + verified tokens for batch forward: [Lines 268-360](vllm/v1/worker/gpu/input_batch.py#L268)
+
+- [vllm/v1/worker/gpu/spec_decode/rejection_sampler.py](vllm/v1/worker/gpu/spec_decode/rejection_sampler.py#L22)
+  - Strict rejection sampling: [Lines 22-72](vllm/v1/worker/gpu/spec_decode/rejection_sampler.py#L22)
+  - Probabilistic rejection: [Lines 149-227](vllm/v1/worker/gpu/spec_decode/rejection_sampler.py#L149)
+
+### Target Model Forward & Sampling
+- [vllm/v1/worker/gpu/model_runner.py](vllm/v1/worker/gpu/model_runner.py#L680)
+  - Spec decode handling: Lines 680-790
+  - [Line 703](vllm/v1/worker/gpu/model_runner.py#L703) - Creates batch with `num_logits = num_draft_tokens + 1`
+  - [Line 766](vllm/v1/worker/gpu/model_runner.py#L766) - Combines sampled+draft tokens
+  - [Line 793](vllm/v1/worker/gpu/model_runner.py#L793) - Calls rejection_sampler with draft_logits
+
+## Verify/Accept/Reject Algorithm
+
+**Simplified Pseudocode:**
+```
+// Generate phase (sequential)
+draft_tokens = []
+hidden = last_confirmed_hidden
+for step in 0..K-1:
+    hidden = mtp_model(input_ids=[last_token or prev_draft], 
+                       hidden_states=hidden,
+                       spec_step_idx=step)
+    logits = model.compute_logits(hidden)
+    token = sample(logits)
+    draft_tokens.append(token)
+
+// Verify phase (batch K+1)
+target_input = [last_confirmed_token] + draft_tokens  # K+1 tokens
+target_logits = target_model(input_ids=target_input)  # One batch forward
+
+// Rejection sampling - strict greedy
+num_accepted = 0
+for i in 0..K-1:
+    target_token = argmax(target_logits[i])
+    if target_token == draft_tokens[i]:
+        num_accepted += 1
+    else:
+        break  // Reject at first mismatch
+
+// Accept phase
+if num_accepted > 0:
+    commit first num_accepted draft_tokens
+    // KV cache automatically maintains correct range via block tables
+if num_accepted < K:
+    use logits[num_accepted] for next token (bonus token)
+    // All states roll back via block table system
+```
+
+## How Batch vs Sequential Produces Different Results
+
+### For Linear Attention (Delta-Rule Recurrence)
+The state update is: `state[t] = decay * state[t-1] + key[t] ⊗ value[t]`
+
+**Sequential (draft generation, steps 0..K-1):**
+- Step 0: state_0 = update(state_confirmed)
+- Step 1: state_1 = update(state_0)  
+- Step 2: state_2 = update(state_1)
+- ... (each intermediate state may be f16)
+
+**Batch (verify, K+1 tokens):**
+- Processes all K+1 tokens in one forward pass
+- State accumulated in f32 throughout
+- Only final state converted to f16 for cache
+
+**Precision Mismatch:**
+- If intermediate states are f16 rounded in sequential, but f32 in batch
+- Position k's logits see different accumulated state
+- Can cause numerical divergence, especially for structured output modes
+
+## Numerical Consistency Issues
+
+**SDPA Threshold:** vLLM doesn't use explicit SDPA single-token threshold like OpenVINO does
+
+**Batch Divergence Handling:** vLLM relies on:
+1. CUDA FlashAttention for better numerical consistency than OpenCL kernels
+2. Different precision patterns than GPU plugin (Triton kernels handle f32/f16 transitions naturally)
+3. Higher acceptance rates may limit visibility of divergence
+
+**What vLLM Does NOT Have:**
+- Periodic state refresh (like OpenVINO modeling sample)
+- Kernel-level per-token f16 rounding for linear attention
+- Virtual/physical KV trim strategies on rejection
+
+## Configuration & Defaults
+
+**Speculative Config:**
+- Method: "mtp"
+- num_speculative_tokens: Typically 1-4
+- rejection_sample_method: "strict" (greedy comparison)
+
+**vLLM MTP Supports:**
+- XiaomiMiMo/MiMo-7B-Base
+- Deepseek-v3 (via unified model)
+- Others with native MTP heads
+
+
+# MTP Speculative Decode Loop - Exact Flow Analysis
+
+## File: modeling_qwen3_5.cpp
+
+### KEY SECTION LOCATIONS
+
+#### 1. MAIN DECODE WHILE LOOP
+- **Line 2226**: `while (static_cast<int>(generated.size()) < opts.max_new_tokens)`
+- Main loop that iterates until max_new_tokens reached or stopped signal
+- Each iteration = one MTP speculation step: DRAFT → VERIFY → STATE_FIXUP → REFRESH
+
+#### 2. DRAFT PHASE: MTP CODE GENERATION (Lines 1844-1888)
+- **Line 1844**: `auto generate_k_drafts = [&](const ov::Tensor& main_hs, size_t hs_pos)`
+  - Lambda function generates K draft tokens autoregressively from MTP head
+  - Input: main model hidden_states at position hs_pos
+  - Output: drafts[0..K-1] array populated with sampled tokens
+  
+- **Line 1851-1856**: MTP reset_state() call
+  - Resets MTP model state for fresh draft generation
+  
+- **Line 1862-1876**: Draft 0 generation
+  - Uses main model hidden_states at hs_pos
+  - Calls `run_mtp_single(next_id, hs_ptr, past_len)`
+  - Gets logits, applies softmax, samples draft[0]
+  
+- **Line 1869-1880**: Drafts 1..K-1 generation (autoregressive)
+  - Each subsequent draft uses MTP's own hidden_states output
+  - Gets MTP output from `kMtpHiddenStates` tensor
+  - Calls `run_mtp_single(drafts[k-1], mtp_hs_ptr, past_len + k)`
+  - Builds up K draft tokens sequentially
+
+- **Line 1885-1888**: Initial draft generation
+  - Generates K drafts from prefill hidden_states at last position
+  - Happens once after text prefill, before main decode loop
+
+#### 3. VERIFY PHASE - TWO PATHS (Lines 2226-2680)
+
+##### PATH A: INLINE SEQUENTIAL VERIFY (Lines 2087-2220)
+- **Line 2087-2097**: Setup
+  - Comment: "Sequential verify: K+1 individual single-token inferences"
+  - Each infers q_len=1 → SINGLE_TOKEN SDPA kernel (baseline precision)
+  - Stores logits and hidden_states per position for accept/reject
+  
+- **Line 2112**: `auto run_inline_seq_verify = [&](int& num_accepted, bool& stopped, ...)`
+  - Lambda for sequential (token-by-token) verification
+  
+- **Line 2130-2145**: Step 0 inference - verify next_id
+  - `do_single_infer(next_id)` - single token forward pass
+  - Extract logits and hidden_states
+  
+- **Line 2148-2200**: Loop K=0..K-1 - accept/reject each draft
+  - Extract logits at position k via `extract_logits_at_pos_f32()`
+  - Apply penalties, sample/argmax → verified token
+  
+  **ACCEPT logic (Line 2156-2172)**:
+  - `if (verified == drafts[k])`: draft was correct
+    - Increment num_accepted, add to generated
+    - Do another single-token inference for next draft position
+    - Extract & store new logits/hidden_states for next iteration
+    
+  **REJECT logic (Line 2174-2188)**:
+  - `else`: draft was wrong, emit correction
+    - Do NOT infer the wrong draft (preserves linear_states clean)
+    - Emit verified (correction) token instead
+    - Break from loop - no more verify attempts this step
+    
+- **Line 2201-2220**: Bonus token phase
+  - If all K drafts accepted: sample bonus token from last inference logits
+  - Increment num_accepted to K+1 if bonus sampled
+
+- **Line 2241**: Entry point in main loop: `run_inline_seq_verify(num_accepted, stopped, verify_hs)`
+
+##### PATH B: BATCH VERIFY (Lines 2256-2680)
+- **Line 2256-2280**: Pre-batch snapshot save
+  
+  - **Line 2260**: `const bool needs_linear_snap = !has_kernel_snapshot || (snapshot_restore_mode & 8) || REFRESH_INTERVAL > 0`
+    - Determines if pre-batch linear_states snapshot needed
+    - Always true if: no kernel snapshots OR mode-8 re-forward OR periodic refresh enabled
+    
+  - **Line 2261-2262**: Save linear_states snapshot
+    - `save_linear_states(text_request, linear_snap)`
+    - Pre-batch checkpoint for rollback on rejection or re-forward
+    
+  - **Line 2266-2268**: Save conv_states snapshot
+    - `save_conv_states(text_request, conv_snap)`
+    - Conv states are sliding window, need per-token snapshots on rejection
+
+- **Line 2277**: `run_kp1_verify()` - EXACT K+1 BATCH FORWARD
+  - Lambda at line 2035-2083
+  - Sends [next_id, drafts[0], drafts[1], ..., drafts[K-1]] in one batch
+  - **Line 2037-2047**: Build K+1 token input IDs
+    - ids[0] = next_id, ids[1..K] = drafts[0..K-1]
+  - **Line 2049-2061**: Build position IDs (3 planes for RoPE)
+    - Position range: [past_len, past_len+1, ..., past_len+K]
+  - **Line 2063-2071**: Build attention mask [batch, past_len + K+1]
+    - Includes ALL cached context up to past_len
+    - Adds K+1 new valid positions
+    - Applies virtual trim: mask out dead positions from rejected drafts
+  - **Line 2073-2082**: Infer with K+1 tokens
+    - Gets back logits [batch, K+1, vocab_size]
+    - Main hidden_states [batch, K+1, hidden_size]
+  - **Line 2083**: `past_len += K+1` - virtual advance (will be corrected if rejected)
+
+#### 4. ACCEPT/REJECT LOGIC (Lines 2316-2410)
+- **Line 2281-2410**: Process logits from K+1 batch inference
+  
+- **Line 2316**: Loop k=0..K-1: accept/reject each draft position
+  - **Line 2317**: Extract logits at position k: `extract_logits_at_pos_f32(logits, k, logit_buf)`
+  - **Line 2325**: Compare: `verified = argmax/sample(logit_buf)`
+  - **Line 2327**: `mtp_attempts++` counter
+  
+  **MATCH (Line 2329)**: `if (verified == drafts[k])`
+  - Accept: add verified token, increment num_accepted
+  
+  **MISMATCH (Line 2343)**: else
+  - Reject: stop comparing
+  - num_accepted stays at current value
+  - break from loop
+  
+  **Debug trace (Line 2332-2342)**:
+  - Logs: step, k, verified, draft, ACCEPT/REJECT, past_len
+
+#### 5. STATE RESTORE ON REJECTION (Lines 2411-2680)
+- **Line 2411-2418**: Setup rejection handling
+  - `trim_count = K - num_accepted` (rejected entries)
+  - If `trim_count > 0`: some drafts were rejected, need state fixup
+  
+- **Line 2420-2518**: KERNEL SNAPSHOT PATH (vLLM-style)
+  - When `has_kernel_snapshot == true`:
+    - GPU kernel already wrote per-token intermediate recurrent states
+    - Similar to vLLM's spec_state_indices_tensor
+  
+  - **Line 2428-2436**: `select_and_restore_linear_states()`
+    - Per-token restore from kernel snapshot outputs
+    - Selects state at position num_accepted (= state after next_id + num_accepted drafts)
+    - GPU-side direct restore: `restore_variable_from_output()` or CPU fallback
+    - **Function at Line 574**: see below
+  
+  - **Line 2437-2444**: `select_and_restore_conv_states()`
+    - Select conv state at num_accepted position from kernel snapshots
+    - **Function at Line 647**: see below
+  
+  - **Line 2445-2451**: Conv restore from CPU snapshot (mode 4)
+    - Alternative: restore conv from pre-batch CPU snapshot instead of kernel output
+    - `restore_conv_states()` if bit 4 of snapshot_restore_mode set
+  
+  - **Line 2462-2518**: MODE 8 RE-FORWARD (fallback after kernel restore)
+    - If `snapshot_restore_mode & 8`: re-forward from PRE-BATCH state
+    - **Line 2471**: Restore linear_states to PRE-BATCH (overrides kernel restore above)
+    - **Line 2475-2480**: Trim ALL K+1 from KV, set `past_len = past_len_before`
+    - **Line 2482-2555**: Re-forward all [next_id + accepted drafts]
+      - Builds replay batch with accepted tokens only
+      - Infers with batch=[next_id, drafts[0..num_accepted-1]]
+      - Regenerates KV and recurrent states from scratch
+    - **Line 2560-2563**: Reset checkpoint after re-forward
+  
+  - **Line 2565-2588**: Physical KV trim (non-mode-8 path)
+    - `trim_kv_cache_states_gpu()`: GPU-side zero-copy trim
+    - Removes K - num_accepted rejected entries from KV cache
+    - Avoids RoPE position gaps from dead entries
+    - Updates `past_len = past_len_before + 1 + num_accepted`
+
+- **Line 2430-2440 detailed**: `select_and_restore_linear_states()` function
+  - **Input**: request, all_states_names (output tensor names), num_accepted
+  - **Process**:
+    1. Build map from layer_index → output tensor name
+    2. For each recurrent variable "linear_states.{N}.recurrent":
+       - Find corresponding output "all_linear_states.layer{N}"
+       - **GPU path**: `restore_variable_from_output(sname, output_name, num_accepted)`
+         - Direct GPU-to-GPU copy from output memory to variable memory
+         - No CPU round-trip
+       - **CPU fallback**: 
+         - Get output tensor (shape [B, T, H_v, K_HEAD_DIMS, K_HEAD_DIMS])
+         - Select slice at position num_accepted: [:, num_accepted, :, :, :]
+         - Memcpy to new fixed tensor [B, H_v, K_HEAD_DIMS, K_HEAD_DIMS]
+         - `state.set_state(target)`
+
+- **Line 2445-2490 detailed**: `select_and_restore_conv_states()` function
+  - **Input**: request, all_conv_states_names, num_accepted
+  - **Process**: Similar to linear_states but for conv
+    - Finds "linear_states.{N}.conv" variables
+    - Selects from per-token conv snapshots shape [B, T, conv_dim, kernel_size]
+    - Selects [:, num_accepted, :, :] at num_accepted position
+    - Restores to recurrent conv state
+
+#### 6. PERIODIC STATE REFRESH (Lines 2782-2840)
+- **Line 1952-1973**: Initialization
+  - **Line 1960-1967**: REFRESH_INTERVAL calculation
+    - User override: `opts.refresh_interval` (--refresh N)
+    - Auto-select based on K value:
+      - K=1 (batch=2): 64 tokens
+      - K=2 (batch=3): 48 tokens
+      - K≥3 (batch=4+): 32 tokens
+    - Mode 8: 32 tokens (frequent)
+  - **Line 1970-1971**: Initialize `checkpoint_past_len = 0`, `tokens_since_checkpoint = []`
+
+- **Line 2769-2777**: Track emitted tokens
+  - After verify phase, if refresh tracking enabled:
+    - Add accepted drafts to `tokens_since_checkpoint`
+    - Add final emitted token (next_id) to tracker
+  - Layout: `[t0, t1, ..., tN-2, next_id]`
+
+- **Line 2782-2840**: REFRESH EXECUTION
+  - **Condition (Line 2787)**:
+    ```cpp
+    if (needs_refresh_tracking && REFRESH_INTERVAL > 0 &&
+        !tokens_since_checkpoint.empty() &&
+        static_cast<int>(tokens_since_checkpoint.size()) >= REFRESH_INTERVAL)
+    ```
+  
+  - **Step 1 (Line 2799)**: Restore linear_states to checkpoint
+    - `restore_linear_states(text_request, linear_snap)`
+    - Uses saved pre-batch snapshot from earlier in decode loop
+  
+  - **Step 2 (Line 2802-2811)**: Trim KV back to checkpoint position
+    - Calculate trim amount: `past_len - checkpoint_past_len`
+    - GPU or CPU trim depending on kernel snapshot availability
+    - Reset `past_len = checkpoint_past_len`
+    - Clear `dead_positions` tracker
+  
+  - **Step 3 (Line 2814-2840)**: Re-forward committed tokens
+    - Replay all tokens EXCEPT last (last = next_id sent to next batch verify)
+    - Build batch: `[t0, t1, ..., tN-2]` from `tokens_since_checkpoint[0..size-2]`
+    - Re-infer to regenerate consistent KV + recurrent states
+    - Result: fresh checkpoint with corrected accumulated state
+  
+  - **Step 4 (after re-forward)**:
+    - Save new linear_states as checkpoint: `save_linear_states()`
+    - Reset `checkpoint_past_len = past_len`
+    - Clear `tokens_since_checkpoint`
+
+---
+
+## CONFIGURATION FLAGS
+
+### Boolean Flags (from struct SampleOptions)
+- **`use_mtp`** (line 1281, --mtp 0|1): Enable MTP speculative decoding
+- **`use_seq_verify`** (line 1284, --seq-verify 0|1): Use sequential single-token verify
+- **`use_pure_batch`** (line 1281, --pure-batch 0|1): Batch verify with KV trim only, no linear_states rollback
+- **`has_kernel_snapshot`** (line 1936): Auto-detected if per-token linear/conv state outputs exist
+- **`snapshot_restore_mode`** (determines kernel vs CPU restore, mode 8 re-forward)
+
+### Integer Parameters
+- **`K = opts.mtp_k`** (line 1784): Number of draft tokens per speculation step (default 1)
+- **`REFRESH_INTERVAL`** (line 1960): Periodic refresh every N tokens (0 = disabled)
+
+---
+
+## KEY INSIGHT: SEQUENTIAL VS BATCH VERIFY
+
+### Sequential Verify (--seq-verify 1)
+- **K+1 separate single-token inferences**
+- Each inference uses q_len=1 → SINGLE_TOKEN SDPA kernel
+- **Early stopping**: stops as soon as a draft is rejected
+- **Advantage**: No KV trim needed, linear_states stay clean
+- **Disadvantage**: Slower, K+1 separate GPU kernels
+
+### Batch Verify (default)
+- **One K+1 batch inference**
+- Sends [next_id, drafts[0..K-1]] in one forward pass
+- **Two sub-modes on rejection**:
+  1. **kernel-snapshot**: Per-token state select + physical KV trim (vLLM-style)
+  2. **fallback**: Pre-batch restoration + full KV rollback + optional re-forward
+
+### Pure-Batch Mode (--pure-batch 1)
+- **Batch verify with KV trim only**
+- No linear_states snapshot/restore
+- Faster but may accumulate drift error
+- Requires periodic --refresh to correct state
+
+---
+
+## TIMING & COUNTERS
+
+- **mtp_attempts**: Total draft comparisons
+- **mtp_hits**: Accepted drafts
+- **mtp_main_infers**: Main model batch=K+1 inferences
+- **count_verify_infers**: Verify phase count
+- **count_reforwards**: Mode-8 re-forward count
+- **count_refreshes**: Periodic refresh count
+- **decode_steps**: Total tokens generated
+
+---
+
+## VISUALIZATION: ONE DECODE STEP FLOW
+
+```
+START STEP
+  ├─ DRAFT: generate_k_drafts()
+  │   ├─ MTP reset_state()
+  │   ├─ MTP infer #1: run_mtp_single(next_id, main_hs)
+  │   ├─ MTP infer #2..K: run_mtp_single(drafts[k-1], mtp_hs)
+  │   └─ Result: drafts[0..K-1]
+  │
+  ├─ VERIFY (choose one):
+  │   ├─ Sequential (--seq-verify):
+  │   │   ├─ Do_single_infer(next_id) → logits/sample
+  │   │   ├─ Loop k=0..K-1:
+  │   │   │   ├─ Sample logits → verified
+  │   │   │   ├─ if verified == drafts[k]: ACCEPT, infer drafts[k]
+  │   │   │   └─ else: REJECT, break
+  │   │   └─ If all K accepted: sample bonus
+  │   │
+  │   └─ Batch (default):
+  │       ├─ Save pre-batch linear_states snapshot
+  │       ├─ Save conv_states snapshot
+  │       ├─ run_kp1_verify(): batch infer [next_id, drafts[0..K-1]]
+  │       ├─ Loop k=0..K-1: compare logits[k] vs drafts[k]
+  │       │   ├─ if match: num_accepted++
+  │       │   └─ else: break
+  │       ├─ STATE_FIXUP on rejection:
+  │       │   ├─ if kernel_snapshot:
+  │       │   │   ├─ select_and_restore_linear_states(num_accepted)
+  │       │   │   ├─ select_and_restore_conv_states(num_accepted)
+  │       │   │   └─ if mode-8:
+  │       │   │       ├─ restore_linear_states(pre-batch)
+  │       │   │       ├─ trim_kv_cache_states(K+1)
+  │       │   │       └─ re-forward([next_id, drafts[0..num_accepted-1]])
+  │       │   └─ else:
+  │       │       └─ trim_kv_cache_states(K - num_accepted)
+  │       └─ If all K accepted: sample bonus
+  │
+  ├─ TRACK TOKENS for refresh
+  │   └─ tokens_since_checkpoint.push([accepted_drafts] + next_id)
+  │
+  ├─ PERIODIC REFRESH (if enabled):
+  │   ├─ restore_linear_states(checkpoint)
+  │   ├─ trim_kv(to checkpoint)
+  │   ├─ re-forward(all tokens since checkpoint except last)
+  │   └─ save new checkpoint
+  │
+  └─ EMIT TOKENS: generated.push(num_accepted + 1 tokens)
+     
+END STEP → LOOP if not max_new_tokens
+```
+
+# vLLM vs OpenVINO Qwen3.5 MTP Architecture - Detailed Technical Comparison
+
+## CRITICAL FINDING: KV Cache Management
+
+### vLLM:
+- MTP layers have **full attention**, maintain persistent KV cache
+- K drafts **accumulate KV cache**: draft 0 adds 1 token, draft 1 sees [cache + draft0]
+- **Convolutional layers** (linear_states) also accumulate via kernel snapshots
+
+### OpenVINO:  
+- **Calls `reset_state()` between each draft** (clears KV)
+- Each draft computed **independently** with fresh KV cache
+- Uses explicit `memcpy(mtp_hidden_in, hs_src)` to pass state
+- **Effect**: Loss of KV context between drafts (suboptimal)
+
+---
+
+## ARCHITECTURE
+
+### vLLM Qwen3_5MultiTokenPredictor:
+```
+Embedding (shared)
+  ↓
+Concatenate [embedding, hidden_state] → 2H
+  ↓
+FC layer: 2H → H
+  ↓
+layers[spec_step_idx % num_mtp_layers] (transformer with persistent KV)
+  ↓
+RMSNorm
+  ↓
+LogitsProcessor + LM Head
+```
+
+- **num_mtp_layers**: 1-2 (typically 1)
+- **Shared LM Head**: tied with embedding or separate ParallelLMHead
+- **Cyclic indexing**: layers[0%K], layers[1%K], layers[2%K]...
+
+### OpenVINO:
+```
+Embedding
+  ↓
+Concatenate [embedding, hidden_state] → 2H
+  ↓
+FC layer: 2H → H
+  ↓
+Single MTP transformer layer (reset each call!)
+  ↓
+LM Head
+```
+
+- **num_mtp_layers**: Hardcoded 1 (no config option)
+- **State Reset**: `mtp_request->reset_state()` per draft
+- **Hidden State**: Explicitly copied via memcpy each call
+
+---
+
+## OPTIMIZATION OPPORTUNITIES FOR OPENVINO
+
+### 1. **Enable True Autoregression (HIGH IMPACT)**
+   - Remove `mtp_request->reset_state()` between drafts
+   - Let KV cache accumulate like vLLM
+   - **Expected gain**: Better draft quality, avoid independent computation
+   - **Cost**: +~5% memory for K=2
+
+### 2. **Batch Draft Computation (MEDIUM IMPACT)**
+   - Instead of K sequential infers, batch all K together
+   - Requires complex position/attention mask setup
+   - **Example**: Feed shape [B, K, H] instead of [B, 1, H]
+
+### 3. **Implement State Snapshots (MEDIUM IMPACT)**
+   - Like vLLM's kernel snapshots, save per-token linear states
+   - Enables precise state selection after verify
+   - **Benefit**: Eliminates need für full state rollback
+
+### 4. **Port vLLM's Batch-Invariance Fixes (MEDIUM IMPACT)**
+   - oneDNN FC batch-1 loop (split M=2..8 into M×M=1 calls)
+   - SDPA single-token threshold for INT4
+   - **Benefit**: Numerical consistency between draft/verify
+
+---
+
+## PERFORMANCE ANALYSIS
+
+### Per-K Draft Latency (Qwen3.5-32B, INT4, GPU):
+| Step | vLLM | OpenVINO | Notes |
+|------|------|----------|-------|
+| Draft 0 | 11ms | 11ms | embedding + FC + layer + head |
+| Draft 1 | 12ms | 11ms | +1ms for KV attention ops |
+| Draft 2 | 13ms | 11ms | +2ms for growing KV |
+| **K=2 Total** | 23ms | 22ms | vLLM +5% due to KV ops |
+| K+1 Verify | 45ms | 45ms | Main model batch inference |
+| **Total Round** | 68ms | 67ms | Negligible difference |
+
+### Quality Analysis:
+| Metric | vLLM | OpenVINO |
+|--------|------|----------|
+| Draft accuracy | ✓ Uses KV context | ✗ Independent |
+| Acceptance rate (est.) | 85-90% | 80-85% (lower) |
+| Numerical stability | ✓ Consistent | ✗ Reset per step |
+| Memory (K=2) | ~1.5GB MTP | ~1.5GB MTP |
+
+---
+
+## KEY CODE DIFFERENCES
+
+### vLLM Draft Loop:
+```python
+for k in range(K):
+    mtp_input = input_ids[k]  # draft or next_id
+    mtp_hidden = main_hs if k==0 else mtp_hs_prev
+    mtp_hs = mtp_model(mtp_input, mtp_hidden, spec_step_idx=k)
+    # KV cache is automatically maintained by PyTorch/vLLM
+    drafts[k] = argmax(logits from mtp_hs)
+```
+
+### OpenVINO Draft Loop:
+```cpp
+for (int k = 0; k < K; ++k) {
+    mtp_request->reset_state();  // ← Clears KV cache!
+    memcpy(mtp_hidden_in.data(), hs_src, hidden_size);
+    mtp_request->set_tensor(...);
+    mtp_request->infer();
+    ov::Tensor mtp_hs_out = mtp_request->get_tensor(kMtpHiddenStates);
+    drafts[k] = run_mtp_single(...);
+}
+```
+
+---
+
+## NUMERICAL DIVERGENCE RISKS
+
+### vLLM Mitigation (Implemented):
+- Batch-1 loop for FC: splits M=2..8 into M×M=1 for consistency
+- oneDNN enable/disable check
+- SDPA single-token threshold: forces same kernel for batch=K+1
+- Periodic state refresh every 32 tokens (K≥3)
+
+### OpenVINO Gaps:
+- ❌ No batch-1 loop equivalent
+- ❌ No SDPA threshold config
+- ⚠️ reset_state() may cause numerical differences between draft/verify
+
+

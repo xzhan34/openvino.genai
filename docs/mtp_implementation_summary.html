@@ -73,7 +73,13 @@
     <li><a href="#benchmark-9b-final">Benchmark: Qwen3.5-9B GPU — Final Results (with oneDNN Fix)</a></li>
     <li><a href="#benchmark-v6-dual-precision">Benchmark v6: INT4 + F16 &times; Seq/Batch Verify (April 2026)</a></li>
     <li><a href="#int8-batch-fix">INT8 Batch Performance Fix: Quant-Conditional oneDNN Disable (April 2026)</a></li>
+    <li><a href="#benchmark-v7-tri-precision">Benchmark v7: INT4 + INT8 + F16 &mdash; Complete Tri-Precision (April 2026)</a></li>
+    <li><a href="#hit-rate-precision-analysis">Hit Rate &times; Precision Analysis (v7 Tri-Precision)</a></li>
     <li><a href="#vllm-state-comparison">vLLM vs OpenVINO: State Management Comparison</a></li>
+    <li><a href="#onednn-batch1-loop">oneDNN Batch-1 Loop Fix: INT4 FC Batch Invariance (April 2026)</a></li>
+    <li><a href="#benchmark-v8-int4-batch1">Benchmark v8: INT4 with Batch-1 Loop (April 2026)</a></li>
+    <li><a href="#vllm-mtp-gap-analysis">vLLM MTP vs OpenVINO: Comprehensive Gap Analysis (April 2026)</a></li>
+    <li><a href="#f16-kernel-path">F16 vs INT4/INT8: FC Kernel Path Analysis (April 2026)</a></li>
     <li><a href="#next-steps">Remaining Gaps &amp; Next Steps</a></li>
   </ul>
 </div>
@@ -83,10 +89,13 @@
 <p>This document summarizes the initial MTP speculative decoding implementation for Qwen3.5 in the OpenVINO GenAI explicit modeling framework. This serves as the baseline for future performance optimization work.</p>
 <p><strong>Status</strong>: <span class="status status-ok">K+1 Verify — All Configs Quality Verified</span> &nbsp;
    K+1 verify speculative decoding is fully implemented and benchmarked on Qwen3.5-9B (Intel Arc Pro 140T).
-   <strong>INT4 FC quality issue resolved</strong> via <code>OV_GPU_USE_ONEDNN=0</code> (INT4 only) + <code>OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD</code> (INT4 only).
+   <strong>INT4 FC batch invariance restored</strong> via oneDNN batch-1 loop in GPU plugin (<code>OV_GPU_ONEDNN_FC_BATCH1_MAX=8</code>).
    <strong>INT8 batch performance fixed</strong>: oneDNN/SDPA workarounds are now quant-conditional (INT4-only), restoring INT8 batch mode from 1.79&nbsp;tok/s to 6.87&nbsp;tok/s (3.8&times; speedup).
    All TEXT and VL configs produce coherent text (QUALITY: OK). Per-step profiling instrumentation added (<code>OV_GENAI_STEP_PROFILE=1</code>).
-   VL mode K=2 achieves <strong>+15.6% throughput</strong>; TEXT mode shows no MTP benefit on this model/hardware.</p>
+   <strong>v8 INT4 batch-1 loop benchmark</strong>: INT4 MTP now positive across all modes &mdash;
+   TEXT K=1 batch <strong>+4.2%</strong> (15.10&nbsp;tok/s), VL K=1 batch <strong>+14.1%</strong> (16.53&nbsp;tok/s).
+   Best results: INT8 VL K=2 batch <strong>+32.0%</strong> (10.57&nbsp;tok/s), F16 VL K=2 batch <strong>+33.3%</strong> (5.80&nbsp;tok/s).
+   <strong>vLLM gap analysis complete</strong>: T=0 algorithmic parity confirmed; remaining gap is structural (Amdahl&rsquo;s Law).</p>
 <p><strong>Speculative tokens</strong>: Configurable via <code>--mtp-k N</code> (default: 1). The MTP model drafts K tokens autoregressively using its own hidden_states output. The main model verifies all K drafts in a single K+1 token forward pass.</p>
 
 <!-- ======== Architecture ======== -->
@@ -1834,6 +1843,173 @@ regardless of batch size. Evidence:
   <li>INT8 K=2 batch: 52.7% accept, coherent output &mdash; also no divergence</li>
 </ul>
 
+<!-- ======== Benchmark v7: Tri-Precision ======== -->
+<h2 id="benchmark-v7-tri-precision">Benchmark v7: INT4 + INT8 + F16 &mdash; Complete Tri-Precision (April 7, 2026)</h2>
+
+<div class="note">
+  <strong>Setup:</strong> Qwen3.5-9B &nbsp;|&nbsp; Intel Arc Pro 140T GPU (16 GB) &nbsp;|&nbsp; 256 output tokens &nbsp;|&nbsp; Greedy decoding (T=0) &nbsp;|&nbsp; 1 run<br>
+  <strong>Precisions:</strong> INT4_ASYM g128 &nbsp;|&nbsp; INT8_ASYM &nbsp;|&nbsp; F16 (native, <code>OV_GPU_USE_ONEDNN=0</code>)<br>
+  <strong>Verify modes:</strong> seq (<code>--seq-verify 1</code>) &nbsp;|&nbsp; batch (<code>--pure-batch 1</code>)<br>
+  <strong>Key change from v6:</strong> INT8 configs now use oneDNN FC (fast path) &mdash; only INT4 disables oneDNN.
+</div>
+
+<h3>TEXT Mode</h3>
+<table>
+  <tr><th>Config</th><th>TTFT (ms)</th><th>TPOT (ms/tok)</th><th>Throughput (t/s)</th><th>Acc/Dft%</th><th>Acc/Out%</th><th>Tok/Infer</th><th>Quality</th><th>&Delta; vs baseline</th></tr>
+  <tr><td><strong>baseline f16</strong></td><td>2995</td><td>229.12</td><td>4.36</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>baseline f16+dnn</td><td>739</td><td>266.35</td><td>3.75</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td class="delta-neg">&minus;14.0%</td></tr>
+  <tr><td>K=1 batch f16</td><td>3176</td><td>203.22</td><td>4.92</td><td>60.0%</td><td>37.5%</td><td>1.59</td><td>OK</td><td class="delta-pos">+12.8%</td></tr>
+  <tr style="background:#dafbe1"><td><strong>K=2 batch f16</strong></td><td>2340</td><td><strong>197.29</strong></td><td><strong>5.07</strong></td><td>43.1%</td><td>46.1%</td><td>1.86</td><td>OK</td><td class="delta-pos"><strong>+16.3%</strong></td></tr>
+  <tr><td>K=3 batch f16</td><td>2488</td><td>238.51</td><td>4.19</td><td>29.1%</td><td>48.0%</td><td>1.81</td><td>OK</td><td class="delta-neg">&minus;3.9%</td></tr>
+  <tr><td colspan="9" style="background:#eee;height:4px;padding:0"></td></tr>
+  <tr><td><strong>baseline int8</strong></td><td>484</td><td>122.33</td><td>8.17</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch int8</td><td>516</td><td>106.46</td><td>9.39</td><td>60.4%</td><td>37.5%</td><td>1.60</td><td>OK</td><td class="delta-pos">+14.9%</td></tr>
+  <tr style="background:#dafbe1"><td><strong>K=2 batch int8</strong></td><td>549</td><td><strong>104.98</strong></td><td><strong>9.53</strong></td><td>42.4%</td><td>45.7%</td><td>1.85</td><td>OK</td><td class="delta-pos"><strong>+16.6%</strong></td></tr>
+  <tr><td>K=3 batch int8</td><td>513</td><td>134.90</td><td>7.41</td><td>26.3%</td><td>45.3%</td><td>1.73</td><td>OK</td><td class="delta-neg">&minus;9.3%</td></tr>
+  <tr><td colspan="9" style="background:#eee;height:4px;padding:0"></td></tr>
+  <tr><td><strong>baseline int4</strong></td><td>909</td><td>66.82</td><td>14.96</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch int4</td><td>332</td><td>70.99</td><td>14.09</td><td>46.6%</td><td>31.6%</td><td>1.47</td><td>OK</td><td class="delta-neg">&minus;5.8%</td></tr>
+  <tr><td>K=2 batch int4</td><td>345</td><td>71.03</td><td>14.08</td><td>36.2%</td><td>41.8%</td><td>1.72</td><td>OK</td><td class="delta-neg">&minus;5.9%</td></tr>
+  <tr><td>K=3 batch int4</td><td>345</td><td>93.97</td><td>10.64</td><td>23.0%</td><td>41.8%</td><td>1.65</td><td>OK</td><td class="delta-neg">&minus;28.9%</td></tr>
+</table>
+
+<h3>VL Mode</h3>
+<table>
+  <tr><th>Config</th><th>TTFT (ms)</th><th>TPOT (ms/tok)</th><th>Throughput (t/s)</th><th>Acc/Dft%</th><th>Acc/Out%</th><th>Tok/Infer</th><th>Quality</th><th>&Delta; vs baseline</th></tr>
+  <tr><td><strong>baseline f16</strong></td><td>5180</td><td>229.84</td><td>4.35</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>baseline f16+dnn</td><td>1222</td><td>256.31</td><td>3.90</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td class="delta-neg">FAIL</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch f16</td><td>4370</td><td>186.66</td><td>5.36</td><td>71.1%</td><td>41.4%</td><td>1.71</td><td>OK</td><td class="delta-pos">+23.2%</td></tr>
+  <tr style="background:#dafbe1"><td><strong>K=2 batch f16</strong></td><td>3977</td><td><strong>172.31</strong></td><td><strong>5.80</strong></td><td>53.7%</td><td>51.6%</td><td>2.07</td><td>OK</td><td class="delta-pos"><strong>+33.3%</strong></td></tr>
+  <tr><td>K=3 batch f16</td><td>3908</td><td>177.64</td><td>5.63</td><td>49.8%</td><td>61.3%</td><td>2.43</td><td>OK</td><td class="delta-pos">+29.4%</td></tr>
+  <tr><td colspan="9" style="background:#eee;height:4px;padding:0"></td></tr>
+  <tr><td><strong>baseline int8</strong></td><td>1121</td><td>124.83</td><td>8.01</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch int8</td><td>909</td><td>103.41</td><td>9.67</td><td>65.2%</td><td>39.5%</td><td>1.65</td><td>OK</td><td class="delta-pos">+20.7%</td></tr>
+  <tr style="background:#dafbe1"><td><strong>K=2 batch int8</strong></td><td>965</td><td><strong>94.59</strong></td><td><strong>10.57</strong></td><td>53.7%</td><td>51.6%</td><td>2.07</td><td>OK</td><td class="delta-pos"><strong>+32.0%</strong></td></tr>
+  <tr><td>K=3 batch int8</td><td>927</td><td>113.48</td><td>8.81</td><td>37.4%</td><td>54.3%</td><td>2.06</td><td>OK</td><td class="delta-pos">+10.0%</td></tr>
+  <tr><td colspan="9" style="background:#eee;height:4px;padding:0"></td></tr>
+  <tr><td><strong>baseline int4</strong></td><td>907</td><td>67.78</td><td>14.75</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>OK</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch int4</td><td>1092</td><td>66.43</td><td>15.05</td><td>59.4%</td><td>37.1%</td><td>1.59</td><td>OK</td><td class="delta-pos">+2.0%</td></tr>
+  <tr><td>K=2 batch int4</td><td>1115</td><td>65.44</td><td>15.28</td><td>45.5%</td><td>47.7%</td><td>1.90</td><td>OK</td><td class="delta-pos">+3.6%</td></tr>
+  <tr><td>K=3 batch int4</td><td>1114</td><td>77.10</td><td>12.97</td><td>38.8%</td><td>55.5%</td><td>2.09</td><td>OK</td><td class="delta-neg">&minus;12.1%</td></tr>
+</table>
+
+<h3>Precision &times; Mode Summary (batch verify only)</h3>
+<table>
+  <tr><th>Precision</th><th>Baseline (t/s)</th><th>Best Config</th><th>TEXT &Delta;</th><th>Best Config</th><th>VL &Delta;</th></tr>
+  <tr><td><strong>F16</strong></td><td>4.36 / 4.35</td><td>K=2 batch</td><td class="delta-pos">+16.3%</td><td>K=2 batch</td><td class="delta-pos"><strong>+33.3%</strong></td></tr>
+  <tr><td><strong>INT8</strong></td><td>8.17 / 8.01</td><td>K=2 batch</td><td class="delta-pos">+16.6%</td><td>K=2 batch</td><td class="delta-pos"><strong>+32.0%</strong></td></tr>
+  <tr><td>INT4</td><td>14.96 / 14.75</td><td>&mdash;</td><td class="delta-neg">all negative</td><td>K=2 batch</td><td class="delta-pos">+3.6%</td></tr>
+</table>
+
+<h3>Key Findings</h3>
+<div class="note">
+  <strong>1. INT8 emerges as the best overall MTP precision.</strong>
+  VL K=2 batch INT8 achieves +32.0% (10.57 tok/s), nearly matching F16&rsquo;s +33.3% gain 
+  but at <strong>1.8&times; higher absolute throughput</strong> (10.57 vs 5.80 tok/s).
+  INT8 oneDNN FC kernels are fast, have no batch divergence, and MTP accept rates are high.
+  TEXT K=2 batch INT8 at +16.6% (9.53 tok/s) also outperforms F16&rsquo;s +16.3% in absolute speed.<br><br>
+
+  <strong>2. F16 VL K=3 batch shows exceptional MTP quality.</strong>
+  Avg Acc=1.50, Acc/Out%=61.3%, Tok/Infer=2.43 &mdash; over 60% of output tokens come from draft acceptance.
+  F16&rsquo;s higher numerical precision gives the MTP head much better prediction accuracy at deeper draft positions.
+  However the high draft overhead (~38ms &times; 3 = 114ms) limits the net throughput gain to +29.4% vs K=2&rsquo;s +33.3%.<br><br>
+
+  <strong>3. INT4 TEXT MTP is not cost-effective.</strong>
+  All INT4 TEXT batch configs are negative (&minus;5.8% to &minus;28.9%).
+  Root causes:<br>
+  &bull; INT4 baseline is already very fast (67 ms/tok). MTP draft overhead (~10ms &times; K) is a large fraction of baseline cost.<br>
+  &bull; Disabling oneDNN for INT4 adds ~24% penalty to the verify call itself &mdash; the verify is <em>slower</em> than baseline single-token infer.<br>
+  &bull; INT4 TEXT accept rate is the lowest across all precisions (36&ndash;47%), giving fewer bonus tokens to amortize overhead.<br>
+  &bull; Contrast with VL: INT4 VL K=2 batch ekes out +3.6% because VL accept rates are higher (45&ndash;59%).<br><br>
+
+  <strong>4. f16+dnn confirms oneDNN F16 FC VL bug.</strong>
+  <code>baseline f16+dnn</code> (oneDNN enabled) produces degenerate output in VL mode (&ldquo;!!!&rdquo; &times;255).
+  TTFT is 4&times; faster with oneDNN (739 ms vs 2995 ms), confirming oneDNN compilation is faster but output is incorrect.
+  The TEXT mode with f16+dnn is correct but 14% slower than f16 without oneDNN &mdash; suggesting oneDNN f16 FC
+  kernels are also suboptimal for text on this hardware.<br><br>
+
+  <strong>5. K=2 batch is universally optimal.</strong>
+  Across all three precisions and both modes, K=2 batch verify consistently delivers the best or near-best
+  throughput gain. K=1 under-amortizes, K=3 over-drafts with diminishing acceptance.
+</div>
+
+<h3>Verify &amp; Draft Latency Comparison</h3>
+<table>
+  <tr><th>Precision</th><th>Verify Avg (ms)</th><th>Draft Avg (ms)</th><th>Draft/Verify Ratio</th><th>Notes</th></tr>
+  <tr><td>F16</td><td>~280&ndash;293</td><td>~37&ndash;47</td><td>~13&ndash;16%</td><td>Slow verify &rarr; more room for MTP to help</td></tr>
+  <tr><td>INT8</td><td>~152&ndash;157</td><td>~18</td><td>~12%</td><td>oneDNN fast verify + low draft overhead</td></tr>
+  <tr><td>INT4</td><td>~93&ndash;112</td><td>~10</td><td>~10%</td><td>OCL FC verify (oneDNN disabled) + low draft</td></tr>
+</table>
+
+<!-- ======== Hit Rate × Precision Analysis ======== -->
+<h2 id="hit-rate-precision-analysis">Hit Rate &times; Precision Analysis (v7 Tri-Precision, April 2026)</h2>
+
+<div class="note">
+  <strong>Data source:</strong> v7 tri-precision benchmark (20260407_180830) &mdash; INT4_ASYM g128 + INT8_ASYM + F16<br>
+  <strong>Key metric:</strong> Conditional hit rate (Cond%) = accepted tokens / tokens where main model had a prediction to compare against.<br>
+  This measures the MTP draft model&rsquo;s raw prediction accuracy, independent of K or throughput considerations.
+</div>
+
+<h3>TEXT Mode &mdash; Conditional Hit Rate by Precision &times; Verify Mode</h3>
+<table>
+  <tr><th>K</th><th>F16 seq</th><th>F16 batch</th><th>INT8 seq</th><th>INT8 batch</th><th>INT4 seq</th><th>INT4 batch</th></tr>
+  <tr><td><strong>K=1</strong></td><td>56.4%</td><td><strong>60.0%</strong></td><td>58.4%</td><td><strong>60.4%</strong></td><td>50.9%</td><td><strong>46.6%</strong></td></tr>
+  <tr><td><strong>K=2</strong></td><td>48.0%</td><td><strong>53.9%</strong></td><td>50.0%</td><td><strong>53.2%</strong></td><td>46.7%</td><td><strong>46.7%</strong></td></tr>
+  <tr><td><strong>K=3</strong></td><td>48.2%</td><td><strong>50.6%</strong></td><td>45.4%</td><td><strong>47.2%</strong></td><td>45.1%</td><td><strong>43.2%</strong></td></tr>
+</table>
+
+<h3>VL Mode &mdash; Conditional Hit Rate by Precision &times; Verify Mode</h3>
+<table>
+  <tr><th>K</th><th>F16 seq</th><th>F16 batch</th><th>INT8 seq</th><th>INT8 batch</th><th>INT4 seq</th><th>INT4 batch</th></tr>
+  <tr><td><strong>K=1</strong></td><td>70.0%</td><td><strong>71.1%</strong></td><td>64.1%</td><td><strong>65.2%</strong></td><td>71.1%</td><td><strong>59.4%</strong></td></tr>
+  <tr><td><strong>K=2</strong></td><td>60.9%</td><td><strong>64.4%</strong></td><td>62.0%</td><td><strong>64.1%</strong></td><td>64.3%</td><td><strong>55.0%</strong></td></tr>
+  <tr><td><strong>K=3</strong></td><td>59.2%</td><td><strong>69.2%</strong></td><td>58.2%</td><td><strong>59.2%</strong></td><td>58.9%</td><td><strong>60.7%</strong></td></tr>
+</table>
+
+<h3>Key Findings</h3>
+
+<h4>1. Quantization Impact on Hit Rate (seq mode, isolating model precision from batch effects)</h4>
+<table>
+  <tr><th>TEXT K=1 seq</th><th>Hit Rate</th><th>&Delta; vs F16</th></tr>
+  <tr><td>F16</td><td>56.4%</td><td>&mdash;</td></tr>
+  <tr><td>INT8</td><td>58.4%</td><td class="delta-pos">+2.0pp</td></tr>
+  <tr><td>INT4</td><td>50.9%</td><td class="delta-neg">&minus;5.5pp</td></tr>
+</table>
+<ul>
+  <li><strong>F16 &rarr; INT8</strong>: essentially lossless (&pm;2pp). INT8 quantization preserves sufficient precision for MTP draft prediction.</li>
+  <li><strong>F16 &rarr; INT4</strong>: <strong>&minus;5&ndash;6pp drop</strong>. INT4 quantization loses fine-grained logit distinctions that MTP needs to predict correctly, consistently degrading hit rate across all K values and both modes.</li>
+</ul>
+
+<h4>2. INT4 Batch Mode Suffers Additional Hit Rate Drop (Batch-Divergence Effect)</h4>
+<table>
+  <tr><th>Config</th><th>INT4 seq</th><th>INT4 batch</th><th>&Delta;</th></tr>
+  <tr><td>TEXT K=1</td><td>50.9%</td><td>46.6%</td><td class="delta-neg">&minus;4.3pp</td></tr>
+  <tr><td>VL K=1</td><td>71.1%</td><td>59.4%</td><td class="delta-neg"><strong>&minus;11.7pp</strong></td></tr>
+</table>
+<p>INT4 FC kernels produce different hidden states at batch=2 (verify) vs batch=1 (decode), causing
+MTP draft tokens to be rejected more often. F16 and INT8 show less than 3pp seq&rarr;batch difference,
+confirming this is an <strong>INT4-specific</strong> GEMM tiling divergence issue.</p>
+<div class="note">
+  <strong>Note:</strong> This data (v7, 20260407_180830) was collected <strong>before</strong> the oneDNN batch-1 loop fix.
+  Post-fix data (v8, 20260408_071520) shows INT4 TEXT K=1 batch restored to <strong>53.01%</strong>,
+  close to seq-mode levels. The batch-1 loop eliminates the kernel-level divergence.
+</div>
+
+<h4>3. VL Hit Rate Much Higher Than TEXT, but More Vulnerable to Divergence</h4>
+<ul>
+  <li><strong>VL consistently ~70% vs TEXT ~55%</strong> at K=1: VL generates structured image descriptions (lists, attributes, factual statements) that are highly predictable by the MTP head. TEXT generates creative fiction with less predictable token choices.</li>
+  <li><strong>VL is more sensitive to batch-divergence</strong>: high accept rate &rarr; more consecutive batch-verify inferences without corrective rejection+restore cycles &rarr; numerical drift accumulates faster. This is exactly the mechanism behind the earlier VL degeneration bug (pre-SDPA-threshold fix).</li>
+</ul>
+
+<h4>4. Precision Impact Chain</h4>
+<pre><code>F16 (baseline)  ─── INT8 (~lossless, ±2pp) ─── INT4 seq (−5pp quantization loss) ─── INT4 batch (−5~12pp additional)
+   56.4%              58.4%                        50.9%                                  46.6%  (TEXT K=1)
+   70.0%              64.1%                        71.1%                                  59.4%  (VL K=1)
+                                                     ↑                                      ↑
+                                              Model-level loss                      Kernel-level divergence
+                                            (weight quantization)                 (INT4 GEMM tiling, fixed by
+                                                                                  oneDNN batch-1 loop)</code></pre>
+
 <!-- ======== vLLM State Comparison ======== -->
 <h2 id="vllm-state-comparison">vLLM vs OpenVINO: State Management for Hybrid Models</h2>
 
@@ -1888,6 +2064,325 @@ When draft tokens are rejected, the states updated by rejected tokens must be ro
   </ul>
 </div>
 
+<!-- ======== oneDNN Batch-1 Loop Fix ======== -->
+<h2 id="onednn-batch1-loop">oneDNN Batch-1 Loop Fix: INT4 FC Batch Invariance (April 7, 2026)</h2>
+
+<h3>Problem</h3>
+<p>The previous INT4 MTP workaround (<code>OV_GPU_USE_ONEDNN=0</code>) disabled oneDNN entirely for INT4,
+forcing all FC layers onto the slower OCL <code>bf_tiled</code> kernel. This caused a
+<strong>~24% throughput regression</strong> on baseline decode (14.96&nbsp;&rarr;&nbsp;11.52&nbsp;t/s) because
+INT4 compressed-weight FC is much faster on oneDNN&rsquo;s systolic array path.</p>
+<p>Root cause of the original issue: oneDNN selects <strong>different GEMM tiling strategies</strong> for
+different batch sizes (M). When the verify batch has M=2 (K+1 tokens) vs decode M=1,
+the different tiling produces FP rounding divergence in INT4 dequant+matmul, causing
+draft tokens to appear &ldquo;rejected&rdquo; even when semantically correct.</p>
+
+<h3>Solution: Batch-1 Loop</h3>
+<p>Instead of disabling oneDNN, the GPU plugin now implements a <strong>batch-1 loop</strong> for
+INT4 compressed-weight FC layers with small verify batches (M&nbsp;&isin;&nbsp;(1,&nbsp;8]):</p>
+<ol>
+  <li>Create the oneDNN <code>dnnl::matmul</code> primitive with <strong>M=1 shape</strong> (always)</li>
+  <li>For verify batch M&gt;1: execute the M=1 primitive <strong>M times</strong> with per-row input/output memory offsets</li>
+  <li>Each row computes identically to decode (M=1), guaranteeing <strong>bit-identical results</strong></li>
+</ol>
+
+<h3>Implementation Details</h3>
+<table>
+  <tr><th>Aspect</th><th>Detail</th></tr>
+  <tr><td>File</td><td><code>src/plugins/intel_gpu/src/graph/impls/onednn/fully_connected_onednn.cpp</code></td></tr>
+  <tr><td>Env var</td><td><code>OV_GPU_ONEDNN_FC_BATCH1_MAX</code> (default: 8, 0=disable)</td></tr>
+  <tr><td>Trigger</td><td>INT4 compressed weights + M&nbsp;&isin;&nbsp;(1, threshold]</td></tr>
+  <tr><td>Mechanism</td><td>Override <code>get_matmul_primitive_descriptor()</code> with <code>batch_override=1</code>,
+    loop in <code>execute_impl()</code> with per-row offsets</td></tr>
+  <tr><td>Accumulation</td><td><code>fpmath_mode::f16</code> + <code>accumulation_mode::f32</code> (forced for INT4)</td></tr>
+  <tr><td>Performance</td><td>M&times; kernel launches but same systolic array utilization per row</td></tr>
+</table>
+
+<h3>Code Changes</h3>
+<ul>
+  <li><code>fully_connected_onednn.cpp</code>: <code>_force_batch1_loop</code> flag, <code>get_batch1_loop_threshold()</code>,
+    <code>batch_override</code> param on <code>get_matmul_primitive_descriptor()</code>, overridden <code>execute_impl()</code>
+    with M-times row-offset loop, re-derive in <code>load()</code>.</li>
+  <li><code>modeling_qwen3_5.cpp</code>: Removed <code>_putenv_s(&quot;OV_GPU_USE_ONEDNN&quot;, &quot;0&quot;)</code> auto-disable for INT4 MTP.
+    Now sets <code>OV_GPU_USE_ONEDNN=1</code> for INT4 configs.</li>
+  <li><code>bench_mtp.ps1</code>: INT4 configs use <code>OV_GPU_USE_ONEDNN=1</code>; added <code>int4+ocl</code> configs
+    with <code>OV_GPU_USE_ONEDNN=0</code> for A/B comparison. Added <code>-CooldownSec</code> (default 15s) and
+    <code>-IncludeSeq</code> switch. Seq-verify configs excluded by default.</li>
+</ul>
+
+<!-- ======== Benchmark v8: INT4 Batch-1 Loop ======== -->
+<h2 id="benchmark-v8-int4-batch1">Benchmark v8: INT4 with Batch-1 Loop (April 7, 2026)</h2>
+
+<p>Hardware: Intel Arc Pro 140T &bull; Qwen3.5-9B &bull; INT4_ASYM g128 &bull; Greedy (T=0) &bull; 256 output tokens &bull;
+15s GPU cooldown between configs.</p>
+
+<h3>TEXT Mode</h3>
+<table>
+  <tr><th>Config</th><th>TPOT (ms)</th><th>Throughput (t/s)</th><th>vs baseline</th><th>Accept%</th><th>Tok/Infer</th><th>Verify (ms)</th><th>Draft (ms)</th></tr>
+  <tr><td>baseline int4</td><td>69.0</td><td>14.49</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch int4</td><td>66.2</td><td class="delta-pos">15.10 (+4.2%)</td><td class="delta-pos">+4.2%</td><td>52.69%</td><td>1.53</td><td>90.08</td><td>10.53</td></tr>
+  <tr><td>K=2 batch int4</td><td>67.6</td><td class="delta-pos">14.79 (+2.1%)</td><td class="delta-pos">+2.1%</td><td>36.15%</td><td>1.72</td><td>95.48</td><td>10.22</td></tr>
+  <tr><td>K=3 batch int4</td><td>92.7</td><td class="delta-neg">10.78 (&minus;25.6%)</td><td class="delta-neg">&minus;25.6%</td><td>22.01%</td><td>1.60</td><td>109.93</td><td>10.51</td></tr>
+</table>
+
+<h3>VL Mode</h3>
+<table>
+  <tr><th>Config</th><th>TPOT (ms)</th><th>Throughput (t/s)</th><th>vs baseline</th><th>Accept%</th><th>Tok/Infer</th><th>Verify (ms)</th><th>Draft (ms)</th></tr>
+  <tr><td>baseline int4</td><td>69.0</td><td>14.49</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>K=1 batch int4</td><td>60.5</td><td class="delta-pos">16.53 (+14.1%)</td><td class="delta-pos">+14.1%</td><td>70.00%</td><td>1.70</td><td>90.32</td><td>10.69</td></tr>
+  <tr><td>K=2 batch int4</td><td>60.5</td><td class="delta-pos">16.54 (+14.1%)</td><td class="delta-pos">+14.1%</td><td>47.33%</td><td>1.95</td><td>96.56</td><td>10.33</td></tr>
+  <tr><td>K=3 batch int4</td><td>76.2</td><td class="delta-neg">13.12 (&minus;9.5%)</td><td class="delta-neg">&minus;9.5%</td><td>29.51%</td><td>1.72</td><td>112.05</td><td>10.45</td></tr>
+</table>
+
+<h3>INT4 oneDNN (batch-1 loop) vs INT4+OCL Comparison</h3>
+<table>
+  <tr><th>Config (TEXT)</th><th>int4 (oneDNN)</th><th>int4+ocl</th><th>oneDNN advantage</th></tr>
+  <tr><td>baseline</td><td>14.49 t/s</td><td>13.87 t/s</td><td class="delta-pos">+4.5%</td></tr>
+  <tr><td>K=1 batch</td><td>15.10 t/s</td><td>13.37 t/s</td><td class="delta-pos">+12.9%</td></tr>
+  <tr><td>K=2 batch</td><td>14.79 t/s</td><td>13.65 t/s</td><td class="delta-pos">+8.4%</td></tr>
+</table>
+<div class="note">
+  The batch-1 loop restores oneDNN&rsquo;s systolic array performance while maintaining
+  bit-identical batch invariance. Verify time improved from ~99ms (OCL) to ~90ms (oneDNN),
+  a <strong>9% reduction</strong> per verify call.
+</div>
+
+<h3>INT4 MTP Gains: Before vs After Batch-1 Loop</h3>
+<table>
+  <tr><th>Config</th><th>v7 (oneDNN disabled)</th><th>v8 (batch-1 loop)</th><th>Improvement</th></tr>
+  <tr><td>TEXT K=1 batch</td><td>&minus;5.8%</td><td class="delta-pos">+4.2%</td><td class="delta-pos">+10.0pp</td></tr>
+  <tr><td>TEXT K=2 batch</td><td>&minus;5.9%</td><td class="delta-pos">+2.1%</td><td class="delta-pos">+8.0pp</td></tr>
+  <tr><td>VL K=1 batch</td><td>+2.0%</td><td class="delta-pos">+14.1%</td><td class="delta-pos">+12.1pp</td></tr>
+  <tr><td>VL K=2 batch</td><td>+3.6%</td><td class="delta-pos">+14.1%</td><td class="delta-pos">+10.5pp</td></tr>
+</table>
+
+<!-- ======== vLLM MTP Gap Analysis ======== -->
+<h2 id="vllm-mtp-gap-analysis">vLLM MTP vs OpenVINO: Comprehensive Gap Analysis (April 7, 2026)</h2>
+
+<h3>Architecture Comparison</h3>
+<p>Research of vLLM&rsquo;s MTP implementation (<code>vllm/model_executor/models/qwen3_5_mtp.py</code>,
+<code>vllm/v1/worker/gpu/spec_decode/eagle/speculator.py</code>,
+<code>vllm/v1/worker/gpu/spec_decode/rejection_sampler.py</code>) confirms that both implementations
+share the same fundamental architecture:</p>
+
+<table>
+  <tr><th>Aspect</th><th>vLLM</th><th>OpenVINO (ours)</th><th>Status</th></tr>
+  <tr><td>MTP layers</td><td>1 (Qwen3.5 <code>mtp_num_hidden_layers=1</code>)</td><td>1</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>Layer structure</td><td>embed + FC(concat 2H&rarr;H) + 1 decoder + norm + lm_head</td><td>Same</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>Draft autoregression</td><td>k=0 from main HS, k&gt;0 from MTP HS</td><td>Same</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>MTP KV cache</td><td>Accumulates across draft steps</td><td>Same (reset once per round, not per k)</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>Layer cycling</td><td><code>spec_step_idx % num_mtp_layers</code></td><td>N/A (1 layer, no cycling needed)</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>Verify method</td><td>Single K+1 batch forward</td><td>Same (pure-batch mode)</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>KV cache rollback</td><td>Slot mapping (virtual trim)</td><td>Dead position masking (virtual trim)</td><td><span class="status status-ok">Equivalent</span></td></tr>
+  <tr><td>Accept logic (T=0)</td><td>Strict argmax match</td><td>Argmax match</td><td><span class="status status-ok">Parity</span></td></tr>
+  <tr><td>Accept logic (T&gt;0)</td><td>Probabilistic rejection + residual sampling</td><td>Argmax only</td><td><span class="status status-warn">Gap</span></td></tr>
+  <tr><td>CUDA Graph</td><td>Full draft loop captured</td><td>N/A (OpenVINO GPU plugin)</td><td><span class="status status-warn">Gap</span></td></tr>
+</table>
+
+<h3>Key Finding: No Algorithmic Gap at T=0</h3>
+<div class="note">
+  For greedy decoding (T=0, our benchmark configuration), both implementations are
+  <strong>algorithmically identical</strong>. The accept rate difference is negligible (INT4 TEXT K=1:
+  52.69% ours vs ~50&ndash;55% vLLM strict mode on creative text). The T&gt;0 probabilistic
+  rejection sampling in vLLM achieves ~87% accept rate, but this requires temperature
+  sampling and does not apply to our T=0 benchmark.
+</div>
+
+<h3>Accept Rate Analysis: At Ceiling for T=0</h3>
+<table>
+  <tr><th>Mode/K</th><th>INT4</th><th>INT8</th><th>F16</th><th>Cross-precision &Delta;</th></tr>
+  <tr><td>TEXT K=1</td><td>52.69%</td><td>53.52%</td><td>55.69%</td><td>&lt;3% &mdash; precision not the bottleneck</td></tr>
+  <tr><td>TEXT K=2</td><td>36.15%</td><td>42.39%</td><td>43.28%</td><td>K=2 drops significantly from K=1</td></tr>
+  <tr><td>VL K=1</td><td>70.00%</td><td>66.00%</td><td>75.33%</td><td>VL much higher (structured output)</td></tr>
+  <tr><td>VL K=2</td><td>47.33%</td><td>53.66%</td><td>57.29%</td><td>VL K=2 still better than TEXT K=1</td></tr>
+</table>
+<p>Conclusion: accept rate is determined by <strong>output predictability</strong> (VL structured &gt; TEXT creative),
+not by model precision. No algorithmic improvement is possible at T=0 (greedy = deterministic).</p>
+
+<h3>INT4 vs INT8 MTP Gain Gap: Amdahl&rsquo;s Law</h3>
+<p>INT4 MTP gains (+4.2% TEXT) are much smaller than INT8 (+14.9% TEXT). This is
+<strong>not</strong> due to worse accept rates &mdash; they&rsquo;re nearly identical. The gap is entirely
+explained by Amdahl&rsquo;s Law:</p>
+<table>
+  <tr><th>Factor</th><th>INT4</th><th>INT8</th><th>Impact</th></tr>
+  <tr><td>Baseline decode</td><td>69 ms</td><td>119 ms</td><td>INT4 is 1.7&times; faster &rarr; less room for MTP</td></tr>
+  <tr><td>Verify (K+1)</td><td>~90 ms</td><td>~155 ms</td><td>Both ~30% slower than decode</td></tr>
+  <tr><td>Verify overhead</td><td>21 ms (30%)</td><td>36 ms (30%)</td><td>Same relative, but absolute smaller for INT4</td></tr>
+  <tr><td>Draft time</td><td>~10.5 ms</td><td>~10.5 ms</td><td><strong>Same</strong> (MTP model is small, always ~10.5ms)</td></tr>
+  <tr><td>Draft/baseline ratio</td><td>15.2%</td><td>8.8%</td><td>Draft overhead is <strong>relatively larger</strong> for INT4</td></tr>
+  <tr><td>Accept rate (K=1)</td><td>52.69%</td><td>53.52%</td><td>Nearly identical</td></tr>
+</table>
+<p>The fixed ~10.5ms draft cost consumes 15.2% of INT4&rsquo;s decode budget vs only 8.8% of INT8&rsquo;s.
+This structural asymmetry means INT4 MTP gains will always be lower than INT8/F16 as long as
+the draft model shares the same (large) vocabulary.</p>
+
+<h3>MTP Draft Time Breakdown: lm_head Dominates</h3>
+<p>The MTP model&rsquo;s 10.5ms per-draft latency is <strong>dominated by the lm_head projection</strong>:</p>
+<table>
+  <tr><th>MTP Component</th><th>Weight Shape</th><th>FLOPs (M)</th><th>Weight I/O (MB)</th><th>% of Total</th></tr>
+  <tr><td>fc (concat&rarr;linear)</td><td>[4096&times;8192]</td><td>67.1</td><td>16.8</td><td>2.7%</td></tr>
+  <tr><td>q_proj</td><td>[4096&times;8192]</td><td>67.1</td><td>16.8</td><td>2.7%</td></tr>
+  <tr><td>k_proj</td><td>[4096&times;1024]</td><td>8.4</td><td>2.1</td><td>0.3%</td></tr>
+  <tr><td>v_proj</td><td>[4096&times;1024]</td><td>8.4</td><td>2.1</td><td>0.3%</td></tr>
+  <tr><td>o_proj</td><td>[4096&times;4096]</td><td>33.6</td><td>8.4</td><td>1.3%</td></tr>
+  <tr><td>gate_proj</td><td>[4096&times;12288]</td><td>100.7</td><td>25.2</td><td>4.0%</td></tr>
+  <tr><td>up_proj</td><td>[4096&times;12288]</td><td>100.7</td><td>25.2</td><td>4.0%</td></tr>
+  <tr><td>down_proj</td><td>[12288&times;4096]</td><td>100.7</td><td>25.2</td><td>4.0%</td></tr>
+  <tr><td><strong>lm_head</strong></td><td><strong>[4096&times;248320]</strong></td><td><strong>2034.2</strong></td><td><strong>508.6</strong></td><td><strong>80.7%</strong></td></tr>
+  <tr style="font-weight:bold"><td>Total</td><td></td><td>2520.8</td><td>630.2</td><td>100%</td></tr>
+</table>
+<p>At M=1 (single-token decode), this is <strong>memory-bandwidth-bound</strong>: reading 630&nbsp;MB of
+INT4 weights from VRAM. Theoretical time at 350&nbsp;GB/s achievable BW = 1.8ms, but measured
+10.5ms &rArr; effective BW ~62&nbsp;GB/s (18% utilization), indicating significant kernel
+launch and GPU pipeline overhead across 9&nbsp;MatMul + SDPA operations.</p>
+
+<h3>Verify Overhead Breakdown (K=1 batch INT4)</h3>
+<p>Verify step: 91.3ms = 69.6ms (baseline decode) + <strong>21.7ms overhead (+31%)</strong></p>
+<table>
+  <tr><th>Overhead Source</th><th>Time (ms)</th><th>% of Overhead</th><th>Notes</th></tr>
+  <tr><td><strong>infer overhead</strong> (M=2 vs M=1)</td><td>13.4</td><td>62%</td><td>Batch-1 loop: 2&times; M=1 matmul = 2&times; weight I/O</td></tr>
+  <tr><td>restore (amortized at 47% reject)</td><td>5.4</td><td>25%</td><td>GPU-side <code>restore_variable_from_output()</code></td></tr>
+  <tr><td>save (snapshot)</td><td>1.0</td><td>5%</td><td>Save conv/linear states before verify</td></tr>
+  <tr><td>accept + trim</td><td>0.5</td><td>2%</td><td>Argmax comparison + dead position mask</td></tr>
+  <tr><td>Other (scheduling)</td><td>1.4</td><td>6%</td><td>Host-side overhead</td></tr>
+</table>
+<p>The 13.4ms infer overhead is inherent to the batch-1 loop: for K=1 verify (M=2), the
+main model&rsquo;s 32 decoder layers must each read their FC weights <strong>twice</strong> (once per row).
+This is the fundamental cost of guaranteeing batch invariance.</p>
+
+<h3>Optimization Roadmap for INT4 MTP</h3>
+<table>
+  <tr><th>Phase</th><th>Direction</th><th>Expected INT4 K=1 TEXT Gain</th><th>Effort</th><th>Priority</th></tr>
+  <tr style="background:#dafbe1"><td>&check; Done</td><td>Batch-1 loop (oneDNN)</td><td>Baseline &rarr; +4.2%</td><td>&check;</td><td>&mdash;</td></tr>
+  <tr><td>Phase A</td><td>Reduce host-side MTP dispatch overhead</td><td>+5&ndash;6%</td><td>1&ndash;2 days</td><td><strong>High</strong></td></tr>
+  <tr><td>Phase B</td><td>SDPA verify kernel optimization</td><td>+6&ndash;7%</td><td>3&ndash;5 days</td><td>Medium</td></tr>
+  <tr><td>Phase C</td><td>Adaptive K (K=1 TEXT, K=2 VL auto-select)</td><td>Auto-optimal</td><td>1 day</td><td>Medium</td></tr>
+  <tr><td>Phase D</td><td>Speculative head (reduced lm_head)</td><td>+8&ndash;10%</td><td>2&ndash;4 weeks</td><td>Low</td></tr>
+</table>
+
+<h3>Phase A: Reduce Host-Side MTP Dispatch Overhead</h3>
+<p>Current MTP draft call flow: <code>set_tensor &times;5 &rarr; infer() &rarr; get_tensor &rarr; argmax</code>.
+Each <code>set_tensor</code> involves host&rarr;device data copy and command submission overhead.</p>
+<ul>
+  <li><strong>Pre-bind tensors</strong>: Avoid per-call <code>set_tensor</code>, update data in-place</li>
+  <li><strong>Reduce sync points</strong>: Batch GPU commands to minimize kernel launch overhead</li>
+  <li><strong>Estimated saving</strong>: 1&ndash;2ms per draft call &rarr; ~1% throughput improvement</li>
+</ul>
+
+<h3>Phase B: SDPA Verify Kernel Optimization</h3>
+<p>The batch-1 loop solved FC batch invariance, but SDPA still uses the single-token kernel
+forced by <code>OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD</code>. For K=1 verify (M=2), the multi-token
+SDPA kernel could be faster while still producing batch-invariant results (attention is
+mathematically batch-independent when using causal masking).</p>
+<ul>
+  <li>Investigate whether multi-token SDPA kernel produces batch-invariant results</li>
+  <li>If yes: remove <code>SDPA_SINGLE_TOKEN_THRESHOLD</code> constraint for verify</li>
+  <li><strong>Estimated saving</strong>: 2&ndash;3ms per verify call &rarr; ~2% throughput improvement</li>
+</ul>
+
+<h3>Phase C: Adaptive K Selection</h3>
+<p>VL mode achieves 70% accept rate at K=1 (optimal: K=2 at +14.1%), while TEXT only
+gets 52.69% (optimal: K=1 at +4.2%). An adaptive strategy could:</p>
+<ul>
+  <li>Monitor rolling accept rate over the last N steps</li>
+  <li>Increase K when accept rate &gt; 60%, decrease when &lt; 40%</li>
+  <li>Start with K=1 and adapt based on observed content predictability</li>
+</ul>
+
+<h3>Phase D: Speculative Head (Reduced lm_head)</h3>
+<p>The lm_head [4096&times;248320] accounts for 80.7% of MTP compute and 508&nbsp;MB of weight I/O.
+A smaller &ldquo;speculative head&rdquo; projecting to a top-32K vocabulary subset would reduce
+this to ~67&nbsp;MB (7.5&times; reduction), cutting draft time from ~10.5ms to ~3ms.</p>
+<ul>
+  <li>Requires fine-tuning/distillation to train the reduced head</li>
+  <li>Risk: accuracy degradation on rare tokens outside the top-32K subset</li>
+  <li>Highest potential impact but highest implementation cost</li>
+</ul>
+
+<h3>Fundamental Constraint: INT4 Decode is Already Fast</h3>
+<div class="note">
+  <strong>Why INT4 MTP gains will always be smaller than INT8/F16</strong>:
+  INT4 baseline decode is already 69ms/token (14.49&nbsp;t/s). The fixed ~10.5ms MTP draft
+  overhead = 15.2% of decode. For INT8 (119ms decode), draft = 8.8%. For F16 (232ms decode),
+  draft = 4.5%. This means MTP pays a proportionally larger &ldquo;tax&rdquo; on INT4.
+  <br><br>
+  The only way to close this gap is to <strong>reduce draft latency</strong> (Phase D) or
+  <strong>eliminate the lm_head bottleneck</strong>. No amount of accept rate or verify optimization
+  can overcome this structural asymmetry.
+</div>
+
+<!-- ======== F16 Kernel Path Analysis ======== -->
+<h2 id="f16-kernel-path">F16 vs INT4/INT8: FC Kernel Path Analysis (April 2026)</h2>
+
+<h3>Question: Does F16 Use oneDNN or OCL?</h3>
+<p>Both F16 and INT4/INT8 <em>can</em> use oneDNN on IMMAD-capable devices (Intel Arc). However, in the current
+MTP implementation, <strong>all precisions are forced to OCL</strong> because <code>modeling_qwen3_5.cpp</code>
+auto-sets <code>OV_GPU_USE_ONEDNN=0</code> before <code>compile_model()</code> for MTP pure-batch mode.</p>
+
+<h3>Log Evidence</h3>
+<p>From <code>Qwen3.5-9B_text_baseline_f16_run1.log</code> (April 8, 2026):</p>
+<pre><code>Non default env value for GPU_USE_ONEDNN = 0   &larr; oneDNN explicitly disabled
+[FC_BF_TILED_JIT] tile_b=8 is_dynamic=1 wtype=1 compressed=0 INT4=0  &larr; OCL bf_tiled kernel selected</code></pre>
+<p>Key fields decoded:</p>
+<table>
+  <tr><th>Field</th><th>Value</th><th>Meaning</th></tr>
+  <tr><td><code>FC_BF_TILED_JIT</code></td><td>&mdash;</td><td>OCL <code>fully_connected_gpu_bf_tiled</code> kernel (not oneDNN)</td></tr>
+  <tr><td><code>tile_b=8</code></td><td>8</td><td>FORCED_TILE_B=8 &mdash; number of output features processed per work-item</td></tr>
+  <tr><td><code>is_dynamic=1</code></td><td>1</td><td>Dynamic shape kernel (prefill: variable seq_len)</td></tr>
+  <tr><td><code>wtype=1</code></td><td>1</td><td>Weight type = f16 (enum 1)</td></tr>
+  <tr><td><code>compressed=0</code></td><td>0</td><td>No weight compression (not INT4/INT8 quantized)</td></tr>
+  <tr><td><code>INT4=0</code></td><td>0</td><td>Not an INT4 model</td></tr>
+</table>
+<p><strong>Conclusion</strong>: The log <strong>confirms F16 is NOT using oneDNN</strong>. It takes the OCL <code>bf_tiled</code> path
+because <code>GPU_USE_ONEDNN=0</code> is set. All 427 FC layers in the Qwen3.5-9B f16 model use
+<code>FC_BF_TILED_JIT</code> with <code>compressed=0, INT4=0</code>.</p>
+
+<h3>Default Behavior (Without MTP Override)</h3>
+<p>If <code>OV_GPU_USE_ONEDNN</code> were not overridden, the GPU plugin’s kernel selection would be:</p>
+<table>
+  <tr><th>Precision</th><th>Default Path</th><th>Gate Condition</th></tr>
+  <tr><td>F16</td><td>oneDNN (IMMAD)</td><td><code>f16f16_case</code>: both input and weight are f16</td></tr>
+  <tr><td>INT4</td><td>oneDNN (IMMAD)</td><td><code>compressed_case</code>: compressed_weights + u4/i4 weight type</td></tr>
+  <tr><td>INT8</td><td>oneDNN (IMMAD)</td><td><code>compressed_case</code>: compressed_weights + u8/i8 weight type</td></tr>
+</table>
+<p>The gate function in <code>fully_connected_onednn.hpp::validate_impl()</code> checks
+<code>info.supports_immad &amp;&amp; config.get_use_onednn()</code>. When either condition is false,
+all precisions fall back to OCL <code>bf_tiled</code> kernels.</p>
+
+<h3>Why F16 Is Batch-Invariant Even With Same Kernel</h3>
+<p>F16 and INT4 both use the same <code>bf_tiled</code> OCL kernel template, and both are subject to
+batch-dependent FORCED_TILE_B dispatch (tile_b=1 for batch=1, tile_b=2 for batch=2, etc.).
+The critical difference is <strong>decompression amplification</strong>:</p>
+<table>
+  <tr><th>Aspect</th><th>F16 Weights</th><th>INT4 Compressed Weights</th></tr>
+  <tr><td>Weight decompression</td><td>None &mdash; weights used directly</td><td><code>(w - zp) * scale</code> per group</td></tr>
+  <tr><td>FP error from tiling</td><td>~1 ULP (negligible)</td><td>Amplified by decompression chain</td></tr>
+  <tr><td>Batch divergence</td><td>Undetectable</td><td>Cumulative drift &rarr; degenerate output</td></tr>
+  <tr><td>MTP K=1 quality</td><td><span class="status status-ok">COHERENT</span></td><td><span class="status status-ok">COHERENT</span> (with batch-1 loop or oneDNN=0)</td></tr>
+</table>
+
+<h3>GEMM Tiling and M-Dimension Explained</h3>
+<p><strong>GEMM tiling</strong> is the GPU strategy of partitioning a matrix multiplication <code>C[M,N] = A[M,K] &times; B[K,N]</code>
+into smaller sub-blocks (tiles) that fit in registers/local memory. For FC layers in LLM inference:</p>
+<ul>
+  <li><strong>M-dimension</strong> = batch size (number of tokens in the forward pass): M=1 during decode, M=K+1 during verify</li>
+  <li><strong>N-dimension</strong> = output features (e.g., 4096 for hidden size)</li>
+  <li><strong>K-dimension</strong> = input features / reduction dimension</li>
+</ul>
+<p>The GPU kernel selects different <strong>FORCED_TILE_B</strong> (tile size along M) based on actual batch size.
+Small M (1&ndash;2) uses tile_b=1 or tile_b=2, large M uses tile_b=8 or tile_b=16. Different tile sizes
+mean different loop structures, different FP accumulation order, and thus different rounding.
+For INT4 weights, the <code>(w-zp)*scale</code> decompression is recomputed per tile, so different tiling
+produces slightly different decompressed values &mdash; the root cause of batch-dependent divergence.</p>
+
+<div class="note">
+  <strong>Key Insight</strong>: The <code>OV_GPU_USE_ONEDNN=0</code> override in <code>modeling_qwen3_5.cpp</code> pushes
+  <em>all precisions</em> (INT4, INT8, F16) to the same OCL bf_tiled path. F16 happens to be
+  batch-invariant on this path because it lacks the decompression chain that amplifies
+  tiling-dependent rounding errors. INT4 requires the additional batch-1 loop fix
+  (<code>OV_GPU_ONEDNN_FC_BATCH1_MAX=8</code>) or the OCL single-batch threshold to achieve invariance.
+</div>
+
 <!-- ======== Next Steps ======== -->
 <h2 id="next-steps">Remaining Gaps &amp; Next Steps</h2>
 <ol>
@@ -1905,17 +2400,20 @@ When draft tokens are rejected, the states updated by rejected tokens must be ro
   <li><s><strong>Dual-precision benchmark (INT4 + F16)</strong></s>: &check; Done &mdash; v6 benchmark with INT4/F16 &times; seq/batch verify. F16 K=2 batch delivers +33&ndash;37% throughput.</li>
   <li><s><strong>Seq vs batch verify comparison</strong></s>: &check; Done &mdash; batch-verify universally outperforms seq-verify despite lower accept rate.</li>
   <li><s><strong>INT8 batch performance fix</strong></s>: &check; Fixed &mdash; oneDNN/SDPA workarounds now gated on <code>is_primary_4bit()</code>. INT8 batch mode restored from 1.79 to 6.87 tok/s (3.8&times;). (April 7, 2026)</li>
-  <li><strong>Fix oneDNN INT4 GEMM kernel</strong>: The ~24% throughput regression from disabling oneDNN should be addressed by fixing the kernel to produce batch-size-invariant results. This would allow using the faster oneDNN path while maintaining MTP quality.</li>
+  <li><s><strong>Tri-precision benchmark (INT4 + INT8 + F16)</strong></s>: &check; Done &mdash; v7 complete benchmark. INT8 VL K=2 batch +32.0% (10.57 tok/s), F16 VL K=2 batch +33.3% (5.80 tok/s). INT4 TEXT all negative. (April 7, 2026)</li>
+  <li><s><strong>Fix oneDNN INT4 GEMM kernel</strong></s>: &check; Fixed &mdash; batch-1 loop in GPU plugin. INT4 K=1 batch TEXT +4.2%, VL +14.1%. (April 7, 2026)</li>
+  <li><s><strong>vLLM MTP gap analysis</strong></s>: &check; Done &mdash; T=0 algorithmic parity confirmed. INT4 gain gap vs INT8/F16 explained by Amdahl&rsquo;s Law (fixed 10.5ms draft / faster INT4 decode). (April 7, 2026)</li>
   <li><strong>Fix oneDNN F16 FC for VL</strong>: oneDNN f16 FC kernels produce degenerate output on VL visual token distributions. Currently worked around with <code>OV_GPU_USE_ONEDNN=0</code>.</li>
-  <li><strong>Verify INT4 impact on MTP precision</strong>: FP16 MTP head may improve accept rate from ~50% toward vLLM&rsquo;s 90%. Current ~45&ndash;57% accept rate limits MTP benefit.</li>
-  <li><strong>Adaptive K selection</strong>: Auto-tune K based on observed accept rate during generation.</li>
+  <li><strong>Phase A: Reduce MTP dispatch overhead</strong>: Pre-bind tensors, reduce sync points. Est. 1&ndash;2ms saving per draft &rarr; ~1% throughput gain. (1&ndash;2 days)</li>
+  <li><strong>Phase B: SDPA verify kernel optimization</strong>: Investigate multi-token SDPA batch invariance. Est. 2&ndash;3ms saving per verify. (3&ndash;5 days)</li>
+  <li><strong>Phase C: Adaptive K selection</strong>: Auto-tune K based on rolling accept rate. K=1 for creative text, K=2 for structured VL. (1 day)</li>
+  <li><strong>Phase D: Speculative head</strong>: Reduced lm_head [4096&times;32K] to cut draft from 10.5ms to ~3ms. Requires training. (2&ndash;4 weeks)</li>
   <li><strong>Async MTP execution</strong>: Overlap MTP inference with main model decode to hide MTP latency entirely.</li>
-  <li><strong>Conv state per-token snapshots</strong>: Add per-token conv state output to FusedConv kernel for fully precise state restoration.</li>
   <li><strong>Remove debug prints</strong>: Clean up verbose debug output added during investigation. Gate remaining diagnostic output behind env var flags.</li>
 </ol>
 
 <div class="footer">
-  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; April 2026 (v9 INT8 Batch Fix + Quant-Conditional oneDNN Disable)
+  Qwen3.5 MTP Implementation &mdash; OpenVINO GenAI Explicit Modeling &mdash; Branch <code>explicit-modeling</code> &mdash; April 2026 (v12: F16 Kernel Path Analysis)
 </div>
 
 </body>

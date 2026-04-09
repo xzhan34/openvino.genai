@@ -410,9 +410,9 @@ function Set-QuantEnv([string]$quant) {
         Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_MODE -ErrorAction SilentlyContinue
         Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE -ErrorAction SilentlyContinue
         Remove-Item Env:\OV_GENAI_INFLIGHT_QUANT_BACKUP_MODE -ErrorAction SilentlyContinue
-        # Disable oneDNN FC for f16: oneDNN f16 FC kernels produce degenerate output
-        # for VL visual token distributions on Arc Pro 140T GPU.
-        $env:OV_GPU_USE_ONEDNN = "0"
+        # Enable oneDNN for f16: test whether oneDNN f16 FC improves perf vs OCL bf_tiled.
+        # Previously disabled due to degenerate VL output (under investigation).
+        $env:OV_GPU_USE_ONEDNN = "1"
     }
 }
 
