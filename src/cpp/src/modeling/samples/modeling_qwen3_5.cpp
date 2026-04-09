@@ -1493,16 +1493,19 @@ int main(int argc, char* argv[]) try {
         }
     }
 
-    // Auto-set SDPA single-token threshold for MTP pure-batch mode (INT4 only).
+    // Auto-set SDPA single-token threshold for MTP pure-batch mode.
     // SDPA multi-token kernel uses different tiling than single-token kernel,
     // causing batch-size-dependent numerical divergence (same root cause class
     // as the oneDNN FC issue).  Force single-token SDPA kernel for batch sizes
     // up to K+1 to ensure batch=1 draft and batch=K+1 verify produce identical
     // hidden states at each token position.
     //
-    // NOTE: Only applied for INT4 quantization. INT8/f16 do not exhibit this
-    // divergence and benefit from the faster multi-token SDPA kernel.
-    if (use_mtp && use_pure_batch && text_quant_config.is_primary_4bit()) {
+    // Applied for all quantization modes: INT4/INT8/f16 all exhibit cumulative
+    // divergence in Mamba recurrent states when multi-token SDPA causes
+    // batch-vs-sequential discrepancy.  Especially pronounced with longer KV
+    // caches (e.g. VL mode) and K>=2 where the error accumulates over many
+    // reject-and-restore cycles.
+    if (use_mtp && use_pure_batch) {
         const int sdpa_threshold = opts.mtp_k + 1;  // K+1 tokens in verify batch
         auto* existing = std::getenv("OV_GPU_SDPA_SINGLE_TOKEN_THRESHOLD");
         const int current = existing ? std::atoi(existing) : 0;
