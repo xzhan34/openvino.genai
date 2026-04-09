@@ -2036,19 +2036,36 @@ int main(int argc, char* argv[]) try {
 
     // Periodic state refresh for pure-batch mode: rolling checkpoint to
     // correct accumulated state drift from batch=K+1 inference.
-    // With oneDNN batch-1 loop + SDPA threshold, K=1 and K=2 are fully
-    // batch-size-invariant and need NO refresh.  K≥3 still has residual
-    // drift from other batch-dependent kernels and needs modest refresh.
+    // The batch-1 FC loop + SDPA single-token threshold eliminate the major
+    // batch-dependent divergence sources.  However, residual per-token
+    // numerical drift persists from GPU compute-path differences (different
+    // seq_len values cause slight FP rounding variation in intermediate
+    // layers).  This drift compounds across layers and generation steps:
+    //   K=1: max recurrent error ~0.004 per rejection → tolerable
+    //   K=2: max recurrent error ~0.012 per rejection → compounds
+    //         to visible quality degradation after ~100 tokens
+    //   K≥3: even larger drift → needs aggressive refresh
+    // Periodic refresh re-forwards from a clean checkpoint to reset drift.
     const int REFRESH_INTERVAL = [&]() -> int {
         if (opts.refresh_interval > 0) return opts.refresh_interval;
         auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
         int mode = env ? std::atoi(env) : 3;
         if (mode & 8) return 32;  // re-forward mode: frequent refresh
         if (has_kernel_snapshot && max_K >= 3) {
-            // K≥3: batch=4+, residual drift beyond FC/SDPA → 32 tokens
+            // K≥3: batch=4+, large residual drift → 32 tokens
             return 32;
         }
-        return 0;  // K=1/K=2: no refresh needed with batch-1 loop + SDPA threshold
+        if (has_kernel_snapshot && max_K >= 2) {
+            // K=2: moderate residual drift → 10 tokens
+            // Intel GPU compute paths produce subtly different FP results for
+            // different seq_len values (seq_len=3 batch verify vs seq_len=1 decode).
+            // With K=2, max recurrent state error ~0.012 per rejection compounds
+            // to visible quality degradation (token-0 degeneracy) after ~100-130
+            // tokens in VL INT4 mode.  Refresh every 10 tokens prevents this while
+            // maintaining significantly better throughput than mode 8 (re-forward).
+            return 10;
+        }
+        return 0;  // K=1: drift too small to cause issues
     }();
     int64_t checkpoint_past_len = 0;
     std::vector<int64_t> tokens_since_checkpoint;
@@ -2350,7 +2367,8 @@ int main(int argc, char* argv[]) try {
                 // because re-forward must start from pre-batch state (not post-accepted).
                 // Periodic refresh also needs pre-batch snapshot for checkpoint rollback.
                 auto t_snap_save0 = std::chrono::steady_clock::now();
-                const bool needs_linear_snap = !has_kernel_snapshot || (snapshot_restore_mode & 8) || REFRESH_INTERVAL > 0;
+                static const bool do_validate = []() { auto* e = std::getenv("OV_GENAI_VALIDATE_SNAPSHOT"); return e && std::string(e) == "1"; }();
+                const bool needs_linear_snap = !has_kernel_snapshot || (snapshot_restore_mode & 8) || REFRESH_INTERVAL > 0 || do_validate;
                 if (needs_linear_snap) {
                     save_linear_states(text_request, linear_snap);
                 }
@@ -2360,8 +2378,9 @@ int main(int argc, char* argv[]) try {
                 // (kernel snapshot restore for both linear + conv), the CPU conv_snap
                 // is never read — conv states are restored from GPU kernel snapshots.
                 // Skipping saves ~1ms/step of GPU→CPU sync overhead (2 conv layers).
+                // Exception: periodic refresh needs pre-batch conv states for clean re-forward.
                 const bool needs_conv_snap = has_kernel_snapshot && !conv_snap.empty() &&
-                                             (snapshot_restore_mode & 4);
+                                             ((snapshot_restore_mode & 4) || REFRESH_INTERVAL > 0 || do_validate);
                 if (needs_conv_snap) {
                     save_conv_states(text_request, conv_snap);
                 }
@@ -2662,6 +2681,9 @@ int main(int argc, char* argv[]) try {
                             // add next_id (correction/bonus) to tracking below.
                             if (needs_refresh_tracking) {
                                 save_linear_states(text_request, linear_snap);
+                                if (!conv_snap.empty()) {
+                                    save_conv_states(text_request, conv_snap);
+                                }
                                 checkpoint_past_len = past_len;
                                 tokens_since_checkpoint.clear();
                                 did_reforward_this_cycle = true;
@@ -2700,8 +2722,11 @@ int main(int argc, char* argv[]) try {
                                 snap_states.emplace_back(sname, copy);
                             }
 
-                            // 2. Undo: restore pre-batch linear states + full KV rollback + re-forward
+                            // 2. Undo: restore pre-batch linear+conv states + full KV rollback + re-forward
                             restore_linear_states(text_request, linear_snap);
+                            if (!conv_snap.empty()) {
+                                restore_conv_states(text_request, conv_snap);
+                            }
                             // Undo the physical KV trim: we need to trim all kp1 entries
                             // But we already trimmed `trim_count`, so now trim the remaining `num_accepted+1`
                             trim_kv_cache_states(text_request, static_cast<size_t>(num_accepted) + 1);
@@ -2928,8 +2953,11 @@ int main(int argc, char* argv[]) try {
                 static_cast<int>(tokens_since_checkpoint.size()) >= REFRESH_INTERVAL) {
                 auto t_rf0 = std::chrono::steady_clock::now();
 
-                // 1. Restore linear_states to last checkpoint
+                // 1. Restore linear_states + conv_states to last checkpoint
                 restore_linear_states(text_request, linear_snap);
+                if (!conv_snap.empty()) {
+                    restore_conv_states(text_request, conv_snap);
+                }
 
                 // 2. Trim KV back to checkpoint position
                 const size_t trim_amount = static_cast<size_t>(past_len - checkpoint_past_len);
@@ -2998,8 +3026,11 @@ int main(int argc, char* argv[]) try {
                         ov::genai::modeling::models::Qwen3_5TextIO::kHiddenStates);
                 }
 
-                // 4. New checkpoint: save corrected linear_states
+                // 4. New checkpoint: save corrected linear_states + conv_states
                 save_linear_states(text_request, linear_snap);
+                if (!conv_snap.empty()) {
+                    save_conv_states(text_request, conv_snap);
+                }
                 checkpoint_past_len = past_len;
                 tokens_since_checkpoint.clear();
                 tokens_since_checkpoint.push_back(next_id);
