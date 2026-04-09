@@ -18,6 +18,9 @@ if(ENABLE_SYSTEM_OPENCL)
     # Try to find OpenCL since ENABLE_SYSTEM_OPENCL is ON
     find_package(OpenCL QUIET)
     if(TARGET OpenCL::OpenCL)
+        # Make the imported target globally visible so that src/python/ can
+        # resolve it when evaluating $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>.
+        set_target_properties(OpenCL::OpenCL PROPERTIES IMPORTED_GLOBAL TRUE)
         message(STATUS "OpenCL found via OpenVINO configuration - enabling CDPruner DPP acceleration")
 
         set(opencl_header_search_params
