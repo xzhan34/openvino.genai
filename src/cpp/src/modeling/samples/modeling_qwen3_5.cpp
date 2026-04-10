@@ -2050,21 +2050,49 @@ int main(int argc, char* argv[]) try {
     // correct accumulated state drift from batch=K+1 inference.
     // NOT needed for sequential verify (each token processed as batch=1,
     // so there is no batch-vs-sequential divergence to correct).
+    // Default: 0 (disabled).  Periodic refresh is very expensive (O(N) re-
+    // forward per refresh) and caused K=2 to be -54% vs baseline.  Use the
+    // drift guard mechanism below instead.
     const int REFRESH_INTERVAL = [&]() -> int {
-        if (use_seq_verify) return 0;  // sequential verify: no refresh needed
+        if (use_seq_verify) return 0;
         if (opts.refresh_interval > 0) return opts.refresh_interval;
         if (opts.refresh_interval < 0) return 0;  // negative = force disable
         auto* env = std::getenv("OV_GENAI_SNAPSHOT_RESTORE");
         int mode = env ? std::atoi(env) : 3;
         if (mode & 8) return 32;  // re-forward mode: frequent refresh
-        if (has_kernel_snapshot && max_K >= 3) {
-            return 32;
-        }
-        if (has_kernel_snapshot && max_K >= 2) {
-            return 10;
-        }
-        return 0;  // K=1: drift too small to cause issues
+        return 0;
     }();
+
+    // Drift guard: for K>=2 batch verify, track consecutive accepted tokens
+    // without a rejection.  When the count exceeds the threshold, one verify
+    // step is executed as sequential (batch=1) instead of batch, which
+    // naturally corrects any accumulated recurrent-state divergence from
+    // batch=K+1 processing.  Cost: ~one extra main-model infer per trigger
+    // (sequential verify does 1+avg_accepted infers vs 1 batch infer).
+    // Resets to 0 on every rejection (kernel snapshot restores correct state).
+    //
+    // Why needed: GatedDeltaNet recurrent attention accumulates f16 rounding
+    // drift when processing K+1 tokens as a batch (different from sequential).
+    // K=1 (batch=2) drift is negligible.  K=2 (batch=3) + high acceptance
+    // (e.g. VL 67%) can produce 80+ consecutive accepts, causing degeneration.
+    const int DRIFT_GUARD_THRESHOLD = [&]() -> int {
+        if (use_seq_verify) return 0;       // seq verify: no drift
+        if (max_K < 2) return 0;            // K=1: drift too small
+        auto* env = std::getenv("OV_GENAI_DRIFT_GUARD");
+        if (env) {
+            try { return std::stoi(std::string(env)); } catch (...) {}
+        }
+        return 32;                          // K>=2: correct after 32 consecutive accepts
+    }();
+    int drift_guard_counter = 0;  // consecutive accepted tokens without rejection
+    size_t drift_guard_triggers = 0;  // total number of drift guard corrections
+    if (DRIFT_GUARD_THRESHOLD > 0) {
+        std::cout << "[mtp] Drift guard: seq-verify correction after "
+                  << DRIFT_GUARD_THRESHOLD << " consecutive accepted tokens" << std::endl;
+    }
+    if (REFRESH_INTERVAL > 0) {
+        std::cout << "[mtp] Periodic refresh every " << REFRESH_INTERVAL << " tokens" << std::endl;
+    }
     int64_t checkpoint_past_len = 0;
     std::vector<int64_t> tokens_since_checkpoint;
     double time_refresh_ms = 0;
@@ -2345,7 +2373,13 @@ int main(int argc, char* argv[]) try {
             double step_state_restore = 0, step_kv_trim = 0, step_reforward = 0;
             int trim_count = 0;
 
-            if (use_seq_verify) {
+            // Drift guard: when consecutive accepted tokens exceed threshold,
+            // use sequential verify for this ONE step to correct recurrent state.
+            const bool drift_guard_active = !use_seq_verify && DRIFT_GUARD_THRESHOLD > 0 &&
+                                            drift_guard_counter >= DRIFT_GUARD_THRESHOLD;
+            const bool use_seq_this_step = use_seq_verify || drift_guard_active;
+
+            if (use_seq_this_step) {
                 // Inline sequential verify: interleaves inference + accept/reject.
                 // Early stop on rejection → no KV trim, no linear_state corruption.
                 run_inline_seq_verify(num_accepted, stopped, verify_hs);
@@ -2934,6 +2968,23 @@ int main(int argc, char* argv[]) try {
                     }
                     tokens_since_checkpoint.push_back(next_id);
                 }
+
+                // Drift guard counter: tracks consecutive accepted tokens without rejection.
+                // Rejection (via kernel snapshot) corrects recurrent state → reset counter.
+                // Full acceptance accumulates → counter grows toward threshold.
+                if (DRIFT_GUARD_THRESHOLD > 0) {
+                    if (trim_count > 0) {
+                        drift_guard_counter = 0;  // rejection corrected state
+                    } else {
+                        drift_guard_counter += num_accepted + 1;  // all K accepted + bonus
+                    }
+                }
+            }
+
+            // Drift guard triggered: sequential verify corrected the state this step.
+            if (drift_guard_active) {
+                drift_guard_counter = 0;
+                drift_guard_triggers++;
             }
 
             auto t_v1 = std::chrono::steady_clock::now();
@@ -3046,8 +3097,8 @@ int main(int argc, char* argv[]) try {
 
             // === DRAFT PHASE: generate K drafts for next iteration ===
             auto t_d0 = std::chrono::steady_clock::now();
-            if (use_seq_verify) {
-                // In inline sequential mode, verify_hs has the hidden_states from the
+            if (use_seq_this_step) {
+                // Sequential verify (or drift guard) provides verify_hs from the
                 // last inference step (which processed the last accepted draft or next_id).
                 ov::Tensor hs_for_draft(ov::element::f32, {batch, 1, hidden_size}, verify_hs.data());
                 generate_k_drafts(hs_for_draft, 0);
@@ -3121,8 +3172,12 @@ int main(int argc, char* argv[]) try {
                 for (int k = 0; k < K; ++k) {
                     fprintf(stderr, " k%d=%.1f", k, step_mtp_k_ms[static_cast<size_t>(k)]);
                 }
-                fprintf(stderr, ") | accepted=%d/%d gen=%zu\n",
+                fprintf(stderr, ") | accepted=%d/%d gen=%zu",
                     num_accepted, K, generated.size());
+                if (drift_guard_active) {
+                    fprintf(stderr, " [DRIFT_GUARD: seq-verify correction, counter was %d]", DRIFT_GUARD_THRESHOLD);
+                }
+                fprintf(stderr, "\n");
             }
         }
     } else {
@@ -3250,6 +3305,11 @@ int main(int argc, char* argv[]) try {
             if (count_refreshes > 0) {
                 std::cout << "  State refresh:      " << time_refresh_ms << " ms (" << count_refreshes << " refreshes"
                           << ", avg " << std::to_string(time_refresh_ms / count_refreshes) << " ms)"
+                          << std::endl;
+            }
+            if (DRIFT_GUARD_THRESHOLD > 0) {
+                std::cout << "  Drift guard:        " << drift_guard_triggers << " corrections"
+                          << " (threshold=" << DRIFT_GUARD_THRESHOLD << " consecutive accepts)"
                           << std::endl;
             }
             if (use_pure_batch || has_kernel_snapshot) {
