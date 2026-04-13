@@ -35,9 +35,15 @@ if(NOT ENABLE_GIL_PYTHON_API)
     target_compile_definitions(${TARGET_NAME} PRIVATE Py_GIL_DISABLED=1)
 endif()
 
+# Filter OpenCL::OpenCL from the generator expression — it is not resolved as an
+# imported target inside $<TARGET_PROPERTY> and produces the invalid -lOpenCL::OpenCL.
+# Re-add the real target explicitly below.
 target_link_libraries(${TARGET_NAME} PRIVATE
     openvino::genai
-    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+    "$<FILTER:$<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>,EXCLUDE,OpenCL>")
+if(TARGET OpenCL::OpenCL)
+    target_link_libraries(${TARGET_NAME} PRIVATE OpenCL::OpenCL)
+endif()
 target_include_directories(${TARGET_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/.." "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src") # for tokenizer/tokenizers_path.hpp
 target_compile_definitions(${TARGET_NAME} PRIVATE openvino_genai_EXPORTS)
 set_target_properties(${TARGET_NAME} PROPERTIES
