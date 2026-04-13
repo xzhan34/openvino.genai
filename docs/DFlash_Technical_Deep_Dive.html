@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DFlash: Block Diffusion for Flash Speculative Decoding — 技术深度解析</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #3fb950;
+    --accent3: #d29922;
+    --accent4: #f85149;
+    --code-bg: #1c2128;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.75;
+    padding: 2rem;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2.2rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+  }
+  h2 {
+    font-size: 1.6rem;
+    color: var(--accent);
+    margin: 2.5rem 0 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.25rem;
+    color: var(--accent2);
+    margin: 1.8rem 0 0.8rem;
+  }
+  h4 {
+    font-size: 1.05rem;
+    color: var(--accent3);
+    margin: 1.2rem 0 0.6rem;
+  }
+  p, li { margin-bottom: 0.8rem; color: var(--text); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul, ol { padding-left: 1.5rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin: 1.2rem 0;
+  }
+  .highlight {
+    background: linear-gradient(135deg, rgba(88,166,255,0.12), rgba(63,185,80,0.08));
+    border-left: 4px solid var(--accent);
+    padding: 1rem 1.5rem;
+    border-radius: 0 8px 8px 0;
+    margin: 1.2rem 0;
+  }
+  .warn {
+    background: rgba(210,153,34,0.1);
+    border-left: 4px solid var(--accent3);
+    padding: 1rem 1.5rem;
+    border-radius: 0 8px 8px 0;
+    margin: 1.2rem 0;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+    font-size: 0.88em;
+    line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.6rem 0.8rem;
+    text-align: center;
+  }
+  th {
+    background: rgba(88,166,255,0.12);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  td { background: var(--card); }
+  .tag {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.82em;
+    font-weight: 600;
+    margin-right: 4px;
+  }
+  .tag-green { background: rgba(63,185,80,0.2); color: var(--accent2); }
+  .tag-blue { background: rgba(88,166,255,0.2); color: var(--accent); }
+  .tag-yellow { background: rgba(210,153,34,0.2); color: var(--accent3); }
+  .tag-red { background: rgba(248,81,73,0.2); color: var(--accent4); }
+  .meta {
+    color: var(--muted);
+    font-size: 0.9em;
+    margin-bottom: 2rem;
+  }
+  .formula {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.5rem;
+    margin: 1rem 0;
+    text-align: center;
+    font-size: 1.1em;
+    font-style: italic;
+    color: var(--accent);
+  }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 768px) { .cols { grid-template-columns: 1fr; } }
+  .toc {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin: 1.5rem 0;
+  }
+  .toc ol { padding-left: 1.2rem; }
+  .toc li { margin-bottom: 0.3rem; }
+  .flow-box {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 1rem 0;
+  }
+  .flow-step {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    text-align: center;
+    font-size: 0.9em;
+  }
+  .flow-arrow { color: var(--accent); font-size: 1.4em; font-weight: bold; }
+  .perf-num {
+    font-size: 2rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+</style>
+</head>
+<body>
+
+<h1>DFlash: Block Diffusion for Flash Speculative Decoding</h1>
+<p class="meta">
+  论文: arXiv:2602.06036v1 &nbsp;|&nbsp; 作者: Jian Chen, Yesheng Liang, Zhijian Liu &nbsp;|&nbsp;
+  <a href="https://arxiv.org/abs/2602.06036">Paper</a> &nbsp;|&nbsp;
+  <a href="https://github.com/z-lab/dflash">Code</a> &nbsp;|&nbsp;
+  <a href="https://hf.co/collections/z-lab/dflash">Models</a>
+</p>
+
+<div class="toc">
+  <strong>目录</strong>
+  <ol>
+    <li><a href="#overview">概述：什么是 DFlash？</a></li>
+    <li><a href="#background">背景：为什么需要 DFlash？</a></li>
+    <li><a href="#core-idea">核心思想：扩散模型 × 投机解码</a></li>
+    <li><a href="#architecture">系统架构与推理流程</a></li>
+    <li><a href="#kv-injection">关键技术 1：KV 注入条件化</a></li>
+    <li><a href="#parallel-draft">关键技术 2：并行扩散起草</a></li>
+    <li><a href="#acceptance">接受率与验证机制</a></li>
+    <li><a href="#training">训练方法</a></li>
+    <li><a href="#experiments">实验结果</a></li>
+    <li><a href="#code">源码解析</a></li>
+    <li><a href="#summary">总结</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="overview">1. 概述：什么是 DFlash？</h2>
+
+<div class="highlight">
+  <strong>一句话总结：</strong>DFlash 是一种<strong>基于块扩散模型（Block Diffusion）的投机解码框架</strong>，
+  使用轻量级扩散草稿模型（drafter）在<strong>单次前向传播</strong>中并行生成多个候选 token，
+  再由目标大模型并行验证，实现<strong>无损加速超过 6×</strong>，比 EAGLE-3 快最多 <strong>2.5×</strong>。
+</div>
+
+<div class="cols">
+  <div class="card">
+    <h4>🎯 核心定位</h4>
+    <p>将扩散语言模型（dLLM）定位为<strong>投机解码的专用起草器</strong>，
+    而非完整的生成模型。利用扩散的并行性消除顺序起草瓶颈。</p>
+  </div>
+  <div class="card">
+    <h4>⚡ 关键创新</h4>
+    <ul>
+      <li>从目标模型提取隐藏特征作为<strong>上下文条件</strong></li>
+      <li>通过 <strong>KV 注入</strong>将条件信息持久注入每一层</li>
+      <li><strong>单次前向</strong>并行生成整个 token 块</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cols">
+  <div class="card" style="text-align:center;">
+    <div class="perf-num">6.1×</div>
+    <p>在 Qwen3-8B 上的最大加速比</p>
+  </div>
+  <div class="card" style="text-align:center;">
+    <div class="perf-num">~7.9</div>
+    <p>平均接受长度 τ（MATH-500, temp=0）</p>
+  </div>
+  <div class="card" style="text-align:center;">
+    <div class="perf-num">2.5×</div>
+    <p>相比 EAGLE-3 的额外加速</p>
+  </div>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="background">2. 背景：为什么需要 DFlash？</h2>
+
+<h3>2.1 自回归解码的瓶颈</h3>
+<p>大语言模型（LLM）的推理本质是<strong>逐 token 顺序生成</strong>，每个 token 必须等待之前所有 token 计算完成。
+这导致：</p>
+<ul>
+  <li><strong>推理延迟高</strong>：受限于顺序依赖，无法充分利用 GPU 并行能力</li>
+  <li><strong>GPU 利用率低</strong>：单 token 生成时计算/内存比极低（memory-bound）</li>
+  <li><strong>长 CoT 推理更严重</strong>：推理模型（如 o1、DeepSeek-R1）生成链长达数千 token</li>
+</ul>
+
+<h3>2.2 现有投机解码的局限</h3>
+<p>投机解码（Speculative Decoding）的基本范式是：</p>
+<div class="flow-box">
+  <div class="flow-step">小草稿模型<br>生成 γ 个候选 token</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">大目标模型<br>并行验证</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">接受匹配的 token<br>拒绝不匹配的</div>
+</div>
+<p>但现有方法（如 EAGLE 系列、Medusa）的草稿模型仍然<strong>自回归生成</strong>，存在两个根本限制：</p>
+
+<div class="cols">
+  <div class="card">
+    <h4><span class="tag tag-red">限制 1</span> 起草延迟线性增长</h4>
+    <p>自回归起草 γ 个 token 需要 γ 次前向传播：</p>
+    <div class="formula">T<sub>draft</sub> = γ · t<sub>step</sub></div>
+    <p>为了控制延迟，被迫使用极浅的模型（如 EAGLE-3 仅 1 层 Transformer），严重限制了草稿质量。</p>
+  </div>
+  <div class="card">
+    <h4><span class="tag tag-red">限制 2</span> 错误累积</h4>
+    <p>自回归起草中，前面 token 的错误会<strong>级联传播</strong>到后续所有 token，导致接受长度快速饱和。
+    实际加速比被限制在 2-3× 左右。</p>
+  </div>
+</div>
+
+<h3>2.3 扩散 LLM 的机遇与挑战</h3>
+<p>扩散语言模型（如 LLaDA、Block Diffusion）可以<strong>并行生成</strong>多个 token，但作为独立生成模型使用时：</p>
+<ul>
+  <li>生成质量通常<strong>不如自回归模型</strong></li>
+  <li>需要多步去噪才能保证质量，<strong>抵消了并行优势</strong></li>
+  <li>大型扩散起草器（如 7B 参数的 DiffuSpec）<strong>内存开销过大</strong></li>
+</ul>
+
+<div class="warn">
+  <strong>DFlash 的关键洞察：</strong> 不要让扩散模型独立工作——让它作为目标模型的<strong>"扩散适配器"</strong>，
+  借助目标模型的隐藏特征来获得高质量的上下文信息，从而实现又快又准的并行起草。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="core-idea">3. 核心思想：扩散模型 × 投机解码</h2>
+
+<p>DFlash 的核心洞察可以总结为一句话：<strong>"the target knows best"（目标模型最了解答案）</strong>。</p>
+
+<div class="card">
+  <h4>为什么这个思路有效？</h4>
+  <p>大型自回归 LLM 的隐藏层特征不仅编码了当前 token 的信息，还<strong>隐式包含了关于未来多个 token 的预测信息</strong>
+  （参见 Samragh et al., 2025）。DFlash 利用这些特征作为条件，让草稿模型不需要"从头推理"，
+  而是在目标模型的"指导"下进行并行预测。</p>
+</div>
+
+<p>这创造了一个<strong>双赢组合</strong>：</p>
+<table>
+  <tr>
+    <th>组件</th>
+    <th>角色</th>
+    <th>优势</th>
+  </tr>
+  <tr>
+    <td>大型自回归目标模型</td>
+    <td>提供上下文特征 + 验证</td>
+    <td>高质量推理能力，保证输出无损</td>
+  </tr>
+  <tr>
+    <td>轻量扩散草稿模型</td>
+    <td>并行起草 token 块</td>
+    <td>单次前向传播完成，延迟极低</td>
+  </tr>
+</table>
+
+
+<!-- ================================================================== -->
+<h2 id="architecture">4. 系统架构与推理流程</h2>
+
+<h3>4.1 整体推理流程</h3>
+<p>DFlash 的推理分为两个阶段：</p>
+
+<h4>阶段 1：预填充（Prefill）</h4>
+<div class="flow-box">
+  <div class="flow-step">输入 prompt</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">目标模型前向传播</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">生成第 1 个 token<br>+ 提取隐藏特征</div>
+</div>
+<p>在 prefill 过程中，从目标模型的<strong>均匀采样的固定层</strong>（如第 2 层到倒数第 3 层之间的 5 个层）
+提取隐藏状态（hidden states），然后通过一个<strong>轻量投影层（Linear + RMSNorm）</strong>将多层特征拼接融合为
+紧凑的目标上下文特征。</p>
+
+<h4>阶段 2：投机解码循环</h4>
+<div class="flow-box">
+  <div class="flow-step">1. 用 mask token<br>填充块位置</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">2. 草稿模型<br>单次并行预测</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">3. 目标模型<br>并行验证</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">4. 确定接受长度<br>保留正确 token</div>
+</div>
+<p>每个循环中：</p>
+<ol>
+  <li>当前位置开始，填充 <code>block_size</code> 个位置（第一个为已知的 bonus token，其余为 mask token）</li>
+  <li>草稿模型接收 noise embedding（mask token 的嵌入）和目标上下文特征，<strong>一次前向传播</strong>预测所有位置</li>
+  <li>目标模型对草稿结果进行并行验证</li>
+  <li>逐位置比较，找到第一个不匹配的位置，之前的全部接受，不匹配位置使用目标模型的输出作为 bonus token</li>
+  <li>更新上下文特征，进入下一个循环</li>
+</ol>
+
+<h3>4.2 草稿模型架构</h3>
+<p>DFlash 的草稿模型（<code>DFlashDraftModel</code>）是一个改造过的 Qwen3 Transformer：</p>
+
+<div class="card">
+  <table>
+    <tr><th>组件</th><th>说明</th></tr>
+    <tr><td>层数</td><td>5 层（默认）或 8 层（Coder）— 比 EAGLE-3 的 1 层深得多</td></tr>
+    <tr><td>隐藏维度</td><td>与目标模型相同（如 Qwen3-8B 的 4096）</td></tr>
+    <tr><td>注意力</td><td>自定义 <code>Qwen3DFlashAttention</code>，支持 KV 注入</td></tr>
+    <tr><td>Embedding 层</td><td>与目标模型<strong>共享</strong>，冻结不训练</td></tr>
+    <tr><td>LM Head</td><td>与目标模型<strong>共享</strong>，冻结不训练</td></tr>
+    <tr><td>投影层</td><td><code>fc</code>：将多层隐藏特征投影到 hidden_size；<code>hidden_norm</code>：RMSNorm 归一化</td></tr>
+    <tr><td>block_size</td><td>16（默认）或 10（LLaMA）</td></tr>
+  </table>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="kv-injection">5. 关键技术 1：KV 注入条件化</h2>
+
+<p>这是 DFlash 最核心的设计创新，也是其高接受率的关键原因。</p>
+
+<h3>5.1 与 EAGLE 的对比</h3>
+<div class="cols">
+  <div class="card">
+    <h4><span class="tag tag-yellow">EAGLE-3 方式</span></h4>
+    <p>将目标模型的隐藏特征与草稿模型的 token embedding <strong>在输入端融合</strong>，
+    仅作为草稿模型的输入。随着层数增加，目标信息<strong>逐层稀释</strong>，
+    导致增加草稿层数对接受长度的提升效果递减。</p>
+  </div>
+  <div class="card">
+    <h4><span class="tag tag-green">DFlash 方式 (KV 注入)</span></h4>
+    <p>将融合后的目标上下文特征视为<strong>持久的上下文信息</strong>，
+    直接注入到草稿模型<strong>每一层</strong>的 Key 和 Value 投影中。
+    目标信息在所有层中<strong>始终保持强条件化</strong>，使接受长度能随层数有效扩展。</p>
+  </div>
+</div>
+
+<h3>5.2 KV 注入的实现细节</h3>
+<p>在源码 <code>Qwen3DFlashAttention.forward()</code> 中，注入逻辑如下：</p>
+
+<pre><code># 目标上下文特征生成 K, V
+k_ctx = self.k_proj(target_hidden)    # shape: [bsz, ctx_len, kv_heads * head_dim]
+v_ctx = self.v_proj(target_hidden)
+
+# 草稿 token 自身的 K, V
+k_noise = self.k_proj(hidden_states)  # shape: [bsz, q_len, kv_heads * head_dim]
+v_noise = self.v_proj(hidden_states)
+
+# 拼接：目标上下文 K/V 在前，草稿 K/V 在后
+k = torch.cat([k_ctx, k_noise], dim=1)  # [bsz, ctx_len + q_len, ...]
+v = torch.cat([v_ctx, v_noise], dim=1)
+
+# Query 仅来自草稿 token
+q = self.q_proj(hidden_states)          # [bsz, q_len, ...]</code></pre>
+
+<p>这意味着草稿模型中<strong>每一层的每一个注意力头</strong>都能直接 attend 到目标模型的上下文特征，
+确保了条件信号不会被稀释。</p>
+
+<h3>5.3 上下文特征提取流程</h3>
+<pre><code># 从目标模型的指定层提取隐藏状态
+def extract_context_feature(hidden_states, layer_ids):
+    offset = 1  # 跳过 embedding 层
+    selected = [hidden_states[layer_id + offset] for layer_id in layer_ids]
+    return torch.cat(selected, dim=-1)  # 拼接所有层的特征
+
+# 通过投影层融合
+# fc: Linear(num_layers * hidden_size → hidden_size)
+# hidden_norm: RMSNorm
+target_hidden = self.hidden_norm(self.fc(target_hidden))</code></pre>
+
+<p>例如，对于 Qwen3-8B（32 层，hidden_size=4096），如果从 5 个层提取特征：</p>
+<ul>
+  <li>输入维度：5 × 4096 = 20480</li>
+  <li>经 <code>fc</code> 投影后：4096</li>
+  <li>经 <code>hidden_norm</code> 归一化后注入每层</li>
+</ul>
+
+
+<!-- ================================================================== -->
+<h2 id="parallel-draft">6. 关键技术 2：并行扩散起草</h2>
+
+<h3>6.1 扩散 vs 自回归的起草开销</h3>
+<p>这是 DFlash 相比 EAGLE 的另一个关键优势：</p>
+
+<table>
+  <tr>
+    <th>方式</th>
+    <th>起草开销公式</th>
+    <th>γ=16 时的效果</th>
+  </tr>
+  <tr>
+    <td>自回归（EAGLE-3, 1 层）</td>
+    <td>T<sub>draft</sub> = γ × t<sub>step</sub></td>
+    <td>16 次顺序前向传播</td>
+  </tr>
+  <tr>
+    <td>扩散（DFlash, 5 层）</td>
+    <td>T<sub>draft</sub> = t<sub>parallel</sub></td>
+    <td>1 次并行前向传播</td>
+  </tr>
+</table>
+
+<div class="highlight">
+  <strong>关键优势：</strong> 因为起草开销<strong>不随 γ 线性增长</strong>，DFlash 可以使用<strong>更深（5 层甚至 8 层）</strong>的草稿模型，
+  获得更高的草稿质量和接受长度，同时<strong>总延迟仍然更低</strong>。
+  实验表明，5 层 DFlash 生成 16 个 token 比 1 层 EAGLE-3 生成 8 个 token 还快。
+</div>
+
+<h3>6.2 块级扩散过程</h3>
+<p>在推理时，DFlash 使用以下方式生成一个块：</p>
+<ol>
+  <li>已知位置 0 的 token（上一轮验证产生的 bonus token）</li>
+  <li>位置 1 到 block_size-1 填充为 <code>mask_token_id</code></li>
+  <li>将整个块通过目标模型的 <code>embed_tokens</code> 获得 noise embedding</li>
+  <li>草稿模型接收 noise embedding + 目标上下文特征，<strong>一次前向传播</strong>同时预测所有 mask 位置</li>
+  <li>通过共享的 <code>lm_head</code> 将隐藏状态映射为 logits，采样得到草稿 token</li>
+</ol>
+
+<p>源码中的核心推理循环：</p>
+<pre><code># 草稿模型单次并行预测
+draft_logits = target.lm_head(self(
+    target_hidden=target_hidden,
+    noise_embedding=noise_embedding,
+    position_ids=...,
+    past_key_values=past_key_values_draft,
+    use_cache=True,
+    is_causal=False,  # 非因果注意力！块内双向
+))
+block_output_ids[:, 1:] = sample(draft_logits)</code></pre>
+
+<p>注意 <code>is_causal=False</code>：块内使用<strong>双向注意力</strong>，允许每个位置看到整个块的信息。</p>
+
+
+<!-- ================================================================== -->
+<h2 id="acceptance">7. 接受率与验证机制</h2>
+
+<h3>7.1 投机解码的加速公式</h3>
+<p>投机解码的平均每 token 延迟为：</p>
+<div class="formula">
+  L = (T<sub>draft</sub> + T<sub>verify</sub>) / τ
+</div>
+<p>其中 τ ∈ [1, γ+1] 是每轮循环中<strong>期望接受的 token 数量</strong>（包括目标模型生成的 bonus token），加速比为：</p>
+<div class="formula">
+  η = L<sub>target</sub> / L = L<sub>target</sub> × τ / (T<sub>draft</sub> + T<sub>verify</sub>)
+</div>
+<p>提升加速比有两条路径：<strong>增大 τ（接受长度）</strong>或<strong>减小 T<sub>draft</sub>（起草开销）</strong>。
+DFlash 在两条路径上都有优势。</p>
+
+<h3>7.2 验证与接受长度计算</h3>
+<p>目标模型对草稿块进行并行验证的过程：</p>
+
+<pre><code># 目标模型并行验证整个草稿块
+output = target(
+    block_output_ids,
+    position_ids=block_position_ids,
+    past_key_values=past_key_values_target,
+    use_cache=True,
+    output_hidden_states=True,
+)
+
+# 计算接受长度：从第一个位置开始，连续匹配的 token 数量
+posterior = sample(output.logits, temperature)
+acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+
+# 接受匹配的 token + 使用目标模型在不匹配位置的输出作为 bonus token
+output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
+output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
+start += acceptance_length + 1  # 前进 acceptance_length + 1 个 token</code></pre>
+
+<p>验证逻辑的关键：</p>
+<ul>
+  <li><code>block_output_ids[:, 1:]</code>：草稿模型预测的 token（位置 1 到 block_size-1）</li>
+  <li><code>posterior[:, :-1]</code>：目标模型对同样位置的预测</li>
+  <li><code>.cumprod(dim=1)</code>：<strong>累积乘积</strong>保证了一旦某个位置不匹配，后续所有位置都被拒绝</li>
+  <li>即使所有草稿 token 被拒绝，目标模型仍然贡献 1 个 bonus token，所以 τ ≥ 1</li>
+</ul>
+
+<h3>7.3 接受率实验数据</h3>
+
+<table>
+  <tr>
+    <th>模型</th>
+    <th>方法</th>
+    <th>平均接受长度 τ</th>
+    <th>加速比</th>
+    <th>条件</th>
+  </tr>
+  <tr>
+    <td rowspan="3">Qwen3-4B</td>
+    <td>EAGLE-3 (tree=16)</td>
+    <td>3.05</td>
+    <td>1.81×</td>
+    <td rowspan="3">temp=0, 均值</td>
+  </tr>
+  <tr>
+    <td>EAGLE-3 (tree=60)</td>
+    <td>3.48</td>
+    <td>2.08×</td>
+  </tr>
+  <tr>
+    <td><strong>DFlash (block=16)</strong></td>
+    <td><strong>6.54</strong></td>
+    <td><strong>4.91×</strong></td>
+  </tr>
+  <tr>
+    <td rowspan="3">Qwen3-8B</td>
+    <td>EAGLE-3 (tree=16)</td>
+    <td>2.96</td>
+    <td>1.76×</td>
+    <td rowspan="3">temp=0, 均值</td>
+  </tr>
+  <tr>
+    <td>EAGLE-3 (tree=60)</td>
+    <td>3.40</td>
+    <td>2.02×</td>
+  </tr>
+  <tr>
+    <td><strong>DFlash (block=16)</strong></td>
+    <td><strong>6.49</strong></td>
+    <td><strong>4.86×</strong></td>
+  </tr>
+</table>
+
+<div class="highlight">
+  <strong>接受长度分析：</strong>
+  <ul>
+    <li>DFlash 的接受长度 τ ≈ <strong>6-8</strong>（MATH-500 上最高可达 7.87），
+    意味着平均每轮有 6-8 个 token 被接受</li>
+    <li>相比 EAGLE-3 的 τ ≈ 3-3.5，DFlash 的接受长度<strong>提高约 2×</strong></li>
+    <li>在 block_size=16 时，接受率约为 <strong>40-50%</strong>（6-8 / 16）</li>
+    <li>高温采样（temp=1）时接受长度略有下降但仍显著优于 EAGLE-3</li>
+  </ul>
+</div>
+
+<h3>7.4 接受长度随层数扩展</h3>
+<p>DFlash 的 KV 注入设计使得接受长度能有效随草稿模型深度扩展：</p>
+<table>
+  <tr>
+    <th>草稿层数</th>
+    <th>Math500 τ</th>
+    <th>HumanEval τ</th>
+    <th>MT-Bench τ</th>
+    <th>平均加速</th>
+  </tr>
+  <tr>
+    <td>3 层</td>
+    <td>5.64</td>
+    <td>4.61</td>
+    <td>3.18</td>
+    <td>~3.66×</td>
+  </tr>
+  <tr>
+    <td>5 层</td>
+    <td>5.99</td>
+    <td>4.94</td>
+    <td>3.37</td>
+    <td>~3.67× (最佳平衡)</td>
+  </tr>
+  <tr>
+    <td>8 层</td>
+    <td>6.33</td>
+    <td>5.29</td>
+    <td>3.50</td>
+    <td>~3.61× (τ更高但延迟也更大)</td>
+  </tr>
+</table>
+<p>8 层模型的接受长度最高，但由于起草延迟增加，5 层模型在端到端加速比上最优。</p>
+
+
+<!-- ================================================================== -->
+<h2 id="training">8. 训练方法</h2>
+
+<h3>8.1 训练总览</h3>
+<p>DFlash 的训练是让草稿模型对齐目标模型的输出，具体修改了标准块扩散训练的几个关键环节：</p>
+
+<div class="card">
+  <h4>训练设置</h4>
+  <ul>
+    <li><strong>目标模型</strong>：冻结，用于提取隐藏特征和提供训练标签</li>
+    <li><strong>可训练参数</strong>：仅草稿 Transformer 层 + 投影层（<code>fc</code> + <code>hidden_norm</code>）</li>
+    <li><strong>共享冻结</strong>：token embedding 和 LM head 与目标模型共享且冻结</li>
+    <li><strong>优化器</strong>：AdamW，学习率 6×10⁻⁴，余弦调度，warmup 4%</li>
+    <li><strong>训练数据</strong>：~800K 样本，来自 NVIDIA Nemotron + CodeAlpaca，<strong>使用目标模型生成的响应</strong></li>
+    <li><strong>训练轮数</strong>：6 个 epoch</li>
+  </ul>
+</div>
+
+<h3>8.2 随机锚点采样构建块</h3>
+<p>标准块扩散训练将响应均匀分割为块，但 DFlash 改用<strong>随机锚点采样</strong>：</p>
+<ul>
+  <li>从响应中<strong>随机采样锚点 token</strong></li>
+  <li>每个锚点作为块的第一个位置（已知的 clean token）</li>
+  <li>锚点后的 <code>block_size - 1</code> 个位置标记为 mask</li>
+  <li>草稿模型训练预测这些 mask 位置</li>
+</ul>
+<p>这直接模拟了推理时的行为（验证后的 bonus token 作为下一轮的第一个 token），
+并提供更多样化的训练数据。实验表明，这比标准块分割方式显著提高接受长度（5.64 vs 4.94）。</p>
+
+<h3>8.3 位置衰减损失权重</h3>
+<p>在投机解码中，块内<strong>靠前位置的错误会使后续所有位置无效</strong>。
+因此 DFlash 使用指数衰减权重强调早期位置：</p>
+<div class="formula">
+  w<sub>k</sub> = exp(−(k−1) / γ)
+</div>
+<p>其中 k 是块内位置，γ 控制衰减速率（block_size=16 时 γ=7）。
+这使得训练更快收敛，且最终接受长度更高。</p>
+
+<h3>8.4 高效训练设计</h3>
+<ul>
+  <li><strong>Flex Attention</strong>：所有块拼接为单个序列，使用稀疏注意力掩码：块内双向注意力，块间禁止注意力</li>
+  <li><strong>离线缓存</strong>：支持预计算目标隐藏特征并缓存到磁盘，减少训练时 GPU 开销</li>
+  <li><strong>长上下文训练</strong>：固定每个序列的 mask 块数量，每个 epoch 随机采样锚点位置，提供数据增强</li>
+</ul>
+
+
+<!-- ================================================================== -->
+<h2 id="experiments">9. 实验结果</h2>
+
+<h3>9.1 Transformers 后端性能</h3>
+<p>在 Qwen3 模型（thinking 模式关闭）上的全面评估：</p>
+
+<table>
+  <tr>
+    <th>任务类型</th>
+    <th>基准</th>
+    <th>DFlash 加速比 (temp=0)</th>
+    <th>DFlash τ (temp=0)</th>
+  </tr>
+  <tr>
+    <td rowspan="3">数学</td>
+    <td>GSM8K</td>
+    <td>5.15×</td>
+    <td>6.53-6.54</td>
+  </tr>
+  <tr>
+    <td>MATH-500</td>
+    <td>6.08-6.09×</td>
+    <td>7.84-7.87</td>
+  </tr>
+  <tr>
+    <td>AIME25</td>
+    <td>5.62-5.68×</td>
+    <td>7.08-7.27</td>
+  </tr>
+  <tr>
+    <td rowspan="3">编程</td>
+    <td>HumanEval</td>
+    <td>5.14-5.21×</td>
+    <td>6.50-6.64</td>
+  </tr>
+  <tr>
+    <td>MBPP</td>
+    <td>4.65-4.78×</td>
+    <td>5.95-6.09</td>
+  </tr>
+  <tr>
+    <td>LiveCodeBench</td>
+    <td>5.41-5.51×</td>
+    <td>7.09-7.27</td>
+  </tr>
+  <tr>
+    <td>对话</td>
+    <td>MT-Bench</td>
+    <td>2.75-2.85×</td>
+    <td>4.24-4.35</td>
+  </tr>
+</table>
+
+<p>MT-Bench 的加速比较低是因为对话生成的 token 序列较短，投机解码的开销/收益比不同。</p>
+
+<h3>9.2 推理模式（thinking 启用）</h3>
+<table>
+  <tr>
+    <th>模型</th>
+    <th>GPQA τ</th>
+    <th>MATH-500 τ</th>
+    <th>AIME25 τ</th>
+    <th>加速比</th>
+  </tr>
+  <tr>
+    <td>Qwen3-4B (temp=0)</td>
+    <td>5.23</td>
+    <td>5.74</td>
+    <td>5.54</td>
+    <td>~4.4×</td>
+  </tr>
+  <tr>
+    <td>Qwen3-8B (temp=0)</td>
+    <td>5.17</td>
+    <td>5.82</td>
+    <td>5.74</td>
+    <td>~4.4×</td>
+  </tr>
+</table>
+
+<h3>9.3 SGLang 生产级部署</h3>
+<p>在 B200 GPU 上使用 SGLang + FlashAttention-4 后端的并发性能：</p>
+
+<table>
+  <tr>
+    <th>模型</th>
+    <th>任务</th>
+    <th>并发=1 加速</th>
+    <th>并发=8 加速</th>
+    <th>并发=32 加速</th>
+    <th>平均 τ</th>
+  </tr>
+  <tr>
+    <td>Qwen3-8B</td>
+    <td>Math500</td>
+    <td>5.1×</td>
+    <td>4.5×</td>
+    <td>2.8×</td>
+    <td>8.01</td>
+  </tr>
+  <tr>
+    <td>Qwen3-8B</td>
+    <td>HumanEval</td>
+    <td>4.2×</td>
+    <td>3.6×</td>
+    <td>2.4×</td>
+    <td>6.50</td>
+  </tr>
+  <tr>
+    <td>Qwen3-Coder-30B-A3B</td>
+    <td>HumanEval</td>
+    <td>3.5×</td>
+    <td>3.2×</td>
+    <td>3.1×</td>
+    <td>8.09</td>
+  </tr>
+</table>
+<p>MoE 模型（如 Qwen3-Coder-30B-A3B）在高并发时加速比下降更平缓，说明 DFlash 在 MoE 场景尤为适合。</p>
+
+<h3>9.4 无目标特征的消融对比</h3>
+<table>
+  <tr>
+    <th>条件</th>
+    <th>GSM8K (temp=0)</th>
+    <th>Math500 (temp=0)</th>
+    <th>AIME25 (temp=0)</th>
+  </tr>
+  <tr>
+    <td>无目标特征（纯扩散）</td>
+    <td>2.83× / τ=3.38</td>
+    <td>3.73× / τ=4.61</td>
+    <td>3.35× / τ=4.07</td>
+  </tr>
+  <tr>
+    <td><strong>有目标特征（DFlash）</strong></td>
+    <td><strong>5.15× / τ=6.54</strong></td>
+    <td><strong>6.08× / τ=7.87</strong></td>
+    <td><strong>5.62× / τ=7.08</strong></td>
+  </tr>
+</table>
+<p>目标上下文特征使接受长度<strong>提升约 60-70%</strong>，加速比<strong>提升约 60-80%</strong>。</p>
+
+
+<!-- ================================================================== -->
+<h2 id="code">10. 源码解析</h2>
+
+<h3>10.1 项目结构</h3>
+<pre><code>dflash/
+├── dflash/
+│   ├── __init__.py         # 导出 DFlashDraftModel, sample, extract_context_feature
+│   ├── model.py            # 核心实现：模型定义 + 推理逻辑 + 数据集加载
+│   └── benchmark.py        # 评测脚本（支持 vLLM / SGLang / Transformers 后端）
+├── pyproject.toml          # 项目配置
+├── README.md               # 文档
+└── LICENSE</code></pre>
+
+<h3>10.2 核心类和函数</h3>
+
+<div class="card">
+  <h4><code>DFlashDraftModel</code> — 草稿模型主类</h4>
+  <ul>
+    <li>继承自 <code>Qwen3PreTrainedModel</code></li>
+    <li><strong>forward()</strong>：接收 <code>noise_embedding</code>（mask token 嵌入）和 <code>target_hidden</code>（目标特征），
+    通过投影融合后逐层传播，返回归一化后的隐藏状态</li>
+    <li><strong>spec_generate()</strong>：完整的投机解码推理循环，包含 prefill、起草、验证、接受判定</li>
+    <li>关键属性：<code>fc</code>（特征投影）、<code>hidden_norm</code>（RMSNorm）、<code>target_layer_ids</code>（要提取的目标层 ID）、
+    <code>block_size</code>、<code>mask_token_id</code></li>
+  </ul>
+</div>
+
+<div class="card">
+  <h4><code>Qwen3DFlashAttention</code> — 带 KV 注入的注意力层</h4>
+  <ul>
+    <li>核心改动：<code>forward()</code> 接收额外的 <code>target_hidden</code> 参数</li>
+    <li>Q 仅来自草稿 token：<code>q = q_proj(hidden_states)</code></li>
+    <li>K、V 由目标特征和草稿特征<strong>拼接</strong>组成</li>
+    <li>使用与目标模型相同的 QKNorm 和 RoPE</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h4>辅助函数</h4>
+  <ul>
+    <li><code>build_target_layer_ids(num_target_layers, num_draft_layers)</code>：
+    均匀选择目标模型中从第 2 层到倒数第 3 层之间的层 ID</li>
+    <li><code>extract_context_feature(hidden_states, layer_ids)</code>：
+    从目标模型输出中提取并拼接指定层的隐藏状态</li>
+    <li><code>sample(logits, temperature)</code>：
+    温度为 0 时 argmax，否则 softmax + multinomial 采样</li>
+  </ul>
+</div>
+
+<h3>10.3 推理循环关键代码注释</h3>
+<pre><code>def spec_generate(self, target, input_ids, max_new_tokens, stop_token_ids, temperature):
+    # === 1. 初始化 ===
+    output_ids = torch.full((1, max_length + block_size), mask_token_id)  # 全填 mask
+    
+    # === 2. Prefill ===
+    output = target(input_ids, ..., output_hidden_states=True)           # 目标模型 prefill
+    output_ids[:, num_input:num_input+1] = sample(output.logits, temp)   # 生成第 1 个 token
+    target_hidden = extract_context_feature(output.hidden_states, ...)   # 提取上下文特征
+    
+    # === 3. 解码循环 ===
+    while start < max_length:
+        # 3a. 获取当前块（第一个 token 已知，其余为 mask）
+        block_output_ids = output_ids[:, start:start+block_size].clone()
+        noise_embedding = target.model.embed_tokens(block_output_ids)
+        
+        # 3b. 草稿模型并行预测 (单次前向)
+        draft_hidden = self(target_hidden=target_hidden, noise_embedding=noise_embedding, ...)
+        draft_logits = target.lm_head(draft_hidden[:, -block_size+1:, :])
+        block_output_ids[:, 1:] = sample(draft_logits)
+        
+        # 3c. 目标模型并行验证
+        output = target(block_output_ids, ..., output_hidden_states=True)
+        posterior = sample(output.logits, temperature)
+        
+        # 3d. 计算接受长度
+        match = (block_output_ids[:, 1:] == posterior[:, :-1])  # 逐位置比较
+        acceptance_length = match.cumprod(dim=1).sum(dim=1)[0]  # 连续匹配数
+        
+        # 3e. 接受 + bonus token
+        output_ids[:, start:start+acceptance_length+1] = block_output_ids[:, :acceptance_length+1]
+        output_ids[:, start+acceptance_length+1] = posterior[:, acceptance_length]  # bonus
+        start += acceptance_length + 1
+        
+        # 3f. 更新上下文特征
+        target_hidden = extract_context_feature(output.hidden_states, ...)[:, :acceptance_length+1, :]</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="summary">11. 总结</h2>
+
+<div class="card">
+  <h3>DFlash 的核心贡献</h3>
+  <table>
+    <tr>
+      <th>#</th>
+      <th>创新点</th>
+      <th>效果</th>
+    </tr>
+    <tr>
+      <td>1</td>
+      <td><strong>扩散模型作为投机起草器</strong>的新范式</td>
+      <td>消除了顺序起草瓶颈，起草延迟不随 γ 增长</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td><strong>KV 注入条件化</strong>：将目标特征注入每层 K/V</td>
+      <td>接受长度随层数有效扩展，τ 提升 ~2×</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td><strong>随机锚点采样</strong> + <strong>位置衰减损失</strong></td>
+      <td>更好的训练-推理对齐，更快收敛</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td><strong>共享 embedding + LM head</strong></td>
+      <td>极小的额外参数量，草稿模型作为轻量适配器</td>
+    </tr>
+  </table>
+</div>
+
+<div class="highlight">
+  <strong>新范式：</strong> DFlash 不是让扩散模型取代自回归模型，而是让扩散模型承担<strong>专用的、优化过的起草角色</strong>。
+  降低去噪步数以最大化并行性，同时依赖投机验证来<strong>保证输出质量无损</strong>。
+  这重新定义了扩散 LLM 的发展方向——不是作为完整的替代方案，而是作为加速自回归的<strong>协作者</strong>。
+</div>
+
+<div class="card" style="text-align:center;">
+  <h3>性能总览</h3>
+  <div class="cols" style="gap: 2rem; margin-top: 1rem;">
+    <div>
+      <div class="perf-num">6.1×</div>
+      <p>最大加速比 (Qwen3-8B, Transformers)</p>
+    </div>
+    <div>
+      <div class="perf-num">7.87</div>
+      <p>最高接受长度 τ (MATH-500)</p>
+    </div>
+    <div>
+      <div class="perf-num">5.1×</div>
+      <p>SGLang 单并发加速 (B200 GPU)</p>
+    </div>
+    <div>
+      <div class="perf-num">2.5×</div>
+      <p>比 EAGLE-3 额外提升</p>
+    </div>
+  </div>
+</div>
+
+<hr style="border-color: var(--border); margin: 3rem 0 1rem;">
+<p class="meta" style="text-align: center;">
+  本文档基于 <a href="https://arxiv.org/abs/2602.06036">DFlash 论文 (arXiv:2602.06036)</a> 和
+  <a href="https://github.com/z-lab/dflash">开源代码</a> 整理。
+  &copy; 2026 技术分析文档
+</p>
+
+</body>
+</html>
