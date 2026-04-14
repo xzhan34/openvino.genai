@@ -370,8 +370,29 @@ int main(int argc, char* argv[]) try {
     std::cout << "  Device:       " << device << std::endl;
     std::cout << "  Max tokens:   " << max_new_tokens << std::endl;
 
-    // Load target model config (Qwen3.5)
-    auto target_qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(target_dir);
+    // Load target model config.
+    // Qwen3.5 has a nested VLM config (text_config + vision_config).
+    // Qwen3 has a flat config. We try Qwen3.5 first; on failure, fall back
+    // to flat ModelConfig and enter draft-only mode (no target model build).
+    ov::genai::modeling::models::Qwen3_5Config target_qwen35_cfg;
+    bool draft_only_mode = false;
+    try {
+        target_qwen35_cfg = ov::genai::modeling::models::Qwen3_5Config::from_json_file(target_dir);
+    } catch (const std::exception& e) {
+        // Flat config (Qwen3-4B, etc.) — construct minimal Qwen3_5Config for draft model export.
+        auto flat_target_cfg = ov::genai::loaders::ModelConfig::from_hf_json(target_dir / "config.json");
+        target_qwen35_cfg.tie_word_embeddings = flat_target_cfg.tie_word_embeddings;
+        target_qwen35_cfg.text.num_hidden_layers = flat_target_cfg.num_hidden_layers;
+        target_qwen35_cfg.text.hidden_size = flat_target_cfg.hidden_size;
+        target_qwen35_cfg.text.vocab_size = flat_target_cfg.vocab_size;
+        draft_only_mode = true;
+        std::cout << "[INFO] Target config is not Qwen3.5 VLM format (" << e.what() << ")." << std::endl;
+        std::cout << "[INFO] Draft-only mode enabled — target model will not be built." << std::endl;
+        std::cout << "[INFO] Parsed flat config: hidden_size=" << flat_target_cfg.hidden_size
+                  << " num_layers=" << flat_target_cfg.num_hidden_layers
+                  << " tie_word_embeddings=" << flat_target_cfg.tie_word_embeddings << std::endl;
+    }
+
     // Also load the generic ModelConfig for DFlash-related fields
     auto draft_cfg = ov::genai::loaders::ModelConfig::from_hf_json(draft_dir / "config.json");
 
@@ -505,13 +526,13 @@ int main(int argc, char* argv[]) try {
             draft_quant_config.enabled() ? draft_quant_config
                                          : ov::genai::modeling::weights::QuantizationConfig{});
 
-        if (!target_model) {
+        if (!target_model && !draft_only_mode) {
             std::cout << "[Building target model (Qwen3.5 DFlash target" << (vl_mode ? " VL" : "") << ")...]" << std::endl;
             target_model = ov::genai::modeling::models::create_qwen3_5_dflash_target_model(
                 target_qwen35_cfg, target_layer_ids, target_source, target_finalizer, dflash_cfg.block_size, vl_mode);
         }
 
-        if (vl_mode && !vision_model) {
+        if (vl_mode && !vision_model && !draft_only_mode) {
             std::cout << "[Building vision model...]" << std::endl;
             ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer;
             vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(
@@ -532,8 +553,10 @@ int main(int argc, char* argv[]) try {
 
         // Export IR if requested
         if (export_ir) {
-            std::cout << "[export-ir] Serializing target model to " << target_xml << " ..." << std::endl;
-            ov::serialize(target_model, target_xml.string(), target_bin.string());
+            if (target_model) {
+                std::cout << "[export-ir] Serializing target model to " << target_xml << " ..." << std::endl;
+                ov::serialize(target_model, target_xml.string(), target_bin.string());
+            }
             std::cout << "[export-ir] Serializing draft model to " << draft_xml << " ..." << std::endl;
             ov::serialize(combined_draft_model, draft_xml.string(), draft_bin.string());
             if (vision_model) {
@@ -542,8 +565,18 @@ int main(int argc, char* argv[]) try {
                 std::cout << "[export-ir] Serializing vision model to " << vision_xml << " ..." << std::endl;
                 ov::serialize(vision_model, vision_xml.string(), vision_bin.string());
             }
-            std::cout << "[export-ir] Export complete. Exiting." << std::endl;
+            std::cout << "[export-ir] Export complete." << std::endl;
+            if (draft_only_mode) {
+                std::cout << "[export-ir] Draft-only mode: only draft model IR was exported." << std::endl;
+                std::cout << "[export-ir] Target model IR was skipped (flat Qwen3 config)." << std::endl;
+            }
+            std::cout << "[export-ir] Exiting." << std::endl;
             return 0;
+        }
+        if (draft_only_mode) {
+            std::cerr << "[ERROR] Draft-only mode does not support inference. "
+                      << "Use OV_GENAI_EXPORT_DFLASH_IR=1 to export draft IR only." << std::endl;
+            return 1;
         }
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
 
