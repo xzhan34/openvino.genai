@@ -237,6 +237,32 @@ bool deferred_state_commit_enabled_by_default() {
     return !(raw && std::string(raw) == "1");
 }
 
+bool is_export_ir_mode() {
+    const char* raw = std::getenv("OV_GENAI_EXPORT_DFLASH_IR");
+    return raw && std::string(raw) == "1";
+}
+
+bool has_ir_model_pair(const std::filesystem::path& xml_path, const std::filesystem::path& bin_path) {
+    return std::filesystem::exists(xml_path) && std::filesystem::is_regular_file(xml_path) &&
+           std::filesystem::exists(bin_path) && std::filesystem::is_regular_file(bin_path);
+}
+
+std::string quant_mode_cache_token(ov::genai::modeling::weights::QuantizationConfig::Mode m) {
+    switch (m) {
+        case ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM: return "4a";
+        case ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM:  return "4s";
+        case ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM: return "8a";
+        case ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM:  return "8s";
+        default: return "fp";
+    }
+}
+
+std::string quant_ir_suffix(const ov::genai::modeling::weights::QuantizationConfig& cfg) {
+    if (!cfg.enabled()) return "";
+    return "_q" + quant_mode_cache_token(cfg.mode) + "_b" + quant_mode_cache_token(cfg.backup_mode) +
+           "_g" + std::to_string(cfg.group_size);
+}
+
 std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens) {
     std::string prompt = "<|im_start|>user\n<|vision_start|>";
     for (int64_t i = 0; i < image_tokens; ++i)
@@ -426,13 +452,47 @@ int main(int argc, char* argv[]) try {
     PerfStats perf;
     double dflash_throughput = 0.0;
 
+    // IR cache/export: determine paths and check for cached IR models
+    const bool export_ir = is_export_ir_mode();
+    const std::filesystem::path ir_dir = draft_dir;  // Store IR alongside draft model
+    const std::string target_ir_stem = std::string("dflash_target") + (vl_mode ? "_vl" : "") + quant_ir_suffix(target_quant_config);
+    const std::string draft_ir_stem = std::string("dflash_draft_combined") + quant_ir_suffix(draft_quant_config);
+    const auto target_xml = ir_dir / (target_ir_stem + ".xml");
+    const auto target_bin = ir_dir / (target_ir_stem + ".bin");
+    const auto draft_xml = ir_dir / (draft_ir_stem + ".xml");
+    const auto draft_bin = ir_dir / (draft_ir_stem + ".bin");
+
+    const bool load_target_from_ir = !export_ir && has_ir_model_pair(target_xml, target_bin);
+    const bool load_draft_from_ir = !export_ir && has_ir_model_pair(draft_xml, draft_bin);
+
+    if (export_ir) {
+        std::cout << "[export-ir] Export mode enabled via OV_GENAI_EXPORT_DFLASH_IR=1" << std::endl;
+        std::cout << "[export-ir] Target IR: " << target_xml << std::endl;
+        std::cout << "[export-ir] Draft IR:  " << draft_xml << std::endl;
+    } else if (load_target_from_ir && load_draft_from_ir) {
+        std::cout << "[cache-ir] Found cached IR models, will load from IR" << std::endl;
+    }
+
     // Build models inside a scope so that weight sources are freed after model building.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB of safetensors data.
     std::shared_ptr<ov::Model> target_model;
     std::shared_ptr<ov::Model> combined_draft_model;
     std::shared_ptr<ov::Model> vision_model;
     ov::Tensor vl_pos_embed_weight;  // Extracted in scope for VL preprocessing later
-    {
+
+    ov::Core core;
+
+    if (load_target_from_ir) {
+        std::cout << "[cache-ir] Loading target model from IR: " << target_xml << std::endl;
+        target_model = core.read_model(target_xml.string(), target_bin.string());
+    }
+    if (load_draft_from_ir) {
+        std::cout << "[cache-ir] Loading draft model from IR: " << draft_xml << std::endl;
+        combined_draft_model = core.read_model(draft_xml.string(), draft_bin.string());
+    }
+
+    // Build from safetensors if not loaded from IR
+    if (!target_model || !combined_draft_model || (vl_mode && !vision_model)) {
         auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
         ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
         ov::genai::safetensors::SafetensorsWeightFinalizer target_finalizer(
@@ -445,11 +505,13 @@ int main(int argc, char* argv[]) try {
             draft_quant_config.enabled() ? draft_quant_config
                                          : ov::genai::modeling::weights::QuantizationConfig{});
 
-        std::cout << "[Building target model (Qwen3.5 DFlash target" << (vl_mode ? " VL" : "") << ")...]" << std::endl;
-        target_model = ov::genai::modeling::models::create_qwen3_5_dflash_target_model(
-            target_qwen35_cfg, target_layer_ids, target_source, target_finalizer, dflash_cfg.block_size, vl_mode);
+        if (!target_model) {
+            std::cout << "[Building target model (Qwen3.5 DFlash target" << (vl_mode ? " VL" : "") << ")...]" << std::endl;
+            target_model = ov::genai::modeling::models::create_qwen3_5_dflash_target_model(
+                target_qwen35_cfg, target_layer_ids, target_source, target_finalizer, dflash_cfg.block_size, vl_mode);
+        }
 
-        if (vl_mode) {
+        if (vl_mode && !vision_model) {
             std::cout << "[Building vision model...]" << std::endl;
             ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer;
             vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(
@@ -460,15 +522,32 @@ int main(int argc, char* argv[]) try {
             vl_pos_embed_weight = target_source.get_tensor(pos_embed_name);
         }
 
-        // Build combined draft model (embed + draft layers + lm_head in single graph)
-        std::cout << "[Building combined draft model (embed+draft+lm_head)...]" << std::endl;
-        combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model(
-            target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
-            draft_source, draft_finalizer);
+        if (!combined_draft_model) {
+            // Build combined draft model (embed + draft layers + lm_head in single graph)
+            std::cout << "[Building combined draft model (embed+draft+lm_head)...]" << std::endl;
+            combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model(
+                target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
+                draft_source, draft_finalizer);
+        }
+
+        // Export IR if requested
+        if (export_ir) {
+            std::cout << "[export-ir] Serializing target model to " << target_xml << " ..." << std::endl;
+            ov::serialize(target_model, target_xml.string(), target_bin.string());
+            std::cout << "[export-ir] Serializing draft model to " << draft_xml << " ..." << std::endl;
+            ov::serialize(combined_draft_model, draft_xml.string(), draft_bin.string());
+            if (vision_model) {
+                const auto vision_xml = ir_dir / "dflash_vision.xml";
+                const auto vision_bin = ir_dir / "dflash_vision.bin";
+                std::cout << "[export-ir] Serializing vision model to " << vision_xml << " ..." << std::endl;
+                ov::serialize(vision_model, vision_xml.string(), vision_bin.string());
+            }
+            std::cout << "[export-ir] Export complete. Exiting." << std::endl;
+            return 0;
+        }
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
 
     // Compile models
-    ov::Core core;
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
         {ov::hint::kv_cache_precision.name(), ov::element::f16},
