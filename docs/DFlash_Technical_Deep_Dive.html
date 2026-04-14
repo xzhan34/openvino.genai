@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DFlash: Block Diffusion for Flash Speculative Decoding — 技术深度解析</title>
+<title>DFlash 技术深度解析 — 论文解读 &amp; 全系列代码分析 &amp; Qwen3-Omni 架构</title>
 <style>
   :root {
     --bg: #0d1117;
@@ -174,6 +174,45 @@
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
   }
+
+  /* === Merged styles from Code Analysis document === */
+  .highlight-box {
+    background: linear-gradient(135deg, #1a2332, #162230);
+    border: 1px solid var(--accent);
+    border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0;
+  }
+  .new-box { background: #1a3a2a; border: 1px solid var(--accent2); border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; }
+  .old-box { background: #3a1a1a; border: 1px solid #ff7b72; border-radius: 8px; padding: 1.5rem; margin: 1.5rem 0; }
+  .tag-new { background: #1a3a2a; color: var(--accent2); border: 1px solid var(--accent2); }
+  .tag-old { background: #3a1a1a; color: #ff7b72; border: 1px solid #ff7b72; }
+  .tag-same { background: #1a2a3a; color: var(--accent); border: 1px solid var(--accent); }
+  .tag-diff { background: #3a2a1a; color: var(--accent3); border: 1px solid var(--accent3); }
+  .badge { display: inline-block; padding: 0.2em 0.5em; border-radius: 6px; font-size: 0.75em; font-weight: 700; margin-right: 0.3em; }
+  .badge-green { background: #1a3a2a; color: var(--accent2); }
+  .badge-blue { background: #1a2a3a; color: var(--accent); }
+  .badge-orange { background: #3a2a1a; color: var(--accent3); }
+  .badge-red { background: #3a1a1a; color: #ff7b72; }
+  .badge-file { background: #1f6feb; color: white; }
+  .badge-class { background: #8957e5; color: white; }
+  .badge-func { background: #238636; color: white; }
+  .badge-key { background: #da3633; color: white; }
+  .card.blue { border-left: 4px solid var(--accent); }
+  .card.green { border-left: 4px solid var(--accent2); }
+  .card.red { border-left: 4px solid #ff7b72; }
+  .card.yellow { border-left: 4px solid var(--accent3); }
+  .card.purple { border-left: 4px solid #d2a8ff; }
+  .card.orange { border-left: 4px solid #ffa657; }
+  .diagram { background: #010409; border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-family: Consolas, monospace; white-space: pre; overflow-x: auto; font-size: .82em; line-height: 1.5; color: var(--accent); margin: 12px 0; }
+  .flow-diagram { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; text-align: center; font-family: monospace; line-height: 1.8; margin: 1rem 0; }
+  .arrow { color: var(--accent); font-weight: bold; }
+  .box-inline { display: inline-block; border: 1px solid var(--accent3); border-radius: 6px; padding: 0.2em 0.6em; margin: 0.2em; color: var(--accent3); }
+  .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+  .kw { color: #ff7b72; } .fn { color: #d2a8ff; } .str { color: #a5d6ff; }
+  .cm { color: #8b949e; font-style: italic; } .cmt { color: #8b949e; font-style: italic; }
+  .num { color: #79c0ff; } .cls { color: #ffa657; } .op { color: #f85149; }
+  #back-to-top { position: fixed; bottom: 25px; right: 25px; width: 42px; height: 42px; background: var(--accent); color: white; border: none; border-radius: 50%; cursor: pointer; font-size: 1.2em; display: none; z-index: 999; }
+  @media (max-width: 768px) { .summary-grid { grid-template-columns: 1fr; } }
+
 </style>
 </head>
 <body>
@@ -972,12 +1011,1678 @@ start += acceptance_length + 1  # 前进 acceptance_length + 1 个 token</code><
   </div>
 </div>
 
+
+<hr style="border-color: var(--border); margin: 4rem 0 2rem;">
+
+<!-- ============================================================ -->
+<!-- PART II: DFlash Code Analysis & Qwen3-Omni Architecture      -->
+<!-- ============================================================ -->
+
+<h1>🔬 Qwen3.5-4B-DFlash 代码深度分析<br><small style="font-size:0.55em;color:var(--text-muted)">及与 Qwen3-4B-DFlash-b16 详细对比</small></h1>
+
+<div class="highlight-box">
+<strong>文档概述：</strong>本文档对 <code>z-lab/Qwen3.5-4B-DFlash</code> 的全部 Python 代码进行逐行级别的深度分析，包括架构设计、注意力机制、推理流程的完整解读。同时与前代 <code>z-lab/Qwen3-4B-DFlash-b16</code> 进行系统性对比。<strong>附录 A</strong> 包含 Qwen3-4B-DFlash-b16 原始代码深度解析，<strong>附录 B</strong> 包含 Qwen3-4B 与 Qwen3-Omni-4B 架构差异分析。
+</div>
+
+<!-- ============================================================ -->
+<h2>1. 项目文件结构对比</h2>
+
+<div class="summary-grid">
+<div class="new-box">
+<h4>✅ Qwen3.5-4B-DFlash <span class="tag tag-new">新版</span></h4>
+<pre><code>Qwen3.5-4B-DFlash/
+├── config.json          <span class="cmt"># 模型配置</span>
+├── dflash.py            <span class="cmt"># 唯一的Python文件 (179行)</span>
+├── model.safetensors    <span class="cmt"># 模型权重</span>
+├── README.md            <span class="cmt"># 文档与基准测试</span>
+├── assets/              <span class="cmt"># 图片素材</span>
+└── .gitattributes</code></pre>
+</div>
+<div class="old-box">
+<h4>📦 Qwen3-4B-DFlash-b16 <span class="tag tag-old">旧版</span></h4>
+<pre><code>Qwen3-4B-DFlash-b16/
+├── config.json           <span class="cmt"># 模型配置</span>
+├── dflash.py             <span class="cmt"># HuggingFace入口 (261行)</span>
+├── modeling_dflash.py    <span class="cmt"># 独立版本 (有spec_generate)</span>
+├── utils.py              <span class="cmt"># 工具函数集</span>
+├── model.safetensors     <span class="cmt"># 模型权重</span>
+├── README.md             <span class="cmt"># 文档</span>
+├── assets/               <span class="cmt"># 图片素材</span>
+└── .gitattributes</code></pre>
+</div>
+</div>
+
+<div class="card">
+<h4>关键差异总结</h4>
+<table>
+<tr><th>维度</th><th>Qwen3.5 (新) <span class="tag tag-new">NEW</span></th><th>Qwen3 (旧) <span class="tag tag-old">OLD</span></th></tr>
+<tr><td>Python 文件数</td><td><strong>1</strong> (dflash.py)</td><td><strong>3</strong> (dflash.py + modeling_dflash.py + utils.py)</td></tr>
+<tr><td>总代码行数</td><td>~179 行</td><td>~261 + 独立文件约800+行</td></tr>
+<tr><td>推理方法</td><td>无 <code>spec_generate()</code>，依赖框架调度</td><td>内置 <code>spec_generate()</code>，可独立运行</td></tr>
+<tr><td>工具函数</td><td>无 (全部由框架提供)</td><td><code>utils.py</code> 含评测数据集加载等</td></tr>
+<tr><td>设计理念</td><td><span class="badge badge-green">纯模型定义</span> 与推理引擎解耦</td><td><span class="badge badge-orange">自包含</span> 模型+推理+评测一体</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. config.json 参数详细对比</h2>
+
+<div class="card">
+<table>
+<tr><th>参数</th><th>Qwen3.5-4B-DFlash <span class="tag tag-new">NEW</span></th><th>Qwen3-4B-DFlash-b16 <span class="tag tag-old">OLD</span></th><th>状态</th></tr>
+<tr><td><code>vocab_size</code></td><td>248,320</td><td>151,936</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>num_target_layers</code></td><td>32 (Qwen3.5-4B)</td><td>36 (Qwen3-4B)</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>num_hidden_layers</code></td><td>5</td><td>5</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>hidden_size</code></td><td>2,560</td><td>2,560</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>intermediate_size</code></td><td>9,728</td><td>9,728</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>num_attention_heads</code></td><td>32</td><td>32</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>num_key_value_heads</code></td><td>8 (GQA 4:1)</td><td>8 (GQA 4:1)</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>head_dim</code></td><td>128</td><td>128</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>block_size</code></td><td>16</td><td>16</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>target_layer_ids</code></td><td>[1, 8, 15, 22, 29]</td><td>[1, 9, 17, 25, 33]</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>mask_token_id</code></td><td>248,070</td><td>151,669</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>rope_theta</code></td><td>10,000,000 (10M)</td><td>1,000,000 (1M)</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>max_position_embeddings</code></td><td>262,144 (256K)</td><td>40,960 (40K)</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>eos_token_id</code></td><td>248,044</td><td>151,645</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>pad_token_id</code></td><td>248,044</td><td>—（未设置）</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>bos_token_id</code></td><td>—（未设置）</td><td>151,643</td><td><span class="tag tag-diff">不同</span></td></tr>
+<tr><td><code>rope_scaling</code></td><td>null</td><td>null</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>rms_norm_eps</code></td><td>1e-06</td><td>1e-06</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>dtype</code></td><td>bfloat16</td><td>bfloat16</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>layer_types</code></td><td>[full_attention × 5]</td><td>[full_attention × 5]</td><td><span class="tag tag-same">相同</span></td></tr>
+<tr><td><code>transformers_version</code></td><td>4.57.1</td><td>4.57.3</td><td><span class="tag tag-diff">不同</span></td></tr>
+</table>
+</div>
+
+<h3>2.1 target_layer_ids 分布分析</h3>
+<div class="card">
+<p>Draft 模型从目标模型的特定 hidden layers 抽取特征。两个版本的层选择策略反映了各自目标模型的深度差异：</p>
+
+<table>
+<tr><th>属性</th><th>Qwen3.5 (32 layers)</th><th>Qwen3 (36 layers)</th></tr>
+<tr><td>选取层</td><td>[1, 8, 15, 22, 29]</td><td>[1, 9, 17, 25, 33]</td></tr>
+<tr><td>层间距</td><td>7, 7, 7, 7</td><td>8, 8, 8, 8</td></tr>
+<tr><td>覆盖范围</td><td>第1层 ~ 第29层 (共32层)</td><td>第1层 ~ 第33层 (共36层)</td></tr>
+<tr><td>策略</td><td>均匀间隔 ≈ 32/5 ≈ 6.4</td><td>均匀间隔 ≈ 36/5 ≈ 7.2</td></tr>
+</table>
+
+<p>两个版本均采用<strong>均匀分布策略</strong>——从较浅层到较深层等间距选取 5 个锚定层，使 draft 模型能够获取目标模型不同深度的表征信息。这一策略通过 <code>build_target_layer_ids()</code> 函数（旧版中定义于 <code>utils.py</code>）自动计算。新版直接在 <code>config.json</code> 中硬编码了具体值。</p>
+</div>
+
+<h3>2.2 RoPE 与上下文长度升级</h3>
+<div class="card">
+<p>Qwen3.5-4B 相比 Qwen3-4B 在位置编码上有显著升级：</p>
+<ul>
+<li><code>rope_theta</code>: 10M vs 1M — <strong>10倍增大</strong>，使位置编码在长距离上衰减更慢，有利于长上下文建模</li>
+<li><code>max_position_embeddings</code>: 256K vs 40K — <strong>6.4倍扩展</strong>，支持远超 40K 的超长上下文</li>
+<li>配套了 sliding-window attention 选项（README 提到 <code>--speculative-dflash-draft-window-size</code>），在长上下文推理时保持 drafter 效率</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. dflash.py 代码深度分析（Qwen3.5-4B-DFlash）</h2>
+
+<p>新版 <code>dflash.py</code> 共 179 行，是<strong>唯一的 Python 源文件</strong>，定义了完整的 draft 模型结构。代码风格极简、无冗余。</p>
+
+<h3>3.1 导入与依赖</h3>
+<div class="card">
+<pre><code><span class="kw">from</span> typing <span class="kw">import</span> Optional, Callable
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> Unpack, Tuple
+<span class="kw">import</span> torch
+<span class="kw">from</span> torch <span class="kw">import</span> nn
+<span class="kw">from</span> transformers.models.qwen3.modeling_qwen3 <span class="kw">import</span> (
+    Qwen3RMSNorm, Qwen3RotaryEmbedding, Qwen3Config,
+    Qwen3PreTrainedModel, Qwen3MLP, GradientCheckpointingLayer,
+    FlashAttentionKwargs, rotate_half,
+    eager_attention_forward, ALL_ATTENTION_FUNCTIONS,
+)
+<span class="kw">from</span> transformers.modeling_outputs <span class="kw">import</span> CausalLMOutputWithPast
+<span class="kw">from</span> transformers.cache_utils <span class="kw">import</span> Cache</code></pre>
+
+<h4>与旧版的关键区别：</h4>
+<table>
+<tr><th>新版 (Qwen3.5)</th><th>旧版 (Qwen3)</th></tr>
+<tr><td>❌ 不导入 <code>DynamicCache</code></td><td>✅ 导入 <code>DynamicCache</code>（用于 <code>spec_generate</code>）</td></tr>
+<tr><td>❌ 不导入 <code>.utils</code></td><td>✅ <code>from .utils import build_target_layer_ids, extract_context_feature, sample</code></td></tr>
+<tr><td>仅使用 <code>Cache</code> 基类作为类型注解</td><td>使用 <code>DynamicCache</code> 实例化 KV cache</td></tr>
+</table>
+
+<p><strong>设计含义</strong>：新版完全不涉及推理调度，cache 的创建和管理由外部框架（vLLM/SGLang）负责。</p>
+</div>
+
+<h3>3.2 apply_rotary_pos_emb() — 旋转位置编码</h3>
+<div class="card">
+<pre><code><span class="kw">def</span> <span class="fn">apply_rotary_pos_emb</span>(q, k, cos, sin, position_ids=<span class="kw">None</span>, unsqueeze_dim=<span class="num">1</span>):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_len = q.size(<span class="num">-2</span>)
+    <span class="cmt"># 关键：Q 只取最后 q_len 个位置的 cos/sin</span>
+    q_embed = (q * cos[..., -q_len:, :]) + (rotate_half(q) * sin[..., -q_len:, :])
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    <span class="kw">return</span> q_embed, k_embed</code></pre>
+
+<p>此函数与旧版<strong>完全相同</strong>。核心特点：</p>
+<ul>
+<li><strong>Q 取最后 q_len 个位置</strong>：因为 DFlash 的注意力机制中 K/V 包含 context + noise 两部分（长度为 <code>ctx_len + q_len</code>），而 Q 只是 noise 部分（长度 <code>q_len</code>），所以 Q 的 RoPE 只需要对应最后 q_len 个位置</li>
+<li><strong>K 使用全部位置</strong>：K 需要覆盖 context 和 noise 的完整位置序列</li>
+<li>使用标准的 <code>rotate_half</code> 实现（从 Qwen3 导入的），将向量分为两半并旋转</li>
+</ul>
+</div>
+
+<h3>3.3 Qwen3DFlashAttention — 核心注意力机制</h3>
+<div class="card">
+<h4>3.3.1 初始化</h4>
+<pre><code><span class="kw">class</span> <span class="cls">Qwen3DFlashAttention</span>(nn.Module):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config: Qwen3Config, layer_idx: int):
+        <span class="cmt"># 标准 Qwen3 注意力参数</span>
+        self.head_dim = getattr(config, <span class="str">"head_dim"</span>, config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads  <span class="cmt"># = 32/8 = 4</span>
+        self.scaling = self.head_dim ** <span class="num">-0.5</span>      <span class="cmt"># = 128^(-0.5) ≈ 0.0884</span>
+        self.is_causal = <span class="kw">False</span>                     <span class="cmt"># ⚡ 关键：非因果注意力！</span>
+
+        <span class="cmt"># QKV + Output 投影</span>
+        self.q_proj = nn.Linear(2560, 32 * 128, bias=<span class="kw">False</span>)   <span class="cmt"># [2560 → 4096]</span>
+        self.k_proj = nn.Linear(2560,  8 * 128, bias=<span class="kw">False</span>)   <span class="cmt"># [2560 → 1024] (GQA)</span>
+        self.v_proj = nn.Linear(2560,  8 * 128, bias=<span class="kw">False</span>)   <span class="cmt"># [2560 → 1024] (GQA)</span>
+        self.o_proj = nn.Linear(4096, 2560, bias=<span class="kw">False</span>)       <span class="cmt"># [4096 → 2560]</span>
+
+        <span class="cmt"># QK 归一化（Qwen3 特有）</span>
+        self.q_norm = Qwen3RMSNorm(128, eps=1e-6)
+        self.k_norm = Qwen3RMSNorm(128, eps=1e-6)
+
+        <span class="cmt"># 滑动窗口（当 layer_types 指定时启用）</span>
+        self.sliding_window = config.sliding_window \
+            <span class="kw">if</span> config.layer_types[layer_idx] == <span class="str">"sliding_attention"</span> <span class="kw">else</span> <span class="kw">None</span></code></pre>
+
+<p><strong>重要设计决策：</strong></p>
+<ul>
+<li><code>is_causal = False</code> — DFlash 使用<strong>双向注意力</strong>（non-causal），因为 draft token 之间是并行生成的扩散过程，不是从左到右的自回归序列</li>
+<li>GQA (Grouped Query Attention) 比例 4:1 — 每 4 个 query head 共享 1 组 KV head，与目标模型 Qwen3.5-4B 相同</li>
+<li>QK Norm — 在 RoPE 之前对 Q、K 分别施加 RMSNorm（Qwen3 架构特色，不同于标准 LLaMA）</li>
+<li>sliding_window — 支持滑动窗口注意力（当前配置均为 <code>full_attention</code>，但代码已预留支持）</li>
+</ul>
+
+<h4>3.3.2 Forward — KV 注入机制</h4>
+<pre><code><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states, target_hidden, position_embeddings, attention_mask, ...):
+    bsz, q_len = hidden_states.shape[:-1]     <span class="cmt"># noise tokens 数量</span>
+    ctx_len = target_hidden.shape[<span class="num">1</span>]           <span class="cmt"># context tokens 数量</span>
+
+    <span class="cmt"># Step 1: Q 仅来自 noise（draft tokens）</span>
+    q = self.q_proj(hidden_states)              <span class="cmt"># [B, q_len, 4096]</span>
+    q = self.q_norm(q.view(bsz, q_len, -1, self.head_dim)).transpose(1, 2)
+
+    <span class="cmt"># Step 2: K/V 拼接 context + noise</span>
+    k_ctx   = self.k_proj(target_hidden)        <span class="cmt"># [B, ctx_len, 1024]</span>
+    k_noise = self.k_proj(hidden_states)        <span class="cmt"># [B, q_len,  1024]</span>
+    v_ctx   = self.v_proj(target_hidden)
+    v_noise = self.v_proj(hidden_states)
+    k = torch.cat([k_ctx, k_noise], dim=<span class="num">1</span>)     <span class="cmt"># [B, ctx_len+q_len, 1024]</span>
+    v = torch.cat([v_ctx, v_noise], dim=<span class="num">1</span>)
+
+    <span class="cmt"># Step 3: K norm + RoPE</span>
+    k = self.k_norm(k.view(...)).transpose(1, 2)
+    cos, sin = position_embeddings
+    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+    <span class="cmt"># Step 4: KV Cache (if present)</span>
+    <span class="kw">if</span> past_key_values <span class="kw">is not None</span>:
+        k, v = past_key_values.update(k, v, self.layer_idx, ...)
+
+    <span class="cmt"># Step 5: 执行注意力计算</span>
+    attn_output, _ = attn_fn(self, q, k, v, attention_mask, ...)</code></pre>
+
+<div class="flow-diagram">
+<strong>DFlash KV 注入流程图：</strong><br><br>
+<span class="box-inline">target_hidden (从目标模型抽取)</span>
+<span class="arrow">─── K_proj/V_proj ───→</span>
+<span class="box-inline">k_ctx, v_ctx</span><br>
+<span style="font-size:2em;color:var(--accent)">⬇ concat</span><br>
+<span class="box-inline">hidden_states (noise embedding)</span>
+<span class="arrow">─── K_proj/V_proj ───→</span>
+<span class="box-inline">k_noise, v_noise</span><br>
+<br>
+<span class="box-inline">K = [k_ctx; k_noise]</span> &nbsp;&nbsp; <span class="box-inline">V = [v_ctx; v_noise]</span><br>
+<span style="font-size:1.5em;color:var(--accent)">⬇</span><br>
+<span class="box-inline">Q (from noise only)</span>
+<span class="arrow">──── Attention(Q, K, V) ────→</span>
+<span class="box-inline">output</span>
+</div>
+
+<p>这是 DFlash 的<strong>核心创新机制</strong>——通过将目标模型的中间层 hidden states 注入到 draft 模型的 KV 中，draft 模型能够以极少参数量获得目标模型的知识引导。两个版本的 KV 注入逻辑<strong>完全相同</strong>。</p>
+</div>
+
+<h3>3.4 Qwen3DFlashDecoderLayer — Transformer 解码层</h3>
+<div class="card">
+<pre><code><span class="kw">class</span> <span class="cls">Qwen3DFlashDecoderLayer</span>(GradientCheckpointingLayer):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config, layer_idx):
+        self.self_attn = Qwen3DFlashAttention(config, layer_idx)
+        self.mlp = Qwen3MLP(config)                     <span class="cmt"># SwiGLU MLP</span>
+        self.input_layernorm = Qwen3RMSNorm(2560, eps=1e-6)
+        self.post_attention_layernorm = Qwen3RMSNorm(2560, eps=1e-6)
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, target_hidden, hidden_states, ...):
+        <span class="cmt"># Pre-norm → Attention → Residual</span>
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            target_hidden=target_hidden,  <span class="cmt"># ← 注入目标特征</span>
+            ...
+        )[<span class="num">0</span>]
+        hidden_states = residual + hidden_states
+
+        <span class="cmt"># Pre-norm → MLP → Residual</span>
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        <span class="kw">return</span> hidden_states</code></pre>
+
+<p>标准的 Pre-LayerNorm Transformer 解码器块，与旧版<strong>完全相同</strong>。每层都接收 <code>target_hidden</code> 参数并传递给注意力模块。</p>
+<p>MLP 使用 Qwen3 的 SwiGLU 架构：<code>gate_proj</code> (2560→9728) + <code>up_proj</code> (2560→9728) → SiLU gate → <code>down_proj</code> (9728→2560)</p>
+</div>
+
+<h3>3.5 DFlashDraftModel — 主模型类</h3>
+<div class="card">
+<h4>3.5.1 初始化</h4>
+<pre><code><span class="kw">class</span> <span class="cls">DFlashDraftModel</span>(Qwen3PreTrainedModel):
+    config_class = Qwen3Config
+    _no_split_modules = [<span class="str">"Qwen3DFlashDecoderLayer"</span>]
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config):
+        <span class="cmt"># 5 层 Decoder</span>
+        self.layers = nn.ModuleList(
+            [Qwen3DFlashDecoderLayer(config, i) <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">5</span>)]
+        )
+        <span class="cmt"># 从 config 读取 target_layer_ids（不再有 build_target_layer_ids 回退）</span>
+        self.target_layer_ids = self.config.dflash_config.get(<span class="str">"target_layer_ids"</span>, <span class="kw">None</span>)
+
+        <span class="cmt"># 特征压缩：5个目标层的隐藏状态拼接后降维</span>
+        self.fc = nn.Linear(<span class="num">5</span> * <span class="num">2560</span>, <span class="num">2560</span>, bias=<span class="kw">False</span>)   <span class="cmt"># [12800 → 2560]</span>
+        self.hidden_norm = Qwen3RMSNorm(<span class="num">2560</span>, eps=<span class="num">1e-6</span>)
+
+        <span class="cmt"># RoPE 与归一化</span>
+        self.norm = Qwen3RMSNorm(<span class="num">2560</span>, eps=<span class="num">1e-6</span>)
+        self.rotary_emb = Qwen3RotaryEmbedding(config)
+
+        self.block_size = config.block_size       <span class="cmt"># = 16</span>
+        self.mask_token_id = self.config.dflash_config.get(<span class="str">"mask_token_id"</span>, <span class="kw">None</span>)
+        self.post_init()</code></pre>
+
+<h4>与旧版初始化的对比：</h4>
+<table>
+<tr><th>机制</th><th>Qwen3.5 (新)</th><th>Qwen3 (旧)</th></tr>
+<tr>
+<td><code>target_layer_ids</code> 读取</td>
+<td><code>config.dflash_config.get("target_layer_ids", <strong>None</strong>)</code></td>
+<td><code>config.dflash_config.get("target_layer_ids", <strong>build_target_layer_ids(...)</strong>)</code></td>
+</tr>
+<tr>
+<td>回退策略</td>
+<td>不提供回退，若 config 缺失则为 None</td>
+<td>自动根据层数计算均匀分布的层 ID</td>
+</tr>
+</table>
+<p><strong>含义</strong>：新版要求 <code>config.json</code> 必须明确指定 <code>target_layer_ids</code>，消除了运行时动态计算，使配置更确定性。</p>
+
+<h4>3.5.2 特征压缩管线</h4>
+<div class="flow-diagram">
+<span class="box-inline">target_model.hidden_states[1]</span> <span style="color:var(--text-muted)">[B, L, 2560]</span><br>
+<span class="box-inline">target_model.hidden_states[8]</span> <span style="color:var(--text-muted)">[B, L, 2560]</span><br>
+<span class="box-inline">target_model.hidden_states[15]</span> <span style="color:var(--text-muted)">[B, L, 2560]</span><br>
+<span class="box-inline">target_model.hidden_states[22]</span> <span style="color:var(--text-muted)">[B, L, 2560]</span><br>
+<span class="box-inline">target_model.hidden_states[29]</span> <span style="color:var(--text-muted)">[B, L, 2560]</span><br>
+<span style="font-size:1.5em;color:var(--accent)">⬇ concat along last dim</span><br>
+<span class="box-inline">target_hidden</span> <span style="color:var(--text-muted)">[B, L, 12800]</span><br>
+<span style="font-size:1.5em;color:var(--accent)">⬇ self.fc (Linear 12800→2560, no bias)</span><br>
+<span class="box-inline">compressed</span> <span style="color:var(--text-muted)">[B, L, 2560]</span><br>
+<span style="font-size:1.5em;color:var(--accent)">⬇ self.hidden_norm (RMSNorm)</span><br>
+<span class="box-inline">target_hidden (normalized)</span> <span style="color:var(--text-muted)">[B, L, 2560]</span>
+</div>
+
+<h4>3.5.3 Forward 方法</h4>
+<pre><code><span class="kw">def</span> <span class="fn">forward</span>(self, position_ids, attention_mask=<span class="kw">None</span>,
+             noise_embedding=<span class="kw">None</span>, target_hidden=<span class="kw">None</span>,
+             past_key_values=<span class="kw">None</span>, use_cache=<span class="kw">False</span>, **kwargs):
+
+    hidden_states = noise_embedding                  <span class="cmt"># mask tokens embeddings</span>
+    target_hidden = self.hidden_norm(self.fc(target_hidden))  <span class="cmt"># 压缩+归一化</span>
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    <span class="kw">for</span> layer <span class="kw">in</span> self.layers:
+        hidden_states = layer(
+            hidden_states=hidden_states,
+            target_hidden=target_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    <span class="kw">return</span> self.norm(hidden_states)                  <span class="cmt"># 最终 RMSNorm</span></code></pre>
+
+<p><strong>关键特征</strong>：</p>
+<ul>
+<li>返回值是 <code>norm(hidden_states)</code> — 一个 tensor，而非包装在 <code>CausalLMOutputWithPast</code> 中</li>
+<li>外部框架负责将此输出送入目标模型的 <code>lm_head</code> 得到 logits</li>
+<li><strong>没有 <code>spec_generate()</code></strong> — 推理的 prefill、draft、verify 全部由推理引擎调度</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. spec_generate() 对比：新版 vs. 旧版</h2>
+
+<div class="card">
+<p>这是两个版本之间<strong>最重要的架构差异</strong>。</p>
+
+<div class="old-box">
+<h4>旧版 (Qwen3-4B-DFlash-b16): 内置完整推理循环</h4>
+<pre><code><span class="kw">@torch.inference_mode()</span>
+<span class="kw">def</span> <span class="fn">spec_generate</span>(self, target, input_ids, max_new_tokens, stop_token_ids, temperature):
+    <span class="cmt"># 1. Prefill: 目标模型处理输入</span>
+    output = target(input_ids, ..., output_hidden_states=<span class="kw">True</span>)
+    target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+
+    <span class="cmt"># 2. Decode 循环</span>
+    <span class="kw">while</span> start < max_length:
+        <span class="cmt"># 2a. Draft: 用 mask tokens 生成候选</span>
+        noise_embedding = target.model.embed_tokens(block_output_ids)
+        draft_logits = target.lm_head(self(...))
+        block_output_ids[:, <span class="num">1</span>:] = sample(draft_logits)
+
+        <span class="cmt"># 2b. Verify: 目标模型验证候选</span>
+        output = target(block_output_ids, ...)
+        posterior = sample(output.logits, temperature)
+
+        <span class="cmt"># 2c. Accept: 确定接受长度</span>
+        acceptance_length = (draft == posterior).cumprod(dim=1).sum()
+        start += acceptance_length + <span class="num">1</span>
+
+        <span class="cmt"># 2d. Update: 刷新 target_hidden, 裁剪 KV cache</span>
+        target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+        past_key_values_draft.crop(start)
+        past_key_values_target.crop(start + <span class="num">1</span>)</code></pre>
+<p>旧版需要自行管理：DynamicCache 实例化、KV cache crop、acceptance 计算、停止条件判断。</p>
+</div>
+
+<div class="new-box">
+<h4>新版 (Qwen3.5-4B-DFlash): 纯模型定义</h4>
+<pre><code><span class="cmt"># 没有 spec_generate()！</span>
+<span class="cmt"># 只有 forward()，返回 normalized hidden states</span>
+<span class="cmt"># 推理循环由 vLLM / SGLang 框架负责</span></code></pre>
+</div>
+
+<table>
+<tr><th>职责</th><th>新版处理者</th><th>旧版处理者</th></tr>
+<tr><td>KV Cache 管理</td><td>vLLM/SGLang</td><td><code>DynamicCache</code> + 手动 <code>crop()</code></td></tr>
+<tr><td>Draft token 采样</td><td>vLLM/SGLang</td><td><code>utils.sample()</code></td></tr>
+<tr><td>Hidden states 抽取</td><td>vLLM/SGLang</td><td><code>utils.extract_context_feature()</code></td></tr>
+<tr><td>Acceptance 验证</td><td>vLLM/SGLang</td><td><code>spec_generate()</code> 中的 <code>cumprod</code> 逻辑</td></tr>
+<tr><td>停止条件</td><td>vLLM/SGLang</td><td><code>spec_generate()</code> 检查 <code>stop_token_ids</code></td></tr>
+<tr><td>Embedding 查找</td><td>vLLM/SGLang 调用 <code>target.embed_tokens</code></td><td><code>spec_generate()</code> 中调用 <code>target.model.embed_tokens</code></td></tr>
+<tr><td>LM Head 投影</td><td>vLLM/SGLang 调用 <code>target.lm_head</code></td><td><code>spec_generate()</code> 中调用 <code>target.lm_head</code></td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. utils.py 深度分析（仅旧版存在）</h2>
+
+<div class="card">
+<p>旧版的 <code>utils.py</code> 包含 4 个主要函数，新版完全不需要它们：</p>
+
+<h4>5.1 build_target_layer_ids(num_target_layers, num_draft_layers)</h4>
+<pre><code><span class="kw">def</span> <span class="fn">build_target_layer_ids</span>(num_target_layers, num_draft_layers):
+    <span class="kw">if</span> num_draft_layers == <span class="num">1</span>:
+        <span class="kw">return</span> [(num_target_layers // <span class="num">2</span>)]   <span class="cmt"># 单层：取中间层</span>
+    start = <span class="num">1</span>
+    end = num_target_layers - <span class="num">3</span>
+    span = end - start
+    target_layer_ids = [
+        int(round(start + (i * span) / (num_draft_layers - <span class="num">1</span>)))
+        <span class="kw">for</span> i <span class="kw">in</span> range(num_draft_layers)
+    ]
+    <span class="kw">return</span> target_layer_ids</code></pre>
+<p>计算均匀分布的目标层 ID。对于 Qwen3-4B (36层, 5个draft层)：<code>start=1, end=33, span=32</code> → [1, 9, 17, 25, 33]。</p>
+<p>新版中此函数被淘汰，因为 <code>target_layer_ids</code> 直接写入 <code>config.json</code>。</p>
+
+<h4>5.2 extract_context_feature(hidden_states, layer_ids)</h4>
+<pre><code><span class="kw">def</span> <span class="fn">extract_context_feature</span>(hidden_states, layer_ids):
+    offset = <span class="num">1</span>   <span class="cmt"># hidden_states[0] 是 embedding layer 输出</span>
+    selected = [hidden_states[lid + offset] <span class="kw">for</span> lid <span class="kw">in</span> layer_ids]
+    <span class="kw">return</span> torch.cat(selected, dim=-<span class="num">1</span>)</code></pre>
+<p>从目标模型的所有层输出中，按 <code>layer_ids</code> 选取特定层的 hidden states 并沿最后维度拼接。新版中此操作由推理框架在调用 draft model 之前完成。</p>
+
+<h4>5.3 sample(logits, temperature)</h4>
+<pre><code><span class="kw">def</span> <span class="fn">sample</span>(logits, temperature=<span class="num">0.0</span>):
+    <span class="kw">if</span> temperature < <span class="num">1e-5</span>:
+        <span class="kw">return</span> torch.argmax(logits, dim=-<span class="num">1</span>)   <span class="cmt"># greedy</span>
+    logits = logits / temperature
+    probs = torch.softmax(logits, dim=-<span class="num">1</span>)
+    <span class="kw">return</span> torch.multinomial(probs, num_samples=<span class="num">1</span>)</code></pre>
+<p>简单的温度采样。新版中采样由推理引擎处理。</p>
+
+<h4>5.4 load_and_process_dataset(data_name)</h4>
+<p>支持 12 种评测数据集（GSM8K, MATH-500, AIME24/25, Alpaca, MT-Bench, HumanEval, MBPP, LBPP, SWE-bench, LiveCodeBench），新版中完全移除——评测由独立脚本或框架基准工具完成。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. 推理数据流对比</h2>
+
+<div class="card">
+<h4>新版数据流（框架驱动）</h4>
+<div class="flow-diagram">
+<span class="box-inline">Input Tokens</span><br>
+<span style="font-size:1.2em;color:var(--accent)">⬇</span> <span style="color:var(--text-muted)">Framework: prefill with target model</span><br>
+<span class="box-inline">Target Model (Qwen3.5-4B, 32 layers)</span><br>
+<span style="font-size:1.2em;color:var(--accent)">⬇</span> <span style="color:var(--text-muted)">Framework: extract hidden_states[1,8,15,22,29] → concat → [B,L,12800]</span><br>
+<span class="box-inline">target_hidden [B, L, 12800]</span><br>
+<span style="font-size:1.2em;color:var(--accent)">⬇</span> <span style="color:var(--text-muted)">Framework: embed mask tokens → noise_embedding</span><br>
+<span class="box-inline">DFlashDraftModel.forward(noise_embedding, target_hidden, ...)</span><br>
+<span style="font-size:1.2em;color:var(--accent)">⬇</span> <span style="color:var(--text-muted)">fc(12800→2560) → hidden_norm → 5× DecoderLayer → norm</span><br>
+<span class="box-inline">draft_hidden [B, block_size, 2560]</span><br>
+<span style="font-size:1.2em;color:var(--accent)">⬇</span> <span style="color:var(--text-muted)">Framework: target.lm_head(draft_hidden) → sample → verify</span><br>
+<span class="box-inline">Accepted Tokens</span>
+</div>
+
+<h4>旧版数据流（自包含）</h4>
+<div class="flow-diagram">
+<span class="box-inline">Input Tokens</span><br>
+<span style="font-size:1.2em;color:var(--accent5)">⬇</span> <span style="color:var(--text-muted)">spec_generate: target(input_ids, output_hidden_states=True)</span><br>
+<span class="box-inline">Target Model + extract_context_feature()</span><br>
+<span style="font-size:1.2em;color:var(--accent5)">⬇</span> <span style="color:var(--text-muted)">spec_generate: embed mask tokens + call self.forward()</span><br>
+<span class="box-inline">DFlashDraftModel.forward() → target.lm_head()</span><br>
+<span style="font-size:1.2em;color:var(--accent5)">⬇</span> <span style="color:var(--text-muted)">spec_generate: sample() + target verify + cumprod accept</span><br>
+<span class="box-inline">Accepted + KV cache crop + loop</span>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. DFlash 推理原理回顾</h2>
+
+<div class="card">
+<p>DFlash (<a href="https://arxiv.org/abs/2602.06036">arXiv:2602.06036</a>) 是一种基于<strong>块扩散</strong>（Block Diffusion）的推测解码方法，核心思想是：</p>
+
+<ol>
+<li><strong>Block Diffusion Draft</strong>：将推测解码中的 draft 步骤替换为一个轻量级<strong>离散扩散模型</strong>。给定一个 block 的 mask tokens，扩散模型在单步去噪中并行预测所有 token</li>
+<li><strong>KV 注入</strong>：draft 模型不直接接收目标模型的 logits 或 token，而是注入目标模型的<strong>中间层隐藏状态</strong>（跨多个深度层），作为注意力的 K/V 部分引导生成</li>
+<li><strong>非因果注意力</strong>：由于是扩散生成而非自回归，draft tokens 之间使用<strong>双向注意力</strong>（<code>is_causal=False</code>），每个 draft token 都能看到 block 内其他 token</li>
+<li><strong>目标模型验证</strong>：draft 后目标模型对整个 block 执行一次前向传播进行验证，接受匹配的前缀</li>
+</ol>
+
+<p>相比传统 speculative decoding（如 Eagle, Medusa）的优势：</p>
+<ul>
+<li>无需自回归 draft（每次只 1-step diffusion），draft 速度更快</li>
+<li>通过 KV 注入获得比小型 AR draft model 更强的对齐效果</li>
+<li>Block size 16 时，一次 draft 可生成 16 个候选 token</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>8. 模型参数量估算</h2>
+
+<div class="card">
+<p>两个版本使用相同的 hidden_size=2560, heads=32, kv_heads=8, intermediate=9728, layers=5，因此<strong>可训练参数量几乎相同</strong>（仅 fc 层因 target_layer_ids 数量相同也一致）。</p>
+
+<table>
+<tr><th>组件</th><th>参数量</th><th>计算</th></tr>
+<tr><td>Q proj × 5 layers</td><td>32,768,000</td><td>5 × (2560 × 4096)</td></tr>
+<tr><td>K proj × 5 layers</td><td>13,107,200</td><td>5 × (2560 × 1024)</td></tr>
+<tr><td>V proj × 5 layers</td><td>13,107,200</td><td>5 × (2560 × 1024)</td></tr>
+<tr><td>O proj × 5 layers</td><td>52,428,800</td><td>5 × (4096 × 2560)</td></tr>
+<tr><td>QK Norm × 5 layers</td><td>1,280</td><td>5 × 2 × 128</td></tr>
+<tr><td>MLP (gate+up+down) × 5</td><td>374,784,000</td><td>5 × 3 × (2560 × 9728)</td></tr>
+<tr><td>LayerNorm × (2 per layer + 2)</td><td>30,720</td><td>12 × 2560</td></tr>
+<tr><td>FC (target compression)</td><td>32,768,000</td><td>12800 × 2560</td></tr>
+<tr><td>RoPE (non-trainable)</td><td>—</td><td>—</td></tr>
+<tr style="font-weight:bold;color:var(--accent)"><td>总计</td><td>~519M</td><td></td></tr>
+</table>
+
+<p>约 <strong>519M 参数</strong>（约 0.5B），仅为目标模型 Qwen3.5-4B 的 ~13%，体现了 DFlash 的轻量级设计。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. 基准测试结果（Qwen3.5-4B-DFlash）</h2>
+
+<div class="card">
+<p>以下数据来自 README.md，测试环境为单张 NVIDIA B200 GPU，使用 SGLang，思维模式启用，最大输出长度 4096 tokens。</p>
+
+<h4>Block Size = 16，单并发（最佳加速场景）</h4>
+<table>
+<tr><th>任务</th><th>AR (tok/s)</th><th>MTP</th><th>DFlash</th><th>DFlash 加速比</th></tr>
+<tr><td>Math500</td><td>274</td><td>458 (1.7×)</td><td><strong>959</strong></td><td><strong>3.5×</strong></td></tr>
+<tr><td>GSM8K</td><td>271</td><td>432 (1.6×)</td><td><strong>840</strong></td><td><strong>3.1×</strong></td></tr>
+<tr><td>HumanEval</td><td>270</td><td>472 (1.7×)</td><td><strong>1004</strong></td><td><strong>3.7×</strong></td></tr>
+<tr><td>MBPP</td><td>273</td><td>404 (1.5×)</td><td><strong>895</strong></td><td><strong>3.3×</strong></td></tr>
+<tr><td>MT-Bench</td><td>271</td><td>394 (1.5×)</td><td><strong>774</strong></td><td><strong>2.9×</strong></td></tr>
+<tr><td>Alpaca</td><td>279</td><td>350 (1.3×)</td><td><strong>680</strong></td><td><strong>2.4×</strong></td></tr>
+</table>
+
+<h4>关键观察</h4>
+<ul>
+<li><strong>最高加速 3.7×</strong>（HumanEval, 单并发, B16）：代码生成任务 draft 接受率最高</li>
+<li>DFlash 在所有任务和所有并发度上都<strong>超越 MTP</strong></li>
+<li>高并发时加速比下降（B16, 并发32: 1.3×~1.8×），因为 GPU 已被 AR 充分利用</li>
+<li>B8 vs B16：B16 在单并发时加速更高（3.7× vs 2.9×），但 B8 在高并发时衰减更少</li>
+</ul>
+
+<h4>Acceptance Length (B16)</h4>
+<table>
+<tr><th>任务</th><th>MTP</th><th>DFlash</th></tr>
+<tr><td>Math500</td><td>6.47</td><td><strong>7.11</strong></td></tr>
+<tr><td>GSM8K</td><td>6.15</td><td><strong>6.40</strong></td></tr>
+<tr><td>HumanEval</td><td>6.27</td><td><strong>7.29</strong></td></tr>
+<tr><td>MBPP</td><td>5.27</td><td><strong>6.34</strong></td></tr>
+<tr><td>MT-Bench</td><td>5.31</td><td><strong>5.60</strong></td></tr>
+<tr><td>Alpaca</td><td>5.08</td><td><strong>5.23</strong></td></tr>
+</table>
+<p>DFlash 在 B16 时平均接受长度比 MTP 高 10-16%，代码类任务（HumanEval, MBPP）优势最显著。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>10. 综合对比总结</h2>
+
+<div class="card">
+<table>
+<tr><th>维度</th><th>Qwen3.5-4B-DFlash <span class="tag tag-new">NEW</span></th><th>Qwen3-4B-DFlash-b16 <span class="tag tag-old">OLD</span></th></tr>
+<tr><td><strong>目标模型</strong></td><td>Qwen3.5-4B (32层, 256K上下文)</td><td>Qwen3-4B (36层, 40K上下文)</td></tr>
+<tr><td><strong>词汇表</strong></td><td>248,320 tokens</td><td>151,936 tokens</td></tr>
+<tr><td><strong>RoPE base freq</strong></td><td>θ=10,000,000</td><td>θ=1,000,000</td></tr>
+<tr><td><strong>代码结构</strong></td><td>单文件 (179行)</td><td>三文件 (~800+行)</td></tr>
+<tr><td><strong>推理方式</strong></td><td>框架驱动 (vLLM/SGLang)</td><td>自包含 spec_generate()</td></tr>
+<tr><td><strong>依赖</strong></td><td>最小化 (仅 transformers)</td><td>需要 datasets, torch 等</td></tr>
+<tr><td><strong>评测支持</strong></td><td>无（外部脚本）</td><td>内置 12 种数据集加载</td></tr>
+<tr><td><strong>框架支持</strong></td><td>✅ vLLM + SGLang 原生</td><td>需适配</td></tr>
+<tr><td><strong>Sliding Window 选项</strong></td><td>✅ 可通过 CLI 参数启用</td><td>代码预留但无 CLI 支持</td></tr>
+<tr><td><strong>模型核心架构</strong></td><td colspan="2" style="text-align:center"><span class="tag tag-same">完全相同</span> — Attention, DecoderLayer, forward() 逻辑一致</td></tr>
+<tr><td><strong>KV 注入机制</strong></td><td colspan="2" style="text-align:center"><span class="tag tag-same">完全相同</span> — K/V = concat(target, noise), Q = noise only</td></tr>
+<tr><td><strong>特征压缩</strong></td><td colspan="2" style="text-align:center"><span class="tag tag-same">完全相同</span> — fc(5×hidden→hidden) + RMSNorm</td></tr>
+<tr><td><strong>非因果注意力</strong></td><td colspan="2" style="text-align:center"><span class="tag tag-same">完全相同</span> — is_causal=False</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2>11. 设计演进分析</h2>
+
+<div class="card">
+<h4>从自包含到框架解耦：DFlash 生态成熟的标志</h4>
+
+<p>旧版 Qwen3-4B-DFlash-b16 是 DFlash 的<strong>原型/演示版本</strong>，设计目标是让研究者可以用单个仓库完成：</p>
+<ol>
+<li>加载模型</li>
+<li>运行推理 (<code>spec_generate</code>)</li>
+<li>评测基准 (<code>load_and_process_dataset</code>)</li>
+</ol>
+
+<p>新版 Qwen3.5-4B-DFlash 反映了 DFlash 被<strong>主流推理框架正式支持</strong>后的设计范式转变：</p>
+<ol>
+<li>vLLM 通过 <code>--speculative-config '{"method": "dflash", ...}'</code> 原生支持</li>
+<li>SGLang 通过 <code>--speculative-algorithm DFLASH</code> 原生支持</li>
+<li>Draft 模型仅需提供 <code>forward()</code>，其余全由框架处理</li>
+<li>代码从 ~800 行精简到 179 行，<strong>职责单一原则</strong></li>
+</ol>
+
+<p>这一转变带来的好处：</p>
+<ul>
+<li><strong>批处理支持</strong>：推理框架可以在多请求场景下高效调度 draft model，而自包含版本只支持 batch_size=1</li>
+<li><strong>内存优化</strong>：框架统一管理 KV cache（如 PagedAttention），比手动 DynamicCache.crop() 更高效</li>
+<li><strong>并发扩展</strong>：框架支持 tensor parallelism、多并发请求调度</li>
+<li><strong>可维护性</strong>：模型代码只需关注前向计算，bug surface 大幅减小</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>12. 技术要点速查表</h2>
+
+<div class="card">
+<table>
+<tr><th>问题</th><th>答案</th></tr>
+<tr><td>DFlash 的 draft 是自回归的吗？</td><td>❌ 不是。是单步块扩散（block diffusion），一次并行生成整个 block</td></tr>
+<tr><td>为什么 is_causal=False？</td><td>扩散模型的去噪过程是双向的，每个位置都能看到 block 内所有其他位置</td></tr>
+<tr><td>target_hidden 怎么获得？</td><td>目标模型 forward 时启用 <code>output_hidden_states=True</code>，取指定层的 hidden states 拼接</td></tr>
+<tr><td>Draft model 有 embedding 层吗？</td><td>❌ 没有。直接接收目标模型的 <code>embed_tokens</code> 输出作为 <code>noise_embedding</code></td></tr>
+<tr><td>Draft model 有 lm_head 吗？</td><td>❌ 没有。使用目标模型的 <code>lm_head</code> 将 draft hidden states 映射到 vocab logits</td></tr>
+<tr><td>mask_token_id 的作用？</td><td>扩散过程的初始状态 — block 位置用 mask token 填充，然后 draft model 去噪</td></tr>
+<tr><td>fc 层的作用？</td><td>将 5 个目标层的 hidden states 拼接后（12800维）降维到 2560 维</td></tr>
+<tr><td>新版为什么不需要 utils.py？</td><td>推理循环、采样、特征抽取全部由 vLLM/SGLang 框架负责</td></tr>
+<tr><td>两个版本的模型权重兼容吗？</td><td>❌ 不兼容。不同的目标模型（Qwen3.5 vs Qwen3）、不同的 vocab/token IDs</td></tr>
+<tr><td>参数量？</td><td>约 519M (~0.5B)，约为目标模型的 13%</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<!-- APPENDIX A: DFlash Original Qwen3-4B-DFlash-b16 Deep Analysis -->
+<!-- ============================================================ -->
+
+<h1 style="margin-top:4rem;">📖 附录 A：Qwen3-4B-DFlash-b16 原始代码深度解析</h1>
+
+<p style="color:var(--text-muted);margin-bottom:1.5rem;">
+模型：<code>z-lab/Qwen3-4B-DFlash-b16</code> — 基于块扩散的推测解码草稿模型<br>
+文件：<code>config.json</code>, <code>utils.py</code>, <code>dflash.py</code>, <code>modeling_dflash.py</code>
+</p>
+
+<!-- ===== A-1 ===== -->
+<h2 id="a-overview">A.1 项目总览与架构概述</h2>
+
+<div class="card blue">
+<h3>DFlash 是什么？</h3>
+<p><strong>DFlash</strong> 是一种新型<em>推测解码（Speculative Decoding）</em>方法，使用轻量级的<em>块扩散（Block Diffusion）</em>模型作为草稿模型（drafter），与大型目标模型（如 Qwen3-4B）配合实现推理加速。</p>
+<p>核心创新：草稿模型不是传统的自回归小模型，而是一个<strong>并行扩散</strong>模型——它能一次性并行地草拟 block_size 个 token（本配置为 16），而非逐个生成。</p>
+</div>
+
+<h3>文件结构</h3>
+<table>
+<tr><th>文件</th><th>角色</th><th>代码量</th></tr>
+<tr><td><span class="badge badge-file">config.json</span></td><td>模型超参数和 DFlash 特有配置</td><td>52 行</td></tr>
+<tr><td><span class="badge badge-file">utils.py</span></td><td>工具函数：目标层 ID 构建、特征提取、采样、数据集加载</td><td>~120 行</td></tr>
+<tr><td><span class="badge badge-file">dflash.py</span></td><td>HuggingFace AutoModel 入口模型。从 utils.py 导入工具函数。</td><td>~280 行</td></tr>
+<tr><td><span class="badge badge-file">modeling_dflash.py</span></td><td>独立版本，所有函数内联。用于独立集成/调试。</td><td>~310 行</td></tr>
+</table>
+
+<div class="diagram">
+整体推理架构：
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    Target Model (Qwen3-4B)                  │
+  │  ┌──────────┐  ┌───────────────────┐  ┌──────────────────┐ │
+  │  │embed_tokens│  │36-layer Transformer│  │    lm_head      │ │
+  │  └─────┬─────┘  └──────┬────────────┘  └────────┬─────────┘ │
+  │        │               │                         │           │
+  │        │    hidden_states (各层)                   │           │
+  │        │    layer[1,9,17,25,33]                   │           │
+  └────────┼───────────────┼─────────────────────────┼───────────┘
+           │               │                         │
+           ▼               ▼                         ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │              DFlash Draft Model (5层)                       │
+  │                                                            │
+  │  embed_tokens ──→ noise_embedding                          │
+  │                        │                                   │
+  │  target hidden ─→ fc ─→ hidden_norm ─→ target_hidden       │
+  │  (5层concat)      (12800→2560)                             │
+  │                        │               │                   │
+  │                   ┌────┴───── KV注入 ──┘                   │
+  │                   │                                        │
+  │              5层 DFlash Decoder                             │
+  │              (双向注意力 is_causal=False)                    │
+  │                   │                                        │
+  │              norm → lm_head(共享) → draft_logits            │
+  │                                                            │
+  │  一次并行草拟 block_size=16 个 token                        │
+  └────────────────────────────────────────────────────────────┘
+</div>
+
+<!-- ===== A-2 ===== -->
+<h2 id="a-config">A.2 config.json — 模型配置解析</h2>
+
+<div class="card green">
+<h3>关键配置项</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>含义</th></tr>
+<tr><td><code>architectures</code></td><td><code>["DFlashDraftModel"]</code></td><td>HuggingFace 注册的模型类名</td></tr>
+<tr><td><code>auto_map.AutoModel</code></td><td><code>"dflash.DFlashDraftModel"</code></td><td>AutoModel.from_pretrained 时加载 dflash.py 中的类</td></tr>
+<tr><td><code>block_size</code></td><td><code>16</code></td><td>每次并行草拟的 token 数（扩散步数=1，并行度=16）</td></tr>
+<tr><td><code>num_hidden_layers</code></td><td><code>5</code></td><td>草稿模型只有 5 层 Transformer</td></tr>
+<tr><td><code>num_target_layers</code></td><td><code>36</code></td><td>目标模型（Qwen3-4B）的层数</td></tr>
+<tr><td><code>hidden_size</code></td><td><code>2560</code></td><td>与 Qwen3-4B 相同，<strong>共享嵌入和 LM head</strong></td></tr>
+<tr><td><code>num_attention_heads</code></td><td><code>32</code></td><td>注意力头数</td></tr>
+<tr><td><code>num_key_value_heads</code></td><td><code>8</code></td><td>GQA：32 查询头，8 KV 头（4:1 比率）</td></tr>
+<tr><td><code>head_dim</code></td><td><code>128</code></td><td>每头维度</td></tr>
+<tr><td><code>tie_word_embeddings</code></td><td><code>true</code></td><td>嵌入层和 LM head 共享权重</td></tr>
+</table>
+</div>
+
+<div class="card yellow">
+<h3>dflash_config 专有配置</h3>
+<pre>
+<span class="str">"dflash_config"</span>: {
+  <span class="str">"mask_token_id"</span>: <span class="num">151669</span>,        <span class="cm">// 用于填充未生成位置的掩码 token</span>
+  <span class="str">"target_layer_ids"</span>: [<span class="num">1, 9, 17, 25, 33</span>]  <span class="cm">// 从目标模型提取隐藏状态的层索引</span>
+}
+</pre>
+<p><strong>target_layer_ids = [1, 9, 17, 25, 33]</strong> — 这 5 个层均匀分布在 36 层目标模型中，每隔约 8 层采样一次。5 层的 hidden_states 被 concat 后（5 × 2560 = 12800 维）通过 FC 压缩回 2560 维注入草稿模型。</p>
+</div>
+
+<!-- ===== A-3 ===== -->
+<h2 id="a-utils">A.3 utils.py — 工具函数</h2>
+
+<h3>A.3.1 <span class="badge badge-func">build_target_layer_ids</span></h3>
+<div class="card">
+<pre>
+<span class="kw">def</span> <span class="fn">build_target_layer_ids</span>(num_target_layers: <span class="cls">int</span>, num_draft_layers: <span class="cls">int</span>):
+    <span class="kw">if</span> num_draft_layers == <span class="num">1</span>:
+        <span class="kw">return</span> [(num_target_layers // <span class="num">2</span>)]         <span class="cm"># 只1层时取中间层</span>
+    start = <span class="num">1</span>                                    <span class="cm"># 从第1层开始</span>
+    end = num_target_layers - <span class="num">3</span>                   <span class="cm"># 到倒数第3层（36-3=33）</span>
+    span = end - start                              <span class="cm"># 有效范围 = 32</span>
+    target_layer_ids = [
+        <span class="fn">int</span>(<span class="fn">round</span>(start + (i * span) / (num_draft_layers - <span class="num">1</span>)))
+        <span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(num_draft_layers)
+    ]
+    <span class="kw">return</span> target_layer_ids
+</pre>
+<p><strong>算法：</strong>在 [1, num_target_layers-3] 范围内均匀采样 num_draft_layers 个点。跳过第 0 层（太浅）和最后 2 层（太特化），均匀分布捕获<strong>不同抽象层级</strong>的特征。</p>
+</div>
+
+<h3>A.3.2 <span class="badge badge-func">extract_context_feature</span></h3>
+<div class="card">
+<pre>
+<span class="kw">def</span> <span class="fn">extract_context_feature</span>(
+    hidden_states: <span class="cls">list</span>[torch.Tensor],   <span class="cm"># target 模型输出的所有层 hidden_states</span>
+    layer_ids: <span class="cls">Optional</span>[<span class="cls">list</span>[<span class="cls">int</span>]],      <span class="cm"># [1, 9, 17, 25, 33]</span>
+) -> torch.Tensor:
+    offset = <span class="num">1</span>                              <span class="cm"># HF hidden_states[0] 是 embedding 输出</span>
+    selected_states = []
+    <span class="kw">for</span> layer_id <span class="kw">in</span> layer_ids:
+        selected_states.append(hidden_states[layer_id + offset])
+    target_hidden = torch.cat(selected_states, dim=<span class="num">-1</span>)  <span class="cm"># [B, S, 5×2560] = [B, S, 12800]</span>
+    <span class="kw">return</span> target_hidden
+</pre>
+<p><strong>关键细节：</strong><code>offset=1</code> 因为 HuggingFace 的 <code>output.hidden_states[0]</code> 是 embedding 层输出，<code>[1]</code> 才是第 0 层 Transformer 输出。</p>
+</div>
+
+<h3>A.3.3 <span class="badge badge-func">sample</span></h3>
+<div class="card">
+<pre>
+<span class="kw">def</span> <span class="fn">sample</span>(logits, temperature=<span class="num">0.0</span>):
+    <span class="kw">if</span> temperature < <span class="num">1e-5</span>: <span class="kw">return</span> torch.argmax(logits, dim=<span class="num">-1</span>)  <span class="cm"># 贪心</span>
+    logits = logits / temperature
+    probs = torch.softmax(logits.view(<span class="num">-1</span>, vocab_size), dim=<span class="num">-1</span>)
+    <span class="kw">return</span> torch.multinomial(probs, num_samples=<span class="num">1</span>).view(bsz, seq_len)
+</pre>
+</div>
+
+<!-- ===== A-4 ===== -->
+<h2 id="a-dflash">A.4 dflash.py — 核心模型</h2>
+
+<h3>A.4.1 <span class="badge badge-class">Qwen3DFlashAttention</span> — KV 注入注意力</h3>
+<div class="card purple">
+<ul>
+  <li><code>is_causal = False</code> — 双向注意力，允许块内所有 token 互相看到</li>
+  <li>Q 来自 draft hidden_states，K/V 来自 <strong>target_hidden ⊕ draft hidden_states 拼接</strong></li>
+  <li>QKNorm（Qwen3 风格 RMSNorm）+ GQA（32 Q 头，8 KV 头）</li>
+</ul>
+</div>
+
+<h3>A.4.2 <span class="badge badge-class">Qwen3DFlashDecoderLayer</span></h3>
+<div class="card">
+<pre>
+<span class="kw">class</span> <span class="cls">Qwen3DFlashDecoderLayer</span>:
+    self.self_attn = <span class="cls">Qwen3DFlashAttention</span>(config, layer_idx)
+    self.mlp = <span class="cls">Qwen3MLP</span>(config)                    <span class="cm"># 直接复用 Qwen3 的 MLP</span>
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, target_hidden, hidden_states, ...):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, target_hidden=target_hidden)
+        hidden_states = residual + hidden_states           <span class="cm"># 残差</span>
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states) + residual
+        <span class="kw">return</span> hidden_states
+</pre>
+</div>
+
+<h3>A.4.3 <span class="badge badge-class">DFlashDraftModel</span> — 主类</h3>
+<div class="card green">
+<pre>
+<span class="kw">class</span> <span class="cls">DFlashDraftModel</span>(<span class="cls">Qwen3PreTrainedModel</span>):
+    self.layers = nn.ModuleList([...])             <span class="cm"># 5 层 DFlash 解码层</span>
+    self.fc = nn.Linear(<span class="num">12800</span>, <span class="num">2560</span>, bias=<span class="kw">False</span>)  <span class="cm"># 5层concat→压缩</span>
+    self.hidden_norm = <span class="cls">Qwen3RMSNorm</span>(...)            <span class="cm"># 压缩后归一化</span>
+    self.block_size = <span class="num">16</span>; self.mask_token_id = <span class="num">151669</span>
+</pre>
+<p><strong>DFlash 没有自己的 embed_tokens / lm_head</strong>，共享目标模型的。减少参数并保证词汇空间一致。</p>
+</div>
+
+<!-- ===== A-5 ===== -->
+<h2 id="a-attention">A.5 KV 注入注意力机制详解</h2>
+
+<div class="card purple">
+<div class="diagram">
+传统自回归注意力：             DFlash KV 注入注意力：
+  Q = proj(hidden)              Q = proj(draft_hidden)           ← 只来自草稿
+  K = proj(hidden)              K = proj(target_hidden) ⊕ proj(draft_hidden)  ← 拼接！
+  V = proj(hidden)              V = proj(target_hidden) ⊕ proj(draft_hidden)  ← 拼接！
+  因果掩码 (causal)             非因果 (is_causal=False)          ← 双向！
+</div>
+</div>
+
+<div class="card">
+<h3>forward() 关键步骤</h3>
+<pre>
+<span class="cm"># hidden_states: [B, 16, 2560] — draft    target_hidden: [B, ctx_len, 2560]</span>
+q = self.q_norm(self.q_proj(hidden_states))  <span class="cm"># [B, 32, 16, 128]</span>
+
+k_ctx = self.k_proj(target_hidden)           <span class="cm"># [B, ctx_len, 8*128]</span>
+k_noise = self.k_proj(hidden_states)         <span class="cm"># [B, 16, 8*128]</span>
+k = torch.cat([k_ctx, k_noise], dim=<span class="num">1</span>)      <span class="cm"># [B, ctx_len+16, 8*128]  ← 序列维拼接</span>
+v = torch.cat([v_ctx, v_noise], dim=<span class="num">1</span>)      <span class="cm"># 同理</span>
+<span class="cm"># → attention(Q, K, V, is_causal=False)  每个draft token attend to ALL</span>
+</pre>
+</div>
+
+<div class="card orange">
+<h3>设计原理</h3>
+<ol>
+  <li><strong>KV 注入</strong>：草稿模型直接看到目标模型中间层特征 — target→draft 信息通道</li>
+  <li><strong>非因果</strong>：扩散模型并行去噪，块内所有位置需互相可见</li>
+  <li><strong>拼接式混合注意力</strong>：交叉注意力+自注意力通过 K/V 拼接实现，比独立双注意力更高效</li>
+</ol>
+</div>
+
+<div class="diagram">
+注意力矩阵 (block_size=4, ctx_len=1)：
+          ┌──────────────────────────┐
+          │  t₀   d₀   d₁   d₂   d₃│
+    d₀    │  ✓    ✓    ✓    ✓    ✓  │
+    d₁    │  ✓    ✓    ✓    ✓    ✓  │  ← 全1掩码 (双向+交叉)
+    d₂    │  ✓    ✓    ✓    ✓    ✓  │
+    d₃    │  ✓    ✓    ✓    ✓    ✓  │
+          └──────────────────────────┘
+</div>
+
+<!-- ===== A-6 ===== -->
+<h2 id="a-inference">A.6 推测解码推理流程</h2>
+
+<h3>A.6.1 Prefill</h3>
+<div class="card blue">
+<pre>
+output = target(input_ids, logits_to_keep=<span class="num">1</span>, output_hidden_states=<span class="kw">True</span>)
+output_ids[:, num_input_tokens] = sample(output.logits, temperature)
+target_hidden = extract_context_feature(output.hidden_states, target_layer_ids)
+</pre>
+</div>
+
+<h3>A.6.2 解码循环 (Draft → Verify → Accept)</h3>
+<div class="card green">
+<pre>
+<span class="kw">while</span> start < max_length:
+    <span class="cm">## ═══ Phase 1: Draft ═══</span>
+    noise_embedding = target.model.embed_tokens(block_output_ids)  <span class="cm"># 共享embed</span>
+    draft_hidden = self(target_hidden, noise_embedding, is_causal=<span class="kw">False</span>)
+    draft_logits = target.lm_head(draft_hidden[:, -block_size+<span class="num">1</span>:])  <span class="cm"># 共享lm_head</span>
+    block_output_ids[:, <span class="num">1</span>:] = sample(draft_logits)
+
+    <span class="cm">## ═══ Phase 2: Verify ═══</span>
+    output = target(block_output_ids, output_hidden_states=<span class="kw">True</span>)
+    posterior = sample(output.logits, temperature)
+
+    <span class="cm">## ═══ Phase 3: Accept ═══</span>
+    acceptance_length = (block_output_ids[:, <span class="num">1</span>:] == posterior[:, :-<span class="num">1</span>]).cumprod(<span class="num">1</span>).sum(<span class="num">1</span>)
+    start += acceptance_length + <span class="num">1</span>
+</pre>
+</div>
+
+<div class="card yellow">
+<h3>接受长度计算</h3>
+<pre>
+draft  = [A, B, C, D, ...]    target = [A, B, C, X, ...]
+比较    = [T, T, T, F, ...]   cumprod = [1, 1, 1, 0, ...] → sum = <span class="num">3</span>
+→ 接受 3 个 draft token + 1 个 target 修正 = <strong>一轮产生 4 个 token</strong>
+</pre>
+<p><strong>无损保证：</strong>输出与纯目标模型完全一致（temperature=0）。</p>
+</div>
+
+<h3>A.6.3 推理时间线</h3>
+<div class="diagram">
+Prefill:
+  Target: [input_ids] ─────────→ token₀ + hidden_states
+Round 1:
+  Draft:  [token₀, mask×15] ─→ [t₁..t₁₅]  (并行！)
+  Target: [token₀, t₁..t₁₅] ─→ verify → accept 8 tokens
+Round 2:
+  Draft:  [token₈, mask×15] ─→ [t₉..t₂₃]
+  Target: verify → accept 6 tokens
+  ... 循环直到完成 ...
+</div>
+
+<!-- ===== A-7 ===== -->
+<h2 id="a-diff">A.7 dflash.py vs modeling_dflash.py 差异</h2>
+
+<table>
+<tr><th>差异点</th><th>dflash.py</th><th>modeling_dflash.py</th></tr>
+<tr><td>工具函数</td><td>从 <code>.utils</code> 导入</td><td>全部内联</td></tr>
+<tr><td>target_layer_ids</td><td>优先读 config，fallback 计算</td><td>总是自动计算</td></tr>
+<tr><td>mask_token_id</td><td>从 config 读取</td><td>作为参数传入</td></tr>
+<tr><td>使用场景</td><td>HuggingFace AutoModel</td><td>独立集成 (vLLM/SGLang)</td></tr>
+</table>
+
+<!-- ===== A-8 ===== -->
+<h2 id="a-summary">A.8 总结与关键洞察</h2>
+
+<div class="card blue">
+<h3>DFlash 设计精髓</h3>
+<table>
+<tr><th>设计决策</th><th>原因与效果</th></tr>
+<tr><td><strong>块扩散而非自回归 draft</strong></td><td>一次并行草拟 16 个 token，扩散 1 步完成</td></tr>
+<tr><td><strong>KV 注入</strong></td><td>将目标模型中间层特征拼入 K/V，利用已计算的语义表示</td></tr>
+<tr><td><strong>共享 embed + lm_head</strong></td><td>减少参数、保证词汇空间一致</td></tr>
+<tr><td><strong>5 层 Transformer</strong></td><td>~530M 参数 (目标的 13%)，计算量约 1/7</td></tr>
+<tr><td><strong>is_causal=False</strong></td><td>扩散要求块内并行去噪，位置互相可见</td></tr>
+<tr><td><strong>5 层特征 concat+FC</strong></td><td>12800d→2560d，捕获浅层语法到深层推理的多层次语义</td></tr>
+<tr><td><strong>cumprod 验证</strong></td><td>标准推测解码，<strong>无损</strong>保证</td></tr>
+</table>
+</div>
+
+<div class="card green">
+<h3>参数量分析</h3>
+<table>
+<tr><th>组件</th><th>参数量</th></tr>
+<tr><td>FC (12800→2560)</td><td>32.8M</td></tr>
+<tr><td>5 层 Decoder</td><td>~500M</td></tr>
+<tr><td><strong>总计（不含共享权重）</strong></td><td><strong>~530M</strong> (vs 目标 4B = 13%)</td></tr>
+</table>
+</div>
+
+<div class="card red">
+<h3>推理开销</h3>
+<p>每轮：1× Draft forward (5层, seq=16) + 1× lm_head + 1× Target forward (36层, seq=16, KV cache)。</p>
+<p>如平均接受 τ≈6-8 token/轮，有效加速约 <strong>3-4×</strong>。</p>
+</div>
+
+<div class="card">
+<h3>OpenVINO 集成路径</h3>
+<ul>
+  <li><strong>Target</strong>：标准 Qwen3-4B，已有 IR 支持</li>
+  <li><strong>Draft</strong> 需导出为独立 IR：输入 noise_embedding + target_hidden + position_ids</li>
+  <li><strong>挑战</strong>：KV 注入注意力需 SDPA 支持非因果+异构序列长度</li>
+  <li><strong>共享</strong>：embed_tokens / lm_head 需在两个 IR 间共享</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<!-- APPENDIX B: Qwen3-4B vs Qwen3-Omni-4B Architecture Analysis -->
+<!-- ============================================================ -->
+
+<h1 style="margin-top:4rem;">🏗️ 附录 B：Qwen3-4B vs Qwen3-Omni-4B 架构差异深度分析</h1>
+
+<p style="color:var(--text-muted);margin-bottom:1.5rem;">
+模型路径：<code>C:\work\models\Qwen3-4B</code> &amp; <code>C:\work\models\Qwen3-Omni-4B-Instruct-multilingual</code><br>
+源代码：<code>transformers-internal-q3o-dense (transformers 4.57.0.dev0)</code>
+</p>
+
+<!-- ===== Section 13 ===== -->
+<h2>13. 架构总览：Qwen3-4B vs Qwen3-Omni-4B</h2>
+
+<div class="card">
+<h3>13.1 模型定位对比</h3>
+<table>
+<tr><th>属性</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B</th></tr>
+<tr><td>架构标识</td><td><code>Qwen3ForCausalLM</code></td><td><code>Qwen3OmniForConditionalGeneration</code></td></tr>
+<tr><td>model_type</td><td><code>qwen3</code></td><td><code>qwen3_omni</code></td></tr>
+<tr><td>模态支持</td><td>纯文本</td><td>文本 + 音频 + 图像 + 视频 → 文本 + 语音</td></tr>
+<tr><td>模型总大小</td><td>~8.0 GB (bf16)</td><td>~12.9 GB (bf16)</td></tr>
+<tr><td>transformers 版本</td><td>4.51.0</td><td>4.57.0.dev0 (需特定内部版本)</td></tr>
+<tr><td>组件数量</td><td>1 (单一 Transformer)</td><td>3 (Thinker + Talker + Code2Wav)</td></tr>
+<tr><td>权重文件</td><td>3 个 safetensors</td><td>4 个 safetensors</td></tr>
+<tr><td>张量数量</td><td>~253</td><td>~1910 (thinker:1275 + talker:405 + code2wav:230)</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h3>13.2 三组件架构图</h3>
+
+<!-- ── Inputs row ── -->
+<div style="display:flex;justify-content:center;gap:18px;margin-bottom:6px;flex-wrap:wrap;">
+  <div style="background:#1a2636;border:1px solid #30506a;border-radius:8px;padding:8px 18px;text-align:center;color:#79c0ff;font-size:.82rem;">🎤 音频 (16 kHz)</div>
+  <div style="background:#1a2636;border:1px solid #30506a;border-radius:8px;padding:8px 18px;text-align:center;color:#79c0ff;font-size:.82rem;">🖼️ 图像 / 🎬 视频</div>
+  <div style="background:#1a2636;border:1px solid #30506a;border-radius:8px;padding:8px 18px;text-align:center;color:#79c0ff;font-size:.82rem;">📝 文本 Prompt</div>
+</div>
+<div style="text-align:center;color:var(--text-muted);font-size:1.1rem;line-height:1;">▼ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ▼ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ▼</div>
+
+<!-- ── THINKER ── -->
+<div style="border:2px solid #3fb950;border-radius:12px;padding:16px 14px 12px;margin:10px 0;background:linear-gradient(135deg,#0d1f17,#111b22);">
+  <div style="text-align:center;font-size:1.1rem;font-weight:700;color:#3fb950;margin-bottom:12px;letter-spacing:.5px;">
+    THINKER &nbsp;—&nbsp; 多模态理解 &nbsp;<span style="font-weight:400;font-size:.8rem;color:#8b949e;">( ~5.1B params )</span>
+  </div>
+  <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+    <!-- Audio Encoder -->
+    <div style="flex:1;min-width:180px;max-width:240px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;">
+      <div style="color:#ffa657;font-weight:600;font-size:.88rem;margin-bottom:6px;">Audio Encoder</div>
+      <div style="font-size:.78rem;color:#c9d1d9;line-height:1.55;">
+        Whisper-style 32 层<br>
+        128 mel → Conv↓×3 → 1280d<br>
+        → Linear proj → <b>2560d</b><br>
+        <span style="color:#8b949e;">chunk window = 50/200</span>
+      </div>
+    </div>
+    <!-- Vision Encoder -->
+    <div style="flex:1;min-width:180px;max-width:240px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;">
+      <div style="color:#ffa657;font-weight:600;font-size:.88rem;margin-bottom:6px;">Vision Encoder</div>
+      <div style="font-size:.78rem;color:#c9d1d9;line-height:1.55;">
+        ViT 27 层 · 1152d · 16 头<br>
+        Patch 16×16 · temporal 2<br>
+        DeepStack @ L8/16/24<br>
+        merger → <b>2560d</b><br>
+        <span style="color:#8b949e;">2D RoPE + abs pos embed</span>
+      </div>
+    </div>
+    <!-- Text Decoder -->
+    <div style="flex:1.5;min-width:230px;max-width:340px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;position:relative;">
+      <div style="color:#ffa657;font-weight:600;font-size:.88rem;margin-bottom:6px;">Text Decoder <span style="color:#8b949e;font-weight:400;font-size:.75rem;">(≈ Qwen3-4B)</span></div>
+      <div style="font-size:.78rem;color:#c9d1d9;line-height:1.55;">
+        <b>36 层</b> · hidden <b>2560</b> · MLP 9728<br>
+        32 heads / 8 KV (GQA 4:1) · head 128<br>
+        <b>3D MRoPE</b> [24,20,20] interleaved<br>
+        Q/K Norm · SwiGLU · RMSNorm<br>
+        lm_head → vocab <b>151936</b>
+      </div>
+      <div style="position:absolute;right:8px;bottom:6px;font-size:.65rem;color:#3fb950;background:#0d1f17;padding:2px 6px;border-radius:4px;border:1px solid #3fb95055;">tie_embed</div>
+    </div>
+  </div>
+  <!-- fusion arrows -->
+  <div style="display:flex;align-items:center;justify-content:center;margin:10px 0 2px;gap:6px;">
+    <div style="flex:1;max-width:200px;height:1px;background:linear-gradient(90deg,transparent,#ffa657);"></div>
+    <div style="font-size:.75rem;color:#ffa657;white-space:nowrap;">masked_scatter 融合到 text embeddings</div>
+    <div style="flex:1;max-width:200px;height:1px;background:linear-gradient(90deg,#ffa657,transparent);"></div>
+  </div>
+</div>
+
+<!-- ── Arrow: Thinker → Talker ── -->
+<div style="text-align:center;margin:2px 0;">
+  <div style="display:inline-block;background:#1a2636;border:1px solid #30506a;border-radius:20px;padding:4px 16px;font-size:.76rem;color:#58a6ff;">
+    hidden_states @ <b>layer 14</b> &nbsp;+&nbsp; text embeddings
+  </div>
+  <div style="font-size:1.4rem;color:#58a6ff;line-height:1.1;">⬇</div>
+</div>
+
+<!-- ── TALKER ── -->
+<div style="border:2px solid #d2a8ff;border-radius:12px;padding:16px 14px 12px;margin:4px 0;background:linear-gradient(135deg,#1a1528,#151b22);">
+  <div style="text-align:center;font-size:1.1rem;font-weight:700;color:#d2a8ff;margin-bottom:12px;letter-spacing:.5px;">
+    TALKER &nbsp;—&nbsp; 语音编码生成 &nbsp;<span style="font-weight:400;font-size:.8rem;color:#8b949e;">( ~582M params )</span>
+  </div>
+  <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+    <!-- Projections -->
+    <div style="flex:0 0 160px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;display:flex;flex-direction:column;justify-content:center;">
+      <div style="color:#ff7b72;font-weight:600;font-size:.84rem;margin-bottom:6px;">Projections</div>
+      <div style="font-size:.76rem;color:#c9d1d9;line-height:1.6;">
+        <code style="font-size:.72rem;background:#0d1117;padding:1px 4px;border-radius:3px;">text_proj</code><br>
+        <code style="font-size:.72rem;background:#0d1117;padding:1px 4px;border-radius:3px;">hidden_proj</code><br>
+        2560d → 1024d<br>
+        <span style="color:#8b949e;">Linear+GELU+Linear</span>
+      </div>
+    </div>
+    <!-- Talker Text Decoder -->
+    <div style="flex:1;min-width:200px;max-width:280px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;">
+      <div style="color:#ff7b72;font-weight:600;font-size:.84rem;margin-bottom:6px;">Text Decoder</div>
+      <div style="font-size:.76rem;color:#c9d1d9;line-height:1.6;">
+        <b>28 层</b> · hidden <b>1024</b> · MLP 3072<br>
+        16 heads / 8 KV (GQA 2:1)<br>
+        MRoPE [24,20,20] · Q/K Norm<br>
+        codec_embedding (vocab 3072)<br>
+        codec_head → 主码本 code<sub>0</sub>
+      </div>
+    </div>
+    <!-- arrow -->
+    <div style="display:flex;align-items:center;font-size:1.3rem;color:#d2a8ff;">→</div>
+    <!-- Code Predictor -->
+    <div style="flex:1;min-width:200px;max-width:280px;background:#161b22;border:1px solid #d2a8ff55;border-radius:8px;padding:10px;">
+      <div style="color:#d2a8ff;font-weight:600;font-size:.84rem;margin-bottom:6px;">Code Predictor <span style="font-size:.7rem;font-weight:400;color:#8b949e;">(残差码本)</span></div>
+      <div style="font-size:.76rem;color:#c9d1d9;line-height:1.6;">
+        <b>5 层</b> · 1024d · 16 头 / 8 KV<br>
+        自回归生成 code<sub>1</sub> ~ code<sub>15</sub><br>
+        15 组独立 embedding + lm_head<br>
+        codebook vocab = <b>2048</b>
+      </div>
+    </div>
+  </div>
+  <!-- codec output label -->
+  <div style="text-align:center;margin-top:10px;">
+    <span style="font-size:.75rem;color:#d2a8ff;background:#1a1528;padding:2px 10px;border:1px solid #d2a8ff55;border-radius:12px;">
+      输出：16 组 acoustic codes
+    </span>
+  </div>
+</div>
+
+<!-- ── Arrow: Talker → Code2Wav ── -->
+<div style="text-align:center;margin:2px 0;">
+  <div style="display:inline-block;background:#1a2636;border:1px solid #30506a;border-radius:20px;padding:4px 16px;font-size:.76rem;color:#58a6ff;">
+    16-codebook codes &nbsp;[batch, 16, T]
+  </div>
+  <div style="font-size:1.4rem;color:#58a6ff;line-height:1.1;">⬇</div>
+</div>
+
+<!-- ── CODE2WAV ── -->
+<div style="border:2px solid #ffa657;border-radius:12px;padding:16px 14px 12px;margin:4px 0;background:linear-gradient(135deg,#1f1a0d,#1b1911);">
+  <div style="text-align:center;font-size:1.1rem;font-weight:700;color:#ffa657;margin-bottom:12px;letter-spacing:.5px;">
+    CODE2WAV &nbsp;—&nbsp; 声码器 &nbsp;<span style="font-weight:400;font-size:.8rem;color:#8b949e;">( ~380M params )</span>
+  </div>
+  <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;align-items:stretch;">
+    <!-- Code Embedding -->
+    <div style="flex:0 0 120px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;display:flex;flex-direction:column;justify-content:center;text-align:center;">
+      <div style="color:#79c0ff;font-weight:600;font-size:.82rem;margin-bottom:4px;">Code Embed</div>
+      <div style="font-size:.74rem;color:#c9d1d9;">16 codebooks<br>sum → 1024d</div>
+    </div>
+    <div style="display:flex;align-items:center;font-size:1.2rem;color:#ffa657;">→</div>
+    <!-- Transformer -->
+    <div style="flex:1;min-width:160px;max-width:220px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;">
+      <div style="color:#79c0ff;font-weight:600;font-size:.82rem;margin-bottom:4px;">Transformer</div>
+      <div style="font-size:.74rem;color:#c9d1d9;line-height:1.55;">
+        <b>8 层</b> · 1024d<br>
+        16 头 MHA (非 GQA)<br>
+        <span style="color:#ffa657;font-weight:600;">滑动窗口 = 72</span><br>
+        RoPE θ = 10K
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;font-size:1.2rem;color:#ffa657;">→</div>
+    <!-- ConvNeXt Upsample -->
+    <div style="flex:0 0 100px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;text-align:center;display:flex;flex-direction:column;justify-content:center;">
+      <div style="color:#79c0ff;font-weight:600;font-size:.82rem;margin-bottom:4px;">ConvNeXt</div>
+      <div style="font-size:.74rem;color:#c9d1d9;">×2 → ×2<br><b>= ×4</b></div>
+    </div>
+    <div style="display:flex;align-items:center;font-size:1.2rem;color:#ffa657;">→</div>
+    <!-- Cascade Decoder -->
+    <div style="flex:1;min-width:180px;max-width:260px;background:#161b22;border:1px solid #ffa65755;border-radius:8px;padding:10px;">
+      <div style="color:#ffa657;font-weight:600;font-size:.82rem;margin-bottom:4px;">级联上采样</div>
+      <div style="font-size:.74rem;color:#c9d1d9;line-height:1.55;">
+        TransposedConv + SnakeBeta<br>
+        ×8 → ×5 → ×4 → ×3 = <b>×480</b><br>
+        <span style="color:#8b949e;">总计 ×4 × ×480 = </span><b style="color:#ffa657;">×1920</b>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Output ── -->
+<div style="text-align:center;margin-top:8px;">
+  <div style="font-size:1.4rem;color:#3fb950;line-height:1.1;">⬇</div>
+  <div style="display:inline-flex;gap:24px;margin-top:4px;">
+    <div style="background:#1a3a2a;border:1px solid #3fb95066;border-radius:8px;padding:8px 22px;text-align:center;color:#7ee787;font-size:.88rem;font-weight:600;">📝 文本输出</div>
+    <div style="background:#1a3a2a;border:1px solid #3fb95066;border-radius:8px;padding:8px 22px;text-align:center;color:#7ee787;font-size:.88rem;font-weight:600;">🔊 语音波形 (16kHz)</div>
+  </div>
+</div>
+</div>
+
+<!-- ===== Section 14 ===== -->
+<h2>14. Thinker 文本解码器 vs Qwen3-4B 详细对比</h2>
+
+<div class="card">
+<h3>14.1 核心参数对比</h3>
+<table>
+<tr><th>参数</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B (Thinker Text)</th><th>差异说明</th></tr>
+<tr><td>hidden_size</td><td>2560</td><td>2560</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>num_hidden_layers</td><td>36</td><td>36</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>num_attention_heads</td><td>32</td><td>32</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>num_key_value_heads</td><td>8</td><td>8</td><td style="color:var(--accent2)">✅ 相同 (GQA 4:1)</td></tr>
+<tr><td>head_dim</td><td>128</td><td>128</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>intermediate_size (MLP)</td><td>9728</td><td>9728</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>hidden_act</td><td>silu</td><td>silu</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>vocab_size</td><td>151936</td><td>151936</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>rms_norm_eps</td><td>1e-6</td><td>1e-6</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>rope_theta</td><td>1,000,000</td><td>1,000,000</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>max_position_embeddings</td><td style="color:var(--accent5)">40,960</td><td style="color:var(--accent4)">65,536</td><td style="color:var(--accent5)">⚠️ Omni 扩展了 60%</td></tr>
+<tr><td>tie_word_embeddings</td><td>true</td><td>true</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>RoPE 类型</td><td style="color:var(--accent5)">标准 1D RoPE</td><td style="color:var(--accent4)">3D MRoPE [24,20,20]</td><td style="color:var(--accent5)">⚠️ 多模态位置编码</td></tr>
+<tr><td>attention_bias</td><td>false</td><td>false</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>Q/K Normalization</td><td>✅ 有</td><td>✅ 有</td><td style="color:var(--accent2)">✅ 相同</td></tr>
+<tr><td>sliding_window</td><td>null (未启用)</td><td>N/A (未配置)</td><td style="color:var(--accent2)">✅ 均为全注意力</td></tr>
+</table>
+
+<h4>关键发现</h4>
+<p>Thinker 的文本解码器与 Qwen3-4B <strong>在层结构上完全一致</strong>（相同的 hidden_size、层数、注意力头数、MLP 尺寸）。
+唯一的结构性差异是：</p>
+<ol>
+<li><strong>RoPE 变为 3D MRoPE</strong>：将 128 维 head_dim 分割为 [24, 20, 20] 分别编码时间(T)、高度(H)、宽度(W)，使用交错排列</li>
+<li><strong>max_position_embeddings 增大到 65536</strong>：为多模态长序列预留空间</li>
+<li><strong>新增 DeepStack 视觉特征注入</strong>：在 ViT 第 8/16/24 层提取中间特征，通过 merger_list 投影后注入文本层</li>
+</ol>
+</div>
+
+<div class="card">
+<h3>14.2 层级权重结构对比</h3>
+<p>每层解码器的权重结构完全一致：</p>
+<pre style="background:var(--code-bg);color:var(--text);padding:1rem;border-radius:6px;font-size:0.85rem;">
+<span style="color:var(--accent2)">// Qwen3-4B: model.layers.{i}.*</span>
+<span style="color:var(--accent4)">// Qwen3-Omni: thinker.model.layers.{i}.*</span>
+
+├── input_layernorm.weight          <span style="color:var(--accent2)">// RMSNorm</span>
+├── self_attn.q_proj.weight         <span style="color:var(--accent2)">// [32×128, 2560] = [4096, 2560]</span>
+├── self_attn.q_norm.weight         <span style="color:var(--accent2)">// [128] per-head Q norm</span>
+├── self_attn.k_proj.weight         <span style="color:var(--accent2)">// [8×128, 2560] = [1024, 2560]</span>
+├── self_attn.k_norm.weight         <span style="color:var(--accent2)">// [128] per-head K norm</span>
+├── self_attn.v_proj.weight         <span style="color:var(--accent2)">// [1024, 2560]</span>
+├── self_attn.o_proj.weight         <span style="color:var(--accent2)">// [2560, 4096]</span>
+├── post_attention_layernorm.weight <span style="color:var(--accent2)">// RMSNorm</span>
+├── mlp.gate_proj.weight            <span style="color:var(--accent2)">// [9728, 2560] SwiGLU gate</span>
+├── mlp.up_proj.weight              <span style="color:var(--accent2)">// [9728, 2560] SwiGLU up</span>
+└── mlp.down_proj.weight            <span style="color:var(--accent2)">// [2560, 9728]</span>
+</pre>
+<p style="color:var(--accent3)">结论：Thinker 的文本解码器可以视为 Qwen3-4B 的扩展版本，核心权重结构相同，主要有增加了多模态感知能力（音频/视觉编码器 + 3D RoPE）。</p>
+</div>
+
+<!-- ===== Section 15 ===== -->
+<h2>15. 3D MRoPE 位置编码机制详解</h2>
+
+<div class="card">
+<h3>15.1 MRoPE 原理</h3>
+<p>Qwen3-4B 使用标准 1D RoPE，position_ids shape 为 <code>(batch, seq_len)</code>。<br>
+Qwen3-Omni 使用 <strong>3D Multi-dimensional RoPE (MRoPE)</strong>，position_ids shape 为 <code>(3, batch, seq_len)</code>，
+将 128 维的 head_dim 切分为三段：</p>
+
+<table>
+<tr><th>维度</th><th>用途</th><th>分配的 head_dim</th><th>频率对数</th></tr>
+<tr><td><code>mrope_section[0] = 24</code></td><td>时间维 (Temporal)</td><td>48 维 (24×2 for sin/cos)</td><td>编码视频帧顺序、音频时间步</td></tr>
+<tr><td><code>mrope_section[1] = 20</code></td><td>高度维 (Height)</td><td>40 维 (20×2)</td><td>编码图像/视频的空间高度位置</td></tr>
+<tr><td><code>mrope_section[2] = 20</code></td><td>宽度维 (Width)</td><td>40 维 (20×2)</td><td>编码图像/视频的空间宽度位置</td></tr>
+<tr><td colspan="2"><strong>总计</strong></td><td><strong>128 维</strong></td><td></td></tr>
+</table>
+
+<h4>交错排列 (mrope_interleaved = true)</h4>
+<p>频率排布从 <code>[TTT...HHH...WWW...]</code> 重排为 <code>[T,H,W,T,H,W,...]</code> 交错模式，
+这使得每个 attention head 都能同时感知三个空间维度的位置信息。</p>
+</div>
+
+<div class="card">
+<h3>15.2 不同模态的 Position ID 分配策略</h3>
+<pre style="background:var(--code-bg);color:var(--text);padding:1rem;border-radius:6px;font-size:0.85rem;">
+<span style="color:var(--accent)">纯文本 token:</span>
+  T维: [0, 1, 2, 3, ...]    H维: [0, 1, 2, 3, ...]    W维: [0, 1, 2, 3, ...]
+  <span style="color:var(--text-muted)">→ 退化为等效的 1D RoPE</span>
+
+<span style="color:var(--accent3)">图像 token (如 H=24, W=24 的 patch grid):</span>
+  T维: [t, t, t, ..., t]                    <span style="color:var(--text-muted)">// 时间维恒定</span>
+  H维: [0, 0, ..., 1, 1, ..., 23, 23, ...]  <span style="color:var(--text-muted)">// 逐行递增</span>
+  W维: [0, 1, ..., 23, 0, 1, ..., 23, ...]  <span style="color:var(--text-muted)">// 逐列递增</span>
+
+<span style="color:var(--accent4)">视频 token (如 T=3 帧, 每帧 H=12, W=12):</span>
+  T维: [0,...,0, 25,...,25, 50,...,50]       <span style="color:var(--text-muted)">// 每帧 jump = position_id_per_seconds(13) × seconds_per_chunk(2) = 26</span>
+  H维: [0,0,...,11,11,..., 0,0,...,11,11,...]<span style="color:var(--text-muted)">// 空间位置循环</span>
+  W维: [0,1,...,11, 0,1,...,11, ...]         <span style="color:var(--text-muted)">// 同上</span>
+
+<span style="color:var(--accent5)">音频 token:</span>
+  T维: [0, 1, 2, ...]                       <span style="color:var(--text-muted)">// 线性递增</span>
+  H维: [0, 0, 0, ...]                       <span style="color:var(--text-muted)">// 恒定为 0 (音频无空间维度)</span>
+  W维: [0, 0, 0, ...]                       <span style="color:var(--text-muted)">// 恒定为 0</span>
+</pre>
+<p><code>rope_deltas</code> 机制用于跟踪 prefill 与 decode 阶段之间的位置偏移，确保 KV cache 下的位置连续性。</p>
+</div>
+
+<!-- ===== Section 16 ===== -->
+<h2>16. Thinker 多模态编码器详解</h2>
+
+<div class="card">
+<h3>16.1 Audio Encoder (Whisper-style)</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>说明</th></tr>
+<tr><td>model_type</td><td><code>qwen3_omni_audio_encoder</code></td><td>基于 Whisper 架构改造</td></tr>
+<tr><td>num_mel_bins</td><td>128</td><td>梅尔频谱特征维度</td></tr>
+<tr><td>encoder_layers</td><td>32</td><td>Transformer 编码器层数</td></tr>
+<tr><td>encoder_attention_heads</td><td>20</td><td>注意力头数</td></tr>
+<tr><td>d_model</td><td>1280</td><td>Transformer 隐藏维度</td></tr>
+<tr><td>encoder_ffn_dim</td><td>5120</td><td>FFN 中间维度 (4×d_model)</td></tr>
+<tr><td>output_dim</td><td>2560</td><td>投影到 Thinker text hidden_size</td></tr>
+<tr><td>downsample_hidden_size</td><td>480</td><td>Conv 下采样中间维度</td></tr>
+<tr><td>n_window / n_window_infer</td><td>50 / 200</td><td>分块处理窗口大小 (训练/推理)</td></tr>
+<tr><td>max_source_positions</td><td>1500</td><td>最大源序列长度</td></tr>
+<tr><td>conv_chunksize</td><td>500</td><td>卷积分块大小</td></tr>
+</table>
+
+<h4>处理流水线</h4>
+<pre style="background:var(--code-bg);color:var(--text);padding:1rem;border-radius:6px;font-size:0.85rem;">
+音频输入 (16kHz, hop=160, n_fft=400)
+    ↓ WhisperFeatureExtractor → mel spectrogram [batch, 128, T]
+    ↓ Conv2D×3 下采样 (128mel → 256 → 256 → 480 → 1280d)
+    ↓ 正弦位置编码
+    ↓ 32层 Transformer Encoder (chunked attention, window=50/200)
+    ↓ LayerNorm
+    ↓ Linear projection → 2560d (匹配 Thinker text hidden_size)
+    ↓ masked_scatter → 替换 input_embeds 中的 audio_token (151675) 位置
+</pre>
+</div>
+
+<div class="card">
+<h3>16.2 Vision Encoder (ViT-style)</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>说明</th></tr>
+<tr><td>model_type</td><td><code>qwen3_omni_vision_encoder</code></td><td>类 ViT 架构</td></tr>
+<tr><td>depth</td><td>27</td><td>Vision Transformer 层数</td></tr>
+<tr><td>hidden_size</td><td>1152</td><td>ViT 隐藏维度</td></tr>
+<tr><td>num_heads</td><td>16</td><td>注意力头数</td></tr>
+<tr><td>intermediate_size</td><td>4304</td><td>MLP 中间维度</td></tr>
+<tr><td>hidden_act</td><td>gelu_pytorch_tanh</td><td>激活函数</td></tr>
+<tr><td>patch_size / spatial_patch_size</td><td>16</td><td>空间 patch 尺寸</td></tr>
+<tr><td>temporal_patch_size</td><td>2</td><td>时间 patch 尺寸 (video)</td></tr>
+<tr><td>spatial_merge_size</td><td>2</td><td>空间合并因子 (2×2 → 1)</td></tr>
+<tr><td>out_hidden_size</td><td>2560</td><td>投影到 Thinker hidden_size</td></tr>
+<tr><td>deepstack_visual_indexes</td><td>[8, 16, 24]</td><td>DeepStack 特征提取层</td></tr>
+<tr><td>num_position_embeddings</td><td>2304</td><td>最大位置嵌入数</td></tr>
+<tr><td>apply_vit_abs_pos_embed</td><td>true</td><td>使用绝对位置嵌入</td></tr>
+<tr><td>image_size</td><td>768</td><td>默认输入分辨率</td></tr>
+<tr><td>min_pixels / max_pixels</td><td>3136 / 12845056</td><td>动态分辨率范围</td></tr>
+</table>
+
+<h4>DeepStack 多尺度特征融合</h4>
+<pre style="background:var(--code-bg);color:var(--text);padding:1rem;border-radius:6px;font-size:0.85rem;">
+图像/视频输入
+    ↓ Conv3D Patch Embedding (in_channels=3, patch=16×16, temporal=2)
+    ↓ 绝对位置嵌入 + 2D 旋转位置编码
+    ↓ 27层 Vision Transformer:
+    │   ├─ Layer  8 → merger_list[0] → 1152d → 2560d  <span style="color:var(--accent3)">// 浅层特征</span>
+    │   ├─ Layer 16 → merger_list[1] → 1152d → 2560d  <span style="color:var(--accent4)">// 中层特征</span>
+    │   ├─ Layer 24 → merger_list[2] → 1152d → 2560d  <span style="color:var(--accent5)">// 深层特征</span>
+    │   └─ Layer 27 → merger (final) → 1152d → 2560d  <span style="color:var(--accent)">// 最终特征</span>
+    ↓ 4组特征通过 spatial_merge (2×2→1) + MLP 投影到 2560d
+    ↓ 注入到文本解码器的不同层 (DeepStack injection)
+</pre>
+<p><code>merger_list</code> 包含 3 个独立的 PatchMerger 模块，每个含 <code>ln_q</code> (LayerNorm) + <code>mlp</code> (2层1152→2560d)，加上最终层的 <code>merger</code>。总计 4 组投影权重。</p>
+</div>
+
+<!-- ===== Section 17 ===== -->
+<h2>17. Talker 语音生成模块详解</h2>
+
+<div class="card">
+<h3>17.1 Talker Text Decoder</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>vs Thinker Text</th></tr>
+<tr><td>vocab_size</td><td>3072</td><td style="color:var(--accent5)">≪ 151936 (专用语音 token)</td></tr>
+<tr><td>hidden_size</td><td>1024</td><td style="color:var(--accent5)">≪ 2560 (更紧凑)</td></tr>
+<tr><td>num_hidden_layers</td><td>28</td><td style="color:var(--accent5)">< 36</td></tr>
+<tr><td>num_attention_heads</td><td>16</td><td style="color:var(--accent5)">< 32</td></tr>
+<tr><td>num_key_value_heads</td><td>8</td><td style="color:var(--accent2)">相同 GQA 比例</td></tr>
+<tr><td>head_dim</td><td>128</td><td style="color:var(--accent2)">相同</td></tr>
+<tr><td>intermediate_size</td><td>3072</td><td style="color:var(--accent5)">≪ 9728</td></tr>
+<tr><td>max_position_embeddings</td><td>32768</td><td style="color:var(--accent5)">< 65536</td></tr>
+<tr><td>rope_theta</td><td>1,000,000</td><td style="color:var(--accent2)">相同</td></tr>
+<tr><td>rope_scaling</td><td>MRoPE [24,20,20] interleaved</td><td style="color:var(--accent2)">相同</td></tr>
+<tr><td>Q/K Norm</td><td>✅ 有</td><td style="color:var(--accent2)">相同</td></tr>
+</table>
+
+<h4>Thinker→Talker 投影</h4>
+<table>
+<tr><th>投影层</th><th>结构</th><th>用途</th></tr>
+<tr><td><code>text_projection</code></td><td>Linear(2560→1024, bias) + GELU + Linear(1024→1024, bias)</td><td>Thinker 的 text embeddings → Talker 维度</td></tr>
+<tr><td><code>hidden_projection</code></td><td>Linear(2560→1024, bias) + GELU + Linear(1024→1024, bias)</td><td>Thinker 的 hidden_states @ layer <code>accept_hidden_layer=14</code> → Talker 维度</td></tr>
+</table>
+<p style="color:var(--accent3)">注意：<code>accept_hidden_layer=14</code> 意味着 Talker 不等到 Thinker 的最终层输出，而是取第 14 层的中间隐藏状态，这允许 Thinker 和 Talker 之间的更早期耦合。</p>
+</div>
+
+<div class="card">
+<h3>17.2 Code Predictor (残差码本预测器)</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>说明</th></tr>
+<tr><td>num_hidden_layers</td><td>5</td><td>极轻量级（仅 5 层）</td></tr>
+<tr><td>hidden_size</td><td>1024</td><td>与 Talker 主模型匹配</td></tr>
+<tr><td>num_attention_heads</td><td>16</td><td></td></tr>
+<tr><td>num_key_value_heads</td><td>8</td><td>GQA 2:1</td></tr>
+<tr><td>vocab_size (codebook_size)</td><td>2048</td><td>每组 codebook 的词表大小</td></tr>
+<tr><td>num_code_groups</td><td>16</td><td>多码本数量（实际使用 15 组 + 1 主组）</td></tr>
+<tr><td>layer_types</td><td>[full_attention] × 5</td><td>全注意力（无滑动窗口）</td></tr>
+</table>
+
+<h4>多码本生成流程</h4>
+<pre style="background:var(--code-bg);color:var(--text);padding:1rem;border-radius:6px;font-size:0.85rem;">
+Talker Text Decoder 生成第 1 组码本 (主码本, vocab=3072)
+    ↓ codec_head: [1024 → 3072]
+    ↓ 采样得到 code_0
+    ↓
+Code Predictor 自回归生成第 2~16 组码本:
+    for group_i in 1..15:
+        codec_embedding[i](code_{i-1}) → 输入嵌入
+        ↓ 5层 Transformer 解码
+        ↓ lm_head[i]: [1024 → 2048] 
+        ↓ 采样得到 code_i
+    ↓
+所有 16 组 codes → Code2Wav
+</pre>
+</div>
+
+<div class="card">
+<h3>17.3 特殊 Token 与控制信号</h3>
+<table>
+<tr><th>Token</th><th>ID</th><th>用途</th></tr>
+<tr><td>tts_pad_token_id</td><td>151671</td><td>TTS 填充</td></tr>
+<tr><td>tts_bos_token_id</td><td>151672</td><td>TTS 序列开始</td></tr>
+<tr><td>tts_eos_token_id</td><td>151673</td><td>TTS 序列结束</td></tr>
+<tr><td>audio_start_token_id</td><td>151669</td><td>音频输入开始标记</td></tr>
+<tr><td>audio_end_token_id</td><td>151670</td><td>音频输入结束标记</td></tr>
+<tr><td>audio_token_id</td><td>151675</td><td>音频 placeholder</td></tr>
+<tr><td>codec_pad_id</td><td>2148</td><td>Codec 填充</td></tr>
+<tr><td>codec_bos_id</td><td>2149</td><td>Codec 序列开始</td></tr>
+<tr><td>codec_eos_token_id</td><td>2150</td><td>Codec 序列结束</td></tr>
+<tr><td>codec_nothink_id</td><td>2155</td><td>"不思考" 模式标记</td></tr>
+<tr><td>codec_think_bos_id</td><td>2156</td><td>"思考" 模式开始</td></tr>
+<tr><td>codec_think_eos_id</td><td>2157</td><td>"思考" 模式结束</td></tr>
+</table>
+<p>Talker 支持 <strong>7 种说话人</strong>：f245, m02, m31, f04, m36, f37, br_f019，通过 speaker_id 控制声音风格。</p>
+</div>
+
+<!-- ===== Section 18 ===== -->
+<h2>18. Code2Wav 声码器详解</h2>
+
+<div class="card">
+<h3>18.1 Transformer 预处理器</h3>
+<table>
+<tr><th>参数</th><th>值</th><th>说明</th></tr>
+<tr><td>num_hidden_layers</td><td>8</td><td></td></tr>
+<tr><td>hidden_size</td><td>1024</td><td></td></tr>
+<tr><td>num_attention_heads</td><td>16</td><td></td></tr>
+<tr><td>num_key_value_heads</td><td>16</td><td style="color:var(--accent4)">MHA（非 GQA）</td></tr>
+<tr><td>intermediate_size</td><td>3072</td><td></td></tr>
+<tr><td>sliding_window</td><td>72</td><td style="color:var(--accent4)">滑动窗口注意力</td></tr>
+<tr><td>rope_theta</td><td>10,000</td><td style="color:var(--accent5)">注意：远小于 Thinker/Talker 的 1M</td></tr>
+<tr><td>codebook_size</td><td>2048</td><td></td></tr>
+<tr><td>num_quantizers</td><td>16</td><td>残差向量量化层数</td></tr>
+<tr><td>layer_scale_initial_scale</td><td>0.01</td><td>Layer Scale 初始值</td></tr>
+</table>
+
+<h3>18.2 上采样解码器</h3>
+<table>
+<tr><th>阶段</th><th>上采样率</th><th>累计率</th><th>说明</th></tr>
+<tr><td>ConvNeXt Upsample 1</td><td>×2</td><td>×2</td><td>upsampling_ratios[0]</td></tr>
+<tr><td>ConvNeXt Upsample 2</td><td>×2</td><td>×4</td><td>upsampling_ratios[1]</td></tr>
+<tr><td>Decoder Block 1</td><td>×8</td><td>×32</td><td>TransposedConv + ResBlock + SnakeBeta</td></tr>
+<tr><td>Decoder Block 2</td><td>×5</td><td>×160</td><td>TransposedConv + ResBlock + SnakeBeta</td></tr>
+<tr><td>Decoder Block 3</td><td>×4</td><td>×640</td><td>TransposedConv + ResBlock + SnakeBeta</td></tr>
+<tr><td>Decoder Block 4</td><td>×3</td><td>×1920</td><td>TransposedConv + ResBlock + SnakeBeta</td></tr>
+<tr><td colspan="2"><strong>总上采样率</strong></td><td><strong>×1920</strong></td><td>从 codec frame → 16kHz waveform samples</td></tr>
+</table>
+
+<h4>分块解码 (chunked_decode)</h4>
+<p>为避免 OOM，Code2Wav 支持分块解码：每次处理 ~300 帧，保留 25 帧左上下文确保过渡平滑。</p>
+</div>
+
+<!-- ===== Section 19 ===== -->
+<h2>19. 推理流水线完整数据流</h2>
+
+<div class="card">
+<pre style="background:var(--code-bg);color:var(--text);padding:1.2rem;border-radius:6px;font-size:0.82rem;overflow-x:auto;">
+<span style="color:var(--accent)">═══════════════════════════════════════════════════════════════</span>
+<span style="color:var(--accent)"> Qwen3-Omni-4B 完整推理流水线 (generate())</span>
+<span style="color:var(--accent)">═══════════════════════════════════════════════════════════════</span>
+
+<span style="color:var(--accent2)">Step 1: 输入预处理 (Qwen3OmniProcessor)</span>
+  文本 → tokenizer → input_ids [batch, seq_len]
+  音频 → WhisperFeatureExtractor → mel spectrogram [batch, 128, T_audio]
+  图像 → Qwen2VLImageProcessor → pixel_values [N, C, H, W]
+  视频 → frame extraction → pixel_values_videos [N, C, T, H, W]
+
+<span style="color:var(--accent2)">Step 2: Thinker 编码与文本生成</span>
+  2a. Audio Encoder: mel [B,128,T] → Conv↓×3 → 32层Encoder → proj → [B,T',2560]
+  2b. Vision Encoder: pixels → PatchEmbed → 27层ViT → merger → [B,N',2560]
+      + DeepStack: 层8/16/24特征 → merger_list → 多尺度特征
+  2c. Text Embedding: input_ids → embed_tokens → [B,S,2560]
+  2d. 多模态融合: masked_scatter(audio_features) + masked_scatter(vision_features)
+  2e. 3D RoPE: get_rope_index() → position_ids [3,B,S]
+  2f. 36层 Transformer Decoder + lm_head → 自回归生成文本 token
+      <span style="color:var(--accent3)">同时缓存 layer-14 hidden_states 给 Talker</span>
+
+<span style="color:var(--accent2)">Step 3: Talker 生成语音编码 (if enable_audio_output)</span>
+  3a. 提取 Thinker 第14层 hidden_states
+  3b. hidden_projection: [B,S,2560] → [B,S,1024]
+  3c. text_projection: thinker_embeds → [B,S,1024]
+  3d. 构建 talker_input_embeds (按角色 system/user/assistant 分段)
+  3e. 28层 Transformer Decoder + codec_head → 主码本 code_0
+  3f. Code Predictor: 自回归生成残差码本 code_1 ~ code_15
+      每组: codec_embedding[i] → 5层Transformer → lm_head[i] → 采样
+
+<span style="color:var(--accent2)">Step 4: Code2Wav 波形合成</span>
+  4a. code_embedding: 16组codes → 求和 → [B,1024,T]
+  4b. 8层 Sliding-Window Transformer (window=72)
+  4c. ConvNeXt ×2 上采样 (×4)
+  4d. 4级 TransposedConv 上采样 (×480 = 8×5×4×3)
+  4e. → waveform [B, 1, T×1920] @ 16kHz
+
+<span style="color:var(--accent)">═══════════════════════════════════════════════════════════════</span>
+<span style="color:var(--accent)"> 输出: (thinker_text_output, talker_waveform)</span>
+<span style="color:var(--accent)">═══════════════════════════════════════════════════════════════</span>
+</pre>
+</div>
+
+<!-- ===== Section 20 ===== -->
+<h2>20. 参数量对比与估算</h2>
+
+<div class="card">
+<h3>20.1 Qwen3-4B 参数量</h3>
+<table>
+<tr><th>组件</th><th>参数量估算</th><th>计算</th></tr>
+<tr><td>embed_tokens</td><td>~389M</td><td>151936 × 2560</td></tr>
+<tr><td>36层 Decoder (每层)</td><td>~93M × 36 = 3,358M</td><td>Attn(q+k+v+o) + MLP(gate+up+down) + norms</td></tr>
+<tr><td>lm_head</td><td>tied with embed_tokens</td><td>0 (共享权重)</td></tr>
+<tr><td><strong>总计</strong></td><td><strong>~3,747M (~3.7B)</strong></td><td>实际 8.0 GB @ bf16</td></tr>
+</table>
+
+<h3>20.2 Qwen3-Omni-4B 参数量</h3>
+<table>
+<tr><th>组件</th><th>张量数</th><th>估算参数量</th><th>说明</th></tr>
+<tr><td><strong>Thinker - Text Decoder</strong></td><td>~400</td><td>~3,747M</td><td>与 Qwen3-4B 结构相同</td></tr>
+<tr><td>Thinker - Audio Encoder</td><td>~200</td><td>~637M</td><td>32层 Whisper + Conv + Proj</td></tr>
+<tr><td>Thinker - Vision Encoder</td><td>~670</td><td>~675M</td><td>27层 ViT + 4组 merger</td></tr>
+<tr><td><strong>Thinker 小计</strong></td><td>1275</td><td><strong>~5,059M</strong></td><td></td></tr>
+<tr><td>Talker - Text Decoder</td><td>~340</td><td>~480M</td><td>28层, 1024d</td></tr>
+<tr><td>Talker - Code Predictor</td><td>~55</td><td>~90M</td><td>5层, 15组 codebook heads</td></tr>
+<tr><td>Talker - Projections</td><td>~10</td><td>~12M</td><td>text_proj + hidden_proj</td></tr>
+<tr><td><strong>Talker 小计</strong></td><td>405</td><td><strong>~582M</strong></td><td></td></tr>
+<tr><td>Code2Wav</td><td>230</td><td><strong>~380M</strong></td><td>8层 Transformer + 级联上采样</td></tr>
+<tr><td colspan="2"><strong>总计</strong></td><td><strong>~6,021M (~6.0B)</strong></td><td>实际 12.9 GB @ bf16</td></tr>
+</table>
+
+<h3>20.3 新增参数量分析</h3>
+<table>
+<tr><th>相比 Qwen3-4B 新增</th><th>参数量</th><th>占比</th></tr>
+<tr><td>Audio Encoder</td><td>~637M</td><td>28%</td></tr>
+<tr><td>Vision Encoder + Mergers</td><td>~675M</td><td>30%</td></tr>
+<tr><td>Talker (全部)</td><td>~582M</td><td>26%</td></tr>
+<tr><td>Code2Wav</td><td>~380M</td><td>17%</td></tr>
+<tr><td><strong>总新增</strong></td><td><strong>~2,274M (~2.3B)</strong></td><td>100%</td></tr>
+</table>
+<p style="color:var(--accent3)">Qwen3-Omni 在 Qwen3-4B 基础上增加了约 <strong>60%</strong> 的参数量（3.7B → 6.0B），主要来自多模态编码器和语音生成模块。</p>
+</div>
+
+<!-- ===== Section 21 ===== -->
+<h2>21. 注意力机制差异总结</h2>
+
+<div class="card">
+<table>
+<tr><th>组件</th><th>注意力类型</th><th>头数</th><th>KV头</th><th>GQA比</th><th>窗口</th><th>Q/K Norm</th><th>RoPE</th></tr>
+<tr><td>Qwen3-4B Decoder</td><td>Full Causal</td><td>32</td><td>8</td><td>4:1</td><td>无</td><td>✅</td><td>1D, θ=1M</td></tr>
+<tr><td>Omni Thinker Text</td><td>Full Causal</td><td>32</td><td>8</td><td>4:1</td><td>无</td><td>✅</td><td><strong>3D MRoPE</strong>, θ=1M</td></tr>
+<tr><td>Omni Thinker Audio</td><td>Full (Encoder)</td><td>20</td><td>20</td><td>1:1 (MHA)</td><td>chunk=50/200</td><td>❌</td><td>正弦位置编码</td></tr>
+<tr><td>Omni Thinker Vision</td><td>Full</td><td>16</td><td>16</td><td>1:1 (MHA)</td><td>无</td><td>❌</td><td>2D RoPE + abs</td></tr>
+<tr><td>Omni Talker Text</td><td>Full Causal</td><td>16</td><td>8</td><td>2:1</td><td>无</td><td>✅</td><td>3D MRoPE, θ=1M</td></tr>
+<tr><td>Omni Code Predictor</td><td>Full Causal</td><td>16</td><td>8</td><td>2:1</td><td>无</td><td>✅</td><td>1D, θ=1M</td></tr>
+<tr><td>Omni Code2Wav</td><td><strong>Sliding Window</strong></td><td>16</td><td>16</td><td>1:1 (MHA)</td><td><strong>72</strong></td><td>❌</td><td>1D, θ=10K</td></tr>
+</table>
+</div>
+
+<!-- ===== Section 22 ===== -->
+<h2>22. Tokenizer 与特殊 Token 对比</h2>
+
+<div class="card">
+<table>
+<tr><th>Token</th><th>ID</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B</th></tr>
+<tr><td>&lt;|endoftext|&gt;</td><td>151643</td><td>bos_token</td><td>—</td></tr>
+<tr><td>&lt;|im_start|&gt;</td><td>151644</td><td>✅</td><td>✅ im_start_token_id</td></tr>
+<tr><td>&lt;|im_end|&gt;</td><td>151645</td><td>eos_token</td><td>✅ im_end_token_id</td></tr>
+<tr><td>&lt;|vision_start|&gt;</td><td>151652</td><td>在 tokenizer 中定义</td><td>✅ vision_start_token_id</td></tr>
+<tr><td>&lt;|vision_end|&gt;</td><td>151653</td><td>在 tokenizer 中定义</td><td>✅ vision_end_token_id</td></tr>
+<tr><td>&lt;|image_pad|&gt;</td><td>151655</td><td>在 tokenizer 中定义</td><td>✅ image_token_id</td></tr>
+<tr><td>&lt;|video_pad|&gt;</td><td>151656</td><td>在 tokenizer 中定义</td><td>✅ video_token_id</td></tr>
+<tr><td>&lt;|audio_bos|&gt;</td><td>151669</td><td>—</td><td style="color:var(--accent4)">✅ audio_start_token_id (新增)</td></tr>
+<tr><td>&lt;|audio_eos|&gt;</td><td>151670</td><td>—</td><td style="color:var(--accent4)">✅ audio_end_token_id (新增)</td></tr>
+<tr><td>&lt;|tts_pad|&gt;</td><td>151671</td><td>—</td><td style="color:var(--accent4)">✅ tts_pad_token_id (新增)</td></tr>
+<tr><td>&lt;|tts_bos|&gt;</td><td>151672</td><td>—</td><td style="color:var(--accent4)">✅ tts_bos_token_id (新增)</td></tr>
+<tr><td>&lt;|tts_eos|&gt;</td><td>151673</td><td>—</td><td style="color:var(--accent4)">✅ tts_eos_token_id (新增)</td></tr>
+<tr><td>&lt;|audio_pad|&gt;</td><td>151675</td><td>—</td><td style="color:var(--accent4)">✅ audio_token_id (新增)</td></tr>
+</table>
+<p>Qwen3-4B 的 tokenizer 中已预留了视觉相关的特殊 token（vision/image/video），但模型本身并不使用它们。
+Qwen3-Omni 额外增加了 <strong>6 个音频/TTS 相关</strong>的特殊 token (ID 151669~151675)。</p>
+</div>
+
+<!-- ===== Section 23 ===== -->
+<h2>23. Generation Config 对比</h2>
+
+<div class="card">
+<table>
+<tr><th>参数</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B</th></tr>
+<tr><td>do_sample</td><td>true</td><td>— (由 thinker 继承)</td></tr>
+<tr><td>temperature</td><td>0.6</td><td>talker_temperature: 0.9</td></tr>
+<tr><td>top_k</td><td>20</td><td>talker_top_k: 50</td></tr>
+<tr><td>top_p</td><td>0.95</td><td>talker_top_p: 1.0</td></tr>
+<tr><td>repetition_penalty</td><td>— (默认 1.0)</td><td>talker_repetition_penalty: 1.05</td></tr>
+<tr><td>max_new_tokens</td><td>— (用户指定)</td><td>talker_max_new_tokens: 4096</td></tr>
+<tr><td>eos_token_id</td><td>[151645, 151643]</td><td>— (分 thinker/talker 各自管理)</td></tr>
+</table>
+<p>Qwen3-Omni 的 generation_config 仅包含 <strong>talker 侧</strong>的参数，Thinker 侧的生成参数在运行时传入。
+Talker 使用更高的 temperature (0.9) 和更宽松的 top_k (50) 以增加语音生成的多样性。</p>
+</div>
+
+<!-- ===== Section 24 ===== -->
+<h2>24. 综合架构差异总结</h2>
+
+<div class="card">
+<table>
+<tr><th>维度</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B</th><th>影响</th></tr>
+<tr><td><strong>输入模态</strong></td><td>文本</td><td>文本 + 音频 + 图片 + 视频</td><td>全模态理解能力</td></tr>
+<tr><td><strong>输出模态</strong></td><td>文本</td><td>文本 + 语音波形</td><td>端到端语音对话</td></tr>
+<tr><td><strong>架构复杂度</strong></td><td>单一 Decoder</td><td>三组件级联 (Thinker+Talker+Code2Wav)</td><td>推理需协调三个模型</td></tr>
+<tr><td><strong>核心 LLM</strong></td><td>36 层, 2560d</td><td>36 层, 2560d (Thinker) + 28 层, 1024d (Talker)</td><td>文本核心相同，新增语音 LM</td></tr>
+<tr><td><strong>位置编码</strong></td><td>1D RoPE</td><td>3D MRoPE (文本/音频/视觉多维)</td><td>多模态位置感知</td></tr>
+<tr><td><strong>音频处理</strong></td><td>无</td><td>32 层 Whisper-style Encoder</td><td>语音理解</td></tr>
+<tr><td><strong>视觉处理</strong></td><td>无</td><td>27 层 ViT + DeepStack 4 级融合</td><td>图像/视频理解</td></tr>
+<tr><td><strong>语音合成</strong></td><td>无</td><td>16-codebook RVQ + 1920× 上采样</td><td>高质量语音输出</td></tr>
+<tr><td><strong>权重共享</strong></td><td>embed ↔ lm_head</td><td>Thinker: embed ↔ lm_head; 其余独立</td><td></td></tr>
+<tr><td><strong>模型大小</strong></td><td>~3.7B (8.0 GB)</td><td>~6.0B (12.9 GB)</td><td>增加约 60%</td></tr>
+<tr><td><strong>推理延迟</strong></td><td>单次 forward</td><td>Thinker → Talker → Code2Wav 三阶段</td><td>语音输出有额外延迟</td></tr>
+<tr><td><strong>KV Cache</strong></td><td>36 层</td><td>Thinker 36 层 + Talker 28 层 + Code2Wav 8 层</td><td>内存需求大幅增加</td></tr>
+</table>
+
+<h4>核心结论</h4>
+<ol>
+<li><strong>Thinker 文本核心 ≈ Qwen3-4B</strong>：相同的 36 层/2560d/32 头/8KV 架构，权重结构完全一致，区别仅在 3D MRoPE 和多模态融合</li>
+<li><strong>增量式设计</strong>：在 Qwen3-4B 基础上"外挂"音频/视觉编码器 + Talker + Code2Wav，核心 LLM 能力得以继承</li>
+<li><strong>Thinker-Talker 耦合点</strong>：通过第 14 层 hidden states 传递，不必等到最终层，实现早期语义到语音的映射</li>
+<li><strong>三级语音管线</strong>：语义理解(Thinker) → 声学编码(Talker, 16 codebooks) → 波形合成(Code2Wav, 1920× 上采样)</li>
+</ol>
+</div>
+
+<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
+    Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比文档
+</div>
+
+<button id="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑</button>
+<script>
+window.addEventListener('scroll', function() {
+  document.getElementById('back-to-top').style.display = window.scrollY > 400 ? 'block' : 'none';
+});
+</script>
+
 <hr style="border-color: var(--border); margin: 3rem 0 1rem;">
 <p class="meta" style="text-align: center;">
-  本文档基于 <a href="https://arxiv.org/abs/2602.06036">DFlash 论文 (arXiv:2602.06036)</a> 和
+  本文档基于 DFlash 论文技术解读、全系列代码分析及 Qwen3-Omni 架构对比。原始资料基于 <a href="https://arxiv.org/abs/2602.06036">DFlash 论文 (arXiv:2602.06036)</a> 和
   <a href="https://github.com/z-lab/dflash">开源代码</a> 整理。
   &copy; 2026 技术分析文档
 </p>
+
+
+<button id="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})">&#8593;</button>
+<script>
+window.addEventListener('scroll', function() {
+  var btn = document.getElementById('back-to-top');
+  if (btn) btn.style.display = window.scrollY > 400 ? 'block' : 'none';
+});
+</script>
 
 </body>
 </html>
