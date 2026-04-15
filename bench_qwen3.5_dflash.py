@@ -19,12 +19,12 @@ from typing import Optional
 
 
 # ── Defaults (edit for your environment) ─────────────────────────────────────
-DEFAULT_TARGET_DIR = r"C:\work\models\Qwen3.5-4B" if sys.platform == "win32" else "/work/models/Qwen3.5-4B"
-DEFAULT_DRAFT_DIR  = r"C:\work\models\Qwen3.5-4B-DFlash" if sys.platform == "win32" else "/work/models/Qwen3.5-4B-DFlash"
+DEFAULT_TARGET_DIR = r"C:\work\models\Qwen3.5-4B" if sys.platform == "win32" else "/home/xzhan34/work/models/Qwen3.5-4B"
+DEFAULT_DRAFT_DIR  = r"C:\work\models\Qwen3.5-4B-DFlash" if sys.platform == "win32" else "/home/xzhan34/work/models/Qwen3.5-4B-DFlash"
 DEFAULT_IMAGE_PATH = (
     r"C:\work\openvino_ws\openvino.liangali\docs\articles_en\assets\images\get_started_with_cpp.jpg"
     if sys.platform == "win32"
-    else "/work/openvino_ws/openvino.liangali/docs/articles_en/assets/images/get_started_with_cpp.jpg"
+    else "/home/xzhan34/work/openvino_ws/dflash_ws/openvino.genai/testdata/get_started_with_cpp.jpg"
 )
 DEFAULT_DEVICE     = "GPU"
 DEFAULT_MAX_TOKENS = 128
@@ -71,7 +71,7 @@ def setup_env(genai_dir: Path) -> dict:
             env["OPENVINO_TOKENIZERS_PATH_GENAI"] = str(tokenizers_dll)
     else:
         # Linux: adjust LD_LIBRARY_PATH if needed
-        ov_dir = Path(os.environ.get("OV_DIR", "/work/openvino_ws/openvino.liangali/build"))
+        ov_dir = Path(os.environ.get("OV_DIR", "/home/xzhan34/work/openvino_ws/dflash_ws/openvino/build"))
         lib_dirs = [
             str(ov_dir / "lib"),
             str(genai_dir / "build" / "openvino_genai"),
