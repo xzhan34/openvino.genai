@@ -337,3 +337,90 @@ add_custom_command(TARGET modeling_glm_ocr POST_BUILD
 set_target_properties(modeling_glm_ocr PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+add_executable(modeling_qwen3_omni
+    modeling_qwen3_omni.cpp
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat/load_image.cpp"
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(modeling_qwen3_omni PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(modeling_qwen3_omni PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(modeling_qwen3_omni PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(modeling_qwen3_omni openvino_genai)
+
+add_custom_command(TARGET modeling_qwen3_omni POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:modeling_qwen3_omni>"
+    VERBATIM)
+
+set_target_properties(modeling_qwen3_omni PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)
+
+# Minimal Qwen3-Omni TTS sample for case2/3/4 executable comparison
+add_executable(modeling_qwen3_omni_tts_min
+    modeling_qwen3_omni_tts_min.cpp
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat/load_image.cpp"
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(modeling_qwen3_omni_tts_min PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(modeling_qwen3_omni_tts_min PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(modeling_qwen3_omni_tts_min PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(modeling_qwen3_omni_tts_min openvino_genai)
+
+add_custom_command(TARGET modeling_qwen3_omni_tts_min POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:modeling_qwen3_omni_tts_min>"
+    VERBATIM)
+
+set_target_properties(modeling_qwen3_omni_tts_min PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)
+
+# Standalone video frame extraction tool (replaces Python extract_video_frames.py)
+find_package(OpenCV QUIET COMPONENTS videoio imgcodecs imgproc core)
+if(OpenCV_FOUND)
+    add_executable(extract_video_frames extract_video_frames.cpp)
+    target_include_directories(extract_video_frames PRIVATE
+        ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(extract_video_frames PRIVATE
+        ${OpenCV_LIBS})
+    set_target_properties(extract_video_frames PROPERTIES
+        INSTALL_RPATH_USE_LINK_PATH ON)
+    if(WIN32)
+        # Copy OpenCV DLLs next to the executable
+        foreach(_opencv_target opencv_videoio opencv_imgcodecs opencv_imgproc opencv_core)
+            if(TARGET ${_opencv_target})
+                add_custom_command(TARGET extract_video_frames POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                            "$<TARGET_FILE:${_opencv_target}>"
+                            "$<TARGET_FILE_DIR:extract_video_frames>"
+                    VERBATIM)
+            endif()
+        endforeach()
+    endif()
+else()
+    message(STATUS "OpenCV not found -- extract_video_frames tool will not be built")
+endif()

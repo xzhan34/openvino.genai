@@ -262,15 +262,24 @@ std::vector<std::pair<size_t, size_t>> dtw_and_backtrace(const std::vector<std::
     size_t i = N, j = M;
 
     while (i > 0 || j > 0) {
-        path.push_back({i - 1, j - 1});  // Store zero-indexed coordinates
+        // Python appends (i-1, j-1) before following trace direction
+        // We need to handle underflow safely since i or j might be 0
+        size_t path_i = (i > 0) ? i - 1 : 0;
+        size_t path_j = (j > 0) ? j - 1 : 0;
+        path.push_back({path_i, path_j});
         int t = trace[i][j];
         if (t == 0) {
-            i--;
-            j--;
+            OPENVINO_ASSERT(i > 0 && j > 0, "Invalid DTW trace: diagonal move at matrix boundary");
+            --i;
+            --j;
         } else if (t == 1) {
-            i--;
+            OPENVINO_ASSERT(i > 0, "Invalid DTW trace: up move at top boundary");
+            --i;
         } else if (t == 2) {
-            j--;
+            OPENVINO_ASSERT(j > 0, "Invalid DTW trace: left move at left boundary");
+            --j;
+        } else {
+            OPENVINO_THROW("Invalid DTW trace value: ", t);
         }
     }
 

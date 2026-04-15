@@ -3,10 +3,9 @@
 #
 
 file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
-file(GLOB modeling_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/tests/*.cpp")
 file(GLOB modeling_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/samples/*.cpp")
-list(REMOVE_ITEM SOURCE_FILES ${modeling_tests_src})
 list(REMOVE_ITEM SOURCE_FILES ${modeling_samples_src})
+list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/safetensors_utils/.*")
 list(APPEND SOURCE_FILES "${CMAKE_CURRENT_BINARY_DIR}/version.cpp")
 
 # Dependencies
@@ -126,7 +125,7 @@ if(ANDROID)
 endif()
 
 if(ENABLE_XGRAMMAR)
-    set(XGRAMMAR_VERSION v0.1.25)
+    set(XGRAMMAR_VERSION v0.1.31)
     set(XGRAMMAR_DIR ${CMAKE_BINARY_DIR}/xgrammar)
 
     FetchContent_Declare(
@@ -190,13 +189,9 @@ if(NOT ENABLE_GGUF)
 endif()
 
 # Safetensors support - requires ENABLE_GGUF for building_blocks
-if(NOT ENABLE_GGUF OR NOT ENABLE_SAFETENSORS)
-    set(SAFETENSORS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/hf_config.cpp
-                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_loader.cpp
-                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_modeling.cpp
-                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_source.cpp
-                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_finalizer.cpp)
-    list(REMOVE_ITEM SOURCE_FILES ${SAFETENSORS_SOURCES})
+if(ENABLE_GGUF AND ENABLE_SAFETENSORS)
+    add_subdirectory(src/safetensors_utils)
+    list(APPEND SOURCE_FILES ${SAFETENSORS_UTILS_SOURCES})
 endif()
 
 # New multi-format loaders - conditional compilation
@@ -233,6 +228,7 @@ if(ENABLE_GGUF AND ENABLE_SAFETENSORS)
     target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_SAFETENSORS)
 endif()
 
+
 target_include_directories(${TARGET_NAME_OBJ} SYSTEM PRIVATE "${safetensors.h_SOURCE_DIR}")
 
 target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime openvino::core::dev openvino::threading nlohmann_json::nlohmann_json minja)
@@ -257,7 +253,7 @@ endif()
 # Add native CPU optimization for SIMD instructions
 if (ARCH_DIR STREQUAL "intel64")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        # Force AVX2 only (disable AVX512), enable F16C for FP16 conversion intrinsics
+        # Force AVX2 + F16C (disable AVX512). F16C is needed for _mm256_cvtph_ps in rtn_quantize.hpp
         target_compile_options(${TARGET_NAME_OBJ} PRIVATE "-mavx2" "-mf16c" "-mno-avx512f")
         message(STATUS "Enable SIMD compilation for ${TARGET_NAME_OBJ}")
     elseif(MSVC)
@@ -348,7 +344,6 @@ endif()
 if(rpaths)
     set_target_properties(${TARGET_NAME} PROPERTIES INSTALL_RPATH "${rpaths}")
 endif()
-
 
 install(TARGETS ${TARGET_NAME} EXPORT OpenVINOGenAITargets
         LIBRARY DESTINATION ${LIBRARY_DESTINATION} COMPONENT core_genai

@@ -142,7 +142,7 @@ void update_npu_config_text_embedding(ov::AnyMap& config,
 }
 
 inline bool is_paged_attention_available() {
-#if defined(OPENVINO_ARCH_X86_64) || defined(OPENVINO_ARCH_ARM64)
+#if defined(OPENVINO_ARCH_X86_64) || (defined(OPENVINO_ARCH_ARM64) && defined(HAVE_SVE))
     return true;
 #else
     return false;
@@ -664,6 +664,10 @@ void trim_kv_cache(ov::InferRequest request, KVCacheState& kv_cache_state, std::
     // Try GPU-optimized in-place trim first (zero-copy buffer reinterpretation).
     // All states from the same InferRequest share one plugin, so if the first
     // KV state supports set_shape(), all of them do.
+    // NOTE: ov::VariableState::get_shape()/set_shape() requires a custom OV build
+    // with the trim_variable_state API.  When building against upstream OV that
+    // lacks these APIs, we skip straight to the CPU copy fallback below.
+#if defined(OV_HAS_VARIABLE_STATE_SET_SHAPE)
     try {
         for (auto& state : states) {
             if (adapter_controller && adapter_controller->has_state_name(state.get_name()))
@@ -702,6 +706,7 @@ void trim_kv_cache(ov::InferRequest request, KVCacheState& kv_cache_state, std::
             warned2 = true;
         }
     }
+#endif  // OV_HAS_VARIABLE_STATE_SET_SHAPE
 
     // CPU fallback: read state from device, trim on host, write back.
     for (auto& state : states) {
