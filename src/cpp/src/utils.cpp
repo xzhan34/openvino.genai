@@ -1197,6 +1197,13 @@ ov::genai::GenerationConfig get_multinomial_config() {
     return multinomial_config;
 }
 
+void clear_false_prompt_lookup_from_config(ov::AnyMap& properties) {
+    auto it = properties.find("prompt_lookup");
+    if (it != properties.end() && it->second.as<bool>() == false) {
+        properties.erase(it);
+    }
+}
+
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov
