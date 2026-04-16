@@ -84,6 +84,10 @@ struct PerfStats {
     StageStats verify_wall;
     StageStats other_wall;
     StageStats postproc_wall;
+    StageStats target_hidden_copy_wall;
+    StageStats context_kv_infer_wall;
+    StageStats context_kv_copy_wall;
+    StageStats trim_kv_wall;
 
     size_t draft_steps = 0;
     size_t accepted_tokens = 0;
@@ -778,7 +782,9 @@ int main(int argc, char* argv[]) try {
         }
     }
 
-    // Split model: context_kv always f32 (fc matmul overflow), step uses device default.
+    // Split model: context_kv and step both use draft_compile_cfg.
+    // The fc matmul overflow is fixed by input scaling in dflash_draft.cpp,
+    // so context_kv can safely use f16 inference precision.
     // Combined model (legacy): uses draft_compile_cfg.
     ov::CompiledModel compiled_draft_combined;  // only for legacy combined path
     ov::CompiledModel compiled_context_kv;      // split path
@@ -788,11 +794,9 @@ int main(int argc, char* argv[]) try {
     ov::InferRequest step_draft_request;        // split path
 
     if (use_split_draft) {
-        // context_kv: always f32 (contains the large fc matmul that overflows in f16)
-        ov::AnyMap context_kv_cfg = compile_cfg;
-        context_kv_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
-        std::cout << "[Compiling context_kv model (f32)...]" << std::endl;
-        compiled_context_kv = core.compile_model(context_kv_model, device, context_kv_cfg);
+        // context_kv: uses draft_compile_cfg (f16 on GPU, safe due to fc input scaling)
+        std::cout << "[Compiling context_kv model (" << (device.find("CPU") != std::string::npos ? "f32" : "f16") << ")...]" << std::endl;
+        compiled_context_kv = core.compile_model(context_kv_model, device, draft_compile_cfg);
         context_kv_request = compiled_context_kv.create_infer_request();
 
         // step: uses device default (f16 on GPU, f32 on CPU)
@@ -1076,13 +1080,16 @@ int main(int argc, char* argv[]) try {
         // Trim KV cache for rejected tokens
         const size_t tokens_to_trim = verify_len - num_accepted;
         if (tokens_to_trim > 0) {
+            auto trim_start = Clock::now();
             target_kv_state.num_tokens_to_trim = tokens_to_trim;
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
+            perf.trim_kv_wall.add(duration_ms(trim_start, Clock::now()));
         }
 
         // Update target_hidden if available
         if (has_target_hidden) {
+            auto th_start = Clock::now();
             ov::Tensor target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
             if (num_accepted > 0 &&
                 target_hidden_len + num_accepted <= max_length + static_cast<size_t>(dflash_cfg.block_size)) {
@@ -1092,9 +1099,11 @@ int main(int argc, char* argv[]) try {
                                      {1, target_hidden_len + num_accepted, ctx_dim});
                 src_slice.copy_to(dst_slice);
             }
+            perf.target_hidden_copy_wall.add(duration_ms(th_start, Clock::now()));
 
             // ── Update context KV cache for newly accepted tokens ────────
             if (use_split_draft && num_accepted > 0) {
+                auto ckv_start = Clock::now();
                 // Run context_kv model on the newly accepted target_hidden.
                 ov::Tensor new_ctx_hidden(target_hidden_storage,
                                           {0, target_hidden_len, 0},
@@ -1109,6 +1118,8 @@ int main(int argc, char* argv[]) try {
                 context_kv_request.set_tensor("target_hidden", new_ctx_hidden);
                 context_kv_request.set_tensor("position_ids", new_pos);
                 context_kv_request.infer();
+                perf.context_kv_infer_wall.add(duration_ms(ckv_start, Clock::now()));
+                auto ckv_copy_start = Clock::now();
                 // Append new K,V to existing cache per layer.
                 for (size_t i = 0; i < num_draft_layers; ++i) {
                     auto new_k = ensure_f32_copy(
@@ -1118,6 +1129,7 @@ int main(int argc, char* argv[]) try {
                     context_kv_cache[i].first = concat_kv_seq(context_kv_cache[i].first, new_k);
                     context_kv_cache[i].second = concat_kv_seq(context_kv_cache[i].second, new_v);
                 }
+                perf.context_kv_copy_wall.add(duration_ms(ckv_copy_start, Clock::now()));
             }
         }
         target_hidden_len += num_accepted;
@@ -1206,6 +1218,10 @@ int main(int argc, char* argv[]) try {
     print_stage_stats("target verify", perf.verify_wall);
     print_stage_stats("postproc", perf.postproc_wall);
     print_stage_stats("other (untracked)", perf.other_wall);
+    print_stage_stats("  target_hidden copy", perf.target_hidden_copy_wall);
+    print_stage_stats("  context_kv infer", perf.context_kv_infer_wall);
+    print_stage_stats("  context_kv copy+concat", perf.context_kv_copy_wall);
+    print_stage_stats("  trim_kv", perf.trim_kv_wall);
     if (!perf.accepted_per_step.empty()) {
         std::cout << "[Draft acceptance per step] [";
         for (size_t i = 0; i < perf.accepted_per_step.size(); ++i) {

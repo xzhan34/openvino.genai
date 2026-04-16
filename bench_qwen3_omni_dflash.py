@@ -83,9 +83,9 @@ def setup_env(genai_dir: Path) -> dict:
         env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
         env["OV_TOKENIZERS_LIB_PATH"] = str(genai_dir / "build" / "openvino_genai")
 
-    # Use combined draft model (no split) with f16 precision
+    # Use split draft model (context_kv + step) with f16 precision
     # (fc matmul overflow fixed: dflash_draft.cpp scales input by 1/128, RMSNorm is scale-invariant)
-    env["OV_GENAI_SPLIT_DRAFT"] = "0"
+    env["OV_GENAI_SPLIT_DRAFT"] = "1"
     env["OV_GENAI_DRAFT_PRECISION"] = "f16"
 
     return env

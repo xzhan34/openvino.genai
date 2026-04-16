@@ -246,6 +246,27 @@ target_compile_features(${TARGET_NAME_OBJ} PRIVATE cxx_std_17)
 
 target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE openvino_genai_EXPORTS)
 
+# Enable GPU zero-copy KV cache trim if VariableState::set_shape() is available.
+# This avoids expensive GPU→CPU→GPU round-trips when trimming rejected tokens.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${OpenVINO_INCLUDE_DIRS}")
+set(CMAKE_REQUIRED_LIBRARIES openvino::runtime)
+check_cxx_source_compiles("
+    #include <openvino/runtime/variable_state.hpp>
+    int main() {
+        ov::Shape s;
+        (void)&ov::VariableState::set_shape;
+        (void)&ov::VariableState::get_shape;
+        return 0;
+    }
+" OV_HAS_VARIABLE_STATE_SET_SHAPE_CHECK)
+if(OV_HAS_VARIABLE_STATE_SET_SHAPE_CHECK)
+    target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE OV_HAS_VARIABLE_STATE_SET_SHAPE)
+    message(STATUS "VariableState::set_shape() is available — GPU zero-copy KV trim enabled.")
+else()
+    message(STATUS "VariableState::set_shape() NOT available — falling back to CPU KV trim.")
+endif()
+
 # Add /bigobj flag for MSVC to handle large object files
 if(MSVC)
     target_compile_options(${TARGET_NAME_OBJ} PRIVATE "/bigobj")
