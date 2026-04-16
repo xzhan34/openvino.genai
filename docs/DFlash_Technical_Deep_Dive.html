@@ -2657,8 +2657,303 @@ Talker 使用更高的 temperature (0.9) 和更宽松的 top_k (50) 以增加语
 </ol>
 </div>
 
+
+<!-- ============================================================ -->
+<!-- APPENDIX C: Qwen3-Omni-4B DFlash Integration                -->
+<!-- ============================================================ -->
+
+<h1 style="margin-top:4rem;" id="appendix-c">🔧 附录 C：Qwen3-Omni-4B DFlash 集成：适配、错误与排障</h1>
+
+<p style="color:var(--text-muted);margin-bottom:1.5rem;">
+本附录总结了将 <strong>Qwen3-Omni-4B-Instruct-multilingual</strong> 作为目标模型集成到 DFlash 多目标基准测试
+（<code>benchmark_multi_target.py</code>）的完整过程，使用共享的 <strong>Qwen3-4B-DFlash-b16</strong> 草稿模型。<br>
+<strong>核心挑战</strong>：Qwen3-Omni-4B 需要独立 Python 环境（含自定义 transformers fork 支持 <code>Qwen3OmniForConditionalGeneration</code>），且模型架构不同于标准 <code>AutoModelForCausalLM</code>。
+</p>
+
+<!-- Section 25: Environment Setup -->
+<h2 id="sec25">25. 环境搭建：<code>qwen3-omni-4b</code> Conda 环境</h2>
+
+<h3>25.1 环境创建</h3>
+<pre><code>conda create -n qwen3-omni-4b python=3.10 pip -y</code></pre>
+<p>选择 Python 3.10，因为 <code>autoawq_kernels==0.0.9</code>（原始需求）需要 Python ≤3.12。</p>
+
+<h3>25.2 CUDA 12.4 配置</h3>
+<p>系统默认 CUDA 13.0 位于 <code>/usr/local/cuda/</code>，CUDA 12.4 位于 <code>/usr/local/cuda-12.4/</code>。PyTorch 2.6.0 需要 CUDA 12.4。</p>
+<pre><code>export CUDA_HOME=/usr/local/cuda-12.4
+export PATH=/usr/local/cuda-12.4/bin:$PATH</code></pre>
+
+<h3>25.3 网络代理</h3>
+<p>所有网络操作需要 Intel 代理：</p>
+<pre><code>export http_proxy=http://child-prc.intel.com:913
+export https_proxy=http://child-prc.intel.com:913</code></pre>
+
+<h3>25.4 软件包安装</h3>
+
+<h4>PyTorch 2.6.0+cu124</h4>
+<pre><code>pip install torch==2.6.0 torchaudio==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu124</code></pre>
+
+<h4>flash-attn 2.7.4.post1</h4>
+<div class="warn">
+<strong>错误：</strong><code>ModuleNotFoundError: No module named 'psutil'</code>（metadata 生成阶段）<br>
+<strong>修复：</strong>先安装构建依赖：
+</div>
+<pre><code>pip install psutil packaging ninja setuptools wheel
+pip install flash-attn==2.7.4.post1 --no-build-isolation</code></pre>
+<p>使用 CUDA 12.4 构建成功，约 5 分钟。</p>
+
+<h4>核心依赖</h4>
+<pre><code>pip install accelerate soundfile datasets librosa opencv-python safetensors \
+    sentencepiece qwen-omni-utils qwen-vl-utils scipy scikit-learn pandas \
+    seaborn matplotlib tabulate tensorboardX tqdm huggingface-hub tokenizers \
+    pyyaml regex requests jieba zhconv zhon</code></pre>
+
+<h4>自定义 transformers fork（Qwen3-Omni 支持）</h4>
+<pre><code>cd /media/xzhan34/data/zlab_dflash_ws/qwen3_omni_4B_final_release/\
+transformers-internal-q3o-dense-3d1a4f5e34753e51cb85052539c6ef10cab9a5c1
+pip install -e .</code></pre>
+
+<h4>DFlash 包</h4>
+<pre><code>cd /media/xzhan34/data/zlab_dflash_ws/dflash
+pip install -e .</code></pre>
+<div class="warn">
+<strong>问题：</strong><code>dflash</code> 依赖 <code>transformers&gt;=4.57</code>，安装时覆盖了自定义 fork 为 <code>transformers==4.57.1</code>。<br>
+<strong>修复：</strong>使用 <code>--no-deps</code> 重装自定义 transformers：
+</div>
+<pre><code>cd .../transformers-internal-q3o-dense-.../
+pip install -e . --no-deps</code></pre>
+
+<h3>25.5 最终环境验证</h3>
+<pre><code>torch: 2.6.0+cu124, CUDA: True, devices: 2  # 2× RTX 4090
+flash_attn: 2.7.4.post1
+transformers: 4.57.0.dev0  # 自定义 Qwen3-Omni fork
+Qwen3OmniForConditionalGeneration: OK
+DFlashDraftModel: OK
+_dflash_generate: OK</code></pre>
+
+<!-- Section 26: Script Changes -->
+<h2 id="sec26">26. <code>benchmark_multi_target.py</code> 脚本修改</h2>
+
+<h3>26.1 子进程环境分派</h3>
+<p><strong>问题：</strong><code>qwen3-omni-4b</code> conda 环境有不同的 transformers fork，无法在进程中途切换 conda 环境。</p>
+<p><strong>方案：</strong>添加子进程分派机制 — 当目标模型指定 <code>"env"</code> 键时，脚本在该环境的 Python 中自动重新启动自身，通过 JSON 文件传递结果。</p>
+
+<h4>Target 配置格式</h4>
+<pre><code>{
+    "name": "Qwen3-Omni-4B",
+    "path": "/media/xzhan34/data/models/Qwen3-Omni-4B-Instruct-multilingual",
+    "env": "qwen3-omni-4b",          // conda env → 子进程分派
+    "model_type": "qwen3_omni",       // 触发特殊模型加载
+}</code></pre>
+
+<h4>新增函数</h4>
+<table>
+<tr><th>函数</th><th>用途</th></tr>
+<tr><td><code>get_conda_python(env_name)</code></td><td>解析 conda 环境 → Python 可执行路径</td></tr>
+<tr><td><code>run_target_in_env(target_info, args)</code></td><td>启动子进程并设置环境变量（CUDA_HOME, PATH, proxy）</td></tr>
+<tr><td><code>run_single_target(args)</code></td><td>子进程入口点（<code>--single-target</code> 模式）</td></tr>
+</table>
+
+<h4>子进程环境变量自动设置</h4>
+<pre><code>env["CUDA_HOME"] = "/usr/local/cuda-12.4"
+env["PATH"] = "/usr/local/cuda-12.4/bin:" + env.get("PATH", "")
+env["http_proxy"] = "http://child-prc.intel.com:913"
+env["https_proxy"] = "http://child-prc.intel.com:913"</code></pre>
+
+<h4>执行流程</h4>
+<div class="flow-box">
+  <div class="flow-step">Base env 运行进程内目标<br>(Qwen3-4B) + 共享 draft</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">释放 draft 模型<br>GPU 显存</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">为每个 "env" 目标<br>启动子进程</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">子进程写入结果<br>_subprocess_*.json</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">父进程读取 JSON<br>合并为对比表</div>
+</div>
+
+<h3>26.2 Qwen3-Omni 模型加载（错误 #1：<code>AutoModelForCausalLM</code> 不兼容）</h3>
+
+<div class="card" style="border-left: 4px solid var(--accent4);">
+<h4 style="color:var(--accent4)">错误</h4>
+<pre><code>ValueError: Unrecognized configuration class
+&lt;class 'transformers.models.qwen3_omni.configuration_qwen3_omni.Qwen3OmniConfig'&gt;
+for this kind of AutoModel: AutoModelForCausalLM.</code></pre>
+</div>
+
+<p><strong>根因：</strong><code>Qwen3OmniForConditionalGeneration</code> 是多模态条件生成模型，非因果 LM。<code>AutoModelForCausalLM.from_pretrained()</code> 不支持其 config。</p>
+
+<p><strong>修复：</strong>当 <code>model_type == "qwen3_omni"</code> 时，通过 <code>Qwen3OmniForConditionalGeneration</code> 加载并提取 <code>.thinker</code>：</p>
+
+<pre><code>from transformers import Qwen3OmniForConditionalGeneration
+full_model = Qwen3OmniForConditionalGeneration.from_pretrained(
+    target_path, attn_implementation=attn_impl, dtype=torch.bfloat16,
+).to(device).eval()
+target = _ThinkerWrapper(full_model.thinker)</code></pre>
+
+<h4>Qwen3-Omni 模型层级</h4>
+<pre><code>Qwen3OmniForConditionalGeneration
+  ├── .thinker  → Qwen3OmniThinkerForConditionalGeneration (causal LM)
+  │     ├── .model        → Qwen3OmniThinkerTextModel (decoder)
+  │     │     ├── .embed_tokens  → nn.Embedding
+  │     │     └── .layers, .norm, .rotary_emb
+  │     └── .lm_head      → nn.Linear
+  ├── .talker (optional)
+  └── .code2wav (optional)</code></pre>
+
+<h3>26.3 Tokenizer Chat Template 缺失（错误 #2）</h3>
+
+<div class="card" style="border-left: 4px solid var(--accent4);">
+<h4 style="color:var(--accent4)">错误</h4>
+<pre><code>ValueError: Cannot use chat template functions because tokenizer.chat_template
+is not set and no template argument was passed!</code></pre>
+</div>
+
+<p><strong>根因：</strong>Qwen3-Omni tokenizer 的 <code>tokenizer_config.json</code> 不包含 <code>chat_template</code> 字段。chat template 存储在 <code>AutoProcessor</code> 中。</p>
+
+<p><strong>修复：</strong>加载 Omni tokenizer 后，从 <code>AutoProcessor</code> 拷贝 <code>chat_template</code>：</p>
+<pre><code>from transformers import AutoProcessor
+tokenizer = AutoTokenizer.from_pretrained(target_path)
+processor = AutoProcessor.from_pretrained(target_path)
+tokenizer.chat_template = processor.chat_template  # 从 processor 拷贝</code></pre>
+<p>这样 tokenizer 使用 Omni 原生词表和特殊 token，同时具备正确的 <code>apply_chat_template()</code> 模板。</p>
+
+<h3>26.4 <code>logits_to_keep</code> 不支持（错误 #3）</h3>
+
+<div class="card" style="border-left: 4px solid var(--accent4);">
+<h4 style="color:var(--accent4)">错误</h4>
+<pre><code>RuntimeError: The expanded size of the tensor (1) must match the existing size
+(70) at non-singleton dimension 1. Target sizes: [1, 1]. Tensor sizes: [70]</code></pre>
+</div>
+
+<p><strong>根因：</strong><code>_dflash_generate()</code> 在 prefill 阶段调用 <code>target(..., logits_to_keep=1)</code> 仅返回最后一个 token 的 logits。但 thinker 模型忽略该参数，返回<em>所有</em>位置的 logits。<code>sample(output.logits, temperature)</code> 返回 shape 为 <code>[70]</code> 的张量，赋值到 <code>output_ids[:, num_input_tokens:num_input_tokens+1]</code> 时大小不匹配。</p>
+
+<p><strong>修复：</strong>添加 <code>_ThinkerWrapper</code> 类拦截 <code>logits_to_keep</code> 并手动裁切 logits：</p>
+
+<pre><code>class _ThinkerWrapper(torch.nn.Module):
+    def __init__(self, thinker):
+        super().__init__()
+        self._thinker = thinker
+
+    @property
+    def model(self):
+        return self._thinker.model
+
+    @property
+    def lm_head(self):
+        return self._thinker.lm_head
+
+    def forward(self, *args, **kwargs):
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
+        output = self._thinker(*args, **kwargs)
+        if logits_to_keep is not None and output.logits.shape[1] &gt; logits_to_keep:
+            output.logits = output.logits[:, -logits_to_keep:, :]
+        return output</code></pre>
+
+<p>Wrapper 同时通过 <code>.model</code>（含 <code>.embed_tokens</code>）和 <code>.lm_head</code> 属性暴露接口，供 <code>_dflash_generate()</code> 用于草稿模型的 embedding 和 logit 投影。</p>
+
+<!-- Section 27: Architecture Compatibility -->
+<h2 id="sec27">27. 架构兼容性：为何无需修改草稿模型</h2>
+
+<div class="highlight">
+<strong>关键发现：</strong>Qwen3-4B-DFlash-b16 草稿模型可与 Qwen3-Omni-4B 配合工作，<strong>无需任何代码或权重修改</strong>。
+</div>
+
+<p>这是因为 Qwen3-Omni-4B 的 <code>.thinker</code> 子模块与 Qwen3-4B 共享<strong>完全相同的架构</strong>：</p>
+
+<table>
+<tr><th>属性</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B <code>.thinker</code></th></tr>
+<tr><td><code>num_hidden_layers</code></td><td>36</td><td>36</td></tr>
+<tr><td><code>hidden_size</code></td><td>2560</td><td>2560</td></tr>
+<tr><td><code>num_attention_heads</code></td><td>32</td><td>32</td></tr>
+<tr><td><code>num_key_value_heads</code></td><td>8</td><td>8</td></tr>
+<tr><td><code>vocab_size</code></td><td>131072</td><td>131072</td></tr>
+<tr><td><code>.model.embed_tokens</code></td><td>✅</td><td>✅ (via <code>thinker.model.embed_tokens</code>)</td></tr>
+<tr><td><code>.lm_head</code></td><td>✅</td><td>✅ (via <code>thinker.lm_head</code>)</td></tr>
+<tr><td><code>output_hidden_states</code></td><td>✅ 返回 37 个张量</td><td>✅ 返回 37 个张量</td></tr>
+</table>
+
+<p>草稿模型的 <code>target_layer_ids: [1, 9, 17, 25, 33]</code> 可以直接索引 thinker 的 hidden states，<code>extract_context_feature()</code> 工作方式完全一致。<code>fc</code> 投影层（5×2560 → 2560）完全兼容。</p>
+
+<h4>所有适配均在 <code>benchmark_multi_target.py</code> 中完成</h4>
+<table>
+<tr><th>适配项</th><th>位置</th><th>修改了草稿模型？</th></tr>
+<tr><td>通过 <code>Qwen3OmniForConditionalGeneration</code> 加载，提取 <code>.thinker</code></td><td><code>load_target_model()</code></td><td><span class="tag tag-green">否</span></td></tr>
+<tr><td><code>_ThinkerWrapper</code> 处理 <code>logits_to_keep</code></td><td><code>_ThinkerWrapper.forward()</code></td><td><span class="tag tag-green">否</span></td></tr>
+<tr><td><code>_ThinkerWrapper</code> 代理 <code>.model</code> 和 <code>.lm_head</code></td><td><code>_ThinkerWrapper</code> 属性</td><td><span class="tag tag-green">否</span></td></tr>
+<tr><td>从 <code>AutoProcessor</code> 获取 Tokenizer chat_template</td><td><code>load_target_model()</code></td><td><span class="tag tag-green">否</span></td></tr>
+<tr><td>子进程隔离（不同 transformers fork）</td><td><code>run_target_in_env()</code></td><td><span class="tag tag-green">否</span></td></tr>
+</table>
+
+<!-- Section 28: Benchmark Results -->
+<h2 id="sec28">28. 基准测试结果</h2>
+
+<div class="card">
+<p><strong>硬件：</strong>NVIDIA GeForce RTX 4090, CUDA 12.4<br>
+<strong>数据集：</strong>gsm8k, 8 samples, temperature=0.0, max_new_tokens=2048<br>
+<strong>草稿模型：</strong>Qwen3-4B-DFlash-b16 (block_size=16)</p>
+</div>
+
+<table>
+<tr><th>指标</th><th>Qwen3-4B</th><th>Qwen3-Omni-4B</th></tr>
+<tr><td>平均接受长度 (τ)</td><td><strong>6.30</strong></td><td>1.93</td></tr>
+<tr><td>平均加速比</td><td><strong>4.37×</strong></td><td>1.47×</td></tr>
+<tr><td>推测解码 tok/s</td><td><strong>334.3</strong></td><td>92.1</td></tr>
+<tr><td>自回归 baseline tok/s</td><td>76.6</td><td>62.8</td></tr>
+<tr><td>首 Token 时间 (TTFT)</td><td>0.023s</td><td>0.019s</td></tr>
+<tr><td>平均输出 Token 数</td><td>322</td><td>451</td></tr>
+</table>
+
+<h4>接受长度分布</h4>
+<ul>
+<li><strong>Qwen3-4B：</strong>在 1–16 范围内分布均匀，6.2% 达到完整 block 接受（16 tokens）。</li>
+<li><strong>Qwen3-Omni-4B：</strong>严重偏斜 — 79.5% 仅接受 1 个 token，14.3% 接受 2 个 token。</li>
+</ul>
+
+<div class="highlight">
+<strong>分析：</strong>Qwen3-4B-DFlash 草稿模型是专为 Qwen3-4B 训练的，因此对该目标模型有很高的接受率。对 Qwen3-Omni-4B（不同模型家族）使用时，草稿预测准确度大幅下降，导致接受长度低，仅获得 1.47× 的适度加速。
+</div>
+
+<!-- Section 29: How to Run -->
+<h2 id="sec29">29. 运行方法</h2>
+<pre><code># 从 base conda 环境运行（脚本自动将 Qwen3-Omni 分派到 qwen3-omni-4b 环境）
+conda activate base
+cd /media/xzhan34/data/zlab_dflash_ws/dflash
+
+# 快速测试（8 samples，1 数据集）
+python benchmark_multi_target.py --datasets gsm8k --max-samples 8
+
+# 完整基准测试（所有数据集，128 samples）
+python benchmark_multi_target.py</code></pre>
+<p>结果保存至 <code>benchmark_results/multi_target_comparison.json</code>。</p>
+
+<!-- Section 30: File Inventory -->
+<h2 id="sec30">30. 文件清单</h2>
+<table>
+<tr><th>文件</th><th>说明</th></tr>
+<tr><td><code>benchmark_multi_target.py</code></td><td>主基准测试脚本（含子进程分派）</td></tr>
+<tr><td><code>dflash/benchmark.py</code></td><td>核心 <code>_dflash_generate()</code> 函数（未修改）</td></tr>
+<tr><td><code>dflash/model.py</code></td><td><code>DFlashDraftModel</code> 类（未修改）</td></tr>
+<tr><td><code>benchmark_results/multi_target_comparison.json</code></td><td>对比结果摘要（自动生成）</td></tr>
+<tr><td><code>benchmark_results/multi_Qwen3-4B.json</code></td><td>Qwen3-4B 逐样本结果</td></tr>
+<tr><td><code>benchmark_results/_subprocess_Qwen3-Omni-4B*.json</code></td><td>Qwen3-Omni 逐样本结果</td></tr>
+</table>
+
+<!-- Section 31: Error Summary -->
+<h2 id="sec31">31. 遇到的错误汇总（按时间顺序）</h2>
+<table>
+<tr><th>#</th><th>错误</th><th>根因</th><th>修复</th></tr>
+<tr><td>1</td><td><code>ModuleNotFoundError: No module named 'psutil'</code></td><td>flash-attn 构建需要 psutil</td><td>先 <code>pip install psutil</code></td></tr>
+<tr><td>2</td><td>dflash 安装覆盖自定义 transformers</td><td>dflash 依赖 <code>transformers&gt;=4.57</code></td><td>使用 <code>--no-deps</code> 重装自定义 fork</td></tr>
+<tr><td>3</td><td><code>ValueError: Unrecognized configuration class Qwen3OmniConfig for AutoModelForCausalLM</code></td><td>Qwen3-Omni 不是标准 CausalLM</td><td>通过 <code>Qwen3OmniForConditionalGeneration</code> 加载，提取 <code>.thinker</code></td></tr>
+<tr><td>4</td><td><code>ValueError: tokenizer.chat_template is not set</code></td><td>Omni tokenizer 无 chat template</td><td>从 <code>AutoProcessor</code> 拷贝 <code>chat_template</code> 到 <code>AutoTokenizer</code></td></tr>
+<tr><td>5</td><td><code>RuntimeError: expanded size (1) must match (70)</code></td><td>Thinker 忽略 <code>logits_to_keep</code> 参数</td><td><code>_ThinkerWrapper</code> 类手动裁切 logits</td></tr>
+</table>
+
+
 <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
-    Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比文档
+    Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比 &amp; 集成排障文档
 </div>
 
 <button id="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑</button>
