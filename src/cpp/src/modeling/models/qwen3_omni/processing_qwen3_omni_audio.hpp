@@ -38,13 +38,13 @@ public:
     static nlohmann::json process_audio_info_via_python(
         const nlohmann::json& conversations,
         bool use_audio_in_video,
-        const std::string& python_executable = "/home/wanglei/py_venv/dev_env/bin/python");
+        const std::string& python_executable = "python3");
 
     static nlohmann::json process_audio_features_via_python(
         const nlohmann::json& conversations,
         const std::string& model_dir,
         bool use_audio_in_video,
-        const std::string& python_executable = "/home/wanglei/py_venv/dev_env/bin/python");
+        const std::string& python_executable = "python3");
 };
 
 }  // namespace models

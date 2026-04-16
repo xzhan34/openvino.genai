@@ -20,7 +20,7 @@ def _load_module(module_name: str, file_path: Path):
     return module
 
 
-_LINUX_RELEASE_BASE = Path("/home/wanglei/model/Qwen3_omni/qwen3_omni_4B_final_release")
+_LINUX_RELEASE_BASE = Path("/home/xzhan34/work/openvino.genai.modular-ws/openvino-new-arch.wangleis/qwen3_omni_4B_final_release")
 _RELEASE_DIR_NAME = "qwen3_omni_4B_final_release"
 
 
@@ -62,7 +62,7 @@ def _default_internal_src(model_dir: str = "") -> Path:
 
 
 def _default_model_dir() -> Path:
-    return Path("/home/wanglei/model/Qwen3_omni/Qwen3-Omni-4B-Instruct-multilingual")
+    return Path("/home/xzhan34/work/openvino.genai.modular-ws/models/Qwen3-Omni-4B-Instruct-multilingual")
 
 
 def _compute_audio_features(conversations, model_dir: str, use_audio_in_video: bool, utils_dir: Path):

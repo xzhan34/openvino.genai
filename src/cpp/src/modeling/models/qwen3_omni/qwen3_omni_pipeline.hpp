@@ -44,13 +44,13 @@ Qwen3OmniMultimodalInfo process_qwen3_omni_multimodal_info(
 	const nlohmann::json& conversations,
 	bool use_audio_in_video,
 	bool return_video_kwargs,
-	const std::string& python_executable = "/home/wanglei/py_venv/dev_env/bin/python");
+	const std::string& python_executable = "python3");
 
 Qwen3OmniAudioFeatureInfo process_qwen3_omni_audio_feature_info(
 	const nlohmann::json& conversations,
 	const std::string& model_dir,
 	bool use_audio_in_video,
-	const std::string& python_executable = "/home/wanglei/py_venv/dev_env/bin/python");
+	const std::string& python_executable = "python3");
 
 void validate_qwen3_omni_pipeline_models(
 	const Qwen3OmniPipelineModels& models,

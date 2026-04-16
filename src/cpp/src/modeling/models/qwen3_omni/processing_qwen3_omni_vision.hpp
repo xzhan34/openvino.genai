@@ -50,7 +50,7 @@ public:
     static nlohmann::json process_vision_info_via_python(
         const nlohmann::json& conversations,
         bool return_video_kwargs = false,
-        const std::string& python_executable = "/home/wanglei/py_venv/dev_env/bin/python");
+        const std::string& python_executable = "python3");
 };
 
 }  // namespace models

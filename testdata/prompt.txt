@@ -1,0 +1,1 @@
+You are a weather bot. I'm showing you my current location and a forecast report. Look at the window (video) and listen to the environment. Is the forecast accurate? Respond with a summary and a voice alert.
