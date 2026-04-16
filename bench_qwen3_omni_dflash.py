@@ -58,7 +58,7 @@ def setup_env(genai_dir: Path) -> dict:
     env = os.environ.copy()
 
     if sys.platform == "win32":
-        ov_dir = Path(r"C:\work\openvino_ws\openvino.liangali")
+        ov_dir = genai_dir.parent / "openvino"
         extra_paths = [
             str(ov_dir / "bin" / "intel64" / "RelWithDebInfo"),
             str(ov_dir / "temp" / "Windows_AMD64" / "tbb" / "bin"),

@@ -56,7 +56,7 @@ def setup_env(genai_dir: Path) -> dict:
     env = os.environ.copy()
 
     if sys.platform == "win32":
-        ov_dir = Path(r"C:\work\openvino_ws\openvino.liangali")
+        ov_dir = genai_dir.parent / "openvino"
         extra_paths = [
             str(ov_dir / "bin" / "intel64" / "RelWithDebInfo"),
             str(ov_dir / "temp" / "Windows_AMD64" / "tbb" / "bin"),
@@ -68,13 +68,14 @@ def setup_env(genai_dir: Path) -> dict:
         if tokenizers_dll.exists():
             env["OPENVINO_TOKENIZERS_PATH_GENAI"] = str(tokenizers_dll)
     else:
-        # Linux: adjust LD_LIBRARY_PATH if needed
-        ov_dir = Path(os.environ.get("OV_DIR", "/home/xzhan34/work/openvino_ws/dflash_ws/openvino/build"))
+        # Linux: derive OV dir from genai sibling directory
+        ov_dir = genai_dir.parent / "openvino"
         lib_dirs = [
-            str(ov_dir / "lib"),
+            str(ov_dir / "bin" / "intel64" / "RelWithDebInfo"),
             str(genai_dir / "build" / "openvino_genai"),
         ]
         env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
+        env["OV_TOKENIZERS_LIB_PATH"] = str(genai_dir / "build" / "openvino_genai")
 
     return env
 
