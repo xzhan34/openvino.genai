@@ -1,0 +1,383 @@
+From 755544d32245dbb042574dbc7c9444227f31b4c0 Mon Sep 17 00:00:00 2001
+From: "Zhang, Xiaolin" <xiaolin.zhang@intel.com>
+Date: Thu, 16 Apr 2026 14:37:48 +0800
+Subject: [PATCH] refactor(dflash): decouple Qwen3-Omni DFlash from Qwen3.5
+ dependency
+
+Qwen3-Omni DFlash speculative decoding previously reused the Qwen3.5
+draft model builders (create_qwen3_5_dflash_combined_draft_model, etc.)
+by constructing a Qwen3_5Config compatibility shim from QWen3OmniConfig.
+This created an unnecessary cross-model dependency where the Omni sample
+included Qwen3.5 headers and relied on Qwen3.5 types.
+
+This commit introduces Omni-native DFlash draft model builder functions
+that are fully independent of any Qwen3.5 code:
+
+  - create_qwen3_omni_dflash_combined_draft_model()
+    Merges embed_tokens + DFlash draft layers + lm_head into a single
+    graph.  Handles Qwen3-Omni's tie_word_embeddings quirk (safetensors
+    stores a separate lm_head.weight that must not overwrite the tied
+    embed_tokens binding).
+
+  - create_qwen3_omni_dflash_context_kv_model()
+    Computes fc + RMSNorm + K,V projections + KNorm + RoPE for all draft
+    layers.  Used for context KV preprocessing on newly-accepted tokens.
+
+  - create_qwen3_omni_dflash_step_model()
+    Lightweight draft step: embed -> attention (with pre-computed context
+    KV) -> MLP -> lm_head.  Skips fc + context KV computation entirely.
+
+Changes per file:
+
+  modeling_qwen3_omni_text.cpp (+214 lines):
+    - Added #include for dflash_draft.hpp
+    - Implemented the 3 new Omni-specific DFlash builder functions
+    - Each function takes Qwen3OmniConfig directly (no Qwen3_5Config shim)
+
+  modeling_qwen3_omni.hpp (+43 lines):
+    - Forward declaration of DFlashDraftConfig
+    - Declared the 3 new builder functions with full doxygen comments
+
+  modeling_qwen3_omni_dflash.cpp (-17 lines):
+    - Removed #include of qwen3_5 headers (modeling_qwen3_5_text.hpp,
+      processing_qwen3_5.hpp)
+    - Removed Qwen3_5Config compat_cfg construction
+    - Replaced call to create_qwen3_5_dflash_combined_draft_model with
+      create_qwen3_omni_dflash_combined_draft_model
+
+The Qwen3.5 DFlash functions remain unchanged and continue to work
+independently for Qwen3.5 models.  The lm_head tie_word_embeddings
+bugfix in modeling_qwen3_5_text.cpp (commit 2df78ece) is preserved
+as a standalone general improvement.
+---
+ .../models/qwen3_omni/modeling_qwen3_omni.hpp |  43 ++++
+ .../qwen3_omni/modeling_qwen3_omni_text.cpp   | 214 ++++++++++++++++++
+ .../samples/modeling_qwen3_omni_dflash.cpp    |  19 +-
+ 3 files changed, 259 insertions(+), 17 deletions(-)
+
+diff --git a/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni.hpp b/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni.hpp
+index 5c8bffa4..5eb86cc8 100644
+--- a/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni.hpp
++++ b/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni.hpp
+@@ -168,6 +168,49 @@ std::shared_ptr<ov::Model> create_qwen3_omni_dflash_target_model(
+     ov::genai::modeling::weights::WeightFinalizer& finalizer,
+     bool enable_multimodal_inputs = true);
+ 
++// Forward declaration (defined in dflash_draft.hpp).
++struct DFlashDraftConfig;
++
++/// DFlash combined draft model (embed + draft layers + lm_head) for Qwen3-Omni.
++/// Merges three GPU dispatches into one infer() call per draft step.
++/// Target weights (embed_tokens, lm_head) come from the Omni thinker via a
++/// PrefixMappedWeightSource.  Draft weights come from the standalone DFlash model.
++/// Inputs:  target_hidden [B, T, hidden*num_draft_layers],
++///          input_ids     [B, block_size],
++///          position_ids  [1, T+block_size]
++/// Output:  logits        [B, block_size, vocab_size]
++std::shared_ptr<ov::Model> create_qwen3_omni_dflash_combined_draft_model(
++    const Qwen3OmniConfig& omni_cfg,
++    const DFlashDraftConfig& draft_cfg,
++    ov::genai::modeling::weights::WeightSource& target_source,
++    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
++    ov::genai::modeling::weights::WeightSource& draft_source,
++    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
++
++/// DFlash context KV preprocessing model for Qwen3-Omni.
++/// Computes fc + RMSNorm + K,V projections + KNorm + RoPE for all draft layers.
++/// Runs once per verify cycle on newly accepted tokens.
++/// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
++/// Outputs: context_k_i [1, kv_heads, A, head_dim], context_v_i (×num_layers)
++std::shared_ptr<ov::Model> create_qwen3_omni_dflash_context_kv_model(
++    const DFlashDraftConfig& draft_cfg,
++    ov::genai::modeling::weights::WeightSource& draft_source,
++    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
++
++/// DFlash lightweight draft step model for Qwen3-Omni.
++/// Embed → attention using pre-computed context K,V → MLP → LM head.
++/// Skips fc + context KV computation entirely.
++/// Inputs:  input_ids [1, B], position_ids [1, B],
++///          context_k_i / context_v_i [1, kv_heads, T, head_dim] (×num_layers)
++/// Output:  logits [1, B, vocab_size]
++std::shared_ptr<ov::Model> create_qwen3_omni_dflash_step_model(
++    const Qwen3OmniConfig& omni_cfg,
++    const DFlashDraftConfig& draft_cfg,
++    ov::genai::modeling::weights::WeightSource& target_source,
++    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
++    ov::genai::modeling::weights::WeightSource& draft_source,
++    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
++
+ std::shared_ptr<ov::Model> create_qwen3_omni_vision_model(
+     const Qwen3OmniConfig& cfg,
+     ov::genai::modeling::weights::WeightSource& source,
+diff --git a/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni_text.cpp b/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni_text.cpp
+index 8841d416..2121b2b5 100644
+--- a/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni_text.cpp
++++ b/src/cpp/src/modeling/models/qwen3_omni/modeling_qwen3_omni_text.cpp
+@@ -19,6 +19,7 @@
+ #include "modeling/ops/shape.hpp"
+ #include "modeling/ops/tensor_ops.hpp"
+ #include "modeling/weights/weight_loader.hpp"
++#include "modeling/models/dflash_draft/dflash_draft.hpp"
+ #include "modeling/models/qwen3_omni/processing_qwen3_omni_vl.hpp"
+ 
+ namespace {
+@@ -837,6 +838,219 @@ std::shared_ptr<ov::Model> create_qwen3_omni_dflash_target_model(
+     return ov_model;
+ }
+ 
++// ============================================================================
++// DFlash Combined Draft Model (embed + draft layers + lm_head)
++// ============================================================================
++// Merges embed_tokens, draft layers, and lm_head into a single graph.
++// Target weights (embed_tokens, lm_head) come from the Qwen3-Omni thinker,
++// accessed through a PrefixMappedWeightSource that strips the "thinker." prefix.
++// Draft weights come from the standalone DFlash draft model.
++//
++// Inputs:  target_hidden [B, T, ctx_dim], input_ids [B, block_size],
++//          position_ids [1, T+block_size]
++// Output:  logits [B, block_size, vocab_size]
++
++std::shared_ptr<ov::Model> create_qwen3_omni_dflash_combined_draft_model(
++    const Qwen3OmniConfig& omni_cfg,
++    const DFlashDraftConfig& draft_cfg,
++    ov::genai::modeling::weights::WeightSource& target_source,
++    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
++    ov::genai::modeling::weights::WeightSource& draft_source,
++    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
++    BuilderContext ctx;
++
++    // ── Embedding path (target weights under "model" prefix) ──
++    Module embed_root("model", ctx);
++    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
++    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
++    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
++
++    ov::genai::modeling::weights::LoadOptions options;
++    options.allow_unmatched = true;
++    options.allow_missing = false;
++    options.report_unmatched = false;
++    options.report_missing = true;
++    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
++
++    // ── Draft layers (draft weights) ──
++    DFlashDraftModel draft_model(ctx, draft_cfg);
++    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
++
++    // ── LM head (target weights, tied to embed_tokens when configured) ──
++    Module lm_root("", ctx);
++    LMHead head(ctx, "lm_head", &lm_root);
++    if (omni_cfg.text.tie_word_embeddings) {
++        head.tie_to(embed.weight_param());
++        // When tied, skip load_model for lm_root — Qwen3-Omni safetensors
++        // store a separate lm_head.weight that differs from embed_tokens.weight
++        // even though tie_word_embeddings=True.  load_model would overwrite the
++        // tied binding with the wrong tensor.
++    } else if (!target_source.has("lm_head.weight")) {
++        const std::vector<std::string> embed_candidates = {
++            "model.embed_tokens.weight",
++            "model.language_model.embed_tokens.weight",
++            "language_model.embed_tokens.weight",
++        };
++        std::string embed_weight;
++        for (const auto& name : embed_candidates) {
++            if (target_source.has(name)) { embed_weight = name; break; }
++        }
++        if (!embed_weight.empty()) {
++            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
++            head.weight_param().bind(tied);
++        }
++    } else {
++        ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
++    }
++
++    // ── Inputs ──
++    const ov::element::Type dtype = ov::element::f32;
++    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
++                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
++    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
++    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
++    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
++
++    // ── Forward: embed → draft → lm_head (single graph) ──
++    auto noise_embedding = embed.forward(input_ids);
++    auto draft_hidden = draft_model.forward(target_hidden, noise_embedding, position_ids);
++    auto logits = head.forward(draft_hidden);
++
++    // ── Output ──
++    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
++    set_name(logits_result, "logits");
++
++    return ctx.build_model({logits_result->output(0)});
++}
++
++// ============================================================================
++// DFlash Context KV Preprocessing Model
++// ============================================================================
++// Computes fc(target_hidden) → RMSNorm → K,V projections + KNorm + RoPE
++// for all draft layers.  Runs once per verify cycle on newly-accepted tokens.
++// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
++// Outputs: k_0..k_N [1, kv_heads, A, head_dim], v_0..v_N (same shape)
++
++std::shared_ptr<ov::Model> create_qwen3_omni_dflash_context_kv_model(
++    const DFlashDraftConfig& draft_cfg,
++    ov::genai::modeling::weights::WeightSource& draft_source,
++    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
++    BuilderContext ctx;
++
++    DFlashDraftModel draft_model(ctx, draft_cfg);
++    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
++
++    const ov::element::Type dtype = ov::element::f32;
++    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
++                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
++    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
++    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
++
++    auto kv_pairs = draft_model.build_context_kv(target_hidden, position_ids);
++
++    ov::OutputVector outputs;
++    for (size_t i = 0; i < kv_pairs.size(); ++i) {
++        auto k_result = std::make_shared<ov::op::v0::Result>(kv_pairs[i].first.output());
++        set_name(k_result, "context_k_" + std::to_string(i));
++        auto v_result = std::make_shared<ov::op::v0::Result>(kv_pairs[i].second.output());
++        set_name(v_result, "context_v_" + std::to_string(i));
++        outputs.push_back(k_result->output(0));
++        outputs.push_back(v_result->output(0));
++    }
++
++    return ctx.build_model(outputs);
++}
++
++// ============================================================================
++// DFlash Lightweight Draft Step Model
++// ============================================================================
++// Embed → attention (with pre-computed context KV) → MLP → lm_head.
++// Runs once per draft cycle.  Skips fc + context KV computation entirely.
++// Inputs:  input_ids [1, B], position_ids [1, B],
++//          context_k_0..N [1, kv_heads, T, head_dim], context_v_0..N (same)
++// Output:  logits [1, B, vocab_size]
++
++std::shared_ptr<ov::Model> create_qwen3_omni_dflash_step_model(
++    const Qwen3OmniConfig& omni_cfg,
++    const DFlashDraftConfig& draft_cfg,
++    ov::genai::modeling::weights::WeightSource& target_source,
++    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
++    ov::genai::modeling::weights::WeightSource& draft_source,
++    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
++    BuilderContext ctx;
++
++    // ── Embedding (target weights) ──
++    Module embed_root("model", ctx);
++    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
++    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
++    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
++
++    ov::genai::modeling::weights::LoadOptions options;
++    options.allow_unmatched = true;
++    options.allow_missing = false;
++    options.report_unmatched = false;
++    options.report_missing = true;
++    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
++
++    // ── Draft layers ──
++    DFlashDraftModel draft_model(ctx, draft_cfg);
++    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
++
++    // ── LM head (target weights) ──
++    Module lm_root("", ctx);
++    LMHead head(ctx, "lm_head", &lm_root);
++    if (omni_cfg.text.tie_word_embeddings) {
++        head.tie_to(embed.weight_param());
++    } else if (!target_source.has("lm_head.weight")) {
++        const std::vector<std::string> embed_candidates = {
++            "model.embed_tokens.weight",
++            "model.language_model.embed_tokens.weight",
++            "language_model.embed_tokens.weight",
++        };
++        std::string embed_weight;
++        for (const auto& name : embed_candidates) {
++            if (target_source.has(name)) { embed_weight = name; break; }
++        }
++        if (!embed_weight.empty()) {
++            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
++            head.weight_param().bind(tied);
++        }
++    } else {
++        ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
++    }
++
++    // ── Inputs ──
++    const ov::element::Type dtype = ov::element::f32;
++    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
++    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
++
++    // Context KV inputs: one K,V pair per draft layer.
++    const int32_t kv_heads = draft_cfg.num_key_value_heads > 0
++                                 ? draft_cfg.num_key_value_heads
++                                 : draft_cfg.num_attention_heads;
++    const int32_t head_dim = draft_cfg.head_dim > 0
++                                 ? draft_cfg.head_dim
++                                 : (draft_cfg.hidden_size / draft_cfg.num_attention_heads);
++    std::vector<std::pair<Tensor, Tensor>> context_kv;
++    for (int32_t i = 0; i < draft_cfg.num_hidden_layers; ++i) {
++        auto ck = ctx.parameter("context_k_" + std::to_string(i), dtype,
++                                ov::PartialShape{-1, kv_heads, -1, head_dim});
++        auto cv = ctx.parameter("context_v_" + std::to_string(i), dtype,
++                                ov::PartialShape{-1, kv_heads, -1, head_dim});
++        context_kv.push_back({ck, cv});
++    }
++
++    // ── Forward: embed → draft_with_cached_kv → lm_head ──
++    auto noise_embedding = embed.forward(input_ids);
++    auto draft_hidden = draft_model.forward_with_cached_kv(noise_embedding, position_ids, context_kv);
++    auto logits = head.forward(draft_hidden);
++
++    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
++    set_name(logits_result, "logits");
++
++    return ctx.build_model({logits_result->output(0)});
++}
++
+ }  // namespace models
+ }  // namespace modeling
+ }  // namespace genai
+diff --git a/src/cpp/src/modeling/samples/modeling_qwen3_omni_dflash.cpp b/src/cpp/src/modeling/samples/modeling_qwen3_omni_dflash.cpp
+index 83edd3dc..e2f10c1e 100644
+--- a/src/cpp/src/modeling/samples/modeling_qwen3_omni_dflash.cpp
++++ b/src/cpp/src/modeling/samples/modeling_qwen3_omni_dflash.cpp
+@@ -41,8 +41,6 @@
+ #include "utils.hpp"
+ 
+ #include "modeling/models/dflash_draft/dflash_draft.hpp"
+-#include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
+-#include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
+ #include "modeling/models/qwen3_omni/modeling_qwen3_omni.hpp"
+ #include "modeling/models/qwen3_omni/modeling_qwen3_omni_internal.hpp"
+ #include "modeling/models/qwen3_omni/processing_qwen3_omni_vl.hpp"
+@@ -545,21 +543,8 @@ int main(int argc, char* argv[]) try {
+             // maps to "thinker.model.embed_tokens.weight" in safetensors.
+             ov::genai::modeling::models::PrefixMappedWeightSource thinker_source(target_source, "thinker.");
+ 
+-            // We need to build the combined draft model. The Qwen3.5 builder
+-            // works because the DFlash draft architecture is the same, and both
+-            // Qwen3-4B and Qwen3-Omni share the same vocab/embedding/lm_head.
+-            //
+-            // However, create_qwen3_5_dflash_combined_draft_model takes Qwen3_5Config,
+-            // not Qwen3OmniConfig.  We construct a minimal Qwen3_5Config from
+-            // the Omni thinker config for this purpose.
+-            ov::genai::modeling::models::Qwen3_5Config compat_cfg;
+-            compat_cfg.text.hidden_size = omni_cfg.text.hidden_size;
+-            compat_cfg.text.vocab_size = omni_cfg.text.vocab_size;
+-            compat_cfg.text.num_hidden_layers = omni_cfg.text.num_hidden_layers;
+-            compat_cfg.tie_word_embeddings = omni_cfg.text.tie_word_embeddings;
+-
+-            combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model(
+-                compat_cfg, dflash_cfg, thinker_source, target_finalizer,
++            combined_draft_model = ov::genai::modeling::models::create_qwen3_omni_dflash_combined_draft_model(
++                omni_cfg, dflash_cfg, thinker_source, target_finalizer,
+                 draft_source, draft_finalizer);
+         }
+ 
+-- 
+2.34.1
+

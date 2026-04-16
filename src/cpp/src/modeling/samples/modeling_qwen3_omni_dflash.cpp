@@ -207,6 +207,38 @@ int64_t argmax_last_token(const ov::Tensor& logits) {
     return argmax_logits_slice(logits, shape[1] - 1, 1).front();
 }
 
+// Concatenate two 4D tensors along axis 2 (seq dimension).
+// a: [1, H, T, D], b: [1, H, M, D]  →  [1, H, T+M, D]
+ov::Tensor concat_kv_seq(const ov::Tensor& a, const ov::Tensor& b) {
+    const auto sa = a.get_shape();  // [1, H, T, D]
+    const auto sb = b.get_shape();  // [1, H, M, D]
+    const size_t H = sa[1], T = sa[2], D = sa[3], M = sb[2];
+    ov::Tensor result(a.get_element_type(), {1, H, T + M, D});
+    const auto* pa = a.data<const float>();
+    const auto* pb = b.data<const float>();
+    auto* pr = result.data<float>();
+    for (size_t h = 0; h < H; ++h) {
+        std::memcpy(pr + h * (T + M) * D, pa + h * T * D, T * D * sizeof(float));
+        std::memcpy(pr + h * (T + M) * D + T * D, pb + h * M * D, M * D * sizeof(float));
+    }
+    return result;
+}
+
+// Slice a 4D tensor along axis 2: [1, H, T, D] → [1, H, keep, D]
+// keeping only the first 'keep' elements.
+ov::Tensor slice_kv_seq(const ov::Tensor& t, size_t keep) {
+    const auto s = t.get_shape();  // [1, H, T, D]
+    const size_t H = s[1], T = s[2], D = s[3];
+    if (keep >= T) return t;
+    ov::Tensor result(t.get_element_type(), {1, H, keep, D});
+    const auto* pt = t.data<const float>();
+    auto* pr = result.data<float>();
+    for (size_t h = 0; h < H; ++h) {
+        std::memcpy(pr + h * keep * D, pt + h * T * D, keep * D * sizeof(float));
+    }
+    return result;
+}
+
 int64_t resolve_mask_token_id(ov::genai::Tokenizer tokenizer) {
     const auto vocab = tokenizer.get_vocab();
     const auto it = vocab.find("<|MASK|>");
@@ -471,9 +503,31 @@ int main(int argc, char* argv[]) try {
     const bool load_draft_from_ir = !export_ir && has_ir_model_pair(draft_xml, draft_bin);
 
     // ── Build models ─────────────────────────────────────────────────────
+    // Split draft model (context_kv + step) is the default for all devices.
+    // context_kv model: fc(target_hidden) → RMSNorm → K,V projections + RoPE.
+    //   Runs once after each verify step on newly-accepted tokens only.
+    //   Compiled with f32 to avoid overflow in the fc matmul (ctx_dim=12800).
+    // step model: embed(input_ids) → attention(with cached K,V) → lm_head.
+    //   Runs once per draft cycle on B tokens only — O(B) instead of O(T+B).
+    // This avoids recomputing all context K,V from scratch every draft step,
+    // giving a large TPS improvement as the context grows.
+    // The combined model (legacy) recomputes everything each step.
+    bool use_split_draft = true;
+    {
+        const char* split_env = std::getenv("OV_GENAI_SPLIT_DRAFT");
+        if (split_env) {
+            if (std::string(split_env) == "0") {
+                use_split_draft = false;
+            }
+        }
+    }
+    std::cout << "  Draft mode:   " << (use_split_draft ? "split (context_kv + step)" : "combined (legacy)") << std::endl;
+
     PerfStats perf;
     std::shared_ptr<ov::Model> target_model;
-    std::shared_ptr<ov::Model> combined_draft_model;
+    std::shared_ptr<ov::Model> combined_draft_model;   // CPU path
+    std::shared_ptr<ov::Model> context_kv_model;       // GPU split path
+    std::shared_ptr<ov::Model> step_draft_model;       // GPU split path
     std::shared_ptr<ov::Model> vision_model;
     ov::Tensor vl_pos_embed_weight;
 
@@ -483,12 +537,16 @@ int main(int argc, char* argv[]) try {
         std::cout << "[cache-ir] Loading target model from IR: " << target_xml << std::endl;
         target_model = core.read_model(target_xml.string(), target_bin.string());
     }
-    if (load_draft_from_ir) {
+    if (load_draft_from_ir && !use_split_draft) {
         std::cout << "[cache-ir] Loading draft model from IR: " << draft_xml << std::endl;
         combined_draft_model = core.read_model(draft_xml.string(), draft_bin.string());
     }
 
-    if (!target_model || !combined_draft_model || (vl_mode && !vision_model)) {
+    const bool need_weights = !target_model || (vl_mode && !vision_model)
+                            || (use_split_draft && (!context_kv_model || !step_draft_model))
+                            || (!use_split_draft && !combined_draft_model);
+
+    if (need_weights) {
         // Load safetensors weights
         auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
         ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
@@ -531,18 +589,28 @@ int main(int argc, char* argv[]) try {
             vl_pos_embed_weight = target_source.get_tensor(pos_embed_name);
         }
 
-        if (!combined_draft_model) {
-            // Build combined draft model (embed + draft layers + lm_head).
-            // The draft model uses target's embed_tokens and lm_head weights,
-            // plus draft model's own layer weights.
-            // Qwen3-Omni safetensors use "thinker." prefix for the text decoder,
-            // so we create a PrefixMappedWeightSource.
+        // ── Build draft model(s) ──
+        // Qwen3-Omni safetensors use "thinker." prefix for the text decoder.
+        ov::genai::modeling::models::PrefixMappedWeightSource thinker_source(target_source, "thinker.");
+
+        if (use_split_draft) {
+            // Split draft model: context_kv (f32) + step (f16).
+            // The context_kv model contains the fc matmul (ctx_dim=12800) that
+            // overflows in f16.  By separating it, we can compile it with f32
+            // while the step model runs in fast f16.
+            if (!context_kv_model) {
+                std::cout << "[Building context KV model (fc+norm+K,V projection)...]" << std::endl;
+                context_kv_model = ov::genai::modeling::models::create_qwen3_omni_dflash_context_kv_model(
+                    dflash_cfg, draft_source, draft_finalizer);
+            }
+            if (!step_draft_model) {
+                std::cout << "[Building step draft model (embed+attn+mlp+lm_head)...]" << std::endl;
+                step_draft_model = ov::genai::modeling::models::create_qwen3_omni_dflash_step_model(
+                    omni_cfg, dflash_cfg, thinker_source, target_finalizer,
+                    draft_source, draft_finalizer);
+            }
+        } else if (!combined_draft_model) {
             std::cout << "[Building combined draft model (embed+draft+lm_head)...]" << std::endl;
-
-            // Create a prefix-mapped source so that "model.embed_tokens.weight"
-            // maps to "thinker.model.embed_tokens.weight" in safetensors.
-            ov::genai::modeling::models::PrefixMappedWeightSource thinker_source(target_source, "thinker.");
-
             combined_draft_model = ov::genai::modeling::models::create_qwen3_omni_dflash_combined_draft_model(
                 omni_cfg, dflash_cfg, thinker_source, target_finalizer,
                 draft_source, draft_finalizer);
@@ -554,8 +622,10 @@ int main(int argc, char* argv[]) try {
                 std::cout << "[export-ir] Serializing target model to " << target_xml << " ..." << std::endl;
                 ov::serialize(target_model, target_xml.string(), target_bin.string());
             }
-            std::cout << "[export-ir] Serializing draft model to " << draft_xml << " ..." << std::endl;
-            ov::serialize(combined_draft_model, draft_xml.string(), draft_bin.string());
+            if (combined_draft_model) {
+                std::cout << "[export-ir] Serializing draft model to " << draft_xml << " ..." << std::endl;
+                ov::serialize(combined_draft_model, draft_xml.string(), draft_bin.string());
+            }
             if (vision_model) {
                 const auto vision_xml = ir_dir / "dflash_omni_vision.xml";
                 const auto vision_bin = ir_dir / "dflash_omni_vision.bin";
@@ -693,43 +763,56 @@ int main(int argc, char* argv[]) try {
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
     std::cout << "[Compiling target model (Qwen3-Omni thinker)...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
-    // Draft model precision:
-    //   CPU: use f32 to avoid BF16/F16 overflow in the large fc matmul
-    //        (ctx_dim=12800).  CPU f16 MatMul uses f16 accumulators, which
-    //        overflow when dot products exceed ~65504.
-    //   GPU: use f16 (default).  GPU f16 MatMul uses f32 accumulators
-    //        internally, so overflow does not occur.  Forcing f32 on GPU
-    //        would be extremely slow.
+
+    // Draft precision config
     ov::AnyMap draft_compile_cfg = compile_cfg;
     {
         const char* draft_prec_env = std::getenv("OV_GENAI_DRAFT_PRECISION");
         if (draft_prec_env) {
-            // Explicit override from environment
             const std::string prec_str(draft_prec_env);
             if (prec_str == "f32") {
                 draft_compile_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
-                std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f32 (env override)]" << std::endl;
-            } else {
-                std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f16 (env override)]" << std::endl;
             }
         } else if (device.find("CPU") != std::string::npos) {
-            // CPU: force f32 to avoid f16 accumulator overflow
             draft_compile_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
-            std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f32 (CPU safe mode)]" << std::endl;
-        } else {
-            // GPU: use f16 (same as target model)
-            std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f16]" << std::endl;
         }
     }
-    auto compiled_draft = core.compile_model(combined_draft_model, device, draft_compile_cfg);
+
+    // Split model: context_kv always f32 (fc matmul overflow), step uses device default.
+    // Combined model (legacy): uses draft_compile_cfg.
+    ov::CompiledModel compiled_draft_combined;  // only for legacy combined path
+    ov::CompiledModel compiled_context_kv;      // split path
+    ov::CompiledModel compiled_step_draft;      // split path
+    ov::InferRequest draft_request;             // combined path
+    ov::InferRequest context_kv_request;        // split path
+    ov::InferRequest step_draft_request;        // split path
+
+    if (use_split_draft) {
+        // context_kv: always f32 (contains the large fc matmul that overflows in f16)
+        ov::AnyMap context_kv_cfg = compile_cfg;
+        context_kv_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
+        std::cout << "[Compiling context_kv model (f32)...]" << std::endl;
+        compiled_context_kv = core.compile_model(context_kv_model, device, context_kv_cfg);
+        context_kv_request = compiled_context_kv.create_infer_request();
+
+        // step: uses device default (f16 on GPU, f32 on CPU)
+        std::cout << "[Compiling step draft model (" << (device.find("CPU") != std::string::npos ? "f32" : "f16") << ")...]" << std::endl;
+        compiled_step_draft = core.compile_model(step_draft_model, device, draft_compile_cfg);
+        step_draft_request = compiled_step_draft.create_infer_request();
+    } else {
+        std::cout << "[Compiling combined draft model...]" << std::endl;
+        compiled_draft_combined = core.compile_model(combined_draft_model, device, draft_compile_cfg);
+        draft_request = compiled_draft_combined.create_infer_request();
+    }
     std::cout << "[All models compiled.]" << std::endl;
 
     auto target_request = compiled_target.create_infer_request();
-    auto draft_request = compiled_draft.create_infer_request();
 
     // Free model graphs
     target_model.reset();
     combined_draft_model.reset();
+    context_kv_model.reset();
+    step_draft_model.reset();
     if (vision_model) vision_model.reset();
 
     target_request.reset_state();
@@ -832,6 +915,40 @@ int main(int argc, char* argv[]) try {
         target_hidden_block.copy_to(target_hidden_init);
     }
 
+    // ── Split draft: per-layer context KV cache ──────────────────────────
+    // Each layer stores K,V tensors [1, kv_heads, T, head_dim] in f32.
+    // Initialized from prefill target_hidden via the context_kv model.
+    const size_t num_draft_layers = static_cast<size_t>(dflash_cfg.num_hidden_layers);
+    const size_t kv_heads = static_cast<size_t>(
+        dflash_cfg.num_key_value_heads > 0 ? dflash_cfg.num_key_value_heads : dflash_cfg.num_attention_heads);
+    const size_t head_dim = static_cast<size_t>(
+        dflash_cfg.head_dim > 0 ? dflash_cfg.head_dim : (dflash_cfg.hidden_size / dflash_cfg.num_attention_heads));
+
+    // context_kv_cache[i] = {K, V} for draft layer i.
+    std::vector<std::pair<ov::Tensor, ov::Tensor>> context_kv_cache(num_draft_layers);
+
+    if (use_split_draft && has_target_hidden) {
+        // Precompute context K,V for the entire prompt target_hidden.
+        ov::Tensor prefill_ctx_hidden(target_hidden_storage, {0, 0, 0}, {1, prompt_len, ctx_dim});
+        ov::Tensor prefill_pos(ov::element::i64, {1, prompt_len});
+        {
+            auto* pd = prefill_pos.data<int64_t>();
+            for (size_t i = 0; i < prompt_len; ++i)
+                pd[i] = static_cast<int64_t>(i);
+        }
+        context_kv_request.set_tensor("target_hidden", prefill_ctx_hidden);
+        context_kv_request.set_tensor("position_ids", prefill_pos);
+        context_kv_request.infer();
+        for (size_t i = 0; i < num_draft_layers; ++i) {
+            context_kv_cache[i].first = ensure_f32_copy(
+                context_kv_request.get_tensor("context_k_" + std::to_string(i)));
+            context_kv_cache[i].second = ensure_f32_copy(
+                context_kv_request.get_tensor("context_v_" + std::to_string(i)));
+        }
+        std::cout << "[Split draft] Initialized context KV cache: "
+                  << num_draft_layers << " layers, seq_len=" << prompt_len << std::endl;
+    }
+
     int64_t next_token = argmax_last_token(logits);
     auto prefill_end = Clock::now();
     perf.ttft_ms = duration_ms(prefill_start, prefill_end);
@@ -869,25 +986,45 @@ int main(int argc, char* argv[]) try {
 
         auto draft_start = Clock::now();
 
-        // Draft position_ids (2D): [0..T-1, T..T+B-1] — contiguous context + draft
-        // Must be contiguous to match the Python DFlash benchmark behaviour.
-        const size_t total_pos = target_hidden_len + block_ids.size();
-        ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
-        {
-            auto* pd = draft_pos.data<int64_t>();
-            for (size_t i = 0; i < total_pos; ++i)
-                pd[i] = static_cast<int64_t>(i);
-        }
-
-        ov::Tensor hidden_view(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, ctx_dim});
-        draft_request.set_tensor("target_hidden", hidden_view);
-        draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
-        draft_request.set_tensor("position_ids", draft_pos);
-        draft_request.infer();
-
-        auto draft_logits = draft_request.get_tensor("logits");
+        std::vector<int64_t> draft_tokens;
         const size_t draft_len = block_ids.size() - 1;
-        auto draft_tokens = argmax_logits_slice(draft_logits, 1, draft_len);
+
+        if (use_split_draft) {
+            // ── Split path: step model with cached context K,V ──
+            // position_ids for draft tokens only: [T, T+1, ..., T+B-1]
+            const size_t B = block_ids.size();
+            ov::Tensor step_pos(ov::element::i64, {1, B});
+            {
+                auto* pd = step_pos.data<int64_t>();
+                for (size_t i = 0; i < B; ++i)
+                    pd[i] = static_cast<int64_t>(target_hidden_len + i);
+            }
+            step_draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
+            step_draft_request.set_tensor("position_ids", step_pos);
+            for (size_t i = 0; i < num_draft_layers; ++i) {
+                step_draft_request.set_tensor("context_k_" + std::to_string(i), context_kv_cache[i].first);
+                step_draft_request.set_tensor("context_v_" + std::to_string(i), context_kv_cache[i].second);
+            }
+            step_draft_request.infer();
+            auto draft_logits = step_draft_request.get_tensor("logits");
+            draft_tokens = argmax_logits_slice(draft_logits, 1, draft_len);
+        } else {
+            // ── Combined path (legacy): full context recompute ──
+            const size_t total_pos = target_hidden_len + block_ids.size();
+            ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
+            {
+                auto* pd = draft_pos.data<int64_t>();
+                for (size_t i = 0; i < total_pos; ++i)
+                    pd[i] = static_cast<int64_t>(i);
+            }
+            ov::Tensor hidden_view(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, ctx_dim});
+            draft_request.set_tensor("target_hidden", hidden_view);
+            draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
+            draft_request.set_tensor("position_ids", draft_pos);
+            draft_request.infer();
+            auto draft_logits = draft_request.get_tensor("logits");
+            draft_tokens = argmax_logits_slice(draft_logits, 1, draft_len);
+        }
 
         auto draft_end = Clock::now();
         perf.draft_wall.add(duration_ms(draft_start, draft_end));
@@ -955,6 +1092,33 @@ int main(int argc, char* argv[]) try {
                                      {1, target_hidden_len + num_accepted, ctx_dim});
                 src_slice.copy_to(dst_slice);
             }
+
+            // ── Update context KV cache for newly accepted tokens ────────
+            if (use_split_draft && num_accepted > 0) {
+                // Run context_kv model on the newly accepted target_hidden.
+                ov::Tensor new_ctx_hidden(target_hidden_storage,
+                                          {0, target_hidden_len, 0},
+                                          {1, target_hidden_len + num_accepted, ctx_dim});
+                // Position IDs for newly accepted tokens.
+                ov::Tensor new_pos(ov::element::i64, {1, num_accepted});
+                {
+                    auto* pd = new_pos.data<int64_t>();
+                    for (size_t i = 0; i < num_accepted; ++i)
+                        pd[i] = static_cast<int64_t>(target_hidden_len + i);
+                }
+                context_kv_request.set_tensor("target_hidden", new_ctx_hidden);
+                context_kv_request.set_tensor("position_ids", new_pos);
+                context_kv_request.infer();
+                // Append new K,V to existing cache per layer.
+                for (size_t i = 0; i < num_draft_layers; ++i) {
+                    auto new_k = ensure_f32_copy(
+                        context_kv_request.get_tensor("context_k_" + std::to_string(i)));
+                    auto new_v = ensure_f32_copy(
+                        context_kv_request.get_tensor("context_v_" + std::to_string(i)));
+                    context_kv_cache[i].first = concat_kv_seq(context_kv_cache[i].first, new_k);
+                    context_kv_cache[i].second = concat_kv_seq(context_kv_cache[i].second, new_v);
+                }
+            }
         }
         target_hidden_len += num_accepted;
         past_len += static_cast<int64_t>(num_accepted);
@@ -1021,7 +1185,8 @@ int main(int argc, char* argv[]) try {
         ? perf.total_generate_ms / static_cast<double>(tokens_after_first) : 0.0;
 
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Mode: dflash / " << (vl_mode ? "vl" : "text") << std::endl;
+    std::cout << "Mode: dflash / " << (vl_mode ? "vl" : "text")
+              << " / " << (use_split_draft ? "split" : "combined") << std::endl;
     std::cout << "Prompt token size: " << prompt_len << std::endl;
     std::cout << "Output token size: " << perf.generated_tokens << std::endl;
     std::cout << "TTFT: " << perf.ttft_ms << " ms" << std::endl;
@@ -1037,7 +1202,7 @@ int main(int argc, char* argv[]) try {
     std::cout << std::setprecision(3);
     std::cout << "[Stage timings] wall-clock (ms):" << std::endl;
     print_stage_stats("prefill target", perf.prefill_wall);
-    print_stage_stats("draft (embed+draft+lm_head)", perf.draft_wall);
+    print_stage_stats("draft (step/combined)", perf.draft_wall);
     print_stage_stats("target verify", perf.verify_wall);
     print_stage_stats("postproc", perf.postproc_wall);
     print_stage_stats("other (untracked)", perf.other_wall);
