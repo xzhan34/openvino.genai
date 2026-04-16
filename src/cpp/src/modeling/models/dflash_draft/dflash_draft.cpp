@@ -342,7 +342,10 @@ Tensor DFlashDraftModel::forward(const Tensor& target_hidden,
                                  const Tensor& position_ids) const {
     auto hidden_states = noise_embedding;
     auto* policy = &ctx().op_policy();
-    auto conditioned = ops::linear(target_hidden, fc_weight());
+    // Scale down target_hidden before fc matmul to prevent FP16 overflow.
+    // The fc layer has reduction dim 12800 which can produce values > 65504 (FP16 max).
+    // RMSNorm is scale-invariant: RMSNorm(s*x) = RMSNorm(x), so results are exact.
+    auto conditioned = ops::linear(target_hidden * (1.0f / 128.0f), fc_weight());
     auto context_hidden = hidden_norm_.forward(conditioned);
     auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
     for (const auto& layer : layers_) {
@@ -356,7 +359,9 @@ std::vector<std::pair<Tensor, Tensor>> DFlashDraftModel::build_context_kv(
     const Tensor& target_hidden,
     const Tensor& position_ids) const {
     auto* policy = &ctx().op_policy();
-    auto conditioned = ops::linear(target_hidden, fc_weight());
+    // Scale down target_hidden before fc matmul to prevent FP16 overflow.
+    // RMSNorm is scale-invariant, so results are exact.
+    auto conditioned = ops::linear(target_hidden * (1.0f / 128.0f), fc_weight());
     auto context_hidden = hidden_norm_.forward(conditioned);
     auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
 

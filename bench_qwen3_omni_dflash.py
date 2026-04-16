@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """bench_qwen3_omni_dflash.py — Benchmark Qwen3-Omni DFlash speculative decoding.
 
+
 Cross-platform (Linux / Windows) benchmark script.
 Usage:
     python bench_qwen3_omni_dflash.py [--device GPU.1] [--max-tokens 128] [--block-size 16]
@@ -13,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -26,8 +28,9 @@ DEFAULT_IMAGE_PATH = str(Path(__file__).resolve().parent / "testdata" / "get_sta
 DEFAULT_DEVICE     = "GPU"
 DEFAULT_MAX_TOKENS = 128
 DEFAULT_BLOCK_SIZE = 16
-DEFAULT_PRECISION  = "inf_fp16_kv_int8"
-
+DEFAULT_PRECISION  = "inf_fp16_kv_int8_w_int4_asym"
+#  mixed/default/fp32/inf_fp32_kv_int8/inf_fp32_kv_int4/inf_fp16_kv_int8/inf_fp16_kv_int4/inf_fp32_kv_fp32_w_int8
+# inf_fp32_kv_fp32_w_int4_asym/inf_fp32_kv_int8_w_int4_asym/inf_fp16_kv_int8_w_int4_asym
 
 def find_genai_dir() -> Path:
     """Locate the openvino.genai repo root (directory containing this script)."""
@@ -78,6 +81,11 @@ def setup_env(genai_dir: Path) -> dict:
         ]
         env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
         env["OV_TOKENIZERS_LIB_PATH"] = str(genai_dir / "build" / "openvino_genai")
+
+    # Use combined draft model (no split) with f16 precision
+    # (fc matmul overflow fixed: dflash_draft.cpp upcasts to f32 before fc, RMSNorm converts back)
+    env["OV_GENAI_SPLIT_DRAFT"] = "0"
+    env["OV_GENAI_DRAFT_PRECISION"] = "f16"
 
     return env
 
@@ -155,6 +163,10 @@ def run_test(cmd: list, name: str, env: dict, log_dir: Path, test_num: int) -> T
     if result.returncode != 0:
         print(f"  *** Test {test_num} FAILED (exit code {result.returncode}) ***")
 
+    # Cool down GPU between tests
+    print(f"  Cooling down GPU for 15s...")
+    time.sleep(15)
+
     return TestResult(
         name=name,
         metrics=parse_metrics(output),
@@ -204,8 +216,8 @@ def print_summary(results: list, device: str):
 
     # Pairwise speedup
     pairs = [
-        (0, 1, "Text FP16"),
-        (0, 2, "Text INT4"),
+        (0, 1, "Text FP16vsFP32"),
+        (0, 2, "Text INT4vsFP32"),
         (4, 5, "Codegen"),
         (6, 7, "VL mode"),
     ]
@@ -298,7 +310,7 @@ def main():
     # ── Test definitions ──────────────────────────────────────────────────
     tests = [
         # (name, cmd_builder)
-        ("Baseline FP16 text",
+        ("Baseline FP32 text",
          lambda: baseline_cmd("What is the capital of France?"),
          False),
 
@@ -314,7 +326,7 @@ def main():
          lambda: dflash_cmd("Write a detailed explanation of how neural networks work", max_tok=256),
          True),
 
-        ("Baseline FP16 codegen",
+        ("Baseline FP32 codegen",
          lambda: baseline_cmd("Write a Python function to sort a list using quicksort"),
          False),
 
@@ -322,7 +334,7 @@ def main():
          lambda: dflash_cmd("Write a Python function to sort a list using quicksort"),
          True),
 
-        ("Baseline FP16 VL",
+        ("Baseline FP32 VL",
          lambda: baseline_cmd("Describe this image in detail", image=args.image),
          False),
 

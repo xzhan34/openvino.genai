@@ -133,6 +133,27 @@ ov::Tensor ensure_f32_copy(const ov::Tensor& t) {
     return out;
 }
 
+// Create a ROI (sub-tensor view) that works for both CPU and GPU tensors.
+// For remote (GPU) tensors, returns an ov::RemoteTensor ROI; for CPU, a plain ov::Tensor ROI.
+ov::Tensor make_tensor_roi(const ov::Tensor& parent,
+                           const ov::Coordinate& begin,
+                           const ov::Coordinate& end) {
+    if (parent.is<ov::RemoteTensor>()) {
+        return ov::RemoteTensor(parent, begin, end);
+    }
+    return ov::Tensor(parent, begin, end);
+}
+
+// Copy src tensor into a ROI of dst (works for GPU→GPU and CPU→CPU).
+void copy_to_roi(const ov::Tensor& src, const ov::Tensor& dst_roi) {
+    if (dst_roi.is<ov::RemoteTensor>()) {
+        ov::RemoteTensor remote_roi = dst_roi.as<ov::RemoteTensor>();
+        remote_roi.copy_from(src);
+    } else {
+        src.copy_to(dst_roi);
+    }
+}
+
 template <typename T>
 int64_t argmax_row(const T* data, size_t vocab) {
     T max_val = data[0];
@@ -754,9 +775,16 @@ int main(int argc, char* argv[]) try {
     bool gpu_snapshots = false;
     std::map<std::string, ov::Tensor> snapshot_remote_tensors;
     ov::RemoteContext remote_context;
-    if (has_snapshots) {
+
+    // Try to obtain GPU RemoteContext (used for snapshots and GPU-resident hidden storage).
+    try {
+        remote_context = compiled_target.get_context();
+    } catch (const std::exception&) {
+        // Not on GPU — remote_context remains empty.
+    }
+
+    if (has_snapshots && remote_context) {
         try {
-            remote_context = compiled_target.get_context();
             for (auto& output : compiled_target.outputs()) {
                 std::string snap_name;
                 for (auto& name : output.get_names()) {
@@ -835,11 +863,44 @@ int main(int argc, char* argv[]) try {
     }
 
     target_kv_state.add_inputs(make_ids_tensor(output_ids));
-    ov::Tensor target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
-    const size_t hidden_dim = target_hidden_block.get_shape()[2];
-    ov::Tensor target_hidden_storage(ov::element::f32, {1, max_length + static_cast<size_t>(dflash_cfg.block_size), hidden_dim});
-    ov::Tensor target_hidden_init(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
-    target_hidden_block.copy_to(target_hidden_init);
+
+    // Determine hidden dimension from target output.
+    auto raw_target_hidden = target_request.get_tensor("target_hidden");
+    const size_t hidden_dim = raw_target_hidden.get_shape()[2];
+    const ov::Shape hidden_storage_shape = {1, max_length + static_cast<size_t>(dflash_cfg.block_size), hidden_dim};
+
+    // Allocate target_hidden_storage on GPU (RemoteTensor) if possible, else CPU.
+    // Keeping hidden states on GPU avoids the expensive GPU→CPU synchronization in
+    // ensure_f32_copy and the CPU→GPU upload when the draft model reads them.
+    bool gpu_hidden = false;
+    ov::Tensor target_hidden_storage;
+    if (remote_context) {
+        try {
+            target_hidden_storage = remote_context.create_tensor(ov::element::f32, hidden_storage_shape);
+            gpu_hidden = true;
+            std::cout << "[DFlash] GPU-resident target_hidden storage allocated ("
+                      << hidden_storage_shape[1] << " x " << hidden_dim << " f32)" << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "[DFlash] GPU hidden storage alloc failed: " << e.what()
+                      << ", using CPU storage" << std::endl;
+        }
+    }
+    if (!gpu_hidden) {
+        target_hidden_storage = ov::Tensor(ov::element::f32, hidden_storage_shape);
+    }
+
+    // Copy prefill hidden states into storage.
+    ov::Tensor target_hidden_block;  // Used only as CPU fallback for snapshot branches
+    {
+        auto init_roi = make_tensor_roi(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
+        if (gpu_hidden) {
+            // GPU→GPU: copy target output directly into GPU storage (no sync barrier)
+            copy_to_roi(raw_target_hidden, init_roi);
+        } else {
+            target_hidden_block = ensure_f32_copy(raw_target_hidden);
+            target_hidden_block.copy_to(init_roi);
+        }
+    }
     size_t target_hidden_len = prompt_len;
 
     int64_t next_token = argmax_last_token(logits);
@@ -886,7 +947,7 @@ int main(int argc, char* argv[]) try {
         }
 
         // Run combined draft model (embed + draft + lm_head in one GPU dispatch)
-        ov::Tensor hidden_view(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, hidden_dim});
+        ov::Tensor hidden_view = make_tensor_roi(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, hidden_dim});
         draft_request.set_tensor("target_hidden", hidden_view);
         draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
         draft_request.set_tensor("position_ids", draft_pos);
@@ -976,15 +1037,15 @@ int main(int argc, char* argv[]) try {
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
 
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            if (!gpu_hidden) target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
         } else if (all_accepted) {
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            if (!gpu_hidden) target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
         } else if (!has_linear_states) {
             const size_t tokens_to_trim = verify_len - num_accepted;
             target_kv_state.num_tokens_to_trim = tokens_to_trim;
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            if (!gpu_hidden) target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
         } else {
             restore_linear_states(target_request, saved_linear);
 
@@ -1007,15 +1068,24 @@ int main(int argc, char* argv[]) try {
                 target_request.infer();
             }
 
-            target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+            if (!gpu_hidden) target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
         }
 
+        // Append newly accepted hidden states to storage.
         if (num_accepted > 0 && target_hidden_len + num_accepted <= max_length + static_cast<size_t>(dflash_cfg.block_size)) {
-            ov::Tensor src_slice(target_hidden_block, {0, 0, 0}, {1, num_accepted, hidden_dim});
-            ov::Tensor dst_slice(target_hidden_storage,
-                                 {0, target_hidden_len, 0},
-                                 {1, target_hidden_len + num_accepted, hidden_dim});
-            src_slice.copy_to(dst_slice);
+            auto dst_roi = make_tensor_roi(target_hidden_storage,
+                                           {0, target_hidden_len, 0},
+                                           {1, target_hidden_len + num_accepted, hidden_dim});
+            if (gpu_hidden) {
+                // GPU path: copy target output directly into GPU storage (no CPU sync).
+                auto raw_hidden = target_request.get_tensor("target_hidden");
+                auto src_roi = make_tensor_roi(raw_hidden, {0, 0, 0}, {1, num_accepted, hidden_dim});
+                copy_to_roi(src_roi, dst_roi);
+            } else {
+                // CPU path (existing): target_hidden_block was already copied to CPU above.
+                ov::Tensor src_slice(target_hidden_block, {0, 0, 0}, {1, num_accepted, hidden_dim});
+                src_slice.copy_to(dst_roi);
+            }
             target_hidden_len += num_accepted;
         }
 
