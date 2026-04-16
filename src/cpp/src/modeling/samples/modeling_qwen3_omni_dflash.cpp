@@ -41,8 +41,6 @@
 #include "utils.hpp"
 
 #include "modeling/models/dflash_draft/dflash_draft.hpp"
-#include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
-#include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/models/qwen3_omni/modeling_qwen3_omni.hpp"
 #include "modeling/models/qwen3_omni/modeling_qwen3_omni_internal.hpp"
 #include "modeling/models/qwen3_omni/processing_qwen3_omni_vl.hpp"
@@ -545,21 +543,8 @@ int main(int argc, char* argv[]) try {
             // maps to "thinker.model.embed_tokens.weight" in safetensors.
             ov::genai::modeling::models::PrefixMappedWeightSource thinker_source(target_source, "thinker.");
 
-            // We need to build the combined draft model. The Qwen3.5 builder
-            // works because the DFlash draft architecture is the same, and both
-            // Qwen3-4B and Qwen3-Omni share the same vocab/embedding/lm_head.
-            //
-            // However, create_qwen3_5_dflash_combined_draft_model takes Qwen3_5Config,
-            // not Qwen3OmniConfig.  We construct a minimal Qwen3_5Config from
-            // the Omni thinker config for this purpose.
-            ov::genai::modeling::models::Qwen3_5Config compat_cfg;
-            compat_cfg.text.hidden_size = omni_cfg.text.hidden_size;
-            compat_cfg.text.vocab_size = omni_cfg.text.vocab_size;
-            compat_cfg.text.num_hidden_layers = omni_cfg.text.num_hidden_layers;
-            compat_cfg.tie_word_embeddings = omni_cfg.text.tie_word_embeddings;
-
-            combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model(
-                compat_cfg, dflash_cfg, thinker_source, target_finalizer,
+            combined_draft_model = ov::genai::modeling::models::create_qwen3_omni_dflash_combined_draft_model(
+                omni_cfg, dflash_cfg, thinker_source, target_finalizer,
                 draft_source, draft_finalizer);
         }
 

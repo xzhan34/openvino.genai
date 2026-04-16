@@ -19,6 +19,7 @@
 #include "modeling/ops/shape.hpp"
 #include "modeling/ops/tensor_ops.hpp"
 #include "modeling/weights/weight_loader.hpp"
+#include "modeling/models/dflash_draft/dflash_draft.hpp"
 #include "modeling/models/qwen3_omni/processing_qwen3_omni_vl.hpp"
 
 namespace {
@@ -835,6 +836,219 @@ std::shared_ptr<ov::Model> create_qwen3_omni_dflash_target_model(
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;
+}
+
+// ============================================================================
+// DFlash Combined Draft Model (embed + draft layers + lm_head)
+// ============================================================================
+// Merges embed_tokens, draft layers, and lm_head into a single graph.
+// Target weights (embed_tokens, lm_head) come from the Qwen3-Omni thinker,
+// accessed through a PrefixMappedWeightSource that strips the "thinker." prefix.
+// Draft weights come from the standalone DFlash draft model.
+//
+// Inputs:  target_hidden [B, T, ctx_dim], input_ids [B, block_size],
+//          position_ids [1, T+block_size]
+// Output:  logits [B, block_size, vocab_size]
+
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_combined_draft_model(
+    const Qwen3OmniConfig& omni_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    // ── Embedding path (target weights under "model" prefix) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
+
+    // ── Draft layers (draft weights) ──
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    // ── LM head (target weights, tied to embed_tokens when configured) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+    if (omni_cfg.text.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+        // When tied, skip load_model for lm_root — Qwen3-Omni safetensors
+        // store a separate lm_head.weight that differs from embed_tokens.weight
+        // even though tie_word_embeddings=True.  load_model would overwrite the
+        // tied binding with the wrong tensor.
+    } else if (!target_source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (target_source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    } else {
+        ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
+    }
+
+    // ── Inputs ──
+    const ov::element::Type dtype = ov::element::f32;
+    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
+                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // ── Forward: embed → draft → lm_head (single graph) ──
+    auto noise_embedding = embed.forward(input_ids);
+    auto draft_hidden = draft_model.forward(target_hidden, noise_embedding, position_ids);
+    auto logits = head.forward(draft_hidden);
+
+    // ── Output ──
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({logits_result->output(0)});
+}
+
+// ============================================================================
+// DFlash Context KV Preprocessing Model
+// ============================================================================
+// Computes fc(target_hidden) → RMSNorm → K,V projections + KNorm + RoPE
+// for all draft layers.  Runs once per verify cycle on newly-accepted tokens.
+// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
+// Outputs: k_0..k_N [1, kv_heads, A, head_dim], v_0..v_N (same shape)
+
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_context_kv_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    const ov::element::Type dtype = ov::element::f32;
+    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
+                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    auto kv_pairs = draft_model.build_context_kv(target_hidden, position_ids);
+
+    ov::OutputVector outputs;
+    for (size_t i = 0; i < kv_pairs.size(); ++i) {
+        auto k_result = std::make_shared<ov::op::v0::Result>(kv_pairs[i].first.output());
+        set_name(k_result, "context_k_" + std::to_string(i));
+        auto v_result = std::make_shared<ov::op::v0::Result>(kv_pairs[i].second.output());
+        set_name(v_result, "context_v_" + std::to_string(i));
+        outputs.push_back(k_result->output(0));
+        outputs.push_back(v_result->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
+// ============================================================================
+// DFlash Lightweight Draft Step Model
+// ============================================================================
+// Embed → attention (with pre-computed context KV) → MLP → lm_head.
+// Runs once per draft cycle.  Skips fc + context KV computation entirely.
+// Inputs:  input_ids [1, B], position_ids [1, B],
+//          context_k_0..N [1, kv_heads, T, head_dim], context_v_0..N (same)
+// Output:  logits [1, B, vocab_size]
+
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_step_model(
+    const Qwen3OmniConfig& omni_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    // ── Embedding (target weights) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
+
+    // ── Draft layers ──
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    // ── LM head (target weights) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+    if (omni_cfg.text.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+    } else if (!target_source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (target_source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    } else {
+        ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
+    }
+
+    // ── Inputs ──
+    const ov::element::Type dtype = ov::element::f32;
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // Context KV inputs: one K,V pair per draft layer.
+    const int32_t kv_heads = draft_cfg.num_key_value_heads > 0
+                                 ? draft_cfg.num_key_value_heads
+                                 : draft_cfg.num_attention_heads;
+    const int32_t head_dim = draft_cfg.head_dim > 0
+                                 ? draft_cfg.head_dim
+                                 : (draft_cfg.hidden_size / draft_cfg.num_attention_heads);
+    std::vector<std::pair<Tensor, Tensor>> context_kv;
+    for (int32_t i = 0; i < draft_cfg.num_hidden_layers; ++i) {
+        auto ck = ctx.parameter("context_k_" + std::to_string(i), dtype,
+                                ov::PartialShape{-1, kv_heads, -1, head_dim});
+        auto cv = ctx.parameter("context_v_" + std::to_string(i), dtype,
+                                ov::PartialShape{-1, kv_heads, -1, head_dim});
+        context_kv.push_back({ck, cv});
+    }
+
+    // ── Forward: embed → draft_with_cached_kv → lm_head ──
+    auto noise_embedding = embed.forward(input_ids);
+    auto draft_hidden = draft_model.forward_with_cached_kv(noise_embedding, position_ids, context_kv);
+    auto logits = head.forward(draft_hidden);
+
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({logits_result->output(0)});
 }
 
 }  // namespace models

@@ -168,6 +168,49 @@ std::shared_ptr<ov::Model> create_qwen3_omni_dflash_target_model(
     ov::genai::modeling::weights::WeightFinalizer& finalizer,
     bool enable_multimodal_inputs = true);
 
+// Forward declaration (defined in dflash_draft.hpp).
+struct DFlashDraftConfig;
+
+/// DFlash combined draft model (embed + draft layers + lm_head) for Qwen3-Omni.
+/// Merges three GPU dispatches into one infer() call per draft step.
+/// Target weights (embed_tokens, lm_head) come from the Omni thinker via a
+/// PrefixMappedWeightSource.  Draft weights come from the standalone DFlash model.
+/// Inputs:  target_hidden [B, T, hidden*num_draft_layers],
+///          input_ids     [B, block_size],
+///          position_ids  [1, T+block_size]
+/// Output:  logits        [B, block_size, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_combined_draft_model(
+    const Qwen3OmniConfig& omni_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// DFlash context KV preprocessing model for Qwen3-Omni.
+/// Computes fc + RMSNorm + K,V projections + KNorm + RoPE for all draft layers.
+/// Runs once per verify cycle on newly accepted tokens.
+/// Inputs:  target_hidden [1, A, ctx_dim], position_ids [1, A]
+/// Outputs: context_k_i [1, kv_heads, A, head_dim], context_v_i (×num_layers)
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_context_kv_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
+/// DFlash lightweight draft step model for Qwen3-Omni.
+/// Embed → attention using pre-computed context K,V → MLP → LM head.
+/// Skips fc + context KV computation entirely.
+/// Inputs:  input_ids [1, B], position_ids [1, B],
+///          context_k_i / context_v_i [1, kv_heads, T, head_dim] (×num_layers)
+/// Output:  logits [1, B, vocab_size]
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_step_model(
+    const Qwen3OmniConfig& omni_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer);
+
 std::shared_ptr<ov::Model> create_qwen3_omni_vision_model(
     const Qwen3OmniConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
