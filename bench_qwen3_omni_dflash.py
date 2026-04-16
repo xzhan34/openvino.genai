@@ -28,9 +28,10 @@ DEFAULT_IMAGE_PATH = str(Path(__file__).resolve().parent / "testdata" / "get_sta
 DEFAULT_DEVICE     = "GPU"
 DEFAULT_MAX_TOKENS = 128
 DEFAULT_BLOCK_SIZE = 16
-DEFAULT_PRECISION  = "inf_fp16_kv_int8_w_int4_asym"
-#  mixed/default/fp32/inf_fp32_kv_int8/inf_fp32_kv_int4/inf_fp16_kv_int8/inf_fp16_kv_int4/inf_fp32_kv_fp32_w_int8
-# inf_fp32_kv_fp32_w_int4_asym/inf_fp32_kv_int8_w_int4_asym/inf_fp16_kv_int8_w_int4_asym
+DEFAULT_PRECISION  = "mixed"
+# "mixed" uses GPU defaults (inference_precision=f16, kv_cache=f16) — matches DFlash target config.
+# Other options: default/fp32/inf_fp32_kv_int8/inf_fp32_kv_int4/inf_fp16_kv_int8/inf_fp16_kv_int4
+# inf_fp32_kv_fp32_w_int8/inf_fp32_kv_fp32_w_int4_asym/inf_fp32_kv_int8_w_int4_asym/inf_fp16_kv_int8_w_int4_asym
 
 def find_genai_dir() -> Path:
     """Locate the openvino.genai repo root (directory containing this script)."""
@@ -83,7 +84,7 @@ def setup_env(genai_dir: Path) -> dict:
         env["OV_TOKENIZERS_LIB_PATH"] = str(genai_dir / "build" / "openvino_genai")
 
     # Use combined draft model (no split) with f16 precision
-    # (fc matmul overflow fixed: dflash_draft.cpp upcasts to f32 before fc, RMSNorm converts back)
+    # (fc matmul overflow fixed: dflash_draft.cpp scales input by 1/128, RMSNorm is scale-invariant)
     env["OV_GENAI_SPLIT_DRAFT"] = "0"
     env["OV_GENAI_DRAFT_PRECISION"] = "f16"
 
@@ -216,8 +217,8 @@ def print_summary(results: list, device: str):
 
     # Pairwise speedup
     pairs = [
-        (0, 1, "Text FP16vsFP32"),
-        (0, 2, "Text INT4vsFP32"),
+        (0, 1, "Text FP16"),
+        (0, 2, "Text INT4+FP16"),
         (4, 5, "Codegen"),
         (6, 7, "VL mode"),
     ]
@@ -248,7 +249,7 @@ def main():
     parser.add_argument("--device",      default=DEFAULT_DEVICE,      help="Device (GPU / GPU.1 / CPU)")
     parser.add_argument("--max-tokens",  default=DEFAULT_MAX_TOKENS,  type=int, help="Max new tokens")
     parser.add_argument("--block-size",  default=DEFAULT_BLOCK_SIZE,  type=int, help="DFlash block size")
-    parser.add_argument("--precision",   default=DEFAULT_PRECISION,   help="Baseline precision mode")
+    parser.add_argument("--precision",   default=DEFAULT_PRECISION,   help="Baseline precision mode (default: mixed = f16 inference + f16 kv cache)")
     args = parser.parse_args()
     if args.target_dir is None:
         args.target_dir = os.path.join(args.model_dir, "Qwen3-Omni-4B-Instruct-multilingual")
@@ -310,7 +311,7 @@ def main():
     # ── Test definitions ──────────────────────────────────────────────────
     tests = [
         # (name, cmd_builder)
-        ("Baseline FP32 text",
+        ("Baseline FP16 text",
          lambda: baseline_cmd("What is the capital of France?"),
          False),
 
@@ -326,7 +327,7 @@ def main():
          lambda: dflash_cmd("Write a detailed explanation of how neural networks work", max_tok=256),
          True),
 
-        ("Baseline FP32 codegen",
+        ("Baseline FP16 codegen",
          lambda: baseline_cmd("Write a Python function to sort a list using quicksort"),
          False),
 
@@ -334,7 +335,7 @@ def main():
          lambda: dflash_cmd("Write a Python function to sort a list using quicksort"),
          True),
 
-        ("Baseline FP32 VL",
+        ("Baseline FP16 VL",
          lambda: baseline_cmd("Describe this image in detail", image=args.image),
          False),
 
