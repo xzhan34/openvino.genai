@@ -3378,6 +3378,73 @@ $\text{TPOT}_{实际} = \frac{240}{1.31 + 1} = 104 \text{ms/token}$
 <tr><td><code>bench_qwen3_omni_dflash.py</code></td><td>切换到 split mode (<code>OV_GENAI_SPLIT_DRAFT=1</code>)</td></tr>
 </table>
 
+<h2 id="sec35">35. 核心发现：瓶颈是 Acceptance Rate，不是系统开销</h2>
+
+<h3>35.1 最新性能数据（2026-04-16，trim_kv 优化后）</h3>
+<table>
+<tr><th>#</th><th>Test</th><th>Prompt</th><th>Output</th><th>TTFT (ms)</th><th>TPOT (ms)</th><th>Tok/s</th><th>AccRate</th><th>AvgAccept</th></tr>
+<tr><td>1</td><td>Baseline FP16 text</td><td>97</td><td>8</td><td>1080.83</td><td>151.78</td><td>6.59</td><td>—</td><td>—</td></tr>
+<tr><td>2</td><td>DFlash FP16 text</td><td>15</td><td>8</td><td>277.17</td><td>141.82</td><td>8.06</td><td>0.3750</td><td>0.75</td></tr>
+<tr><td>3</td><td>DFlash INT4+FP16 text</td><td>15</td><td>8</td><td>271.09</td><td>172.33</td><td>6.63</td><td>0.3750</td><td>0.75</td></tr>
+<tr><td>4</td><td>DFlash FP16 long(256)</td><td>17</td><td>256</td><td>384.71</td><td>200.69</td><td>5.00</td><td>0.1602</td><td>0.19</td></tr>
+<tr><td>5</td><td>Baseline FP16 codegen</td><td>101</td><td>128</td><td>1085.86</td><td>149.67</td><td>6.68</td><td>—</td><td>—</td></tr>
+<tr><td>6</td><td>DFlash FP16 codegen</td><td>19</td><td>128</td><td>379.34</td><td>103.52</td><td>9.74</td><td>0.5625</td><td>1.31</td></tr>
+<tr><td>7</td><td>Baseline FP16 VL</td><td>95</td><td>128</td><td>1413.99</td><td>149.42</td><td>6.69</td><td>—</td><td>—</td></tr>
+<tr><td>8</td><td>DFlash FP16 VL</td><td>95</td><td>128</td><td>1473.10</td><td>192.22</td><td>5.24</td><td>0.1797</td><td>0.22</td></tr>
+</table>
+
+<p><strong>Speedup</strong>: Text FP16 1.22×, Codegen 1.46×, VL 0.78× (退化)</p>
+
+<h3>35.2 Per-Step 开销对比：VL vs Codegen</h3>
+<p>定时数据显示，<strong>per-step 系统开销在所有模式下几乎相同</strong>，唯一差异来自 acceptance rate：</p>
+<table>
+<tr><th>阶段</th><th>VL (test8)</th><th>Codegen (test6)</th><th>差异</th></tr>
+<tr><td>draft (16 tokens)</td><td>42.5 ms</td><td>41.8 ms</td><td>&lt; 2%</td></tr>
+<tr><td>target verify</td><td>186.1 ms</td><td>191.0 ms</td><td>&lt; 3%</td></tr>
+<tr><td>other (context_kv等)</td><td>6.2 ms</td><td>6.3 ms</td><td>&lt; 2%</td></tr>
+<tr><td><strong>总计/步</strong></td><td><strong>~235 ms</strong></td><td><strong>~239 ms</strong></td><td><strong>~0%</strong></td></tr>
+</table>
+
+<h3>35.3 Acceptance Rate 是唯一变量</h3>
+<table>
+<tr><th>场景</th><th>AccRate</th><th>AvgAccept</th><th>Steps/128tok</th><th>Tok/步</th><th>Throughput</th></tr>
+<tr style="background:rgba(0,200,0,0.08)"><td>Codegen</td><td>56.25%</td><td>1.31</td><td>55</td><td>2.33</td><td>9.74 tok/s</td></tr>
+<tr><td>Text (simple)</td><td>37.50%</td><td>0.75</td><td>4 (short)</td><td>2.0</td><td>8.06 tok/s</td></tr>
+<tr style="background:rgba(255,0,0,0.08)"><td>VL</td><td>17.97%</td><td>0.22</td><td>104</td><td>1.23</td><td>5.24 tok/s</td></tr>
+<tr style="background:rgba(255,0,0,0.08)"><td>Long text</td><td>16.02%</td><td>0.19</td><td>214 / 256tok</td><td>1.20</td><td>5.00 tok/s</td></tr>
+</table>
+<p>VL 每步最多接受 1 个 draft token（从不超过 2），而 codegen 经常一次接受 7、14 个。Long text (test4) 也只有 16%——<strong>问题不是 VL 特有的，而是 draft model 对非代码文本预测能力差</strong>。</p>
+
+<h3>35.4 系统级优化天花板分析</h3>
+<p>以 block_size=1 为例（最小化 draft 浪费）：</p>
+<ul>
+<li>draft: ~2.6ms（1 token）+ verify: ~149ms（同 baseline） + other: ~4ms ≈ <strong>156 ms/步</strong></li>
+<li>tokens/步: 1.22（22% 接受率）→ TPOT: 156/1.22 = <strong>128ms → 7.8 tok/s → 1.17× baseline</strong></li>
+</ul>
+<p><strong>系统级优化上限约 1.2×，无法达到 1.5×。</strong></p>
+
+<h3>35.5 达到 1.5× 所需的 Acceptance Rate</h3>
+<p>TPOT = step_cost / (1 + avg_accept)。目标 1.5× baseline = 10.0 tok/s → TPOT = 100ms。</p>
+<table>
+<tr><th>block_size</th><th>step_cost (ms)</th><th>需要 avg_accept</th><th>vs 当前 VL (0.22) 的提升倍数</th></tr>
+<tr><td>16</td><td>~235</td><td>1.35</td><td>6.1×</td></tr>
+<tr><td>4</td><td>~165</td><td>0.65</td><td>3.0×</td></tr>
+<tr><td>2</td><td>~156</td><td>0.56</td><td>2.5×</td></tr>
+</table>
+
+<h3>35.6 优化路径</h3>
+<h4>短期（系统层，可立即实现）→ 0.78× → ~1.1-1.2×</h4>
+<ol>
+<li><strong>Adaptive block size</strong>: 根据 running acceptance rate 动态调整 block_size（2~max）。低接受率时减少 draft 浪费。</li>
+<li><strong>Auto-fallback</strong>: 连续 N 步 accepted=0 时退回 autoregressive（保底 1.0×，不退化）。</li>
+</ol>
+<h4>中期（模型层，训练改进）→ 目标 1.5×+</h4>
+<ol start="3">
+<li><strong>VL 训练数据</strong>: 用 Qwen3-Omni 处理图文 prompt → 提取 hidden states → 加入训练集。当前 draft model 只用了 Nemotron-v2 + evol-codealpaca（code-heavy），从未见过 VL hidden states。</li>
+<li><strong>Long-form text 训练数据</strong>: 补充描述性/说明性文本训练数据。</li>
+<li><strong>调整 target layers</strong>: 当前 <code>[1,9,17,25,33]</code>，VL 信息可能集中在特定层。</li>
+</ol>
+
 <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
     Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比 &amp; 集成排障文档
 </div>

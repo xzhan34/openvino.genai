@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -92,6 +93,7 @@ struct PerfStats {
     size_t draft_steps = 0;
     size_t accepted_tokens = 0;
     size_t generated_tokens = 0;
+    size_t ar_fallback_steps = 0;
     double ttft_ms = 0.0;
     double total_generate_ms = 0.0;
     std::vector<size_t> accepted_per_step;
@@ -974,6 +976,18 @@ int main(int argc, char* argv[]) try {
     // mRoPE rope_deltas for decode (VL mode)
     int64_t past_len = static_cast<int64_t>(prompt_len);
 
+    // ── Auto-fallback state ─────────────────────────────────────────────
+    const int max_block_size = dflash_cfg.block_size;
+    bool ar_fallback_active = false;
+    const size_t ar_recovery_check = 5;      // try drafting again every N AR steps
+    size_t ar_steps_since_check = 0;
+    const size_t warmup_steps = 10;          // don't trigger AR fallback in first N draft steps
+
+    // Sliding window: track acceptance in recent W steps
+    const size_t ar_window_size = 8;
+    const size_t ar_window_threshold = 1;    // switch to AR if ≤ this many accepts in window
+    std::deque<size_t> recent_accepts;       // ring buffer of recent per-step acceptance counts
+
     bool stopped_by_eos = false;
     while (output_ids.size() < max_length) {
         if (next_token == eos_token_id) {
@@ -983,6 +997,96 @@ int main(int argc, char* argv[]) try {
         }
         const auto step_start = Clock::now();
         double step_tracked_ms = 0.0;
+
+        // ── Auto-fallback: pure autoregressive step ──────────────────────
+        if (ar_fallback_active) {
+            ++ar_steps_since_check;
+            // Periodically try drafting again to check if acceptance recovers
+            if (ar_steps_since_check >= ar_recovery_check) {
+                ar_fallback_active = false;
+                ar_steps_since_check = 0;
+                // Don't clear recent_accepts — window will re-trigger immediately if acceptance stays low
+            } else {
+                // Pure AR: run target for single token
+                auto ar_verify_start = Clock::now();
+                std::vector<int64_t> ar_ids = {output_ids.back()};
+                target_request.set_tensor("input_ids", make_ids_tensor(ar_ids));
+                target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + 1));
+                if (vl_mode) {
+                    auto decode_pos = ov::genai::modeling::models::Qwen3VLInputPlanner::build_decode_position_ids(
+                        vl_rope_deltas, past_len, 1);
+                    target_request.set_tensor("position_ids", decode_pos);
+                    make_decode_zero_tensors(1);
+                    set_target_multimodal_inputs(target_request,
+                                                 zero_visual_embeds, zero_visual_pos_mask,
+                                                 zero_audio_features, zero_audio_pos_mask,
+                                                 zero_deepstack);
+                } else {
+                    target_request.set_tensor("position_ids",
+                                              make_mrope_position_ids(target_hidden_len, 1));
+                }
+                target_request.set_tensor("beam_idx", beam_idx);
+                target_request.infer();
+                auto ar_verify_end = Clock::now();
+                perf.verify_wall.add(duration_ms(ar_verify_start, ar_verify_end));
+
+                logits = target_request.get_tensor("logits");
+                int64_t ar_next = argmax_last_token(logits);
+
+                // Update target_hidden
+                if (has_target_hidden) {
+                    auto th_start = Clock::now();
+                    ov::Tensor target_hidden_block = ensure_f32_copy(target_request.get_tensor("target_hidden"));
+                    if (target_hidden_len + 1 <= max_length + static_cast<size_t>(max_block_size)) {
+                        ov::Tensor src_slice(target_hidden_block, {0, 0, 0}, {1, 1, ctx_dim});
+                        ov::Tensor dst_slice(target_hidden_storage,
+                                             {0, target_hidden_len, 0},
+                                             {1, target_hidden_len + 1, ctx_dim});
+                        src_slice.copy_to(dst_slice);
+                    }
+                    perf.target_hidden_copy_wall.add(duration_ms(th_start, Clock::now()));
+
+                    if (use_split_draft) {
+                        auto ckv_start = Clock::now();
+                        ov::Tensor new_ctx_hidden(target_hidden_storage,
+                                                  {0, target_hidden_len, 0},
+                                                  {1, target_hidden_len + 1, ctx_dim});
+                        ov::Tensor new_pos(ov::element::i64, {1, 1});
+                        new_pos.data<int64_t>()[0] = static_cast<int64_t>(target_hidden_len);
+                        context_kv_request.set_tensor("target_hidden", new_ctx_hidden);
+                        context_kv_request.set_tensor("position_ids", new_pos);
+                        context_kv_request.infer();
+                        perf.context_kv_infer_wall.add(duration_ms(ckv_start, Clock::now()));
+                        auto ckv_copy_start = Clock::now();
+                        for (size_t i = 0; i < num_draft_layers; ++i) {
+                            auto new_k = ensure_f32_copy(
+                                context_kv_request.get_tensor("context_k_" + std::to_string(i)));
+                            auto new_v = ensure_f32_copy(
+                                context_kv_request.get_tensor("context_v_" + std::to_string(i)));
+                            context_kv_cache[i].first = concat_kv_seq(context_kv_cache[i].first, new_k);
+                            context_kv_cache[i].second = concat_kv_seq(context_kv_cache[i].second, new_v);
+                        }
+                        perf.context_kv_copy_wall.add(duration_ms(ckv_copy_start, Clock::now()));
+                    }
+                }
+                target_hidden_len += 1;
+                past_len += 1;
+
+                ++perf.ar_fallback_steps;
+                std::cout << "[AR " << perf.ar_fallback_steps << "] id=" << ar_next << std::endl;
+
+                next_token = ar_next;
+                output_ids.push_back(next_token);
+                if (ar_next == eos_token_id) {
+                    stopped_by_eos = true;
+                    std::cout << "\n[Early Stop] EOS in AR at position " << output_ids.size() << std::endl;
+                    break;
+                }
+                const double step_ms = duration_ms(step_start, Clock::now());
+                perf.other_wall.add(std::max(0.0, step_ms - duration_ms(ar_verify_start, ar_verify_end)));
+                continue;
+            }
+        }
 
         // ── Draft ────────────────────────────────────────────────────────
         std::vector<int64_t> block_ids(static_cast<size_t>(dflash_cfg.block_size), mask_token_id);
@@ -1144,6 +1248,31 @@ int main(int argc, char* argv[]) try {
         perf.accepted_tokens += accepted;
         perf.accepted_per_step.push_back(accepted);
 
+        // ── Update AR fallback state (sliding window) ───────────────────
+        recent_accepts.push_back(accepted);
+        if (recent_accepts.size() > ar_window_size)
+            recent_accepts.pop_front();
+
+        if (perf.draft_steps >= warmup_steps && recent_accepts.size() >= ar_window_size) {
+            size_t window_total = 0;
+            for (auto a : recent_accepts) window_total += (a > 0 ? 1 : 0);
+            if (window_total <= ar_window_threshold && !ar_fallback_active) {
+                ar_fallback_active = true;
+                ar_steps_since_check = 0;
+                std::cout << "[Adaptive] Switching to AR fallback (window: "
+                          << window_total << "/" << ar_window_size << " steps with accepts)" << std::endl;
+            }
+        }
+        if (accepted > 0 && perf.draft_steps >= warmup_steps && recent_accepts.size() >= ar_window_size) {
+            // Check if window still shows good acceptance before clearing fallback
+            size_t window_positive = 0;
+            for (auto a : recent_accepts) window_positive += (a > 0 ? 1 : 0);
+            if (window_positive > ar_window_threshold)
+                ar_fallback_active = false;
+        } else if (accepted > 0 && perf.draft_steps < warmup_steps) {
+            ar_fallback_active = false;
+        }
+
         // Print step info
         {
             std::vector<int64_t> step_toks;
@@ -1206,6 +1335,7 @@ int main(int argc, char* argv[]) try {
     std::cout << "TPOT: " << tpot_ms << " ms/token" << std::endl;
     std::cout << "Throughput: " << dflash_throughput << " tokens/s" << std::endl;
     std::cout << "Draft steps: " << perf.draft_steps << std::endl;
+    std::cout << "AR fallback steps: " << perf.ar_fallback_steps << std::endl;
     std::cout << "Accepted draft tokens: " << perf.accepted_tokens << std::endl;
     std::cout << "Acceptance rate: " << std::setprecision(4) << acceptance_rate << std::endl;
     std::cout << std::setprecision(2);
