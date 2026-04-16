@@ -351,6 +351,7 @@ Tensor DFlashDraftModel::forward(const Tensor& target_hidden,
     return norm_.forward(hidden_states);
 }
 
+
 std::vector<std::pair<Tensor, Tensor>> DFlashDraftModel::build_context_kv(
     const Tensor& target_hidden,
     const Tensor& position_ids) const {

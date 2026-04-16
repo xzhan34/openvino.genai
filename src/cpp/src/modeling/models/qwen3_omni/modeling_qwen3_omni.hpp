@@ -158,6 +158,16 @@ std::shared_ptr<ov::Model> create_qwen3_omni_text_model(
     bool use_inputs_embeds = false,
     bool enable_multimodal_inputs = true);
 
+/// DFlash target model: outputs both "logits" and "target_hidden" (concatenated
+/// hidden states at selected layers).  Used by the DFlash speculative decoding
+/// pipeline for Qwen3-Omni.
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_target_model(
+    const Qwen3OmniConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    bool enable_multimodal_inputs = true);
+
 std::shared_ptr<ov::Model> create_qwen3_omni_vision_model(
     const Qwen3OmniConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,

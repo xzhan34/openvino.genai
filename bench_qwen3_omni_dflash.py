@@ -23,7 +23,7 @@ DEFAULT_MODEL_BASE = r"C:\work\models" if sys.platform == "win32" else "/home/xz
 DEFAULT_TARGET_DIR = os.path.join(DEFAULT_MODEL_BASE, "Qwen3-Omni-4B-Instruct-multilingual")
 DEFAULT_DRAFT_DIR  = os.path.join(DEFAULT_MODEL_BASE, "Qwen3-4B-DFlash-b16")
 DEFAULT_IMAGE_PATH = str(Path(__file__).resolve().parent / "testdata" / "get_started_with_cpp.jpg")
-DEFAULT_DEVICE     = "GPU.1"
+DEFAULT_DEVICE     = "GPU"
 DEFAULT_MAX_TOKENS = 128
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_PRECISION  = "inf_fp16_kv_int8"

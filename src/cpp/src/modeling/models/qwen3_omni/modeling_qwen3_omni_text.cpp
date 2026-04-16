@@ -405,6 +405,11 @@ public:
         if (audio_features && audio_pos_mask) {
             hidden_states = embedding_injector_.forward(hidden_states, *audio_features, *audio_pos_mask);
         }
+        // Sort capture IDs for efficient lookup during the layer loop
+        auto sorted_capture_ids = capture_layer_ids_;
+        std::sort(sorted_capture_ids.begin(), sorted_capture_ids.end());
+        size_t capture_idx = 0;
+
         for (size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
             hidden_states = layers_[layer_idx].forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second);
             if (deepstack_embeds && visual_pos_mask && layer_idx < deepstack_embeds->size()) {
@@ -412,12 +417,52 @@ public:
                                                             *visual_pos_mask,
                                                             (*deepstack_embeds)[layer_idx]);
             }
+            // Capture intermediate hidden state at selected layer indices
+            if (capture_idx < sorted_capture_ids.size() &&
+                static_cast<int32_t>(layer_idx) == sorted_capture_ids[capture_idx]) {
+                captured_hidden_.push_back(hidden_states);
+                ++capture_idx;
+            }
         }
         return norm_.forward(hidden_states);
     }
 
     VocabEmbedding& embed_tokens() {
         return embed_tokens_;
+    }
+
+    /// Run the same forward as forward_embeds, but also capture hidden states
+    /// at the specified layer indices and return them concatenated along dim=-1.
+    std::pair<Tensor, Tensor> forward_with_selected_layers(
+        const Tensor& inputs_embeds,
+        const Tensor& position_ids,
+        const Tensor& beam_idx,
+        const std::vector<int32_t>& layer_ids,
+        const Tensor* visual_embeds = nullptr,
+        const Tensor* visual_pos_mask = nullptr,
+        const Tensor* audio_features = nullptr,
+        const Tensor* audio_pos_mask = nullptr,
+        const std::vector<Tensor>* deepstack_embeds = nullptr) {
+        capture_layer_ids_ = layer_ids;
+        captured_hidden_.clear();
+
+        auto final_out = forward_embeds(inputs_embeds,
+                                        position_ids,
+                                        beam_idx,
+                                        visual_embeds,
+                                        visual_pos_mask,
+                                        audio_features,
+                                        audio_pos_mask,
+                                        deepstack_embeds);
+
+        capture_layer_ids_.clear();
+
+        if (captured_hidden_.empty()) {
+            return {final_out, final_out};
+        }
+        auto concat_hidden = ops::concat(captured_hidden_, 2);
+        captured_hidden_.clear();
+        return {final_out, concat_hidden};
     }
 
 private:
@@ -457,6 +502,10 @@ private:
     std::vector<Qwen3OmniTextDecoderLayer> layers_;
     RMSNorm norm_;
     int32_t head_dim_ = 0;
+
+    // DFlash layer capture support — set by forward_with_selected_layers
+    std::vector<int32_t> capture_layer_ids_;
+    std::vector<Tensor> captured_hidden_;
 };
 
 class Qwen3OmniTextForCausalLM : public Module {
@@ -513,6 +562,31 @@ public:
                                             deepstack_embeds);
         return lm_head_.forward(hidden);
     }
+
+    /// DFlash: run forward and capture hidden states at selected layers.
+    /// Returns {logits, target_hidden} where target_hidden is [B, S, hidden*num_layers].
+    std::pair<Tensor, Tensor> forward_with_selected_layers(
+        const Tensor& input_ids,
+        const Tensor& position_ids,
+        const Tensor& beam_idx,
+        const std::vector<int32_t>& layer_ids,
+        const Tensor* visual_embeds = nullptr,
+        const Tensor* visual_pos_mask = nullptr,
+        const Tensor* audio_features = nullptr,
+        const Tensor* audio_pos_mask = nullptr,
+        const std::vector<Tensor>* deepstack_embeds = nullptr) {
+        auto embeds = model_.embed_tokens().forward(input_ids);
+        auto [normed_hidden, concat_hidden] = model_.forward_with_selected_layers(
+            embeds, position_ids, beam_idx, layer_ids,
+            visual_embeds, visual_pos_mask,
+            audio_features, audio_pos_mask,
+            deepstack_embeds);
+        auto logits = lm_head_.forward(normed_hidden);
+        return {logits, concat_hidden};
+    }
+
+    Qwen3OmniTextModel& model() { return model_; }
+    LMHead& lm_head() { return lm_head_; }
 
 private:
     Qwen3OmniTextConfig cfg_;
@@ -645,6 +719,119 @@ std::shared_ptr<ov::Model> create_qwen3_omni_text_model(
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, Qwen3OmniTextIO::kLogits);
     auto ov_model = ctx.build_model({result->output(0)});
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
+}
+
+std::shared_ptr<ov::Model> create_qwen3_omni_dflash_target_model(
+    const Qwen3OmniConfig& cfg,
+    const std::vector<int32_t>& target_layer_ids,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer,
+    bool enable_multimodal_inputs) {
+    PrefixMappedWeightSource thinker_source(source, "thinker.");
+
+    BuilderContext ctx;
+
+    Qwen3OmniTextForCausalLM model(ctx, cfg.text);
+
+    // Weight mapping: safetensors "model.layers[i]." -> internal "language_model.layers.i."
+    model.packed_mapping().rules.push_back({"model.embed_tokens.", "language_model.embed_tokens.", 0});
+    model.packed_mapping().rules.push_back({"model.norm.", "language_model.norm.", 0});
+    for (int32_t i = 0; i < cfg.text.num_hidden_layers; ++i) {
+        const std::string src_bracket = "model.layers[" + std::to_string(i) + "].";
+        const std::string src_dot = "model.layers." + std::to_string(i) + ".";
+        const std::string dst = "language_model.layers." + std::to_string(i) + ".";
+        model.packed_mapping().rules.push_back({src_bracket, dst, 0});
+        model.packed_mapping().rules.push_back({src_dot, dst, 0});
+    }
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_missing = true;
+    options.report_unmatched = true;
+    (void)ov::genai::modeling::weights::load_model(model, thinker_source, finalizer, options);
+
+    // Re-tie lm_head -> embed_tokens after weight loading
+    if (cfg.text.tie_word_embeddings) {
+        model.get_parameter("lm_head.weight").tie_to(
+            model.get_parameter("language_model.embed_tokens.weight"));
+    }
+
+    const auto float_type = ov::element::f32;
+
+    auto input_ids = ctx.parameter(Qwen3OmniTextIO::kInputIds,
+                                   ov::element::i64,
+                                   ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter(Qwen3OmniTextIO::kAttentionMask,
+                                        ov::element::i64,
+                                        ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter(Qwen3OmniTextIO::kPositionIds,
+                                      ov::element::i64,
+                                      ov::PartialShape{3, -1, -1});
+    auto beam_idx = ctx.parameter(Qwen3OmniTextIO::kBeamIdx,
+                                  ov::element::i32,
+                                  ov::PartialShape{-1});
+
+    (void)attention_mask;
+
+    Tensor visual_embeds;
+    Tensor visual_pos_mask;
+    Tensor audio_features;
+    Tensor audio_pos_mask;
+    const Tensor* visual_embeds_ptr = nullptr;
+    const Tensor* visual_pos_mask_ptr = nullptr;
+    const Tensor* audio_features_ptr = nullptr;
+    const Tensor* audio_pos_mask_ptr = nullptr;
+    std::vector<Tensor> deepstack_inputs;
+    const std::vector<Tensor>* deepstack_ptr = nullptr;
+
+    if (enable_multimodal_inputs) {
+        visual_embeds = ctx.parameter(Qwen3OmniTextIO::kVisualEmbeds,
+                                      float_type,
+                                      ov::PartialShape{-1, -1, cfg.text.hidden_size});
+        visual_pos_mask = ctx.parameter(Qwen3OmniTextIO::kVisualPosMask,
+                                        ov::element::boolean,
+                                        ov::PartialShape{-1, -1});
+        audio_features = ctx.parameter(Qwen3OmniTextIO::kAudioFeatures,
+                                       float_type,
+                                       ov::PartialShape{-1, -1, cfg.text.hidden_size});
+        audio_pos_mask = ctx.parameter(Qwen3OmniTextIO::kAudioPosMask,
+                                       ov::element::boolean,
+                                       ov::PartialShape{-1, -1});
+        visual_embeds_ptr = &visual_embeds;
+        visual_pos_mask_ptr = &visual_pos_mask;
+        audio_features_ptr = &audio_features;
+        audio_pos_mask_ptr = &audio_pos_mask;
+
+        const size_t deepstack_count = cfg.vision.deepstack_visual_indexes.size();
+        deepstack_inputs.reserve(deepstack_count);
+        for (size_t i = 0; i < deepstack_count; ++i) {
+            const std::string name = std::string(Qwen3OmniTextIO::kDeepstackEmbedsPrefix) + "." + std::to_string(i);
+            deepstack_inputs.emplace_back(ctx.parameter(name,
+                                                        float_type,
+                                                        ov::PartialShape{-1, -1, cfg.text.hidden_size}));
+        }
+        if (!deepstack_inputs.empty()) {
+            deepstack_ptr = &deepstack_inputs;
+        }
+    }
+
+    // DFlash: forward with selected layer capture -> logits + target_hidden
+    auto [logits, target_hidden] = model.forward_with_selected_layers(
+        input_ids, position_ids, beam_idx, target_layer_ids,
+        visual_embeds_ptr, visual_pos_mask_ptr,
+        audio_features_ptr, audio_pos_mask_ptr,
+        deepstack_ptr);
+
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(target_hidden.output());
+    set_name(logits_result, Qwen3OmniTextIO::kLogits);
+    set_name(hidden_result, "target_hidden");
+
+    auto ov_model = ctx.build_model({logits_result->output(0), hidden_result->output(0)});
     ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
     ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
     return ov_model;

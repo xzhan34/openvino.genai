@@ -368,6 +368,37 @@ set_target_properties(modeling_qwen3_omni PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
 
+# Qwen3-Omni DFlash speculative decoding sample
+add_executable(modeling_qwen3_omni_dflash
+    modeling_qwen3_omni_dflash.cpp
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat/load_image.cpp"
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(modeling_qwen3_omni_dflash PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/samples/cpp/visual_language_chat"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(modeling_qwen3_omni_dflash PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(modeling_qwen3_omni_dflash PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(modeling_qwen3_omni_dflash openvino_genai)
+
+add_custom_command(TARGET modeling_qwen3_omni_dflash POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:modeling_qwen3_omni_dflash>"
+    VERBATIM)
+
+set_target_properties(modeling_qwen3_omni_dflash PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)
+
 # Minimal Qwen3-Omni TTS sample for case2/3/4 executable comparison
 add_executable(modeling_qwen3_omni_tts_min
     modeling_qwen3_omni_tts_min.cpp

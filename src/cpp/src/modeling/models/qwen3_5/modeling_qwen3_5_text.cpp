@@ -1429,6 +1429,10 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
     LMHead head(ctx, "lm_head", &lm_root);
     if (qwen_cfg.tie_word_embeddings) {
         head.tie_to(embed.weight_param());
+        // When tied, skip load_model for lm_root — some safetensors (e.g. Qwen3-Omni)
+        // store a separate lm_head.weight that differs from embed_tokens.weight even
+        // though the model was configured with tie_word_embeddings=True.  load_model
+        // would overwrite the tied binding with the wrong tensor.
     } else if (!target_source.has("lm_head.weight")) {
         const std::vector<std::string> embed_candidates = {
             "model.embed_tokens.weight",
@@ -1443,8 +1447,9 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
             auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
             head.weight_param().bind(tied);
         }
+    } else {
+        ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
     }
-    ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
 
     // ── Inputs ──
     const ov::element::Type dtype = ov::element::f32;
@@ -1556,8 +1561,9 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
             auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
             head.weight_param().bind(tied);
         }
+    } else {
+        ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
     }
-    ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
 
     // ── Inputs ──
     const ov::element::Type dtype = ov::element::f32;
