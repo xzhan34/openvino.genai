@@ -19,21 +19,10 @@ from typing import Optional
 
 
 # ── Defaults (edit for your environment) ─────────────────────────────────────
-DEFAULT_TARGET_DIR = (
-    r"C:\work\models\Qwen3-Omni-4B-Instruct-multilingual"
-    if sys.platform == "win32"
-    else "/home/xzhan34/work/openvino.genai.modular-ws/models/Qwen3-Omni-4B-Instruct-multilingual"
-)
-DEFAULT_DRAFT_DIR = (
-    r"C:\work\models\Qwen3-4B-DFlash-b16"
-    if sys.platform == "win32"
-    else "/home/xzhan34/work/models/Qwen3-4B-DFlash-b16"
-)
-DEFAULT_IMAGE_PATH = (
-    r"C:\work\openvino_ws\openvino.liangali\docs\articles_en\assets\images\get_started_with_cpp.jpg"
-    if sys.platform == "win32"
-    else "/home/xzhan34/work/openvino_ws/dflash_ws/openvino.genai/testdata/get_started_with_cpp.jpg"
-)
+DEFAULT_MODEL_BASE = r"C:\work\models" if sys.platform == "win32" else "/home/xzhan34/work/models"
+DEFAULT_TARGET_DIR = os.path.join(DEFAULT_MODEL_BASE, "Qwen3-Omni-4B-Instruct-multilingual")
+DEFAULT_DRAFT_DIR  = os.path.join(DEFAULT_MODEL_BASE, "Qwen3-4B-DFlash-b16")
+DEFAULT_IMAGE_PATH = str(Path(__file__).resolve().parent / "testdata" / "get_started_with_cpp.jpg")
 DEFAULT_DEVICE     = "GPU.1"
 DEFAULT_MAX_TOKENS = 128
 DEFAULT_BLOCK_SIZE = 16
@@ -240,14 +229,19 @@ def print_summary(results: list, device: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Qwen3-Omni DFlash speculative decoding")
-    parser.add_argument("--target-dir",  default=DEFAULT_TARGET_DIR,  help="Target model directory")
-    parser.add_argument("--draft-dir",   default=DEFAULT_DRAFT_DIR,   help="DFlash draft model directory")
+    parser.add_argument("--model-dir",   default=DEFAULT_MODEL_BASE,  help="Base model directory")
+    parser.add_argument("--target-dir",  default=None,                help="Target model directory (default: <model-dir>/Qwen3-Omni-4B-Instruct-multilingual)")
+    parser.add_argument("--draft-dir",   default=None,                help="DFlash draft model directory (default: <model-dir>/Qwen3-4B-DFlash-b16)")
     parser.add_argument("--image",       default=DEFAULT_IMAGE_PATH,  help="Image path for VL tests")
     parser.add_argument("--device",      default=DEFAULT_DEVICE,      help="Device (GPU / GPU.1 / CPU)")
     parser.add_argument("--max-tokens",  default=DEFAULT_MAX_TOKENS,  type=int, help="Max new tokens")
     parser.add_argument("--block-size",  default=DEFAULT_BLOCK_SIZE,  type=int, help="DFlash block size")
     parser.add_argument("--precision",   default=DEFAULT_PRECISION,   help="Baseline precision mode")
     args = parser.parse_args()
+    if args.target_dir is None:
+        args.target_dir = os.path.join(args.model_dir, "Qwen3-Omni-4B-Instruct-multilingual")
+    if args.draft_dir is None:
+        args.draft_dir = os.path.join(args.model_dir, "Qwen3-4B-DFlash-b16")
 
     genai_dir = find_genai_dir()
     ext = ".exe" if sys.platform == "win32" else ""
