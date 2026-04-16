@@ -3091,6 +3091,293 @@ for (size_t i = 0; i &lt; total_pos; ++i)
 <tr><td><code>CMakeLists.txt</code></td><td>新增 <code>modeling_qwen3_omni_dflash</code> 编译目标</td></tr>
 </table>
 
+<!-- ================================================================== -->
+<h2 id="sec33">33. FC 层 FP16 溢出根因分析与修复</h2>
+
+<p>在 §32.3 中记录了 draft 模型使用 <code>inference_precision=f16</code> 编译时 logits 全 NaN 的现象，当时的解决方案是将 draft 模型回退到 f32 编译。
+本节深入分析了溢出的根因，并实现了一个无性能损失的永久修复，使 FP16 编译成为可能。</p>
+
+<h3>33.1 根因定位</h3>
+
+<p><code>DFlashDraftModel</code> 的 <code>forward()</code> 和 <code>build_context_kv()</code> 中，fc 层执行矩阵乘法：</p>
+
+<pre><code>// dflash_draft.cpp (修复前)
+auto conditioned = ops::linear(target_hidden, fc_weight());
+//   target_hidden: [batch, seq, 12800]  (ctx_dim = hidden_size × num_hidden_layers = 2560 × 5)
+//   fc_weight:     [2560, 12800]
+//   输出:          [batch, seq, 2560]  — 归约维度 12800</code></pre>
+
+<p>该矩阵乘法的归约维度为 <strong>12800</strong>，每个输出元素是 12800 个乘积的累加和。</p>
+
+<h3>33.2 实测数据证明</h3>
+
+<p>使用 Qwen3-Omni-4B 真实推理数据进行验证：</p>
+
+<table>
+<tr><th>张量</th><th>形状</th><th>abs_max</th><th>L2 范数 max</th></tr>
+<tr><td><code>fc.weight</code></td><td>[2560, 12800]</td><td>4.56</td><td>66.37 (行)</td></tr>
+<tr><td><code>target_hidden</code> (context_features)</td><td>[1, 2099, 12800]</td><td>9152</td><td>18956 (行)</td></tr>
+<tr><td><strong>FC 输出 (FP32)</strong></td><td>[1, 2099, 2560]</td><td><strong style="color:red;">155,831</strong></td><td>—</td></tr>
+<tr><td><strong>FC 输出 (FP16)</strong></td><td>[1, 2099, 2560]</td><td><strong style="color:red;">inf (4/5,373,440 元素溢出)</strong></td><td>—</td></tr>
+<tr><td>RMSNorm 输出 (FP32)</td><td>[1, 2099, 2560]</td><td>9.98</td><td>—</td></tr>
+</table>
+
+<div class="highlight">
+<strong>关键发现：</strong>
+<ul>
+<li>FC 输出在 FP32 下 abs_max = 155,831，<strong>超过 FP16 最大值 65,504</strong></li>
+<li>FP16 下产生 <code>inf</code>（4/5.3M 元素溢出，约 0.0001%）</li>
+<li><code>inf</code> 值传播至所有下游计算 → logits 全 NaN → 接受率 0%</li>
+<li>经过 RMSNorm 后，值域收缩到 abs_max ≈ 9.98，完全在 FP16 安全范围内</li>
+</ul>
+</div>
+
+<h3>33.3 为什么 Qwen3.5 没有这个问题</h3>
+
+<p>Qwen3.5 和 Qwen3-Omni 使用 <strong>完全相同的 <code>DFlashDraftModel</code> 类</strong>（<code>dflash_draft.cpp</code>），
+但 Qwen3-Omni 的 target hidden states 有显著更大的激活值（abs_max ~9152 vs Qwen3.5 的更小值），
+可能是因为多模态架构（音频/视觉特征）贡献了极端激活值。</p>
+
+<h3>33.4 修复方案：输入缩放 + RMSNorm 尺度不变性</h3>
+
+<p>RMSNorm 具有尺度不变性：对于任意正标量 <em>s</em>，<strong>RMSNorm(s·x) = RMSNorm(x)</strong>。
+这是因为 RMSNorm 的公式为 $\frac{x}{\text{RMS}(x)} \cdot \gamma$，分子分母同时乘以 <em>s</em> 后抵消。</p>
+
+<p>因此，只需在 fc matmul 之前对 <code>target_hidden</code> 乘以缩放因子 1/128：</p>
+
+<pre><code>// dflash_draft.cpp (修复后)
+// Scale down target_hidden before fc matmul to prevent FP16 overflow.
+// RMSNorm is scale-invariant: RMSNorm(s*x) = RMSNorm(x), so results are exact.
+auto conditioned = ops::linear(target_hidden * (1.0f / 128.0f), fc_weight());
+auto context_hidden = hidden_norm_.forward(conditioned);</code></pre>
+
+<p>修复效果：</p>
+<ul>
+<li>FC 输出最大值：155,831 / 128 ≈ <strong>1,217</strong>（远小于 FP16 max 65,504）</li>
+<li>RMSNorm 输出 <strong>数学上完全相同</strong>（尺度不变性保证）</li>
+<li>无性能损失（仅增加一个 Multiply 算子）</li>
+</ul>
+
+<div class="highlight">
+<strong>为什么 <code>.to(f32)</code> 不起作用？</strong><br>
+OpenVINO GPU 插件设置 <code>inference_precision=f16</code> 时，会在编译阶段优化掉显式的 Convert-to-f32 节点。
+因此 <code>target_hidden.to(ov::element::f32)</code> 插入的 Convert 算子会被删除，matmul 仍然在 f16 下执行。
+缩放方案使用 Multiply 算子，不会被优化掉。
+</div>
+
+<h3>33.5 修复前后对比</h3>
+
+<table>
+<tr><th>指标</th><th>修复前 (f16 combined)</th><th>修复后 (f16 combined)</th></tr>
+<tr><td>FC 输出范围</td><td>[-155,831, +121,566] → <strong>inf</strong></td><td>[-1,217, +950]</td></tr>
+<tr><td>接受率</td><td><strong>0%</strong></td><td><strong>34.6%</strong></td></tr>
+<tr><td>平均每步接受</td><td>0.00</td><td>0.54</td></tr>
+</table>
+
+<h3>33.6 涉及的文件</h3>
+<table>
+<tr><th>文件</th><th>变更</th></tr>
+<tr><td><code>dflash_draft.cpp</code></td><td><code>forward()</code> 和 <code>build_context_kv()</code> 中 fc matmul 前乘以 <code>1/128</code></td></tr>
+<tr><td><code>bench_qwen3_omni_dflash.py</code></td><td>切换到 combined + f16 模式（移除 f32 workaround）</td></tr>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="sec34">34. 性能分析与优化：从 0.90x 到 1.45x 加速</h2>
+
+<p>§33 修复了 FP16 溢出问题后，DFlash 可以在 FP16 下运行但性能远未达标。
+本节记录了系统性的性能分析和优化过程，最终实现了 <strong>1.45x 加速</strong>（vs baseline）。</p>
+
+<h3>34.1 初始性能数据（优化前）</h3>
+
+<p>测试环境：NVIDIA RTX 4090 × 2，Qwen3-Omni-4B + Qwen3-4B-DFlash-b16，block_size=16</p>
+
+<table>
+<tr><th>#</th><th>测试</th><th>Prompt</th><th>Output</th><th>TPOT (ms)</th><th>Tok/s</th><th>AccRate</th><th>AvgAccept</th></tr>
+<tr><td>1</td><td>Baseline FP16 text</td><td>97</td><td>8</td><td>151.78</td><td>6.59</td><td>—</td><td>—</td></tr>
+<tr><td>2</td><td>DFlash FP16 text</td><td>15</td><td>8</td><td>164.43</td><td>6.95</td><td>0.3750</td><td>0.75</td></tr>
+<tr><td>4</td><td>DFlash FP16 long(256)</td><td>17</td><td>256</td><td>597.97</td><td>1.68</td><td>0.1602</td><td>0.19</td></tr>
+<tr><td>5</td><td>Baseline FP16 codegen</td><td>101</td><td>128</td><td>149.70</td><td>6.68</td><td>—</td><td>—</td></tr>
+<tr><td>6</td><td>DFlash FP16 codegen</td><td>19</td><td>128</td><td>168.24</td><td>5.99</td><td>0.5625</td><td>1.31</td></tr>
+</table>
+
+<p>DFlash <strong>比 baseline 还慢</strong>：codegen 仅有 0.90x，long generation 降至 1.68 tok/s（baseline 的 25%）。</p>
+
+<h3>34.2 阶段计时分析</h3>
+
+<p>从 DFlash 日志的 <code>[Stage timings]</code> 提取每步平均耗时：</p>
+
+<table>
+<tr><th>阶段</th><th>text (8 tok)</th><th>codegen (128 tok)</th><th>long (256 tok)</th></tr>
+<tr><td>draft (step/combined)</td><td>51ms</td><td>53ms</td><td>61ms</td></tr>
+<tr><td>target verify</td><td>198ms</td><td>204ms</td><td>268ms</td></tr>
+<tr><td><strong>other (untracked)</strong></td><td><strong>36ms</strong></td><td><strong>131ms</strong></td><td><strong>383ms</strong></td></tr>
+<tr><td>postproc</td><td>0.3ms</td><td>0.3ms</td><td>0.3ms</td></tr>
+<tr><td><strong>合计/步</strong></td><td>~285ms</td><td>~388ms</td><td>~712ms</td></tr>
+</table>
+
+<div class="highlight">
+<strong>关键发现：</strong>"other (untracked)" 耗时占总时间的 12%–54%，且<strong>随 context 长度增长而急剧恶化</strong>（36ms → 383ms）。
+这不是正常计算开销。
+</div>
+
+<h3>34.3 细粒度性能剖析</h3>
+
+<p>在 <code>modeling_qwen3_omni_dflash.cpp</code> 中添加了子阶段计时器，将"other"拆分为四个子项：</p>
+
+<pre><code>StageStats target_hidden_copy_wall;   // ensure_f32_copy(target_hidden)
+StageStats context_kv_infer_wall;     // context_kv_request.infer()
+StageStats context_kv_copy_wall;      // ensure_f32_copy(K,V) + concat_kv_seq
+StageStats trim_kv_wall;             // trim_kv_cache(target_request, ...)</code></pre>
+
+<p>结果（codegen 128 tokens, split mode）：</p>
+
+<table>
+<tr><th>子阶段</th><th>平均/步</th><th>最大值</th><th>占比</th></tr>
+<tr><td>target_hidden copy</td><td>0.09ms</td><td>0.26ms</td><td>0.07%</td></tr>
+<tr><td>context_kv infer</td><td>3.59ms</td><td>4.87ms</td><td>2.6%</td></tr>
+<tr><td>context_kv copy+concat</td><td>0.41ms</td><td>0.93ms</td><td>0.3%</td></tr>
+<tr><td style="color:red;font-weight:bold;">trim_kv</td><td style="color:red;font-weight:bold;">131.9ms</td><td style="color:red;font-weight:bold;">228.2ms</td><td style="color:red;font-weight:bold;">96%</td></tr>
+</table>
+
+<div class="highlight" style="border-left-color: #e74c3c;">
+<strong>瓶颈定位：<code>trim_kv_cache()</code> 占 "other" 时间的 96%！</strong>
+</div>
+
+<h3>34.4 根因：KV Cache Trim 走 CPU 回退路径</h3>
+
+<p>投机解码每步需要 trim target 模型的 KV cache（删除被拒绝的 token）。
+<code>trim_kv_cache()</code> 的实现有两种路径：</p>
+
+<table>
+<tr><th>路径</th><th>条件</th><th>操作</th><th>耗时</th></tr>
+<tr style="background:#e8f5e9;">
+<td><strong>GPU zero-copy</strong></td>
+<td><code>OV_HAS_VARIABLE_STATE_SET_SHAPE</code> 已定义</td>
+<td><code>state.set_shape(new_shape)</code> — GPU 内存重新解释，无拷贝</td>
+<td><strong>&lt;0.3ms</strong></td>
+</tr>
+<tr style="background:#ffebee;">
+<td><strong>CPU 回退</strong></td>
+<td>默认</td>
+<td><code>state.get_state()</code> GPU→CPU → CPU 裁剪 → <code>state.set_state()</code> CPU→GPU</td>
+<td><strong>~132ms</strong></td>
+</tr>
+</table>
+
+<p>CPU 回退路径的开销：</p>
+<ul>
+<li>Qwen3-Omni thinker 有 <strong>36 层 × 2 (K+V) = 72 个 state</strong></li>
+<li>每个 state 形状 [1, H, seq_len, head_dim]，随 context 增长</li>
+<li>每步将 <strong>整个 KV cache</strong> 从 GPU 复制到 CPU，裁剪后写回 — 约 200MB+ 的往返传输</li>
+<li>每步都执行一次（因为投机解码总有被拒绝的 token 需要 trim）</li>
+</ul>
+
+<pre><code>// utils.cpp — CPU fallback path
+for (auto& state : states) {
+    ov::Tensor old_tensor = state.get_state();   // GPU → CPU copy (全量!)
+    // ... trim ...
+    ov::Tensor new_tensor(old_tensor.get_element_type(), shape);
+    trimmed_tensor.copy_to(new_tensor);            // CPU memcpy
+    state.set_state(new_tensor);                   // CPU → GPU copy (全量!)
+}</code></pre>
+
+<h3>34.5 修复：启用 GPU Zero-Copy KV Trim</h3>
+
+<p>OpenVINO 运行时已经支持 <code>VariableState::set_shape()</code> / <code>get_shape()</code> API，
+但 <code>OV_HAS_VARIABLE_STATE_SET_SHAPE</code> 宏<strong>从未被定义</strong>（CMakeLists.txt 中缺失）。</p>
+
+<p>修复：在 <code>src/cpp/CMakeLists.txt</code> 中添加编译期检测：</p>
+
+<pre><code># CMakeLists.txt
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("
+    #include &lt;openvino/runtime/variable_state.hpp&gt;
+    int main() {
+        (void)&amp;ov::VariableState::set_shape;
+        (void)&amp;ov::VariableState::get_shape;
+        return 0;
+    }
+" OV_HAS_VARIABLE_STATE_SET_SHAPE_CHECK)
+
+if(OV_HAS_VARIABLE_STATE_SET_SHAPE_CHECK)
+    target_compile_definitions(... PRIVATE OV_HAS_VARIABLE_STATE_SET_SHAPE)
+endif()</code></pre>
+
+<h3>34.6 同时优化：context_kv f16 编译</h3>
+
+<p>此前 split mode 的 context_kv 模型被迫用 f32 编译（因为包含 fc matmul）。
+§33 的缩放修复后，fc matmul 不再溢出，context_kv 可以安全使用 f16：</p>
+
+<pre><code>// modeling_qwen3_omni_dflash.cpp (修改后)
+if (use_split_draft) {
+    // context_kv: 使用 draft_compile_cfg (GPU 上 f16, 因 fc 输入缩放修复可安全使用)
+    compiled_context_kv = core.compile_model(context_kv_model, device, draft_compile_cfg);
+    // ...
+}</code></pre>
+
+<h3>34.7 优化效果</h3>
+
+<h4>单步耗时对比（codegen, 128 tokens, split mode）</h4>
+
+<table>
+<tr><th>阶段</th><th>优化前</th><th>优化后</th><th>改善</th></tr>
+<tr><td>draft/步</td><td>53ms</td><td>42ms</td><td>1.26x</td></tr>
+<tr><td>verify/步</td><td>204ms</td><td>192ms</td><td>1.06x</td></tr>
+<tr style="background:#e8f5e9;">
+<td><strong>trim_kv/步</strong></td><td style="color:red;"><strong>131.9ms</strong></td><td style="color:green;"><strong>0.27ms</strong></td><td><strong>488x</strong></td>
+</tr>
+<tr style="background:#e8f5e9;">
+<td><strong>other/步 (合计)</strong></td><td style="color:red;"><strong>138ms</strong></td><td style="color:green;"><strong>6.3ms</strong></td><td><strong>22x</strong></td>
+</tr>
+<tr><td>TPOT</td><td>168ms</td><td><strong>104ms</strong></td><td>38% 更快</td></tr>
+</table>
+
+<h4>端到端吞吐量对比</h4>
+
+<table>
+<tr><th>测试</th><th>Baseline</th><th>DFlash (优化前)</th><th>DFlash (优化后)</th><th>vs Baseline</th></tr>
+<tr><td>Codegen (128 tok)</td><td>6.68 tok/s</td><td>5.99 tok/s (0.90x)</td><td style="color:green;font-weight:bold;">9.70 tok/s</td><td style="color:green;font-weight:bold;">1.45x ↑</td></tr>
+<tr><td>Long (256 tok)</td><td>~6.6 tok/s</td><td>1.68 tok/s (0.25x)</td><td style="color:green;font-weight:bold;">5.00 tok/s</td><td style="color:green;font-weight:bold;">3.0x 改善</td></tr>
+</table>
+
+<h3>34.8 适用范围</h3>
+
+<p>GPU zero-copy KV trim 对 <strong>split 和 combined 模式都适用</strong>，因为 <code>trim_kv_cache()</code> 操作的是 <strong>target 模型的 KV cache</strong>，与 draft 模型的运行模式无关：</p>
+
+<table>
+<tr><th>优化项</th><th>Split mode</th><th>Combined mode</th></tr>
+<tr><td>GPU zero-copy KV trim <strong>(主要收益)</strong></td><td>✅</td><td>✅</td></tr>
+<tr><td>context_kv f16 编译</td><td>✅</td><td>N/A（无 context_kv 模型）</td></tr>
+<tr><td>Split vs Combined 本身</td><td>✅</td><td>N/A</td></tr>
+</table>
+
+<h3>34.9 剩余瓶颈</h3>
+
+<p>优化后每步的耗时分布：</p>
+<ul>
+<li><strong>target verify: 192ms/步</strong> — 当前最大瓶颈，是 target 模型推理本身的开销，难以进一步优化</li>
+<li><strong>draft: 42ms/步</strong> (split mode) — 已较优</li>
+<li><strong>接受率</strong> 是长生成场景的关键限制因素（16% long text vs 56% codegen），取决于 draft 模型的训练质量</li>
+</ul>
+
+<p>理论最优 TPOT（接受率 100%，block_size=16）：</p>
+<p style="text-align:center;">
+$\text{TPOT}_{理论} = \frac{\text{draft} + \text{verify} + \text{other}}{B} = \frac{42 + 192 + 6}{16} = 15 \text{ms/token}$
+</p>
+<p>当前实际 TPOT（codegen, 56% 接受率, avg_accept=1.31）：</p>
+<p style="text-align:center;">
+$\text{TPOT}_{实际} = \frac{240}{1.31 + 1} = 104 \text{ms/token}$
+</p>
+<p>即当前效率为理论最优的 $15/104 \approx 14\%$，提升空间主要在接受率（draft 模型质量）。</p>
+
+<h3>34.10 涉及的文件</h3>
+<table>
+<tr><th>文件</th><th>变更</th></tr>
+<tr><td><code>src/cpp/CMakeLists.txt</code></td><td>添加 <code>OV_HAS_VARIABLE_STATE_SET_SHAPE</code> 编译期检测</td></tr>
+<tr><td><code>modeling_qwen3_omni_dflash.cpp</code></td><td>context_kv 改用 <code>draft_compile_cfg</code> (f16)；添加 4 项子阶段计时</td></tr>
+<tr><td><code>bench_qwen3_omni_dflash.py</code></td><td>切换到 split mode (<code>OV_GENAI_SPLIT_DRAFT=1</code>)</td></tr>
+</table>
+
 <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
     Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比 &amp; 集成排障文档
 </div>
