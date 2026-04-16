@@ -693,17 +693,32 @@ int main(int argc, char* argv[]) try {
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
     std::cout << "[Compiling target model (Qwen3-Omni thinker)...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
-    // Draft model: use f32 precision to avoid BF16/F16 instabilities in the
-    // large fc matmul (ctx_dim=12800).  The graph is already f32 but
-    // inference_precision=f16 can cause intermediates to overflow.
+    // Draft model precision:
+    //   CPU: use f32 to avoid BF16/F16 overflow in the large fc matmul
+    //        (ctx_dim=12800).  CPU f16 MatMul uses f16 accumulators, which
+    //        overflow when dot products exceed ~65504.
+    //   GPU: use f16 (default).  GPU f16 MatMul uses f32 accumulators
+    //        internally, so overflow does not occur.  Forcing f32 on GPU
+    //        would be extremely slow.
     ov::AnyMap draft_compile_cfg = compile_cfg;
     {
         const char* draft_prec_env = std::getenv("OV_GENAI_DRAFT_PRECISION");
-        if (draft_prec_env && std::string(draft_prec_env) == "f16") {
-            std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f16...]" << std::endl;
-        } else {
+        if (draft_prec_env) {
+            // Explicit override from environment
+            const std::string prec_str(draft_prec_env);
+            if (prec_str == "f32") {
+                draft_compile_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
+                std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f32 (env override)]" << std::endl;
+            } else {
+                std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f16 (env override)]" << std::endl;
+            }
+        } else if (device.find("CPU") != std::string::npos) {
+            // CPU: force f32 to avoid f16 accumulator overflow
             draft_compile_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
-            std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f32...]" << std::endl;
+            std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f32 (CPU safe mode)]" << std::endl;
+        } else {
+            // GPU: use f16 (same as target model)
+            std::cout << "[Compiling combined draft model with INFERENCE_PRECISION=f16]" << std::endl;
         }
     }
     auto compiled_draft = core.compile_model(combined_draft_model, device, draft_compile_cfg);
