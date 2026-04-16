@@ -2949,8 +2949,147 @@ python benchmark_multi_target.py</code></pre>
 <tr><td>3</td><td><code>ValueError: Unrecognized configuration class Qwen3OmniConfig for AutoModelForCausalLM</code></td><td>Qwen3-Omni 不是标准 CausalLM</td><td>通过 <code>Qwen3OmniForConditionalGeneration</code> 加载，提取 <code>.thinker</code></td></tr>
 <tr><td>4</td><td><code>ValueError: tokenizer.chat_template is not set</code></td><td>Omni tokenizer 无 chat template</td><td>从 <code>AutoProcessor</code> 拷贝 <code>chat_template</code> 到 <code>AutoTokenizer</code></td></tr>
 <tr><td>5</td><td><code>RuntimeError: expanded size (1) must match (70)</code></td><td>Thinker 忽略 <code>logits_to_keep</code> 参数</td><td><code>_ThinkerWrapper</code> 类手动裁切 logits</td></tr>
+<tr><td>6</td><td>C++ draft logits 全 NaN</td><td><code>inference_precision=f16</code> 致 fc matmul 溢出（ctx_dim=12800）</td><td>草稿模型用 <code>inference_precision=f32</code> 编译（<a href="#sec32">§32.3</a>）</td></tr>
+<tr><td>7</td><td>C++ 接受率 0%（draft 预测完全错误）</td><td><code>load_model</code> 用 safetensors 中独立的 <code>lm_head.weight</code> 覆盖了 tied <code>embed_tokens</code></td><td><code>tie_word_embeddings=true</code> 时跳过 <code>load_model(lm_root)</code>（<a href="#sec32">§32.2</a>）</td></tr>
+<tr><td>8</td><td>C++ position_ids 与 Python 不一致</td><td>draft 位置 <code>[0..T-1, T-1..]</code> 存在重叠</td><td>改为连续 <code>[0..T+B-1]</code>（<a href="#sec32">§32.4</a>）</td></tr>
 </table>
 
+
+<!-- Section 32: C++ OpenVINO DFlash Implementation — Root Cause Analysis -->
+<h2 id="sec32">32. C++ OpenVINO DFlash 实现：0% 接受率根因分析</h2>
+
+<p>将 DFlash 推测解码移植到 C++ OpenVINO 框架（<code>modeling_qwen3_omni_dflash.cpp</code>）后，初始测试表现为 <strong>0% 接受率</strong>（所有草稿 logits 为 NaN）。
+经过系统诊断，发现存在三个独立的 Bug，全部修复后接受率从 0% 提升至 <strong>64–73%</strong>。</p>
+
+<h3>32.1 诊断方法</h3>
+<div class="card">
+<ol>
+<li><strong>中间张量对比：</strong>在 C++ combined draft 模型图中添加 debug 输出节点（<code>debug_noise_embedding</code>, <code>debug_conditioned</code>, <code>debug_context_hidden</code> 等），与 Python 逐层对比。</li>
+<li><strong>精度隔离测试：</strong>分别使用 <code>inference_precision=f16</code> 和 <code>f32</code> 编译草稿模型，确认 NaN 仅在 f16 下出现。</li>
+<li><strong>权重验证：</strong>直接从 safetensors 加载并对比 <code>thinker.lm_head.weight</code> 与 <code>thinker.model.embed_tokens.weight</code>，发现 99.9% 元素不同。</li>
+</ol>
+</div>
+
+<h3>32.2 Bug #1：<code>lm_head</code> 权重被覆盖（主因）</h3>
+<div class="warn">
+<strong>严重性：</strong>致命 — 导致 100% 的草稿预测错误（完全不同的 logits 分布）
+</div>
+
+<h4>现象</h4>
+<ul>
+<li>C++ 草稿模型 logits 值量级约 5–6，而 Python 对应值约 30–40</li>
+<li>C++ argmax 结果与 Python 完全不同（0/15 匹配），即使中间层输出 (<code>conditioned</code>, <code>context_hidden</code>) 完全一致</li>
+</ul>
+
+<h4>根因</h4>
+<p>Qwen3-Omni 的 safetensors 文件同时存储了 <code>thinker.lm_head.weight</code>（在 <code>model-00001-of-00004.safetensors</code>）和 <code>thinker.model.embed_tokens.weight</code>（在 <code>model-00002-of-00004.safetensors</code>），
+尽管 <code>config.json</code> 中 <code>tie_word_embeddings = true</code>。这两个张量：</p>
+<ul>
+<li>shape 相同：<code>[151936, 2560]</code>，dtype 相同：<code>bfloat16</code></li>
+<li>但 <strong>99.9% 的元素值不同</strong>，最大差异 0.209，平均差异 0.017</li>
+<li><code>lm_head</code> 的 <code>mean_abs = 0.007</code>，<code>embed_tokens</code> 的 <code>mean_abs = 0.015</code>（相差 2 倍）</li>
+</ul>
+
+<p>在 <code>create_qwen3_5_dflash_combined_draft_model()</code> 中：</p>
+<pre><code>// 构建流程：
+LMHead head(ctx, "lm_head", &amp;lm_root);
+head.tie_to(embed.weight_param());          // ✅ 绑定到 embed_tokens
+// ...
+load_model(lm_root, target_source, ...);    // ❌ 用 lm_head.weight 覆盖了绑定！
+</code></pre>
+
+<p><code>load_model()</code> 遍历 source 中的所有 key，找到 <code>lm_head.weight</code> 后将其绑定到 <code>head</code> 的 weight parameter，
+<strong>覆盖</strong>了之前 <code>tie_to()</code> 建立的到 <code>embed_tokens.weight</code> 的绑定。</p>
+
+<h4>修复</h4>
+<pre><code>if (qwen_cfg.tie_word_embeddings) {
+    head.tie_to(embed.weight_param());
+    // 当 tie=true 时，跳过 load_model — 避免 safetensors 中的
+    // 独立 lm_head.weight 覆盖正确的 tied 绑定
+} else if (!target_source.has("lm_head.weight")) {
+    // ... fallback to embed_tokens
+} else {
+    load_model(lm_root, target_source, target_finalizer, options);
+}
+</code></pre>
+<p>文件：<code>modeling_qwen3_5_text.cpp</code>，影响 <code>create_qwen3_5_dflash_combined_draft_model()</code> 和 <code>create_qwen3_5_dflash_step_model()</code> 两个函数。</p>
+
+<h3>32.3 Bug #2：Draft 模型 f16 推理精度导致 NaN</h3>
+<div class="warn">
+<strong>严重性：</strong>致命 — 产生全 NaN logits，无法进行任何有效推测
+</div>
+
+<h4>现象</h4>
+<ul>
+<li>草稿 logits 全部为 <code>-nan</code></li>
+<li><code>target_hidden</code> 正常（shape <code>[1,22,12800]</code>，<code>sum_abs = 380</code>）</li>
+<li>Python 使用相同输入不产生 NaN</li>
+</ul>
+
+<h4>根因</h4>
+<p>DFlash 草稿模型的 <code>fc</code> 层执行 <code>target_hidden @ fc_weight^T</code>，其中：</p>
+<ul>
+<li><code>target_hidden</code> 维度为 <code>ctx_dim = hidden_size × num_draft_layers = 2560 × 5 = 12800</code></li>
+<li>输入值量级约 42（多层 hidden states 的拼接），权重 <code>mean_abs = 0.145</code></li>
+<li>点积涉及 12800 个乘加运算，结果可达 <strong>700–1300</strong></li>
+</ul>
+<p>虽然图用 <code>f32</code> 构建（<code>dflash_draft.hpp</code> 注释："Draft is always constructed in FP32 to avoid BF16 instabilities"），
+但编译时使用 <code>inference_precision = f16</code> 导致 OpenVINO 在内部以 <code>f16</code> 执行 MatMul。
+<code>f16</code> 最大值约 65504，而 RMSNorm 之前的 <code>conditioned</code> 值已达 <strong>600–1300</strong>，后续 attention 计算中的 softmax 极易溢出为 NaN。</p>
+
+<h4>修复</h4>
+<pre><code>// 草稿模型单独使用 f32 精度编译
+ov::AnyMap draft_compile_cfg = compile_cfg;
+draft_compile_cfg[ov::hint::inference_precision.name()] = ov::element::f32;
+auto compiled_draft = core.compile_model(combined_draft_model, device, draft_compile_cfg);
+</code></pre>
+<p>环境变量 <code>OV_GENAI_DRAFT_PRECISION=f16</code> 可覆盖此默认值用于实验。</p>
+
+<h3>32.4 Bug #3：Draft Position IDs 重叠（次要）</h3>
+
+<h4>现象</h4>
+<p>C++ 使用 <code>[0..T-1, T-1..T+B-2]</code>（位置 T-1 重复两次），而 Python 使用连续的 <code>[0..T+B-1]</code>。</p>
+
+<h4>修复</h4>
+<pre><code>// 修改前：[0..T-1, T-1..T+B-2]（重叠）
+for (size_t i = 0; i &lt; target_hidden_len; ++i)
+    pd[i] = static_cast&lt;int64_t&gt;(i);
+for (size_t i = target_hidden_len; i &lt; total_pos; ++i)
+    pd[i] = static_cast&lt;int64_t&gt;(target_hidden_len - 1 + (i - target_hidden_len));
+
+// 修改后：[0..T+B-1]（连续）
+for (size_t i = 0; i &lt; total_pos; ++i)
+    pd[i] = static_cast&lt;int64_t&gt;(i);
+</code></pre>
+
+<h3>32.5 修复前后对比</h3>
+<table>
+<tr><th>指标</th><th>修复前</th><th>修复后</th><th>变化</th></tr>
+<tr><td>接受率</td><td>0%（NaN logits）</td><td><strong>64–73%</strong></td><td class="tag tag-green">+73%</td></tr>
+<tr><td>平均每步接受 token 数 (τ)</td><td>0</td><td><strong>1.84–2.81</strong></td><td class="tag tag-green">↑</td></tr>
+<tr><td>吞吐量 (tok/s)</td><td>2.65</td><td><strong>7.3–10.1</strong></td><td class="tag tag-green">2.8–3.8×</td></tr>
+<tr><td>草稿 logits 状态</td><td>全 NaN</td><td>有效</td><td class="tag tag-green">✓</td></tr>
+</table>
+
+<div class="highlight">
+<strong>经验总结：</strong>
+<ol>
+<li><code>tie_word_embeddings=true</code> 不意味着 safetensors 中只存一份权重 — 必须在权重加载逻辑中正确处理 tie 语义，加载后不能再覆盖。</li>
+<li>推测解码的草稿模型通常较小，但其 <code>fc</code> 投影层输入维度 (<code>ctx_dim</code>) 可能很大（因为拼接了多层 hidden states），导致 f16 精度不足，应默认使用 f32。</li>
+<li>尽管 Position ID 的细微差别（重叠 vs. 连续）在 Python 中不会导致 NaN，但为了与参考实现保持一致并获得最佳接受率，应严格匹配。</li>
+</ol>
+</div>
+
+<h3>32.6 涉及的文件</h3>
+<table>
+<tr><th>文件</th><th>变更</th></tr>
+<tr><td><code>modeling_qwen3_5_text.cpp</code></td><td>修复 <code>lm_head</code> 权重覆盖 bug（两处：combined_draft 和 step_model）</td></tr>
+<tr><td><code>modeling_qwen3_omni_dflash.cpp</code></td><td>新增 DFlash 推测解码样例；f32 精度编译；连续 position_ids</td></tr>
+<tr><td><code>modeling_qwen3_omni_text.cpp</code></td><td>新增 <code>forward_with_selected_layers()</code> 和 <code>create_qwen3_omni_dflash_target_model()</code></td></tr>
+<tr><td><code>modeling_qwen3_omni.hpp</code></td><td>新增 <code>create_qwen3_omni_dflash_target_model()</code> 声明</td></tr>
+<tr><td><code>dflash_draft.cpp</code></td><td>空行格式调整</td></tr>
+<tr><td><code>CMakeLists.txt</code></td><td>新增 <code>modeling_qwen3_omni_dflash</code> 编译目标</td></tr>
+</table>
 
 <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
     Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比 &amp; 集成排障文档
