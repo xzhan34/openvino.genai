@@ -643,9 +643,12 @@ int main(int argc, char* argv[]) try {
     }
 
     // ── Compile models ───────────────────────────────────────────────────
+    // When weight quantization is enabled (INT4/INT8), use u8 KV cache to match
+    // baseline behavior (inf_fp16_kv_int8_w_int4_asym).  Otherwise keep f16.
+    const auto kv_cache_precision = target_quant_config.enabled() ? ov::element::u8 : ov::element::f16;
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
-        {ov::hint::kv_cache_precision.name(), ov::element::f16},
+        {ov::hint::kv_cache_precision.name(), kv_cache_precision},
     };
 
     ov::genai::Tokenizer tokenizer(target_dir);
