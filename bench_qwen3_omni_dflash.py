@@ -87,6 +87,7 @@ def setup_env(genai_dir: Path) -> dict:
     # (fc matmul overflow fixed: dflash_draft.cpp scales input by 1/128, RMSNorm is scale-invariant)
     env["OV_GENAI_SPLIT_DRAFT"] = "1"
     env["OV_GENAI_DRAFT_PRECISION"] = "f16"
+    env["OV_GENAI_DISABLE_THINKING"] = "1"
 
     return env
 

@@ -956,6 +956,7 @@ int main(int argc, char* argv[]) try {
         }
         std::cout << "[Split draft] Initialized context KV cache: "
                   << num_draft_layers << " layers, seq_len=" << prompt_len << std::endl;
+
     }
 
     int64_t next_token = argmax_last_token(logits);
@@ -985,6 +986,11 @@ int main(int argc, char* argv[]) try {
     const size_t ar_recovery_check = 5;      // try drafting again every N AR steps
     size_t ar_steps_since_check = 0;
     const size_t warmup_steps = 10;          // don't trigger AR fallback in first N draft steps
+
+    // Lazy context KV: track how far context_kv_cache has been built.
+    // During AR fallback we skip context_kv updates; before the next draft
+    // step we batch-rebuild for all deferred positions at once.
+    size_t context_kv_seq_len = prompt_len;  // positions [0..context_kv_seq_len) are in cache
 
     // Sliding window: track acceptance in recent W steps
     const size_t ar_window_size = 8;
@@ -1049,28 +1055,8 @@ int main(int argc, char* argv[]) try {
                     }
                     perf.target_hidden_copy_wall.add(duration_ms(th_start, Clock::now()));
 
-                    if (use_split_draft) {
-                        auto ckv_start = Clock::now();
-                        ov::Tensor new_ctx_hidden(target_hidden_storage,
-                                                  {0, target_hidden_len, 0},
-                                                  {1, target_hidden_len + 1, ctx_dim});
-                        ov::Tensor new_pos(ov::element::i64, {1, 1});
-                        new_pos.data<int64_t>()[0] = static_cast<int64_t>(target_hidden_len);
-                        context_kv_request.set_tensor("target_hidden", new_ctx_hidden);
-                        context_kv_request.set_tensor("position_ids", new_pos);
-                        context_kv_request.infer();
-                        perf.context_kv_infer_wall.add(duration_ms(ckv_start, Clock::now()));
-                        auto ckv_copy_start = Clock::now();
-                        for (size_t i = 0; i < num_draft_layers; ++i) {
-                            auto new_k = ensure_f32_copy(
-                                context_kv_request.get_tensor("context_k_" + std::to_string(i)));
-                            auto new_v = ensure_f32_copy(
-                                context_kv_request.get_tensor("context_v_" + std::to_string(i)));
-                            context_kv_cache[i].first = concat_kv_seq(context_kv_cache[i].first, new_k);
-                            context_kv_cache[i].second = concat_kv_seq(context_kv_cache[i].second, new_v);
-                        }
-                        perf.context_kv_copy_wall.add(duration_ms(ckv_copy_start, Clock::now()));
-                    }
+                    // Skip context_kv update during AR fallback — will be
+                    // batch-rebuilt lazily before the next draft step.
                 }
                 target_hidden_len += 1;
                 past_len += 1;
@@ -1089,6 +1075,37 @@ int main(int argc, char* argv[]) try {
                 perf.other_wall.add(std::max(0.0, step_ms - duration_ms(ar_verify_start, ar_verify_end)));
                 continue;
             }
+        }
+
+        // ── Lazy context KV rebuild ─────────────────────────────────────
+        // If AR fallback skipped context_kv updates, batch-rebuild now.
+        if (use_split_draft && has_target_hidden && context_kv_seq_len < target_hidden_len) {
+            const size_t deferred = target_hidden_len - context_kv_seq_len;
+            auto ckv_start = Clock::now();
+            ov::Tensor deferred_hidden(target_hidden_storage,
+                                       {0, context_kv_seq_len, 0},
+                                       {1, target_hidden_len, ctx_dim});
+            ov::Tensor deferred_pos(ov::element::i64, {1, deferred});
+            {
+                auto* pd = deferred_pos.data<int64_t>();
+                for (size_t i = 0; i < deferred; ++i)
+                    pd[i] = static_cast<int64_t>(context_kv_seq_len + i);
+            }
+            context_kv_request.set_tensor("target_hidden", deferred_hidden);
+            context_kv_request.set_tensor("position_ids", deferred_pos);
+            context_kv_request.infer();
+            perf.context_kv_infer_wall.add(duration_ms(ckv_start, Clock::now()));
+            auto ckv_copy_start = Clock::now();
+            for (size_t i = 0; i < num_draft_layers; ++i) {
+                auto new_k = ensure_f32_copy(
+                    context_kv_request.get_tensor("context_k_" + std::to_string(i)));
+                auto new_v = ensure_f32_copy(
+                    context_kv_request.get_tensor("context_v_" + std::to_string(i)));
+                context_kv_cache[i].first = concat_kv_seq(context_kv_cache[i].first, new_k);
+                context_kv_cache[i].second = concat_kv_seq(context_kv_cache[i].second, new_v);
+            }
+            perf.context_kv_copy_wall.add(duration_ms(ckv_copy_start, Clock::now()));
+            context_kv_seq_len = target_hidden_len;
         }
 
         // ── Draft ────────────────────────────────────────────────────────
@@ -1211,11 +1228,9 @@ int main(int argc, char* argv[]) try {
             // ── Update context KV cache for newly accepted tokens ────────
             if (use_split_draft && num_accepted > 0) {
                 auto ckv_start = Clock::now();
-                // Run context_kv model on the newly accepted target_hidden.
                 ov::Tensor new_ctx_hidden(target_hidden_storage,
                                           {0, target_hidden_len, 0},
                                           {1, target_hidden_len + num_accepted, ctx_dim});
-                // Position IDs for newly accepted tokens.
                 ov::Tensor new_pos(ov::element::i64, {1, num_accepted});
                 {
                     auto* pd = new_pos.data<int64_t>();
@@ -1227,7 +1242,6 @@ int main(int argc, char* argv[]) try {
                 context_kv_request.infer();
                 perf.context_kv_infer_wall.add(duration_ms(ckv_start, Clock::now()));
                 auto ckv_copy_start = Clock::now();
-                // Append new K,V to existing cache per layer.
                 for (size_t i = 0; i < num_draft_layers; ++i) {
                     auto new_k = ensure_f32_copy(
                         context_kv_request.get_tensor("context_k_" + std::to_string(i)));
@@ -1237,6 +1251,7 @@ int main(int argc, char* argv[]) try {
                     context_kv_cache[i].second = concat_kv_seq(context_kv_cache[i].second, new_v);
                 }
                 perf.context_kv_copy_wall.add(duration_ms(ckv_copy_start, Clock::now()));
+                context_kv_seq_len = target_hidden_len + num_accepted;
             }
         }
         target_hidden_len += num_accepted;
