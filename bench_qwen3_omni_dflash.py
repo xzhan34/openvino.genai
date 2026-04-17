@@ -218,7 +218,7 @@ def print_summary(results: list, device: str):
     # Pairwise speedup
     pairs = [
         (0, 1, "Text FP16"),
-        (0, 2, "Text INT4+FP16"),
+        (2, 3, "Text INT4+INT4"),
         (4, 5, "Codegen"),
         (6, 7, "VL mode"),
     ]
@@ -309,22 +309,24 @@ def main():
         return cmd
 
     # ── Test definitions ──────────────────────────────────────────────────
+    _PROMPT_CASES_1_4 = "Suggest five award-winning documentary films with brief background descriptions for aspiring filmmakers to study"
+
     tests = [
         # (name, cmd_builder)
         ("Baseline FP16 text",
-         lambda: baseline_cmd("What is the capital of France?"),
+         lambda: baseline_cmd(_PROMPT_CASES_1_4, max_tok=128),
          False),
 
         ("DFlash FP16 text",
-         lambda: dflash_cmd("What is the capital of France?"),
+         lambda: dflash_cmd(_PROMPT_CASES_1_4, max_tok=128),
          True),
 
-        ("DFlash INT4+FP16 text",
-         lambda: dflash_cmd("What is the capital of France?", tgt_quant="INT4_ASYM"),
-         True),
+        ("Baseline INT4 text",
+         lambda: baseline_cmd(_PROMPT_CASES_1_4, max_tok=128, precision="inf_fp16_kv_int8_w_int4_asym"),
+         False),
 
-        ("DFlash FP16 long(256)",
-         lambda: dflash_cmd("Write a detailed explanation of how neural networks work", max_tok=256),
+        ("DFlash INT4+INT4 text",
+         lambda: dflash_cmd(_PROMPT_CASES_1_4, max_tok=128, tgt_quant="INT4_ASYM", draft_quant="INT4_ASYM"),
          True),
 
         ("Baseline FP16 codegen",
