@@ -203,16 +203,21 @@ def _draft_only_accrate(m: Metrics) -> str:
     return "—"
 
 
-def print_summary(results: list, device: str):
+def print_summary(results: list, device: str, prompts: dict = None):
     """Print a formatted summary table of all test results."""
-    sep  = "+-----+------------------------+--------+--------+-----------+------------+---------+----------+-----------+----------+"
-    hdr  = "| #   | Test                   | Prompt | Output | TTFT (ms) | TPOT (ms)  | Tok/s   | AccRate  | AvgAccept | DraftAcc |"
+    sep  = "+-----+------------------------+--------+--------+-----------+------------+---------+----------+-----------+----------+-------+----------+"
+    hdr  = "| #   | Test                   | Prompt | Output | TTFT (ms) | TPOT (ms)  | Tok/s   | AccRate  | AvgAccept | DraftAcc | Draft | Accepted |"
 
     print()
     print("=" * 60)
     print(f"  BENCHMARK SUMMARY  —  Device: {device}")
     print("=" * 60)
     print()
+    if prompts:
+        print("  Test prompts:")
+        for label, p in prompts.items():
+            print(f"    {label:<12} {p}")
+        print()
     print("  AccRate  = accepted_draft_tokens / generated_tokens")
     print("             (how well the draft model matches the target; higher is better)")
     print("  AvgAccept = accepted_draft_tokens / draft_steps")
@@ -237,7 +242,9 @@ def print_summary(results: list, device: str):
             f"| {m.throughput:>7} "
             f"| {m.acc_rate:>8} "
             f"| {m.avg_accept:>9} "
-            f"| {draft_acc:>8} |"
+            f"| {draft_acc:>8} "
+            f"| {m.draft_steps:>5} "
+            f"| {m.accepted_tokens:>8} |"
         )
         print(row)
 
@@ -248,8 +255,10 @@ def print_summary(results: list, device: str):
     pairs = [
         (0, 1, "Text FP16"),
         (2, 3, "Text INT4+INT4"),
-        (4, 5, "Codegen"),
-        (6, 7, "VL mode"),
+        (4, 5, "Knowledge"),
+        (6, 7, "Codegen"),
+        (8, 9, "Long text"),
+        (10, 11, "VL mode"),
     ]
     print("  Speedup (DFlash vs Baseline):")
     print("  " + "-" * 50)
@@ -325,26 +334,28 @@ def main():
     # Helper to build baseline command (modeling_qwen3_omni uses named args)
     #   --model-dir PATH --image PATH [--prompt TEXT] [--device NAME]
     #   [--output-tokens N] [--precision MODE]
+    # NOTE: modeling_qwen3_omni REQUIRES --image, so baseline always runs in VL mode.
     def baseline_cmd(prompt, max_tok=None, image=None, precision=None):
         cmd = [
             str(baseline_exe),
             "--model-dir", args.target_dir,
+            "--image", image or args.image,
             "--prompt", prompt,
             "--device", args.device,
             "--output-tokens", str(max_tok or args.max_tokens),
             "--precision", precision or args.precision,
         ]
-        if image:
-            cmd.extend(["--image", image])
         return cmd
 
     # ── Test definitions ──────────────────────────────────────────────────
     _PROMPT_TEXT = "List the planets in our solar system in order from the Sun"
+    _PROMPT_KNOWLEDGE = "Solve step by step: What is 15% of 240?"
     _PROMPT_CODEGEN = "Write a Python function to sort a list using quicksort"
+    _PROMPT_LONGTEXT = "Suggest five award-winning documentary films with brief background descriptions for aspiring filmmakers to study"
     _PROMPT_VL = "Describe this image in detail"
 
     tests = [
-        # (name, cmd_builder)
+        # (name, cmd_builder, needs_dflash)
         ("Baseline FP16 text",
          lambda: baseline_cmd(_PROMPT_TEXT, max_tok=128),
          False),
@@ -361,12 +372,28 @@ def main():
          lambda: dflash_cmd(_PROMPT_TEXT, max_tok=128, tgt_quant="INT4_ASYM", draft_quant="INT4_ASYM"),
          True),
 
+        ("Baseline FP16 knowledge",
+         lambda: baseline_cmd(_PROMPT_KNOWLEDGE),
+         False),
+
+        ("DFlash FP16 knowledge",
+         lambda: dflash_cmd(_PROMPT_KNOWLEDGE),
+         True),
+
         ("Baseline FP16 codegen",
          lambda: baseline_cmd(_PROMPT_CODEGEN),
          False),
 
         ("DFlash FP16 codegen",
          lambda: dflash_cmd(_PROMPT_CODEGEN),
+         True),
+
+        ("Baseline FP16 longtext",
+         lambda: baseline_cmd(_PROMPT_LONGTEXT),
+         False),
+
+        ("DFlash FP16 longtext",
+         lambda: dflash_cmd(_PROMPT_LONGTEXT),
          True),
 
         ("Baseline FP16 VL",
@@ -386,9 +413,11 @@ def main():
     print(f"  Draft:  {args.draft_dir}")
     print(f"  Device: {args.device}  Max tokens: {args.max_tokens}  Block size: {args.block_size}")
     print(f"  Baseline precision: {args.precision}")
-    print(f"  Text prompt:    {_PROMPT_TEXT}")
-    print(f"  Codegen prompt: {_PROMPT_CODEGEN}")
-    print(f"  VL prompt:      {_PROMPT_VL}")
+    print(f"  Text prompt:      {_PROMPT_TEXT}")
+    print(f"  Knowledge prompt: {_PROMPT_KNOWLEDGE}")
+    print(f"  Codegen prompt:   {_PROMPT_CODEGEN}")
+    print(f"  Long text prompt: {_PROMPT_LONGTEXT}")
+    print(f"  VL prompt:        {_PROMPT_VL}")
     print("=" * 60)
 
     for name, cmd_fn, needs_dflash in tests:
@@ -401,7 +430,14 @@ def main():
         results.append(r)
 
     # ── Summary ───────────────────────────────────────────────────────────
-    print_summary(results, args.device)
+    prompt_labels = {
+        "Text":      _PROMPT_TEXT,
+        "Knowledge": _PROMPT_KNOWLEDGE,
+        "Codegen":   _PROMPT_CODEGEN,
+        "Long text": _PROMPT_LONGTEXT,
+        "VL":        _PROMPT_VL,
+    }
+    print_summary(results, args.device, prompts=prompt_labels)
     print(f"  Logs saved in: {log_dir}")
     print("=" * 60)
     print("  Benchmark complete.")
