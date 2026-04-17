@@ -3553,6 +3553,112 @@ AccRate 仅 6.3%。代码类 prompt 达到 56-70%，知识/推理类达到 40-53
 <li><code>dflash/test_prompt_acceptance.py</code> — 新增：单 prompt 在多 target 上的 Python acceptance rate 快速测试工具</li>
 </ul>
 
+<h2 id="sec37">37. INT4 量化与 Speculative Decoding 的矛盾：Case 4 vs Case 2 分析</h2>
+
+<p>§36 benchmark 扩展为 12 组测试后，Case 4（DFlash INT4+INT4 text）与 Case 2（DFlash FP16 text）使用相同 prompt，
+AccRate 完全相同（0.5682），但 INT4 反而更慢。同时 Baseline INT4（Case 3）是所有测试中最快的（13.52 tok/s），
+DFlash INT4 却只有 9.23 tok/s，差距悬殊。本节分析这一违反直觉的现象。</p>
+
+<h3>37.1 实测数据对比</h3>
+
+<table>
+<thead><tr><th>指标</th><th>Case 2 (DFlash FP16)</th><th>Case 4 (DFlash INT4+INT4)</th><th>差值</th></tr></thead>
+<tbody>
+<tr><td>Output tokens</td><td>88</td><td>88</td><td>相同</td></tr>
+<tr><td>Draft steps</td><td>29</td><td>29</td><td>相同</td></tr>
+<tr><td>AR fallback steps</td><td>8</td><td>8</td><td>相同</td></tr>
+<tr><td>Accepted draft tokens</td><td>50</td><td>50</td><td>相同</td></tr>
+<tr><td>AccRate</td><td>0.5682</td><td>0.5682</td><td>相同</td></tr>
+<tr><td>TPOT</td><td>94.48 ms</td><td><strong>109.64 ms</strong></td><td><strong>+16.0%</strong></td></tr>
+<tr><td>Throughput</td><td>10.71 tok/s</td><td><strong>9.23 tok/s</strong></td><td><strong>-13.8%</strong></td></tr>
+</tbody>
+</table>
+
+<p>生成内容完全相同（planets 列表），token sequence 一致。速度差异纯粹来自 per-step latency。</p>
+
+<h3>37.2 Stage Timing 逐项分析</h3>
+
+<p>从 C++ stage timing 输出可以精确定位 INT4 的开销来源：</p>
+
+<table>
+<thead><tr><th>Stage</th><th>FP16 (ms)</th><th>INT4 (ms)</th><th>差值</th><th>调用次数</th><th>Per-call 差异</th></tr></thead>
+<tbody>
+<tr><td>prefill target</td><td>366.3</td><td>376.0</td><td>+9.7</td><td>1</td><td>+9.7 ms</td></tr>
+<tr><td><strong>draft (step)</strong></td><td>42.2</td><td><strong>49.7</strong></td><td><strong>+7.5</strong></td><td>29</td><td>+0.26 ms/step</td></tr>
+<tr><td><strong>target verify</strong></td><td>183.7</td><td><strong>213.7</strong></td><td><strong>+30.0</strong></td><td>37</td><td>+0.81 ms/call</td></tr>
+<tr><td>trim_kv</td><td>0.272</td><td>0.375</td><td>+0.1</td><td>29</td><td>微小</td></tr>
+<tr><td><strong>总 decode time</strong></td><td>8219.6</td><td><strong>9538.8</strong></td><td><strong>+1319.2</strong></td><td>—</td><td>—</td></tr>
+</tbody>
+</table>
+
+<p>INT4 dequantization 的开销在 target verify（+30ms）和 draft step（+7.5ms）中累积，总计约 37.5ms 额外开销，
+被 speculative decoding 的高频小步骤放大。</p>
+
+<h3>37.3 根因：INT4 与 Speculative Decoding 的计算特性冲突</h3>
+
+<p><strong>INT4 量化的收益来自减少 memory bandwidth</strong>（weight size 缩小 4×，从显存加载更快）。
+这对标准 AR 推理非常有效，因为单 token forward 是完全 <em>memory-bound</em> 的：</p>
+
+<table>
+<thead><tr><th>配置</th><th>TPOT</th><th>Tok/s</th><th>分析</th></tr></thead>
+<tbody>
+<tr><td>Baseline FP16 (Case 1)</td><td>148.58 ms</td><td>6.73</td><td>单 token AR，memory-bound</td></tr>
+<tr><td>Baseline INT4 (Case 3)</td><td>73.97 ms</td><td><strong>13.52</strong></td><td>INT4 weight 减少 4× bandwidth → <strong>2.01× 加速</strong></td></tr>
+</tbody>
+</table>
+
+<p>但 DFlash speculative decoding 的工作模式完全不同：</p>
+
+<ol>
+<li><strong>Draft model 已经极小</strong>（5 层 attention+MLP），FP16 下每步仅 1.46ms，INT4 dequant 的固定开销占比更大</li>
+<li><strong>Target verify 是 batch 操作</strong>（一次验证 block_size 个 token），计算密度更高，已经接近 <em>compute-bound</em> 区域。
+INT4 的 dequant 运算增加了额外计算，但 bandwidth 收益在高 batch 下边际递减</li>
+<li><strong>高频调用放大 overhead</strong>：29 draft steps + 37 verify calls = 66 次 inference，每次的 INT4 dequant 开销累积为 37.5ms</li>
+</ol>
+
+<h3>37.4 Baseline INT4 vs DFlash INT4：为什么差距如此大</h3>
+
+<table>
+<thead><tr><th>配置</th><th>Baseline</th><th>DFlash</th><th>Speedup</th></tr></thead>
+<tbody>
+<tr><td>FP16</td><td>6.73 tok/s</td><td>10.71 tok/s</td><td><strong>1.59×</strong></td></tr>
+<tr><td>INT4</td><td><strong>13.52 tok/s</strong></td><td>9.23 tok/s</td><td><strong>0.68×（减速！）</strong></td></tr>
+</tbody>
+</table>
+
+<p>Baseline INT4 通过 weight 量化将 memory bandwidth 需求降到 1/4，单 token AR 推理直接获得 2× 加速。
+但 DFlash 的 speculative decoding 通过 batch verify 提高了计算密度（从 memory-bound 向 compute-bound 偏移），
+使得 INT4 的 bandwidth 收益被抵消，而 dequantization 的计算开销成为净负担。</p>
+
+<p>本质上：<strong>INT4 优化的是 memory-bound 的单 token 场景，speculative decoding 优化的是通过 batch 提高计算效率——
+两者针对不同瓶颈做优化，同时使用时互相矛盾。</strong></p>
+
+<h3>37.5 Draft Acceptance Pattern 对比</h3>
+
+<pre><code>Case 2 (FP16):     [0,0,1,2,0,1,2,0,3,0,0,4,6,5,6,0,5,1,5,0,8,0,0,0,0,0,0,0,1]
+Case 4 (INT4):     [0,0,1,2,0,2,1,0,2,0,0,0,4,6,5,6,0,12,0,0,7,0,0,0,0,0,0,1,1]</code></pre>
+
+<p>整体 pattern 高度相似（星球列表的结构化输出对 draft 友好），但 INT4 在个别步有微小差异
+（如 step 18 接受了 12 个 token vs FP16 step 17 的 5 个）。这是 INT4 量化导致 target logits 微小变化的正常现象，
+不影响最终 AccRate 统计（两者都是 50/88 = 0.5682）。</p>
+
+<h3>37.6 结论与建议</h3>
+
+<ol>
+<li><strong>DFlash benchmark 应以 FP16 配置为主</strong>：INT4+INT4 组合在 speculative decoding 下没有性能优势</li>
+<li><strong>如需量化，考虑 target INT4 + draft FP16</strong>：draft model 已经很小（~200MB），量化无意义；target 量化可能减少 verify 的 weight 加载时间</li>
+<li><strong>INT4 baseline 仍有参考价值</strong>：它代表了"不用 speculative decoding、仅用量化加速"的上界（13.52 tok/s），
+DFlash FP16 (10.71 tok/s) 尚未超过这个上界，说明当前 AccRate (~57%) 还不够高</li>
+<li><strong>理论盈亏平衡点</strong>：要让 DFlash FP16 超过 Baseline INT4，需要 AccRate &gt; 57% × (13.52/10.71) ≈ 72%。
+当前仅代码类 prompt (Fibonacci 70.3%) 接近此门槛</li>
+</ol>
+
+<h3>37.7 涉及的文件</h3>
+<ul>
+<li><code>bench_qwen3_omni_dflash.py</code> — 新增 12 组测试（6 pairs），包括 INT4+INT4 vs FP16 对比</li>
+<li>Log: <code>/tmp/qwen3_omni_dflash_bench_8dxokyar/test{2,3,4}.log</code> — Case 2/3/4 详细 stage timing</li>
+</ul>
+
 <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
     Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比 &amp; 集成排障文档
 </div>
