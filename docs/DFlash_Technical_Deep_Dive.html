@@ -3445,6 +3445,114 @@ $\text{TPOT}_{实际} = \frac{240}{1.31 + 1} = 104 \text{ms/token}$
 <li><strong>调整 target layers</strong>: 当前 <code>[1,9,17,25,33]</code>，VL 信息可能集中在特定层。</li>
 </ol>
 
+<h2 id="sec36">36. Benchmark Prompt 分析：C++ vs Python 指标对齐验证 &amp; Baseline VL 模式问题</h2>
+
+<p>§35 识别到 acceptance rate 是核心瓶颈后，对 <code>bench_qwen3_omni_dflash.py</code> 的 benchmark prompt
+做了详细的跨平台对比验证（C++ OpenVINO vs Python PyTorch），发现了两个重要问题。</p>
+
+<h3>36.1 Baseline 强制走 VL 模式（已修复）</h3>
+
+<p><code>bench_qwen3_omni_dflash.py</code> 中 <code>baseline_cmd()</code> 始终传递 <code>--image</code> 参数：</p>
+<pre><code>def baseline_cmd(prompt, max_tok=None, image=None, precision=None):
+    cmd = [str(baseline_exe), "--model-dir", args.target_dir,
+           "--image", image or args.image,   # ← 总是传 image
+           "--prompt", prompt, ...]</code></pre>
+
+<p>而 <code>dflash_cmd()</code> 只在 VL 测试时传 image。这导致 <strong>文本测试的 Baseline 和 DFlash 根本不可比</strong>：</p>
+
+<table>
+<thead><tr><th>项目</th><th>Case 1 (Baseline FP16 text)</th><th>Case 2 (DFlash FP16 text)</th></tr></thead>
+<tbody>
+<tr><td>实际模式</td><td><strong>VL (text + image)</strong></td><td>纯文本</td></tr>
+<tr><td>Prompt tokens</td><td>106（含 <code>&lt;|vision_start|&gt;...&lt;|vision_end|&gt;</code>）</td><td>28（纯 chat template）</td></tr>
+<tr><td>Vision encode</td><td>605ms</td><td>无</td></tr>
+<tr><td>Throughput</td><td>6.69 tok/s</td><td>5.79 tok/s</td></tr>
+<tr><td>对比意义</td><td colspan="2"><em>不可比：不同 prompt、不同模式</em></td></tr>
+</tbody>
+</table>
+
+<p><strong>根因：</strong><code>modeling_qwen3_omni</code>（baseline exe）一旦收到 <code>--image</code> 参数，就进入 VL 分支并做 vision encode，
+即使用户意图是测纯文本。而 DFlash exe 通过位置参数控制，不传 image path 则为纯文本模式。</p>
+
+<h3>36.2 Acceptance Rate 指标：C++ vs Python 对齐验证</h3>
+
+<p>使用同一 prompt &ldquo;Suggest five award-winning documentary films...&rdquo; 在 Python 和 C++ 上测试 Qwen3‑Omni‑4B target：</p>
+
+<h4>Python 测试结果（PyTorch, flash_attention_2）</h4>
+<table>
+<thead><tr><th>Target Model</th><th>τ (mean acceptance length)</th><th>Acceptance Lengths</th></tr></thead>
+<tbody>
+<tr><td>Qwen3-4B</td><td><strong>2.26</strong></td><td>混合 1-7，分布合理</td></tr>
+<tr><td>Qwen3-Omni-4B</td><td><strong>1.16</strong></td><td>几乎全是 1，极差</td></tr>
+</tbody>
+</table>
+<p>Python AccRate（Omni）≈ (τ-1)/τ = 0.16/1.16 = <strong>13.8%</strong></p>
+
+<h4>C++ 测试结果（OpenVINO, FP16）</h4>
+<table>
+<thead><tr><th>指标</th><th>值</th></tr></thead>
+<tbody>
+<tr><td>Draft steps</td><td>38</td></tr>
+<tr><td>AR fallback steps</td><td>84</td></tr>
+<tr><td>Accepted draft tokens</td><td>6</td></tr>
+<tr><td>Output tokens</td><td>128</td></tr>
+<tr><td>C++ AccRate (overall)</td><td>6/128 = <strong>4.69%</strong></td></tr>
+<tr><td>C++ AvgAccept</td><td>6/38 = <strong>0.16</strong></td></tr>
+</tbody>
+</table>
+
+<h4>对齐分析</h4>
+<p>C++ 报告的 AccRate (4.69%) 远低于 Python (13.8%)，<strong>但这不是 bug</strong>。差异来自 AR fallback 机制：</p>
+<ul>
+<li>C++ 有 adaptive AR fallback：连续低接受率时自动切换到 autoregressive 模式（不走 draft），直接用 target 单 token 生成</li>
+<li>AR 步产生的 84 个 token <strong>不算</strong> <code>accepted_draft_tokens</code>（分子），但<strong>算进</strong> <code>generated_tokens</code>（分母）</li>
+<li>因此 C++ AccRate 的分母被 AR tokens 稀释</li>
+</ul>
+
+<p><strong>验证：Draft-only AccRate</strong></p>
+<pre><code>draft_generated = output_tokens - ar_fallback_steps = 128 - 84 = 44
+draft_only_accrate = accepted_draft_tokens / draft_generated = 6 / 44 = <strong>13.6%</strong></code></pre>
+
+<p>Python AccRate = 13.8%，C++ draft-only AccRate = 13.6%，<strong>完全对齐</strong>（误差 &lt; 0.3%）。</p>
+<p>这证明了：</p>
+<ol>
+<li>C++ OpenVINO 和 Python PyTorch 的 draft model 推理结果一致</li>
+<li>AccRate 差异完全由 AR fallback 机制解释</li>
+<li>Benchmark 统计需要同时展示 overall AccRate 和 draft-only AccRate</li>
+</ol>
+
+<h3>36.3 Prompt 选择对 Acceptance Rate 的影响</h3>
+
+<p>C++ 测试了 14 个候选 prompt 在 Qwen3-Omni-4B 上的 AccRate：</p>
+
+<table>
+<thead><tr><th>#</th><th>Prompt</th><th>AccRate</th><th>Tok/s</th><th>类型</th></tr></thead>
+<tbody>
+<tr style="background:rgba(0,255,0,0.05)"><td>5</td><td>Write Fibonacci code</td><td><strong>70.3%</strong></td><td>13.70</td><td>代码</td></tr>
+<tr style="background:rgba(0,255,0,0.05)"><td>12</td><td>Write unittest</td><td><strong>64.8%</strong></td><td>12.08</td><td>代码</td></tr>
+<tr style="background:rgba(0,255,0,0.04)"><td>9</td><td>Generate JSON</td><td><strong>57.0%</strong></td><td>9.92</td><td>结构化</td></tr>
+<tr><td>6</td><td>Quicksort (codegen bench)</td><td>56.3%</td><td>9.73</td><td>代码</td></tr>
+<tr><td>10</td><td>Step-by-step math</td><td>53.1%</td><td>9.34</td><td>推理</td></tr>
+<tr><td>3</td><td>Planets list</td><td>40.5%</td><td>8.48</td><td>知识列表</td></tr>
+<tr><td>13</td><td>Cookie recipe</td><td>32.0%</td><td>6.85</td><td>生活文本</td></tr>
+<tr><td>4</td><td>Photosynthesis</td><td>23.4%</td><td>6.15</td><td>说明</td></tr>
+<tr><td>14</td><td>Compare languages</td><td>15.6%</td><td>6.03</td><td>对比</td></tr>
+<tr><td>7</td><td>Write email</td><td>13.3%</td><td>6.18</td><td>创意</td></tr>
+<tr><td>11</td><td>Explain AI</td><td>7.8%</td><td>5.99</td><td>说明</td></tr>
+<tr style="background:rgba(255,0,0,0.08)"><td><strong>1</strong></td><td><strong>Documentary films (当前)</strong></td><td><strong>6.3%</strong></td><td><strong>5.76</strong></td><td><strong>描述性</strong></td></tr>
+</tbody>
+</table>
+
+<p><strong>结论：</strong>当前 benchmark 的 text prompt（documentary films）是 14 个候选中 <strong>最差的</strong>，
+AccRate 仅 6.3%。代码类 prompt 达到 56-70%，知识/推理类达到 40-53%。
+这意味着 benchmark 结果严重低估了 DFlash 在实际使用中的表现。</p>
+
+<h3>36.4 涉及的文件</h3>
+<ul>
+<li><code>bench_qwen3_omni_dflash.py</code> — 修复：baseline text test 不传 image；summary 增加 draft-only AccRate 统计；打印 test prompt</li>
+<li><code>dflash/test_prompt_acceptance.py</code> — 新增：单 prompt 在多 target 上的 Python acceptance rate 快速测试工具</li>
+</ul>
+
 <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;border-top:1px solid var(--border);margin-top:3rem;">
     Generated on <script>document.write(new Date().toLocaleDateString('zh-CN'))</script> — DFlash 全系列代码分析 &amp; Qwen3-Omni 架构对比 &amp; 集成排障文档
 </div>

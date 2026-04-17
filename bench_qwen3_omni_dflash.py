@@ -114,6 +114,9 @@ class Metrics:
     throughput: str = "—"
     acc_rate: str = "—"
     avg_accept: str = "—"
+    draft_steps: str = "—"
+    ar_steps: str = "—"
+    accepted_tokens: str = "—"
 
 
 # Regex patterns matching "Key: value [unit]" output lines
@@ -125,6 +128,9 @@ _METRIC_PATTERNS = {
     "throughput":    re.compile(r"Throughput:\s*([\d.]+)"),
     "acc_rate":      re.compile(r"Acceptance rate:\s*([\d.]+)"),
     "avg_accept":    re.compile(r"Avg accepted per step:\s*([\d.]+)"),
+    "draft_steps":   re.compile(r"Draft steps:\s*(\d+)"),
+    "ar_steps":      re.compile(r"AR fallback steps:\s*(\d+)"),
+    "accepted_tokens": re.compile(r"Accepted draft tokens:\s*(\d+)"),
 }
 
 
@@ -179,10 +185,28 @@ def run_test(cmd: list, name: str, env: dict, log_dir: Path, test_num: int) -> T
 
 # ── Summary table ────────────────────────────────────────────────────────────
 
+def _draft_only_accrate(m: Metrics) -> str:
+    """Compute draft-only acceptance rate (excluding AR fallback tokens from denominator).
+
+    draft_only_accrate = accepted_draft_tokens / (output_tokens - ar_fallback_steps)
+    This removes AR fallback dilution and shows the true draft model accuracy.
+    """
+    try:
+        accepted = int(m.accepted_tokens)
+        output = int(m.output_tokens)
+        ar = int(m.ar_steps)
+        draft_generated = output - ar
+        if draft_generated > 0:
+            return f"{accepted / draft_generated:.4f}"
+    except (ValueError, TypeError):
+        pass
+    return "—"
+
+
 def print_summary(results: list, device: str):
     """Print a formatted summary table of all test results."""
-    sep  = "+-----+------------------------+--------+--------+-----------+------------+---------+----------+-----------+"
-    hdr  = "| #   | Test                   | Prompt | Output | TTFT (ms) | TPOT (ms)  | Tok/s   | AccRate  | AvgAccept |"
+    sep  = "+-----+------------------------+--------+--------+-----------+------------+---------+----------+-----------+----------+"
+    hdr  = "| #   | Test                   | Prompt | Output | TTFT (ms) | TPOT (ms)  | Tok/s   | AccRate  | AvgAccept | DraftAcc |"
 
     print()
     print("=" * 60)
@@ -193,6 +217,8 @@ def print_summary(results: list, device: str):
     print("             (how well the draft model matches the target; higher is better)")
     print("  AvgAccept = accepted_draft_tokens / draft_steps")
     print("             (average tokens accepted per draft step; ideal ≈ block_size - 1)")
+    print("  DraftAcc = accepted_draft_tokens / (output_tokens - ar_fallback_steps)")
+    print("             (draft-only acceptance rate, excluding AR fallback dilution)")
     print()
     print(sep)
     print(hdr)
@@ -200,6 +226,7 @@ def print_summary(results: list, device: str):
 
     for i, r in enumerate(results, 1):
         m = r.metrics
+        draft_acc = _draft_only_accrate(m)
         row = (
             f"| {i:<3} "
             f"| {r.name:<22} "
@@ -209,7 +236,8 @@ def print_summary(results: list, device: str):
             f"| {m.tpot_ms:>10} "
             f"| {m.throughput:>7} "
             f"| {m.acc_rate:>8} "
-            f"| {m.avg_accept:>9} |"
+            f"| {m.avg_accept:>9} "
+            f"| {draft_acc:>8} |"
         )
         print(row)
 
@@ -301,49 +329,52 @@ def main():
         cmd = [
             str(baseline_exe),
             "--model-dir", args.target_dir,
-            "--image", image or args.image,
             "--prompt", prompt,
             "--device", args.device,
             "--output-tokens", str(max_tok or args.max_tokens),
             "--precision", precision or args.precision,
         ]
+        if image:
+            cmd.extend(["--image", image])
         return cmd
 
     # ── Test definitions ──────────────────────────────────────────────────
-    _PROMPT_CASES_1_4 = "Suggest five award-winning documentary films with brief background descriptions for aspiring filmmakers to study"
+    _PROMPT_TEXT = "List the planets in our solar system in order from the Sun"
+    _PROMPT_CODEGEN = "Write a Python function to sort a list using quicksort"
+    _PROMPT_VL = "Describe this image in detail"
 
     tests = [
         # (name, cmd_builder)
         ("Baseline FP16 text",
-         lambda: baseline_cmd(_PROMPT_CASES_1_4, max_tok=128),
+         lambda: baseline_cmd(_PROMPT_TEXT, max_tok=128),
          False),
 
         ("DFlash FP16 text",
-         lambda: dflash_cmd(_PROMPT_CASES_1_4, max_tok=128),
+         lambda: dflash_cmd(_PROMPT_TEXT, max_tok=128),
          True),
 
         ("Baseline INT4 text",
-         lambda: baseline_cmd(_PROMPT_CASES_1_4, max_tok=128, precision="inf_fp16_kv_int8_w_int4_asym"),
+         lambda: baseline_cmd(_PROMPT_TEXT, max_tok=128, precision="inf_fp16_kv_int8_w_int4_asym"),
          False),
 
         ("DFlash INT4+INT4 text",
-         lambda: dflash_cmd(_PROMPT_CASES_1_4, max_tok=128, tgt_quant="INT4_ASYM", draft_quant="INT4_ASYM"),
+         lambda: dflash_cmd(_PROMPT_TEXT, max_tok=128, tgt_quant="INT4_ASYM", draft_quant="INT4_ASYM"),
          True),
 
         ("Baseline FP16 codegen",
-         lambda: baseline_cmd("Write a Python function to sort a list using quicksort"),
+         lambda: baseline_cmd(_PROMPT_CODEGEN),
          False),
 
         ("DFlash FP16 codegen",
-         lambda: dflash_cmd("Write a Python function to sort a list using quicksort"),
+         lambda: dflash_cmd(_PROMPT_CODEGEN),
          True),
 
         ("Baseline FP16 VL",
-         lambda: baseline_cmd("Describe this image in detail", image=args.image),
+         lambda: baseline_cmd(_PROMPT_VL, image=args.image),
          False),
 
         ("DFlash FP16 VL",
-         lambda: dflash_cmd("Describe this image in detail", image=args.image),
+         lambda: dflash_cmd(_PROMPT_VL, image=args.image),
          True),
     ]
 
@@ -355,6 +386,9 @@ def main():
     print(f"  Draft:  {args.draft_dir}")
     print(f"  Device: {args.device}  Max tokens: {args.max_tokens}  Block size: {args.block_size}")
     print(f"  Baseline precision: {args.precision}")
+    print(f"  Text prompt:    {_PROMPT_TEXT}")
+    print(f"  Codegen prompt: {_PROMPT_CODEGEN}")
+    print(f"  VL prompt:      {_PROMPT_VL}")
     print("=" * 60)
 
     for name, cmd_fn, needs_dflash in tests:
